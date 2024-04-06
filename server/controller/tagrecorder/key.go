@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -56,8 +56,8 @@ type VtapPortKey struct {
 }
 
 type IPRelationKey struct {
-	VPCID int
-	IP    string
+	L3EPCID int
+	IP      string
 }
 
 type K8sLabelKey struct {
@@ -132,4 +132,9 @@ type PrometheusTargetLabelKey struct {
 	MetricID    int
 	LabelNameID int
 	TargetID    int
+}
+
+type PolicyKey struct {
+	ACLGID     int
+	TunnelType int
 }

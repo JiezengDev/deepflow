@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,9 +17,6 @@
 package example
 
 import _ "embed"
-
-//go:embed domain_additional_resource.yaml
-var YamlDomainAdditionalResourceReader []byte
 
 //go:embed domain_aliyun.yaml
 var YamlDomainAliYun []byte

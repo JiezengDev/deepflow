@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,9 +25,9 @@ use std::{
 
 use arc_swap::access::Access;
 use log::{debug, info, warn};
-use sysinfo::{
-    get_current_pid, NetworkExt, Pid, ProcessExt, ProcessRefreshKind, System, SystemExt,
-};
+#[cfg(target_os = "windows")]
+use sysinfo::NetworkExt;
+use sysinfo::{get_current_pid, Pid, ProcessExt, ProcessRefreshKind, System, SystemExt};
 
 use crate::config::handler::EnvironmentAccess;
 use crate::{
@@ -39,6 +39,8 @@ use crate::{
         },
     },
 };
+#[cfg(target_os = "linux")]
+use public::netns::{self, NsFile};
 use public::utils::net::link_list;
 
 #[derive(Default)]
@@ -231,7 +233,7 @@ impl RefCountable for SysStatusBroker {
             CounterValue::Unsigned(self.config.load().sys_free_memory_limit as u64),
         ));
 
-        match get_file_and_size_sum(self.log_dir.clone()) {
+        match get_file_and_size_sum(&self.log_dir) {
             Ok(file_and_size_sum) => {
                 metrics.push((
                     "log_file_size_sum",
@@ -283,11 +285,23 @@ impl RefCountable for SysLoad {
     fn get_counters(&self) -> Vec<Counter> {
         let mut sys = self.0.lock().unwrap();
         sys.refresh_cpu();
-        vec![(
-            "load1",
-            CounterType::Gauged,
-            CounterValue::Float(sys.load_average().one),
-        )]
+        vec![
+            (
+                "load1",
+                CounterType::Gauged,
+                CounterValue::Float(sys.load_average().one),
+            ),
+            (
+                "load5",
+                CounterType::Gauged,
+                CounterValue::Float(sys.load_average().five),
+            ),
+            (
+                "load15",
+                CounterType::Gauged,
+                CounterValue::Float(sys.load_average().fifteen),
+            ),
+        ]
     }
 }
 
@@ -328,21 +342,32 @@ impl Monitor {
 
         // register network hook
         let stats = self.stats.clone();
+        #[cfg(target_os = "windows")]
         let system = self.system.clone();
         let link_map = self.link_map.clone();
         self.stats.register_pre_hook(Box::new(move || {
             let mut link_map_guard = link_map.lock().unwrap();
+
+            #[cfg(target_os = "linux")]
+            if let Err(e) = netns::open_named_and_setns(&NsFile::Root) {
+                warn!("agent must have CAP_SYS_ADMIN to run without 'hostNetwork: true'.");
+                warn!("setns error: {}", e);
+                return;
+            }
 
             // resolve network interface update
             let links = match link_list() {
                 Ok(links) => links,
                 Err(e) => {
                     warn!("get interface list error: {}", e);
+                    #[cfg(target_os = "linux")]
+                    if let Err(e) = netns::reset_netns() {
+                        warn!("reset netns error: {}", e);
+                    };
                     return;
                 }
             };
 
-            let mut system_guard = system.lock().unwrap();
             let mut del_monitor_list = vec![];
             link_map_guard.retain(|name, broker| {
                 let exist = links.iter().any(|link| link.name == name.as_str());
@@ -361,7 +386,7 @@ impl Monitor {
             }
 
             let mut monitor_list = vec![];
-            for link in links {
+            for link in links.iter() {
                 if link_map_guard.contains_key(&link.name) {
                     continue;
                 }
@@ -375,27 +400,49 @@ impl Monitor {
                     options,
                 );
                 link_map_guard.insert(link.name.clone(), link_broker);
-                monitor_list.push(link.name);
+                monitor_list.push(link.name.clone());
             }
 
             if !monitor_list.is_empty() {
                 debug!("adding new monitor interface list: {:?}", monitor_list);
             }
 
-            system_guard.refresh_networks_list();
-            for (interface, net_data) in system_guard.networks() {
-                if let Some(broker) = link_map_guard.get(interface) {
-                    let metric = NetMetricArg {
-                        rx: net_data.total_packets_received(),
-                        tx: net_data.total_packets_transmitted(),
-                        rx_bytes: net_data.total_received(),
-                        tx_bytes: net_data.total_transmitted(),
-                        drop_in: net_data.total_errors_on_received(),
-                        drop_out: net_data.total_errors_on_transmitted(),
-                    };
-                    broker.update(metric);
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            for link in links {
+                if let Some(broker) = link_map_guard.get(&link.name) {
+                    broker.update(NetMetricArg {
+                        rx: link.stats.rx_packets,
+                        tx: link.stats.tx_packets,
+                        rx_bytes: link.stats.rx_bytes,
+                        tx_bytes: link.stats.tx_bytes,
+                        drop_in: link.stats.rx_dropped,
+                        drop_out: link.stats.tx_dropped,
+                    });
                 }
             }
+
+            #[cfg(target_os = "windows")]
+            {
+                let mut system_guard = system.lock().unwrap();
+                system_guard.refresh_networks_list();
+                for (interface, net_data) in system_guard.networks() {
+                    if let Some(broker) = link_map_guard.get(interface) {
+                        broker.update(NetMetricArg {
+                            rx: net_data.total_packets_received(),
+                            tx: net_data.total_packets_transmitted(),
+                            rx_bytes: net_data.total_received(),
+                            tx_bytes: net_data.total_transmitted(),
+                            drop_in: net_data.total_errors_on_received(),
+                            drop_out: net_data.total_errors_on_transmitted(),
+                        });
+                    }
+                }
+            }
+
+            #[cfg(target_os = "linux")]
+            if let Err(e) = netns::reset_netns() {
+                warn!("reset netns error: {}", e);
+            };
         }));
 
         self.stats.register_countable(

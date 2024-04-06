@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/event"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 )
@@ -39,7 +40,7 @@ func (sd *SubDomain) OnUpdaterAdded(addedDBItems []*mysql.SubDomain) {
 	sd.cache.AddSubDomains(addedDBItems)
 }
 
-func (sd *SubDomain) OnUpdaterUpdated(cloudItem *cloudmodel.SubDomain, diffBase *cache.SubDomain) {
+func (sd *SubDomain) OnUpdaterUpdated(cloudItem *cloudmodel.SubDomain, diffBase *diffbase.SubDomain) {
 	diffBase.Update(cloudItem)
 }
 
@@ -56,7 +57,7 @@ type WholeSubDomain struct {
 func NewWholeSubDomain(domainLcuuid, subDomainLcuuid string, c *cache.Cache, eq *queue.OverwriteQueue) *WholeSubDomain {
 	return &WholeSubDomain{
 		cache:         c,
-		eventProducer: event.NewSubDomain(domainLcuuid, subDomainLcuuid, &c.ToolDataSet, eq),
+		eventProducer: event.NewSubDomain(domainLcuuid, subDomainLcuuid, c.ToolDataSet, eq),
 	}
 }
 

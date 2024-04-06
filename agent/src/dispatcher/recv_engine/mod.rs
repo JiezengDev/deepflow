@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,13 +21,15 @@ use std::ffi::CStr;
 use std::sync::{atomic::AtomicU64, Arc};
 use std::time::Duration;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use af_packet::{options::Options, tpacket::Tpacket};
 pub use public::error::{Error, Result};
 use public::packet;
 
 use crate::utils::stats;
 
+#[cfg(target_os = "linux")]
+pub use special_recv_engine::Dpdk;
 pub use special_recv_engine::{Libpcap, LibpcapCounter};
 
 pub const DEFAULT_BLOCK_SIZE: usize = 1 << 20;
@@ -36,9 +38,10 @@ pub const FRAME_SIZE_MIN: usize = 1 << 11; // analyzer
 pub const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub enum RecvEngine {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     AfPacket(Tpacket),
-    Dpdk(),
+    #[cfg(target_os = "linux")]
+    Dpdk(Dpdk),
     Libpcap(Option<Libpcap>),
 }
 
@@ -47,9 +50,10 @@ impl RecvEngine {
 
     pub fn init(&mut self) -> Result<()> {
         match self {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             Self::AfPacket(_) => Ok(()),
-            Self::Dpdk() => todo!(),
+            #[cfg(target_os = "linux")]
+            Self::Dpdk(_) => Ok(()),
             Self::Libpcap(_) => Ok(()),
         }
     }
@@ -59,18 +63,23 @@ impl RecvEngine {
             Self::Libpcap(w) => {
                 let _ = w.take();
             }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             _ => (),
         }
     }
 
     pub unsafe fn recv(&mut self) -> Result<packet::Packet> {
         match self {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             Self::AfPacket(e) => match e.read() {
                 Some(p) => Ok(p),
                 None => Err(Error::Timeout),
             },
-            Self::Dpdk() => todo!(),
+            #[cfg(target_os = "linux")]
+            Self::Dpdk(d) => match d.read() {
+                Ok(p) => Ok(p),
+                _ => Err(Error::Timeout),
+            },
             Self::Libpcap(w) => w
                 .as_mut()
                 .ok_or(Error::LibpcapError(Self::LIBPCAP_NONE.to_string()))
@@ -81,21 +90,23 @@ impl RecvEngine {
     #[allow(unused_variables)]
     pub fn set_bpf(&mut self, ins: Vec<af_packet::RawInstruction>, syntax: &CStr) -> Result<()> {
         match self {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             Self::AfPacket(e) => e.set_bpf(ins).map_err(|e| e.into()),
             Self::Libpcap(w) => w
                 .as_mut()
                 .ok_or(Error::LibpcapError(Self::LIBPCAP_NONE.to_string()))
                 .and_then(|e| e.set_bpf(syntax.to_str().unwrap())),
-            Self::Dpdk() => todo!(),
+            #[cfg(target_os = "linux")]
+            Self::Dpdk(_) => Ok(()),
         }
     }
 
     pub fn get_counter_handle(&self) -> Arc<dyn stats::RefCountable> {
         match self {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             Self::AfPacket(e) => Arc::new(e.get_counter_handle()),
-            Self::Dpdk() => todo!(),
+            #[cfg(target_os = "linux")]
+            Self::Dpdk(d) => d.get_counter_handle(),
             Self::Libpcap(w) => match w {
                 Some(w) => w.get_counter_handle(),
                 None => Arc::new(LibpcapCounter::default()),
@@ -104,7 +115,7 @@ impl RecvEngine {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl Default for RecvEngine {
     fn default() -> Self {
         Self::AfPacket(Tpacket::new(Options::default()).unwrap())

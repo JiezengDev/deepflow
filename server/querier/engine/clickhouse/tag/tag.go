@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,11 +16,16 @@
 
 package tag
 
+import (
+	"strings"
+)
+
 type Tag struct {
-	TagTranslator         string // 对tag进行翻译或转换
-	NotNullFilter         string // 资源非空过滤
-	WhereTranslator       string // 资源过滤转换
-	WhereRegexpTranslator string // 资源过滤正则转换
+	TagTranslator         string            // 对tag进行翻译或转换
+	NotNullFilter         string            // 资源非空过滤
+	WhereTranslator       string            // 资源过滤转换
+	WhereRegexpTranslator string            // 资源过滤正则转换
+	TagTranslatorMap      map[string]string // 自定义分组tag翻译
 }
 
 func NewTag(tagTranslator, notNullFilter, whereTranslator, whereRegexpTranslator string) *Tag {
@@ -33,6 +38,14 @@ func NewTag(tagTranslator, notNullFilter, whereTranslator, whereRegexpTranslator
 }
 
 func GetTag(name, db, table, function string) (*Tag, bool) {
+	name = strings.Trim(name, "`")
 	tag, ok := TagResoureMap[name][function]
+	if db == "flow_tag" {
+		tag, ok = FlowTagResourceMap[name][function]
+	}
+	// Avoid return nil
+	if !ok {
+		return &Tag{}, false
+	}
 	return tag, ok
 }

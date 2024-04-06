@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,10 +18,10 @@ package db
 
 import (
 	"github.com/op/go-logging"
-	"gorm.io/gorm/clause"
 
 	"github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	rcommon "github.com/deepflowio/deepflow/server/controller/recorder/common"
 	"github.com/deepflowio/deepflow/server/controller/recorder/constraint"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db/idmng"
 )
@@ -34,7 +34,9 @@ type Operator[MT constraint.MySQLModel] interface {
 	// 更新数据
 	Update(lcuuid string, updateInfo map[string]interface{}) (*MT, bool)
 	// 批量删除数据
-	DeleteBatch(lcuuids []string) bool
+	DeleteBatch(lcuuids []string) ([]*MT, bool)
+
+	GetSoftDelete() bool
 }
 
 // TODO 使用结构体而非结构体指针作为泛型类型，在需要对结构体value修改时十分不便，
@@ -44,11 +46,22 @@ type DBItemSetter[MT constraint.MySQLModel] interface {
 }
 
 type OperatorBase[MT constraint.MySQLModel] struct {
+	org *rcommon.ORG
+
 	resourceTypeName        string
 	softDelete              bool
 	allocateID              bool
 	fieldsNeededAfterCreate []string // fields needed to be used after create
 	setter                  DBItemSetter[MT]
+}
+
+func (o *OperatorBase[MT]) SetORG(org *rcommon.ORG) Operator[MT] {
+	o.org = org
+	return o
+}
+
+func (o *OperatorBase[MT]) GetSoftDelete() bool {
+	return o.softDelete
 }
 
 func (o *OperatorBase[MT]) setFieldsNeededAfterCreate(fs []string) {
@@ -61,13 +74,13 @@ func (o *OperatorBase[MT]) AddBatch(items []*MT) ([]*MT, bool) {
 		return nil, false
 	}
 
-	err := mysql.Db.Create(&itemsToAdd).Error
+	err := o.org.DB.Create(&itemsToAdd).Error
 	if err != nil {
-		log.Errorf("add %s batch failed: %v", o.resourceTypeName, err)
-		log.Errorf("add %s (lcuuids: %v) failed", o.resourceTypeName, lcuuidsToAdd)
+		log.Error(o.org.LogPre("add %s batch failed: %v", o.resourceTypeName, err))
+		log.Error(o.org.LogPre("add %s (lcuuids: %v) failed", o.resourceTypeName, lcuuidsToAdd))
 
 		if o.allocateID && len(allocatedIDs) > 0 {
-			idmng.ReleaseIDs(o.resourceTypeName, allocatedIDs)
+			idmng.ReleaseIDs(o.org.ID, o.resourceTypeName, allocatedIDs)
 		}
 		return nil, false
 	}
@@ -79,12 +92,12 @@ func (o *OperatorBase[MT]) AddBatch(items []*MT) ([]*MT, bool) {
 	// 		2. We need to use the ids of the created items
 	// 		3. Ids are not allocated by ourselves
 	// 		4. Use gorm to insert batch data
-	if mysql.DbConfig.AutoIncrementIncrement != 1 && len(o.fieldsNeededAfterCreate) != 0 && !o.allocateID && len(lcuuidsToAdd) > 1 {
-		mysql.Db.Select(o.fieldsNeededAfterCreate).Where("lcuuid IN ?", lcuuidsToAdd).Find(&itemsToAdd)
+	if mysql.GetConfig().AutoIncrementIncrement != 1 && len(o.fieldsNeededAfterCreate) != 0 && !o.allocateID && len(lcuuidsToAdd) > 1 {
+		o.org.DB.Select(o.fieldsNeededAfterCreate).Where("lcuuid IN ?", lcuuidsToAdd).Find(&itemsToAdd)
 	}
 
 	for _, item := range itemsToAdd {
-		log.Infof("add %s (detail: %+v) success", o.resourceTypeName, item)
+		log.Info(o.org.LogPre("add %s (detail: %+v) success", o.resourceTypeName, item))
 	}
 
 	return itemsToAdd, true
@@ -92,30 +105,36 @@ func (o *OperatorBase[MT]) AddBatch(items []*MT) ([]*MT, bool) {
 
 func (o *OperatorBase[MT]) Update(lcuuid string, updateInfo map[string]interface{}) (*MT, bool) {
 	dbItem := new(MT)
-	err := mysql.Db.Model(dbItem).Where("lcuuid = ?", lcuuid).Updates(updateInfo).Error
+	err := o.org.DB.Model(&dbItem).Where("lcuuid = ?", lcuuid).Updates(updateInfo).Error
 	if err != nil {
-		log.Errorf("update %s (lcuuid: %s, detail: %+v) success", o.resourceTypeName, lcuuid, updateInfo, err)
+		log.Error(o.org.LogPre("update %s (lcuuid: %s, detail: %+v) failed: %s", o.resourceTypeName, lcuuid, updateInfo, err.Error()))
 		return dbItem, false
 	}
-	log.Infof("update %s (lcuuid: %s, detail: %+v) success", o.resourceTypeName, lcuuid, updateInfo)
+	log.Info(o.org.LogPre("update %s (lcuuid: %s, detail: %+v) success", o.resourceTypeName, lcuuid, updateInfo))
+	o.org.DB.Model(&dbItem).Where("lcuuid = ?", lcuuid).Find(&dbItem)
 	return dbItem, true
 }
 
-func (o *OperatorBase[MT]) DeleteBatch(lcuuids []string) bool {
+func (o *OperatorBase[MT]) DeleteBatch(lcuuids []string) ([]*MT, bool) {
 	var deletedItems []*MT
-	err := mysql.Db.Clauses(clause.Returning{}).Where("lcuuid IN ?", lcuuids).Delete(&deletedItems).Error
+	err := o.org.DB.Where("lcuuid IN ?", lcuuids).Find(&deletedItems).Error
 	if err != nil {
 		log.Errorf("delete %s (lcuuids: %v) failed: %v", o.resourceTypeName, lcuuids, err)
-		return false
+		return nil, false
+	}
+	err = o.org.DB.Delete(&deletedItems).Error
+	if err != nil {
+		log.Error(o.org.LogPre("delete %s (lcuuids: %v) failed: %v", o.resourceTypeName, lcuuids, err))
+		return nil, false
 	}
 	if o.softDelete {
-		log.Infof("update %s (lcuuids: %v) deleted_at success", o.resourceTypeName, lcuuids)
+		log.Info(o.org.LogPre("update %s (lcuuids: %v) deleted_at success", o.resourceTypeName, lcuuids))
 	} else {
-		log.Infof("delete %s (lcuuids: %v) success", o.resourceTypeName, lcuuids)
+		log.Info(o.org.LogPre("delete %s (lcuuids: %v) success", o.resourceTypeName, lcuuids))
 	}
 
 	o.returnUsedIDs(deletedItems)
-	return true
+	return deletedItems, true
 }
 
 func (o *OperatorBase[MT]) formatItemsToAdd(items []*MT) ([]*MT, []string, []int, bool) {
@@ -140,7 +159,7 @@ func (o OperatorBase[MT]) dedupInSelf(items []*MT) ([]*MT, []string, map[string]
 	for _, item := range items {
 		lcuuid := (*item).GetLcuuid()
 		if common.Contains(lcuuids, lcuuid) {
-			log.Infof("%s data is duplicated in cloud data (lcuuid: %s)", o.resourceTypeName, lcuuid)
+			log.Info(o.org.LogPre("%s data is duplicated in cloud data (lcuuid: %s)", o.resourceTypeName, lcuuid))
 		} else {
 			dedupItems = append(dedupItems, item)
 			lcuuids = append(lcuuids, lcuuid)
@@ -152,9 +171,9 @@ func (o OperatorBase[MT]) dedupInSelf(items []*MT) ([]*MT, []string, map[string]
 
 func (o OperatorBase[MT]) dedupInDB(items []*MT, lcuuids []string, lcuuidToItem map[string]*MT) ([]*MT, []string, bool) {
 	var dupItems []*MT
-	err := mysql.Db.Unscoped().Where("lcuuid IN ?", lcuuids).Find(&dupItems).Error
+	err := o.org.DB.Unscoped().Where("lcuuid IN ?", lcuuids).Find(&dupItems).Error
 	if err != nil {
-		log.Errorf("get %s duplicate data failed: %v", o.resourceTypeName, err)
+		log.Error(o.org.LogPre("get %s duplicate data failed: %v", o.resourceTypeName, err))
 		return nil, nil, false
 	}
 
@@ -174,12 +193,11 @@ func (o OperatorBase[MT]) dedupInDB(items []*MT, lcuuids []string, lcuuidToItem 
 					dupItemIDs = append(dupItemIDs, id)
 				}
 				o.setter.setDBItemID(item, id)
-				// (*dbItem).SetID((*dupItem).GetID()) // TODO 不可行
 			}
-			log.Infof("%s data is duplicated with db data (lcuuids: %v, ids: %v), will learn again", o.resourceTypeName, dupLcuuids, dupItemIDs)
-			err = mysql.Db.Unscoped().Delete(&dupItems).Error
+			log.Info(o.org.LogPre("%s data is duplicated with db data (lcuuids: %v, ids: %v, one detail: %+v), will learn again", o.resourceTypeName, dupLcuuids, dupItemIDs, dupItems[0]))
+			err = o.org.DB.Unscoped().Delete(&dupItems).Error
 			if err != nil {
-				log.Errorf("delete duplicated data failed: %+v", err)
+				log.Error(o.org.LogPre("delete duplicated data failed: %+v", err))
 				return items, lcuuids, false
 			}
 		} else {
@@ -190,7 +208,7 @@ func (o OperatorBase[MT]) dedupInDB(items []*MT, lcuuids []string, lcuuidToItem 
 					dupLcuuids = append(dupLcuuids, lcuuid)
 				}
 			}
-			log.Errorf("%s data is duplicated with db data (lcuuids: %v)", o.resourceTypeName, dupLcuuids)
+			log.Error(o.org.LogPre("%s data is duplicated with db data (lcuuids: %v, one detail: %+v)", o.resourceTypeName, dupLcuuids, dupItems[0]))
 
 			count := len(lcuuids) - len(dupLcuuids)
 			dedupItems := make([]*MT, 0, count)
@@ -221,19 +239,19 @@ func (o *OperatorBase[MT]) requestIDs(items []*MT) ([]*MT, []int, bool) {
 			}
 		}
 		if count > 0 {
-			ids, err := idmng.GetIDs(o.resourceTypeName, count)
+			ids, err := idmng.GetIDs(o.org.ID, o.resourceTypeName, count)
 			if err != nil {
-				log.Errorf("%s request ids failed", o.resourceTypeName)
+				log.Error(o.org.LogPre("%s request ids failed", o.resourceTypeName))
 				return itemsHasID, []int{}, false
 			}
 			for i, id := range ids {
 				o.setter.setDBItemID(itemsHasNoID[i], id)
 				itemsHasID = append(itemsHasID, itemsHasNoID[i])
 			}
-			log.Infof("%s use ids: %v", o.resourceTypeName, ids)
+			log.Info(o.org.LogPre("%s use ids: %v", o.resourceTypeName, ids))
 			return itemsHasID, ids, true
 		} else {
-			log.Infof("%s not use any id", o.resourceTypeName)
+			log.Info(o.org.LogPre("%s not use any id", o.resourceTypeName))
 			return itemsHasID, []int{}, true
 		}
 	}
@@ -247,10 +265,10 @@ func (o *OperatorBase[MT]) returnUsedIDs(deletedItems []*MT) {
 		for _, dbItem := range deletedItems {
 			ids = append(ids, (*dbItem).GetID())
 		}
-		err := idmng.ReleaseIDs(o.resourceTypeName, ids)
+		err := idmng.ReleaseIDs(o.org.ID, o.resourceTypeName, ids)
 		if err != nil {
-			log.Errorf("%s release ids: %v failed", o.resourceTypeName, ids)
+			log.Error(o.org.LogPre("%s release ids: %v failed", o.resourceTypeName, ids))
 		}
-		log.Infof("%s return used ids: %v", o.resourceTypeName, ids)
+		log.Info(o.org.LogPre("%s return used ids: %v", o.resourceTypeName, ids))
 	}
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,10 +18,10 @@ package event
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/common"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
-	. "github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 	"github.com/deepflowio/deepflow/server/libs/eventapi"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 )
@@ -31,14 +31,14 @@ type NATGateway struct {
 	deviceType int
 }
 
-func NewNATGateway(toolDS *cache.ToolDataSet, eq *queue.OverwriteQueue) *NATGateway {
+func NewNATGateway(toolDS *tool.DataSet, eq *queue.OverwriteQueue) *NATGateway {
 	mng := &NATGateway{
-		EventManagerBase{
-			resourceType: RESOURCE_TYPE_NAT_GATEWAY_EN,
-			ToolDataSet:  toolDS,
-			Queue:        eq,
-		},
-		common.VIF_DEVICE_TYPE_NAT_GATEWAY,
+		newEventManagerBase(
+			ctrlrcommon.RESOURCE_TYPE_NAT_GATEWAY_EN,
+			toolDS,
+			eq,
+		),
+		ctrlrcommon.VIF_DEVICE_TYPE_NAT_GATEWAY,
 	}
 	return mng
 }
@@ -72,7 +72,7 @@ func (n *NATGateway) ProduceByAdd(items []*mysql.NATGateway) {
 	}
 }
 
-func (n *NATGateway) ProduceByUpdate(cloudItem *cloudmodel.NATGateway, diffBase *cache.NATGateway) {
+func (n *NATGateway) ProduceByUpdate(cloudItem *cloudmodel.NATGateway, diffBase *diffbase.NATGateway) {
 }
 
 func (n *NATGateway) ProduceByDelete(lcuuids []string) {
@@ -84,7 +84,7 @@ func (n *NATGateway) ProduceByDelete(lcuuids []string) {
 			var err error
 			name, err = n.ToolDataSet.GetNATGatewayNameByID(id)
 			if err != nil {
-				log.Errorf("%v, %v", idByLcuuidNotFound(n.resourceType, lcuuid), err)
+				log.Error(n.org.LogPre("%v, %v", idByLcuuidNotFound(n.resourceType, lcuuid), err))
 			}
 		} else {
 			log.Error(nameByIDNotFound(n.resourceType, id))

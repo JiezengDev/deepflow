@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -76,11 +76,7 @@ func NewGenesis(domain mysql.Domain, cfg config.CloudConfig) (*Genesis, error) {
 		defaultVpcName:  cfg.GenesisDefaultVpcName,
 		regionUuid:      config.Get("region_uuid").MustString(),
 		genesisData:     genesis.GenesisSyncData{},
-		cloudStatsd: statsd.CloudStatsd{
-			APICount: make(map[string][]int),
-			APICost:  make(map[string][]int),
-			ResCount: make(map[string][]int),
-		},
+		cloudStatsd:     statsd.NewCloudStatsd(),
 	}, nil
 }
 
@@ -263,9 +259,7 @@ func (g *Genesis) generateIPsAndSubnets() {
 func (g *Genesis) GetCloudData() (cloudmodel.Resource, error) {
 	g.azLcuuid = ""
 	g.defaultVpc = false
-	g.cloudStatsd.APICount = map[string][]int{}
-	g.cloudStatsd.APICost = map[string][]int{}
-	g.cloudStatsd.ResCount = map[string][]int{}
+	g.cloudStatsd = statsd.NewCloudStatsd()
 
 	if genesis.GenesisService == nil {
 		return cloudmodel.Resource{}, errors.New("genesis service is nil")

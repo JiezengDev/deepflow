@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -47,8 +47,7 @@ func (b *BaiduBce) getNatGateways(region model.Region, vpcIdToLcuuid map[string]
 			log.Error(err)
 			return nil, nil, nil, err
 		}
-		b.cloudStatsd.APICost["ListNatGateway"] = append(b.cloudStatsd.APICost["ListNatGateway"], int(time.Now().Sub(startTime).Milliseconds()))
-		b.cloudStatsd.APICount["ListNatGateway"] = append(b.cloudStatsd.APICount["ListNatGateway"], len(result.Nats))
+		b.cloudStatsd.RefreshAPIMoniter("ListNatGateway", len(result.Nats), startTime)
 		results = append(results, result)
 		if !result.IsTruncated {
 			break

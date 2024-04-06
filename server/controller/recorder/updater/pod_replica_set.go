@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,30 +18,55 @@ package updater
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
-	"github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type PodReplicaSet struct {
-	UpdaterBase[cloudmodel.PodReplicaSet, mysql.PodReplicaSet, *cache.PodReplicaSet]
+	UpdaterBase[
+		cloudmodel.PodReplicaSet,
+		mysql.PodReplicaSet,
+		*diffbase.PodReplicaSet,
+		*message.PodReplicaSetAdd,
+		message.PodReplicaSetAdd,
+		*message.PodReplicaSetUpdate,
+		message.PodReplicaSetUpdate,
+		*message.PodReplicaSetFieldsUpdate,
+		message.PodReplicaSetFieldsUpdate,
+		*message.PodReplicaSetDelete,
+		message.PodReplicaSetDelete]
 }
 
 func NewPodReplicaSet(wholeCache *cache.Cache, cloudData []cloudmodel.PodReplicaSet) *PodReplicaSet {
 	updater := &PodReplicaSet{
-		UpdaterBase[cloudmodel.PodReplicaSet, mysql.PodReplicaSet, *cache.PodReplicaSet]{
-			cache:        wholeCache,
-			dbOperator:   db.NewPodReplicaSet(),
-			diffBaseData: wholeCache.PodReplicaSets,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.PodReplicaSet,
+			mysql.PodReplicaSet,
+			*diffbase.PodReplicaSet,
+			*message.PodReplicaSetAdd,
+			message.PodReplicaSetAdd,
+			*message.PodReplicaSetUpdate,
+			message.PodReplicaSetUpdate,
+			*message.PodReplicaSetFieldsUpdate,
+			message.PodReplicaSetFieldsUpdate,
+			*message.PodReplicaSetDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_POD_REPLICA_SET_EN,
+			wholeCache,
+			db.NewPodReplicaSet().SetORG(wholeCache.GetORG()),
+			wholeCache.DiffBaseDataSet.PodReplicaSets,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
 }
 
-func (r *PodReplicaSet) getDiffBaseByCloudItem(cloudItem *cloudmodel.PodReplicaSet) (diffBase *cache.PodReplicaSet, exists bool) {
+func (r *PodReplicaSet) getDiffBaseByCloudItem(cloudItem *cloudmodel.PodReplicaSet) (diffBase *diffbase.PodReplicaSet, exists bool) {
 	diffBase, exists = r.diffBaseData[cloudItem.Lcuuid]
 	return
 }
@@ -49,26 +74,26 @@ func (r *PodReplicaSet) getDiffBaseByCloudItem(cloudItem *cloudmodel.PodReplicaS
 func (r *PodReplicaSet) generateDBItemToAdd(cloudItem *cloudmodel.PodReplicaSet) (*mysql.PodReplicaSet, bool) {
 	podNamespaceID, exists := r.cache.ToolDataSet.GetPodNamespaceIDByLcuuid(cloudItem.PodNamespaceLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
-			common.RESOURCE_TYPE_POD_NAMESPACE_EN, cloudItem.PodNamespaceLcuuid,
-			common.RESOURCE_TYPE_POD_REPLICA_SET_EN, cloudItem.Lcuuid,
-		))
+		log.Error(r.org.LogPre(resourceAForResourceBNotFound(
+			ctrlrcommon.RESOURCE_TYPE_POD_NAMESPACE_EN, cloudItem.PodNamespaceLcuuid,
+			ctrlrcommon.RESOURCE_TYPE_POD_REPLICA_SET_EN, cloudItem.Lcuuid,
+		)))
 		return nil, false
 	}
 	podClusterID, exists := r.cache.ToolDataSet.GetPodClusterIDByLcuuid(cloudItem.PodClusterLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
-			common.RESOURCE_TYPE_POD_CLUSTER_EN, cloudItem.PodClusterLcuuid,
-			common.RESOURCE_TYPE_POD_REPLICA_SET_EN, cloudItem.Lcuuid,
-		))
+		log.Error(r.org.LogPre(resourceAForResourceBNotFound(
+			ctrlrcommon.RESOURCE_TYPE_POD_CLUSTER_EN, cloudItem.PodClusterLcuuid,
+			ctrlrcommon.RESOURCE_TYPE_POD_REPLICA_SET_EN, cloudItem.Lcuuid,
+		)))
 		return nil, false
 	}
 	podGroupID, exists := r.cache.ToolDataSet.GetPodGroupIDByLcuuid(cloudItem.PodGroupLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
-			common.RESOURCE_TYPE_POD_GROUP_EN, cloudItem.PodGroupLcuuid,
-			common.RESOURCE_TYPE_POD_REPLICA_SET_EN, cloudItem.Lcuuid,
-		))
+		log.Error(r.org.LogPre(resourceAForResourceBNotFound(
+			ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN, cloudItem.PodGroupLcuuid,
+			ctrlrcommon.RESOURCE_TYPE_POD_REPLICA_SET_EN, cloudItem.Lcuuid,
+		)))
 		return nil, false
 	}
 	dbItem := &mysql.PodReplicaSet{
@@ -87,26 +112,29 @@ func (r *PodReplicaSet) generateDBItemToAdd(cloudItem *cloudmodel.PodReplicaSet)
 	return dbItem, true
 }
 
-func (r *PodReplicaSet) generateUpdateInfo(diffBase *cache.PodReplicaSet, cloudItem *cloudmodel.PodReplicaSet) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (r *PodReplicaSet) generateUpdateInfo(diffBase *diffbase.PodReplicaSet, cloudItem *cloudmodel.PodReplicaSet) (*message.PodReplicaSetFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.PodReplicaSetFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
-		updateInfo["name"] = cloudItem.Name
+		mapInfo["name"] = cloudItem.Name
+		structInfo.Name.Set(diffBase.Name, cloudItem.Name)
 	}
 	if diffBase.PodNum != cloudItem.PodNum {
-		updateInfo["pod_num"] = cloudItem.PodNum
+		mapInfo["pod_num"] = cloudItem.PodNum
+		structInfo.PodNum.Set(diffBase.PodNum, cloudItem.PodNum)
 	}
 	if diffBase.RegionLcuuid != cloudItem.RegionLcuuid {
-		updateInfo["region"] = cloudItem.RegionLcuuid
+		mapInfo["region"] = cloudItem.RegionLcuuid
+		structInfo.RegionLcuuid.Set(diffBase.RegionLcuuid, cloudItem.RegionLcuuid)
 	}
 	if diffBase.AZLcuuid != cloudItem.AZLcuuid {
-		updateInfo["az"] = cloudItem.AZLcuuid
+		mapInfo["az"] = cloudItem.AZLcuuid
+		structInfo.AZLcuuid.Set(diffBase.AZLcuuid, cloudItem.AZLcuuid)
 	}
 	if diffBase.Label != cloudItem.Label {
-		updateInfo["label"] = cloudItem.Label
+		mapInfo["label"] = cloudItem.Label
+		structInfo.Label.Set(diffBase.Label, cloudItem.Label)
 	}
 
-	if len(updateInfo) > 0 {
-		return updateInfo, true
-	}
-	return nil, false
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

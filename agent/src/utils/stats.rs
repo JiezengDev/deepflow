@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ use std::fmt;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{
-    atomic::{AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering},
     Arc, Condvar, Mutex,
 };
 use std::thread::{self, JoinHandle};
@@ -28,6 +28,7 @@ use cadence::{Metric, MetricBuilder, MetricError, MetricResult, MetricSink, Stat
 use log::{debug, info, warn};
 use prost::Message;
 
+use crate::rpc::get_timestamp;
 pub use public::counter::*;
 use public::{
     proto::stats,
@@ -73,7 +74,7 @@ pub struct Batch {
     hostname: String,
     tags: Vec<(&'static str, String)>,
     points: Vec<Counter>,
-    timestamp: SystemTime,
+    timestamp: u32,
 }
 
 impl Batch {
@@ -107,11 +108,7 @@ impl Batch {
 
         stats::Stats {
             name: format!("{}_{}", STATS_PREFIX, self.module).replace("-", "_"),
-            timestamp: self
-                .timestamp
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            timestamp: self.timestamp as u64,
             tag_names,
             tag_values,
             metrics_float_names,
@@ -142,6 +139,7 @@ pub struct Collector {
 
     min_interval: Arc<AtomicU64>,
 
+    ntp_diff: Arc<AtomicI64>,
     running: Arc<(Mutex<bool>, Condvar)>,
     thread: Mutex<Option<JoinHandle<()>>>,
 
@@ -150,11 +148,15 @@ pub struct Collector {
 }
 
 impl Collector {
-    pub fn new<S: AsRef<str>>(hostname: S) -> Self {
-        Self::with_min_interval(hostname, TICK_CYCLE)
+    pub fn new<S: AsRef<str>>(hostname: S, ntp_diff: Arc<AtomicI64>) -> Self {
+        Self::with_min_interval(hostname, TICK_CYCLE, ntp_diff)
     }
 
-    pub fn with_min_interval<S: AsRef<str>>(hostname: S, interval: Duration) -> Self {
+    pub fn with_min_interval<S: AsRef<str>>(
+        hostname: S,
+        interval: Duration,
+        ntp_diff: Arc<AtomicI64>,
+    ) -> Self {
         let (stats_queue_sender, stats_queue_receiver, counter) = bounded(STATS_SENDER_QUEUE_SIZE);
         let min_interval = if interval <= TICK_CYCLE {
             TICK_CYCLE
@@ -173,12 +175,16 @@ impl Collector {
             thread: Mutex::new(None),
             sender: Arc::new(stats_queue_sender),
             receiver: Arc::new(stats_queue_receiver),
+            ntp_diff,
         };
         Self::register_countable(
             &s,
             "queue",
             Countable::Owned(Box::new(counter)),
-            vec![StatsOption::Tag("module", "0-stats-to-sender".to_string())],
+            vec![
+                StatsOption::Tag("module", "0-stats-to-sender".to_string()),
+                StatsOption::Tag("index", "0".to_string()),
+            ],
         );
         return s;
     }
@@ -233,7 +239,7 @@ impl Collector {
             let equals = s == &source;
             if !closed && equals {
                 warn!(
-                    "Possible memory leak! countable {} is not correctly closed.",
+                    "Found duplicated counter source {}, please check if the old one is correctly closed.",
                     source
                 );
             }
@@ -242,12 +248,36 @@ impl Collector {
         sources.push(source);
     }
 
+    pub fn deregister_countables<I>(&self, countables: I)
+    where
+        I: Iterator<Item = (&'static str, Vec<StatsOption>)>,
+    {
+        let mut tags = vec![];
+        let mut sources = self.sources.lock().unwrap();
+        for (module, options) in countables {
+            tags.clear();
+            for option in options {
+                match option {
+                    StatsOption::Tag(k, v) if !tags.iter().any(|(key, _)| key == &k) => {
+                        tags.push((k, v))
+                    }
+                    _ => (),
+                }
+            }
+            sources.retain(|s| !(s.module == module && s.tags == tags));
+        }
+    }
+
     pub fn register_pre_hook(&self, hook: Box<dyn FnMut() + Send>) {
         self.pre_hooks.lock().unwrap().push(hook);
     }
 
     pub fn set_hostname(&self, hostname: String) {
-        *self.hostname.lock().unwrap() = hostname;
+        let mut last = self.hostname.lock().unwrap();
+        if *last != hostname {
+            info!("set stats hostname to {:?}", hostname);
+            *last = hostname;
+        }
     }
 
     pub fn set_min_interval(&self, interval: Duration) {
@@ -304,6 +334,7 @@ impl Collector {
         let hostname = self.hostname.clone();
         let min_interval = self.min_interval.clone();
         let sender = self.sender.clone();
+        let ntp_diff = self.ntp_diff.clone();
         *self.thread.lock().unwrap() = Some(
             thread::Builder::new()
                 .name("stats-collector".to_owned())
@@ -314,7 +345,7 @@ impl Collector {
                             pre_hooks.lock().unwrap().iter_mut().for_each(|hook| hook());
                         }
 
-                        let now = SystemTime::now();
+                        let now = get_timestamp(ntp_diff.load(Ordering::Relaxed)).as_secs() as u32;
                         {
                             let mut sources = sources.lock().unwrap();
                             let min_interval_loaded = min_interval.load(Ordering::Relaxed);

@@ -1,4 +1,4 @@
-// Copyright (c) 2023 Yunshan Networks
+// Copyright (c) 2024 Yunshan Networks
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,20 +19,33 @@ import (
 	"strings"
 )
 
-var NodeName, NodeIP, PodName, PodIP, NameSpace string
+var NodeName, NodeIP, PodName, PodIP, NameSpace, runningMode string
 
-func init() {
-	NodeName = os.Getenv(NODE_NAME_KEY)
-	NodeIP = os.Getenv(NODE_IP_KEY)
-	PodName = os.Getenv(POD_NAME_KEY)
-	PodIP = os.Getenv(POD_IP_KEY)
-	NameSpace = os.Getenv(NAME_SPACE_KEY)
-	log.Infof("ENV %s=%s; %s=%s; %s=%s; %s=%s; %s=%s",
+func InitEnvData() {
+	runningMode = os.Getenv(RUNNING_MODE_KEY)
+	if IsStandaloneRunningMode() == true {
+		// in standalone mode, currently only NodeIP can be passed through environment variables
+		NodeName, _ = os.Hostname()
+		NodeIP = os.Getenv(NODE_IP_KEY)
+		PodName, _ = os.Hostname()
+		PodIP = os.Getenv(POD_IP_KEY)
+		if PodIP == "" {
+			PodIP = "127.0.0.1"
+		}
+	} else {
+		NodeName = os.Getenv(NODE_NAME_KEY)
+		NodeIP = os.Getenv(NODE_IP_KEY)
+		PodName = os.Getenv(POD_NAME_KEY)
+		PodIP = os.Getenv(POD_IP_KEY)
+		NameSpace = os.Getenv(NAME_SPACE_KEY)
+	}
+	log.Infof("ENV %s=%s; %s=%s; %s=%s; %s=%s; %s=%s, %s=%s",
 		NODE_NAME_KEY, NodeName,
 		NODE_IP_KEY, NodeIP,
 		POD_NAME_KEY, PodName,
 		POD_IP_KEY, PodIP,
-		NAME_SPACE_KEY, NameSpace)
+		NAME_SPACE_KEY, NameSpace,
+		RUNNING_MODE_KEY, runningMode)
 }
 
 func GetNodeName() string {
@@ -56,12 +69,13 @@ func GetNameSpace() string {
 }
 
 var osDict = map[string]int{
-	"centos":  OS_CENTOS,
-	"red hat": OS_REDHAT,
-	"redhat":  OS_REDHAT,
-	"ubuntu":  OS_UBUNTU,
-	"suse":    OS_SUSE,
-	"windows": OS_WINDOWS,
+	"centos":     OS_CENTOS,
+	"red hat":    OS_REDHAT,
+	"redhat":     OS_REDHAT,
+	"ubuntu":     OS_UBUNTU,
+	"suse":       OS_SUSE,
+	"windows":    OS_WINDOWS,
+	"cuttlefish": OS_ANDROID,
 }
 
 var archDict = map[string]int{
@@ -89,4 +103,8 @@ func GetArchType(arch string) int {
 		}
 	}
 	return 0
+}
+
+func IsStandaloneRunningMode() bool {
+	return runningMode == RUNNING_MODE_STANDALONE
 }

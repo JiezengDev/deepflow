@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,32 +21,22 @@ use std::{
 
 use anyhow::Result;
 use log::error;
-use wasmtime::{
-    AsContextMut, Engine, Instance, Linker, Module, Store, StoreLimits, StoreLimitsBuilder,
-    TypedFunc, WasmParams, WasmResults,
-};
+use prost::Message as ProstMessage;
+use wasmtime::{Engine, Linker, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder};
 
 use crate::{
     common::l7_protocol_log::ParseParam,
-    flow_generator::{
-        protocol_logs::{
-            pb_adapter::{KeyVal, TraceInfo},
-            HttpInfo,
-        },
-        Error::{self, WasmVmError},
-        Result as WasmResult,
-    },
-    plugin::CustomInfo,
+    flow_generator::protocol_logs::HttpInfo,
+    plugin::{CustomInfo, L7Protocol, PluginCounterInfo},
     wasm_error,
 };
 
 use super::{
     abi_export::{InstanceWrap, VmParser},
     abi_import::get_linker,
-    metric::get_wasm_metric_counter_map_key,
-    HookPointBitmap, VmCtxBase, VmHttpReqCtx, VmHttpRespCtx, VmParseCtx, WasmCounterMap,
-    HOOK_POINT_HTTP_REQ, HOOK_POINT_HTTP_RESP, HOOK_POINT_PAYLOAD_PARSE,
+    VmCtxBase, VmHttpReqCtx, VmHttpRespCtx, VmOnCustomMessageCtx, VmParseCtx, HOOK_POINT_HTTP_REQ,
+    HOOK_POINT_HTTP_RESP, HOOK_POINT_ON_CUSTOM_MESSAGE, HOOK_POINT_PAYLOAD_PARSE,
 };
 
 pub(super) const WASM_MODULE_NAME: &str = "deepflow";
@@ -55,29 +45,30 @@ pub(super) const EXPORT_FUNC_CHECK_PAYLOAD: &str = "check_payload";
 pub(super) const EXPORT_FUNC_PARSE_PAYLOAD: &str = "parse_payload";
 pub(super) const EXPORT_FUNC_ON_HTTP_REQ: &str = "on_http_req";
 pub(super) const EXPORT_FUNC_ON_HTTP_RESP: &str = "on_http_resp";
+pub(super) const EXPORT_FUNC_ON_CUSTOM_MESSAGE: &str = "on_custom_message";
 pub(super) const EXPORT_FUNC_GET_HOOK_BITMAP: &str = "get_hook_bitmap";
+pub(super) const EXPORT_FUNC_GET_CUSTOM_MESSAGE_HOOK: &str = "get_custom_message_hook";
 
 pub(super) const IMPORT_FUNC_WASM_LOG: &str = "wasm_log";
 pub(super) const IMPORT_FUNC_VM_READ_CTX_BASE: &str = "vm_read_ctx_base";
 pub(super) const IMPORT_FUNC_VM_READ_PAYLOAD: &str = "vm_read_payload";
 pub(super) const IMPORT_FUNC_VM_READ_HTTP_REQ: &str = "vm_read_http_req_info";
 pub(super) const IMPORT_FUNC_VM_READ_HTTP_RESP: &str = "vm_read_http_resp_info";
+pub(super) const IMPORT_FUNC_VM_READ_CUSTOM_MESSAGE: &str = "vm_read_custom_message_info";
 pub(super) const IMPORT_FUNC_HOST_READ_L7_PROTOCOL_INFO: &str = "host_read_l7_protocol_info";
-pub(super) const IMPORT_FUNC_HOST_READ_HTTP_RESULT: &str = "host_read_http_result";
 pub(super) const IMPORT_FUNC_HOST_READ_STR_RESULT: &str = "host_read_str_result";
 
 pub(super) const LOG_LEVEL_INFO: i32 = 0;
 pub(super) const LOG_LEVEL_WARN: i32 = 1;
 pub(super) const LOG_LEVEL_ERR: i32 = 2;
 
-pub fn get_all_wasm_export_func_name() -> [&'static str; 4] {
-    [
-        EXPORT_FUNC_CHECK_PAYLOAD,
-        EXPORT_FUNC_PARSE_PAYLOAD,
-        EXPORT_FUNC_ON_HTTP_REQ,
-        EXPORT_FUNC_ON_HTTP_RESP,
-    ]
-}
+pub const WASM_EXPORT_FUNC_NAME: [&'static str; 5] = [
+    EXPORT_FUNC_CHECK_PAYLOAD,
+    EXPORT_FUNC_PARSE_PAYLOAD,
+    EXPORT_FUNC_ON_HTTP_REQ,
+    EXPORT_FUNC_ON_HTTP_RESP,
+    EXPORT_FUNC_ON_CUSTOM_MESSAGE,
+];
 
 pub(super) struct StoreDataType {
     pub(super) parse_ctx: Option<VmParseCtx>,
@@ -91,7 +82,93 @@ pub struct WasmVm {
     instance: Vec<InstanceWrap>,
 }
 
+#[repr(u16)]
+#[derive(Debug, Clone, Copy)]
+pub(super) enum HookPoint {
+    ProtocolParse = 0,
+    SessionFilter = 1,
+    Sampling = 2,
+}
+
+pub struct WasmData {
+    pub(super) hook_point: HookPoint,
+    pub(super) type_code: u32,
+    pub(super) protobuf: Vec<u8>,
+}
+
+impl WasmData {
+    pub fn from_request<T: ProstMessage + Sized>(protocol: L7Protocol, message: T) -> WasmData {
+        WasmData {
+            hook_point: HookPoint::ProtocolParse,
+            type_code: protocol as u32,
+            protobuf: message.encode_to_vec(),
+        }
+    }
+}
+
 impl WasmVm {
+    pub fn new<S: AsRef<str>, T: AsRef<[u8]>>(modules: &[(S, T)]) -> WasmVm {
+        let limiter_builder = StoreLimitsBuilder::new();
+        // load wasm instance up to 10
+        let limiter = limiter_builder.memories(10).instances(10).build();
+
+        let engine = Engine::default();
+        let mut store = Store::<StoreDataType>::new(
+            &engine,
+            StoreDataType {
+                parse_ctx: None,
+                limiter,
+                wasi_ctx: WasiCtxBuilder::new().build(),
+            },
+        );
+        store.limiter(|s| &mut s.limiter);
+
+        let linker = get_linker(engine.clone(), &mut store);
+        let mut vm = WasmVm {
+            linker,
+            store,
+            instance: vec![],
+        };
+        modules.into_iter().for_each(|(name, prog)| {
+            if let Err(e) = vm.append_prog(name.as_ref(), prog.as_ref()) {
+                wasm_error!(name.as_ref(), "add wasm prog fail: {}", e);
+            }
+        });
+
+        vm
+    }
+
+    pub fn append_prog(&mut self, name: &str, prog: &[u8]) -> Result<()> {
+        for ins in self.instance.iter() {
+            if ins.name.as_str() == name {
+                return Ok(());
+            }
+        }
+        let ins = InstanceWrap::new(&mut self.store, &self.linker, name, prog)?;
+        self.instance.push(ins);
+        Ok(())
+    }
+
+    pub fn counters_in<'a>(&'a self, counters: &mut Vec<PluginCounterInfo<'a>>) {
+        for i in self.instance.iter() {
+            i.counters_in(counters);
+        }
+    }
+
+    pub fn counters<'a>(&'a self) -> Vec<PluginCounterInfo<'a>> {
+        let mut info = vec![];
+        self.counters_in(&mut info);
+        info
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.instance.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.instance.len()
+    }
+
     pub fn on_check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<(u8, String)> {
         if self.instance.len() == 0 {
             return None;
@@ -138,7 +215,12 @@ impl WasmVm {
                 {
                     let end_time = SystemTime::now();
                     let end_time = end_time.duration_since(UNIX_EPOCH).unwrap();
-                    (end_time - start_time).as_micros() as u64
+                    // Local timestamp may be modified
+                    if end_time > start_time {
+                        (end_time - start_time).as_micros() as u64
+                    } else {
+                        0
+                    }
                 },
                 Ordering::Relaxed,
             );
@@ -219,7 +301,12 @@ impl WasmVm {
                 {
                     let end_time = SystemTime::now();
                     let end_time = end_time.duration_since(UNIX_EPOCH).unwrap();
-                    (end_time - start_time).as_micros() as u64
+                    // Local timestamp may be modified
+                    if end_time > start_time {
+                        (end_time - start_time).as_micros() as u64
+                    } else {
+                        0
+                    }
                 },
                 Ordering::Relaxed,
             );
@@ -234,7 +321,7 @@ impl WasmVm {
                 .parse_ctx
                 .as_mut()
                 .unwrap()
-                .take_parse_payload_result()
+                .take_l7_info_result()
                 .map_or(Some(vec![]), |info| Some(info));
             break;
         }
@@ -249,7 +336,7 @@ impl WasmVm {
         payload: &[u8],
         param: &ParseParam,
         info: &HttpInfo,
-    ) -> Option<(Option<TraceInfo>, Vec<KeyVal>)> {
+    ) -> Option<CustomInfo> {
         if self.instance.len() == 0 {
             return None;
         }
@@ -296,7 +383,12 @@ impl WasmVm {
                 {
                     let end_time = SystemTime::now();
                     let end_time = end_time.duration_since(UNIX_EPOCH).unwrap();
-                    (end_time - start_time).as_micros() as u64
+                    // Local timestamp may be modified
+                    if end_time > start_time {
+                        (end_time - start_time).as_micros() as u64
+                    } else {
+                        0
+                    }
                 },
                 Ordering::Relaxed,
             );
@@ -311,8 +403,8 @@ impl WasmVm {
                 .parse_ctx
                 .as_mut()
                 .unwrap()
-                .take_http_result()
-                .map_or(None, |r| Some(r));
+                .take_l7_info_result()
+                .map_or(None, |mut r| r.pop());
 
             break;
         }
@@ -327,7 +419,7 @@ impl WasmVm {
         payload: &[u8],
         param: &ParseParam,
         info: &HttpInfo,
-    ) -> Option<(Option<TraceInfo>, Vec<KeyVal>)> {
+    ) -> Option<CustomInfo> {
         if self.instance.len() == 0 {
             return None;
         }
@@ -374,7 +466,12 @@ impl WasmVm {
                 {
                     let end_time = SystemTime::now();
                     let end_time = end_time.duration_since(UNIX_EPOCH).unwrap();
-                    (end_time - start_time).as_micros() as u64
+                    // Local timestamp may be modified
+                    if end_time > start_time {
+                        (end_time - start_time).as_micros() as u64
+                    } else {
+                        0
+                    }
                 },
                 Ordering::Relaxed,
             );
@@ -389,8 +486,8 @@ impl WasmVm {
                 .parse_ctx
                 .as_mut()
                 .unwrap()
-                .take_http_result()
-                .map_or(None, |r| Some(r));
+                .take_l7_info_result()
+                .map_or(None, |mut r| r.pop());
 
             break;
         }
@@ -400,166 +497,107 @@ impl WasmVm {
         ret
     }
 
-    pub fn append_prog(
+    pub fn on_custom_message(
         &mut self,
-        name: &str,
-        prog: &[u8],
-        counter_map: &WasmCounterMap,
-    ) -> Result<()> {
-        for ins in self.instance.iter() {
-            if ins.name.as_str() == name {
-                return Ok(());
-            }
+        payload: &[u8],
+        param: &ParseParam,
+        wasm_data: WasmData,
+    ) -> Option<CustomInfo> {
+        if self.instance.len() == 0 {
+            return None;
         }
-        let ins = init_instance(&mut self.store, &self.linker, name, prog, counter_map)?;
-        self.instance.push(ins);
-        Ok(())
-    }
-}
 
-pub fn init_wasmtime(modules: Vec<(String, &[u8])>, counter_map: &WasmCounterMap) -> WasmVm {
-    let limiter_builder = StoreLimitsBuilder::new();
-    // load wasm instance up to 10
-    let limiter = limiter_builder.memories(10).instances(10).build();
+        let wasm_data_hook_point = wasm_data.hook_point as u16;
+        let wasm_data_type_code = wasm_data.type_code;
 
-    let engine = Engine::default();
-    let mut store = Store::<StoreDataType>::new(
-        &engine,
-        StoreDataType {
-            parse_ctx: None,
-            limiter,
-            wasi_ctx: WasiCtxBuilder::new().build(),
-        },
-    );
-    store.limiter(|s| &mut s.limiter);
+        let _ = self
+            .store
+            .data_mut()
+            .parse_ctx
+            .insert(VmParseCtx::OnCustomMessageCtx(VmOnCustomMessageCtx::from(
+                (param, payload, wasm_data),
+            )));
 
-    let linker = get_linker(engine.clone(), &mut store);
-    let mut ins = vec![];
-    for (name, i) in modules.into_iter() {
-        match init_instance(&mut store, &linker, name.as_str(), i, counter_map) {
-            Ok(instance) => ins.push(instance),
-            Err(err) => {
-                wasm_error!(name, "instance init fail: {}", err);
+        let mut ret = None;
+        for ins in self.instance.iter() {
+            if ins.hook_point_bitmap.skip(HOOK_POINT_ON_CUSTOM_MESSAGE) {
                 continue;
             }
-        }
-    }
-
-    WasmVm {
-        linker,
-        store,
-        instance: ins,
-    }
-}
-
-fn init_instance(
-    store: &mut Store<StoreDataType>,
-    linker: &Linker<StoreDataType>,
-    name: &str,
-    prog: &[u8],
-    counter_map: &WasmCounterMap,
-) -> Result<InstanceWrap> {
-    let module = Module::from_binary(&store.engine().clone(), prog)?;
-    let instance = linker.instantiate(&mut *store, &module)?;
-
-    let memory = instance.get_export(&mut *store, "memory").map_or(
-        Err(Error::WasmInitFail(format!(
-            "wasm {} have no memory export",
-            name
-        ))),
-        |mem| {
-            if let Some(memory) = mem.into_memory() {
-                Ok(memory)
-            } else {
-                Err(Error::WasmInitFail(format!(
-                    "wasm {} can not get export memory",
-                    name
-                )))
+            if ins.vm_func_on_custom_message.is_none() {
+                continue;
             }
-        },
-    )?;
+            let Some(hook) = ins.custom_message_hook else {
+                continue;
+            };
+            let hook_point = (hook >> 32 & 0xffff) as u16;
+            let type_code = (hook & 0xffff_ffff) as u32;
+            let hook_all = (hook >> 48 & 0xffff) as u16;
+            if hook_all == 0 {
+                if hook_point != wasm_data_hook_point || type_code != wasm_data_type_code {
+                    continue;
+                }
+            }
 
-    // get all vm export func
-    let vm_func_on_http_req =
-        get_instance_export_func::<(), i32>(&instance, &mut *store, EXPORT_FUNC_ON_HTTP_REQ)?;
-    let vm_func_on_http_resp =
-        get_instance_export_func::<(), i32>(&instance, &mut *store, EXPORT_FUNC_ON_HTTP_RESP)?;
-    let vm_func_check_payload =
-        get_instance_export_func::<(), i32>(&instance, &mut *store, EXPORT_FUNC_CHECK_PAYLOAD)?;
-    let vm_func_parse_payload =
-        get_instance_export_func::<(), i32>(&instance, &mut *store, EXPORT_FUNC_PARSE_PAYLOAD)?;
-    let vm_func_get_hook_bitmap =
-        get_instance_export_func::<(), i32>(&instance, &mut *store, EXPORT_FUNC_GET_HOOK_BITMAP)?;
+            let start_time = SystemTime::now();
+            let start_time = start_time.duration_since(UNIX_EPOCH).unwrap();
 
-    // run _start as main to set the parser
-    instance
-        .get_typed_func::<(), ()>(&mut *store, "_start")
-        .map_err(|e| WasmVmError(format!("get export function _start fail: {:?}", e)))?
-        .call(&mut *store, ())
-        .map_err(|e| WasmVmError(format!("vm call _start fail: {:?}", e)))?;
+            self.store
+                .data_mut()
+                .parse_ctx
+                .as_mut()
+                .unwrap()
+                .set_ins_name(ins.name.clone());
 
-    let mut ins = InstanceWrap {
-        ins: instance,
-        hook_point_bitmap: HookPointBitmap(0),
-        name: name.to_string(),
-        memory,
-        check_payload_counter: counter_map
-            .wasm_mertic
-            .get(&get_wasm_metric_counter_map_key(
-                name,
-                EXPORT_FUNC_CHECK_PAYLOAD,
-            ))
-            .map_or(Err(WasmVmError("get counter map error".into())), |m| {
-                Ok(m.clone())
-            })?,
-        parse_payload_counter: counter_map
-            .wasm_mertic
-            .get(&get_wasm_metric_counter_map_key(
-                name,
-                EXPORT_FUNC_PARSE_PAYLOAD,
-            ))
-            .map_or(Err(WasmVmError("get counter map error".into())), |m| {
-                Ok(m.clone())
-            })?,
-        on_http_req_counter: counter_map
-            .wasm_mertic
-            .get(&get_wasm_metric_counter_map_key(
-                name,
-                EXPORT_FUNC_ON_HTTP_REQ,
-            ))
-            .map_or(Err(WasmVmError("get counter map error".into())), |m| {
-                Ok(m.clone())
-            })?,
-        on_http_resp_counter: counter_map
-            .wasm_mertic
-            .get(&get_wasm_metric_counter_map_key(
-                name,
-                EXPORT_FUNC_ON_HTTP_RESP,
-            ))
-            .map_or(Err(WasmVmError("get counter map error".into())), |m| {
-                Ok(m.clone())
-            })?,
+            let abort = ins.on_custom_message(&mut self.store);
 
-        vm_func_on_http_req,
-        vm_func_on_http_resp,
-        vm_func_check_payload,
-        vm_func_parse_payload,
-        vm_func_get_hook_bitmap,
-    };
+            ins.on_custom_message_counter
+                .mem_size
+                .swap(ins.get_mem_size(&mut self.store) as u64, Ordering::Relaxed);
 
-    ins.hook_point_bitmap = ins.get_hook_bitmap(store)?;
-    Ok(ins)
-}
+            if abort.is_err() {
+                wasm_error!(
+                    ins.name,
+                    "wasm on custom message fail: {}",
+                    abort.unwrap_err()
+                );
+                ins.on_custom_message_counter
+                    .fail_cnt
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
 
-fn get_instance_export_func<Params, Results>(
-    ins: &Instance,
-    store: impl AsContextMut,
-    fn_name: &str,
-) -> WasmResult<TypedFunc<Params, Results>>
-where
-    Params: WasmParams,
-    Results: WasmResults,
-{
-    ins.get_typed_func::<Params, Results>(store, fn_name)
-        .map_err(|e| WasmVmError(format!("get export function {} fail: {:?}", fn_name, e)))
+            ins.on_custom_message_counter.exe_duration.swap(
+                {
+                    let end_time = SystemTime::now();
+                    let end_time = end_time.duration_since(UNIX_EPOCH).unwrap();
+                    // Local timestamp may be modified
+                    if end_time > start_time {
+                        (end_time - start_time).as_micros() as u64
+                    } else {
+                        0
+                    }
+                },
+                Ordering::Relaxed,
+            );
+
+            if !abort.unwrap() {
+                continue;
+            }
+
+            ret = self
+                .store
+                .data_mut()
+                .parse_ctx
+                .as_mut()
+                .unwrap()
+                .take_l7_info_result()
+                .map_or(None, |mut r| r.pop());
+
+            break;
+        }
+
+        // clean the ctx
+        drop(self.store.data_mut().parse_ctx.take());
+        ret
+    }
 }

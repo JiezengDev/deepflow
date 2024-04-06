@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,19 +21,19 @@ import (
 	"fmt"
 
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/common"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
-	. "github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 	"github.com/deepflowio/deepflow/server/libs/eventapi"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 )
 
 var (
 	VMStateToString = map[int]string{
-		common.VM_STATE_RUNNING:   "running",
-		common.VM_STATE_STOPPED:   "stopped",
-		common.VM_STATE_EXCEPTION: "exception",
+		ctrlrcommon.VM_STATE_RUNNING:   "running",
+		ctrlrcommon.VM_STATE_STOPPED:   "stopped",
+		ctrlrcommon.VM_STATE_EXCEPTION: "exception",
 	}
 )
 
@@ -42,14 +42,14 @@ type VM struct {
 	deviceType int
 }
 
-func NewVM(toolDS *cache.ToolDataSet, eq *queue.OverwriteQueue) *VM {
+func NewVM(toolDS *tool.DataSet, eq *queue.OverwriteQueue) *VM {
 	mng := &VM{
-		EventManagerBase{
-			resourceType: RESOURCE_TYPE_VM_EN,
-			ToolDataSet:  toolDS,
-			Queue:        eq,
-		},
-		common.VIF_DEVICE_TYPE_VM,
+		newEventManagerBase(
+			ctrlrcommon.RESOURCE_TYPE_VM_EN,
+			toolDS,
+			eq,
+		),
+		ctrlrcommon.VIF_DEVICE_TYPE_VM,
 	}
 	return mng
 }
@@ -84,7 +84,7 @@ func (v *VM) ProduceByAdd(items []*mysql.VM) {
 	}
 }
 
-func (v *VM) ProduceByUpdate(cloudItem *cloudmodel.VM, diffBase *cache.VM) {
+func (v *VM) ProduceByUpdate(cloudItem *cloudmodel.VM, diffBase *diffbase.VM) {
 	id, name, err := v.getVMIDAndNameByLcuuid(cloudItem.Lcuuid)
 	if err != nil {
 		log.Error(err)
@@ -120,7 +120,7 @@ func (v *VM) ProduceByUpdate(cloudItem *cloudmodel.VM, diffBase *cache.VM) {
 		cloudItem.Lcuuid,
 		eType,
 		name,
-		common.VIF_DEVICE_TYPE_VM,
+		ctrlrcommon.VIF_DEVICE_TYPE_VM,
 		id,
 		opts...,
 	)
@@ -130,7 +130,7 @@ func (v *VM) ProduceByDelete(lcuuids []string) {
 	for _, lcuuid := range lcuuids {
 		id, name, err := v.getVMIDAndNameByLcuuid(lcuuid)
 		if err != nil {
-			log.Errorf("%v, %v", idByLcuuidNotFound(v.resourceType, lcuuid), err)
+			log.Error(v.org.LogPre("%v, %v", idByLcuuidNotFound(v.resourceType, lcuuid), err))
 		}
 
 		v.createAndEnqueue(lcuuid, eventapi.RESOURCE_EVENT_TYPE_DELETE, name, v.deviceType, id)
@@ -138,7 +138,7 @@ func (v *VM) ProduceByDelete(lcuuids []string) {
 }
 
 func (v *VM) getIPNetworksByID(id int) (networkIDs []uint32, ips []string) {
-	ipNetworkMap, _ := v.ToolDataSet.EventToolDataSet.GetVMIPNetworkMapByID(id)
+	ipNetworkMap, _ := v.ToolDataSet.EventDataSet.GetVMIPNetworkMapByID(id)
 	for ip, nID := range ipNetworkMap {
 		networkIDs = append(networkIDs, uint32(nID))
 		ips = append(ips, ip.IP)

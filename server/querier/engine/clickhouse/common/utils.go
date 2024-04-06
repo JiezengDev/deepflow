@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,7 +26,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"unicode"
 
 	"github.com/deepflowio/deepflow/server/querier/config"
 	"github.com/deepflowio/deepflow/server/querier/engine/clickhouse/client"
@@ -35,38 +34,12 @@ import (
 )
 
 var log = logging.MustGetLogger("common")
-var symbolRegexp = regexp.MustCompile("[\u3002\uff1b\uff0c\uff1a\u201c\u201d\uff08\uff09\u3001\uff1f\u300a\u300b]")
+var noBackquoteRegexp = regexp.MustCompile("^`[a-zA-Z_]+`$")
 
 func ParseAlias(node sqlparser.SQLNode) string {
 	alias := sqlparser.String(node)
-	// 判断字符串首尾是否为反引号
-	if strings.HasPrefix(alias, "`") && strings.HasSuffix(alias, "`") {
+	if noBackquoteRegexp.MatchString(alias) {
 		alias = strings.Trim(alias, "`")
-	} else {
-		return alias
-	}
-
-	// 中文带上``
-	// 部分特殊字符带上`
-	for _, r := range alias {
-		if unicode.Is(unicode.Scripts["Han"], r) || (symbolRegexp.MatchString(string(r))) {
-			return fmt.Sprintf("`%s`", alias)
-		}
-		if string(r) == "(" || string(r) == ")" {
-			return fmt.Sprintf("`%s`", alias)
-		}
-	}
-	// 纯数字带上``
-	if _, err := strconv.ParseInt(alias, 10, 64); err == nil {
-		return fmt.Sprintf("`%s`", alias)
-	}
-	// K8s Labels字带上``
-	if strings.HasPrefix(alias, "k8s.label") || strings.HasPrefix(alias, "k8s.annotation") || strings.HasPrefix(alias, "k8s.env") || strings.HasPrefix(alias, "os.app") || strings.HasPrefix(alias, "cloud.tag") {
-		return fmt.Sprintf("`%s`", alias)
-	}
-	// 外部字段带上``
-	if strings.HasPrefix(alias, "tag.") || strings.HasPrefix(alias, "attribute.") || strings.HasPrefix(alias, "metrics.") {
-		return fmt.Sprintf("`%s`", alias)
 	}
 	return alias
 }
@@ -98,6 +71,24 @@ func ParsePermission(permission interface{}) ([]bool, error) {
 	return permissions, nil
 }
 
+// not_supported_operators parsed as an array
+func ParseNotSupportedOperator(notSupportedOperator interface{}) []string {
+	notSupportedOperators := []string{}
+	notSupportedOperatorStr := notSupportedOperator.(string)
+	if len(notSupportedOperatorStr) == 3 {
+		if string(notSupportedOperatorStr[0]) == "1" {
+			notSupportedOperators = append(notSupportedOperators, "select")
+		}
+		if string(notSupportedOperatorStr[1]) == "1" {
+			notSupportedOperators = append(notSupportedOperators, "group")
+		}
+		if string(notSupportedOperatorStr[2]) == "1" {
+			notSupportedOperators = append(notSupportedOperators, "where")
+		}
+	}
+	return notSupportedOperators
+}
+
 func IPFilterStringToHex(ip string) string {
 	if strings.Contains(ip, ":") {
 		return fmt.Sprintf("hex(toIPv6(%s))", ip)
@@ -120,10 +111,12 @@ func GetDatasources(db string, table string) ([]string, error) {
 	switch db {
 	case "flow_metrics":
 		var tsdbType string
-		if table == "vtap_flow_port" || table == "vtap_flow_edge_port" {
-			tsdbType = "flow"
-		} else if table == "vtap_app_port" || table == "vtap_app_edge_port" {
-			tsdbType = "app"
+		if table == "network" || table == "network_map" {
+			tsdbType = "network"
+		} else if table == "application" || table == "application_map" {
+			tsdbType = "application"
+		} else if table == TABLE_NAME_VTAP_ACL {
+			tsdbType = TABLE_NAME_VTAP_ACL
 		}
 		client := &http.Client{}
 		url := fmt.Sprintf("http://localhost:20417/v1/data-sources/?type=%s", tsdbType)
@@ -161,18 +154,29 @@ func GetDatasourceInterval(db string, table string, name string) (int, error) {
 	case DB_NAME_FLOW_LOG, DB_NAME_EVENT, DB_NAME_PROFILE:
 		return 1, nil
 	case DB_NAME_FLOW_METRICS:
-		if table == "vtap_flow_port" || table == "vtap_flow_edge_port" {
-			tsdbType = "flow"
-		} else if table == "vtap_app_port" || table == "vtap_app_edge_port" {
-			tsdbType = "app"
-		} else if table == "vtap_acl" {
-			return 60, nil
+		if name == "" {
+			tableSlice := strings.Split(table, ".")
+			if len(tableSlice) == 2 {
+				name = tableSlice[1]
+			}
 		}
+		if strings.HasPrefix(table, "network") {
+			tsdbType = "network"
+		} else if strings.HasPrefix(table, "application") {
+			tsdbType = "application"
+		} else if table == TABLE_NAME_VTAP_ACL {
+			tsdbType = TABLE_NAME_VTAP_ACL
+		}
+	case DB_NAME_DEEPFLOW_SYSTEM, DB_NAME_EXT_METRICS, DB_NAME_PROMETHEUS:
+		tsdbType = db
 	default:
 		return 1, nil
 	}
 	client := &http.Client{}
-	url := fmt.Sprintf("http://localhost:20417/v1/data-sources/?name=%s&type=%s", name, tsdbType)
+	url := fmt.Sprintf("http://localhost:20417/v1/data-sources/?type=%s", tsdbType)
+	if name != "" {
+		url += fmt.Sprintf("&name=%s", name)
+	}
 	reqest, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return 1, err
@@ -195,7 +199,7 @@ func GetDatasourceInterval(db string, table string, name string) (int, error) {
 	return int(body["DATA"].([]interface{})[0].(map[string]interface{})["INTERVAL"].(float64)), nil
 }
 
-func GetExtTables(db string, ctx context.Context) (values []interface{}) {
+func GetExtTables(db, queryCacheTTL string, useQueryCache bool, ctx context.Context) (values []interface{}) {
 	chClient := client.Client{
 		Host:     config.Cfg.Clickhouse.Host,
 		Port:     config.Cfg.Clickhouse.Port,
@@ -208,10 +212,13 @@ func GetExtTables(db string, ctx context.Context) (values []interface{}) {
 	if db == "ext_metrics" {
 		sql = "SELECT table FROM flow_tag.ext_metrics_custom_field GROUP BY table"
 		chClient.DB = "flow_tag"
+	} else if db == "deepflow_system" {
+		sql = "SELECT table FROM flow_tag.deepflow_system_custom_field GROUP BY table"
+		chClient.DB = "flow_tag"
 	} else {
 		sql = "SHOW TABLES FROM " + db
 	}
-	rst, err := chClient.DoQuery(&client.QueryParams{Sql: sql})
+	rst, err := chClient.DoQuery(&client.QueryParams{Sql: sql, UseQueryCache: useQueryCache, QueryCacheTTL: queryCacheTTL})
 	if err != nil {
 		log.Error(err)
 		return nil
@@ -226,7 +233,7 @@ func GetExtTables(db string, ctx context.Context) (values []interface{}) {
 	return values
 }
 
-func GetPrometheusTables(db string, ctx context.Context) (values []interface{}) {
+func GetPrometheusTables(db, queryCacheTTL string, useQueryCache bool, ctx context.Context) (values []interface{}) {
 	chClient := client.Client{
 		Host:     config.Cfg.Clickhouse.Host,
 		Port:     config.Cfg.Clickhouse.Port,
@@ -242,7 +249,7 @@ func GetPrometheusTables(db string, ctx context.Context) (values []interface{}) 
 	} else {
 		sql = "SHOW TABLES FROM " + db
 	}
-	rst, err := chClient.DoQuery(&client.QueryParams{Sql: sql})
+	rst, err := chClient.DoQuery(&client.QueryParams{Sql: sql, UseQueryCache: useQueryCache, QueryCacheTTL: queryCacheTTL})
 	if err != nil {
 		log.Error(err)
 		return nil

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan VMs
+ * Copyright (c) 2024 Yunshan VMs
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package huawei
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/bitly/go-simplejson"
@@ -37,11 +38,12 @@ func (h *HuaWei) getVMs() ([]model.VM, []model.VMSecurityGroup, []model.VInterfa
 	var vifs []model.VInterface
 	var ips []model.IP
 	for project, token := range h.projectTokenMap {
-		jVMs, err := h.getRawData(
-			fmt.Sprintf("https://ecs.%s.%s/v2.1/%s/servers/detail", project.name, h.config.Domain, project.id), token.token, "servers",
-		)
+		// 华为云官方文档：
+		// 云服务器的标签列表。微版本2.26及以上版本支持，如果不使用微版本查询，响应中无tags字段。
+		jVMs, err := h.getRawData(newRawDataGetContext(
+			fmt.Sprintf("https://ecs.%s.%s/v2.1/%s/servers/detail", project.name, h.config.Domain, project.id), token.token, "servers", pageQueryMethodMarker,
+		).addHeader("X-OpenStack-Nova-API-Version", "2.26"))
 		if err != nil {
-			log.Errorf("request failed: %v", err)
 			return nil, nil, nil, nil, err
 		}
 
@@ -75,6 +77,7 @@ func (h *HuaWei) getVMs() ([]model.VM, []model.VMSecurityGroup, []model.VInterfa
 				AZLcuuid:     azLcuuid,
 				RegionLcuuid: regionLcuuid,
 				VPCLcuuid:    vpcLcuuid,
+				CloudTags:    h.formatVMCloudTags(jVM.Get("tags")),
 			}
 
 			jc, ok := jVM.CheckGet("created")
@@ -104,6 +107,25 @@ func (h *HuaWei) getVMs() ([]model.VM, []model.VMSecurityGroup, []model.VInterfa
 		}
 	}
 	return vms, vmSGs, vifs, ips, nil
+}
+
+// 华为云官方文档：
+// 华为云云服务器标签规则：
+//
+//	key与value使用“=”连接，如“key=value”。
+//	如果value为空字符串，则仅返回key。
+func (h *HuaWei) formatVMCloudTags(tags *simplejson.Json) map[string]string {
+	resp := make(map[string]string)
+	for i := range tags.MustArray() {
+		jTag := tags.GetIndex(i).MustString()
+		parts := strings.SplitN(jTag, "=", 2)
+		if len(parts) == 2 {
+			resp[parts[0]] = parts[1]
+		} else {
+			resp[jTag] = ""
+		}
+	}
+	return resp
 }
 
 func (h *HuaWei) formatVMSecurityGroups(jSGs *simplejson.Json, projectID, vmLcuuid string) (vmSGs []model.VMSecurityGroup) {
@@ -163,13 +185,20 @@ func (h *HuaWei) formatVInterfacesAndIPs(addrs *simplejson.Json, regionLcuuid, v
 			vifs = append(vifs, vif)
 
 			ipAddr := jV["addr"].(string)
+			var subnetLcuuid string
+			for _, subnet := range h.toolDataSet.networkLcuuidToSubnets[vif.NetworkLcuuid] {
+				if cloudcommon.IsIPInCIDR(ipAddr, subnet.CIDR) {
+					subnetLcuuid = subnet.Lcuuid
+					break
+				}
+			}
 			ips = append(
 				ips,
 				model.IP{
 					Lcuuid:           common.GenerateUUID(vif.Lcuuid + ipAddr),
 					VInterfaceLcuuid: vif.Lcuuid,
 					IP:               ipAddr,
-					SubnetLcuuid:     h.toolDataSet.networkLcuuidToSubnetLcuuid[vif.NetworkLcuuid],
+					SubnetLcuuid:     subnetLcuuid,
 					RegionLcuuid:     regionLcuuid,
 				},
 			)

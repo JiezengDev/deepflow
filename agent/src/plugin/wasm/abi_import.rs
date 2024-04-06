@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,16 +15,16 @@
  */
 
 use crate::{
-    flow_generator::protocol_logs::pb_adapter::{KeyVal, TraceInfo},
     plugin::{wasm::IMPORT_FUNC_WASM_LOG, CustomInfo},
     wasm_error,
 };
 
 use super::{
-    read_wasm_str, StoreDataType, VmParseCtx, VmResult, IMPORT_FUNC_HOST_READ_HTTP_RESULT,
-    IMPORT_FUNC_HOST_READ_L7_PROTOCOL_INFO, IMPORT_FUNC_HOST_READ_STR_RESULT,
-    IMPORT_FUNC_VM_READ_CTX_BASE, IMPORT_FUNC_VM_READ_HTTP_REQ, IMPORT_FUNC_VM_READ_HTTP_RESP,
-    IMPORT_FUNC_VM_READ_PAYLOAD, LOG_LEVEL_ERR, LOG_LEVEL_INFO, LOG_LEVEL_WARN, WASM_MODULE_NAME,
+    read_wasm_str, StoreDataType, VmParseCtx, VmResult, IMPORT_FUNC_HOST_READ_L7_PROTOCOL_INFO,
+    IMPORT_FUNC_HOST_READ_STR_RESULT, IMPORT_FUNC_VM_READ_CTX_BASE,
+    IMPORT_FUNC_VM_READ_CUSTOM_MESSAGE, IMPORT_FUNC_VM_READ_HTTP_REQ,
+    IMPORT_FUNC_VM_READ_HTTP_RESP, IMPORT_FUNC_VM_READ_PAYLOAD, LOG_LEVEL_ERR, LOG_LEVEL_INFO,
+    LOG_LEVEL_WARN, WASM_MODULE_NAME,
 };
 
 use log::{error, info, warn};
@@ -236,7 +236,7 @@ pub(super) fn vm_read_http_resp_info(
     let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
     let mem_mut = mem.data_mut(caller.as_context_mut());
 
-    let  VmParseCtx::HttpRespCtx(ref resp_ctx) = ctx else {
+    let VmParseCtx::HttpRespCtx(ref resp_ctx) = ctx else {
         wasm_error!(
             ctx.get_ins_name(),
             IMPORT_FUNC_VM_READ_HTTP_RESP,
@@ -252,6 +252,51 @@ pub(super) fn vm_read_http_resp_info(
             ctx.get_ins_name(),
             IMPORT_FUNC_VM_READ_HTTP_RESP,
             "serialize http resp ctx fail: {}",
+            err
+        );
+        return 0;
+    }
+
+    let _ = caller.data_mut().parse_ctx.insert(ctx);
+    size.unwrap() as i32
+}
+
+/*
+    import function, correspond to go func signature:
+
+    //go:wasm-module deepflow
+    //export vm_read_custom_message_info
+    func vmReadCustomMessageInfo(b *byte, length int) int
+*/
+pub(super) fn vm_read_custom_message_info(
+    mut caller: Caller<'_, StoreDataType>,
+    b: i32,
+    len: i32,
+) -> i32 {
+    if !check_memory(&mut caller, b, len, IMPORT_FUNC_VM_READ_CUSTOM_MESSAGE) {
+        return 0;
+    }
+
+    let ctx = caller.data_mut().parse_ctx.take().unwrap();
+    let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+    let mem_mut = mem.data_mut(caller.as_context_mut());
+
+    let VmParseCtx::OnCustomMessageCtx(ref msg_ctx) = ctx else {
+        wasm_error!(
+            ctx.get_ins_name(),
+            IMPORT_FUNC_VM_READ_CUSTOM_MESSAGE,
+            "ctx type incorrect"
+        );
+        let _ = caller.data_mut().parse_ctx.insert(ctx);
+        return 0;
+    };
+
+    let size = msg_ctx.serialize_to_bytes(&mut mem_mut[b as usize..(b + len) as usize]);
+    if let Err(err) = size {
+        wasm_error!(
+            ctx.get_ins_name(),
+            IMPORT_FUNC_VM_READ_CUSTOM_MESSAGE,
+            "serialize custom message ctx fail: {}",
             err
         );
         return 0;
@@ -341,115 +386,8 @@ pub(super) fn host_read_l7_protocol_info(
         .as_mut()
         .unwrap()
         .get_ctx_base_mut()
-        .set_result(VmResult::ParsePayloadResult(infos));
+        .set_result(VmResult::L7InfoResult(infos));
 
-    1
-}
-
-/*
-    import function, host read the serialized http result and deserizlize to CustomInfo.
-
-    correspond to go func signature:
-
-    //go:wasm-module deepflow
-    //export host_read_http_result
-    func hostReadHttpResult(b *byte, length int) bool
-
-
-has trace: 1 byte
-if has trace
-    trace_id, span_id, parent_span_id
-    (
-        str len: 2 bytes
-        str:     $(str len) bytes
-    ) x 3
-
-(
-    key len: 2 bytes
-    key:     $(key len) bytes
-
-    val len: 2 bytes
-    val:     $(val len) bytes
-) x n
-
-*/
-pub(super) fn host_read_http_result(
-    mut caller: Caller<'_, StoreDataType>,
-    b: i32,
-    len: i32,
-) -> i32 {
-    if !check_memory(&mut caller, b, len, IMPORT_FUNC_HOST_READ_HTTP_RESULT) {
-        return 0;
-    }
-    let mut kv = vec![];
-    let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
-    let mem = mem.data(caller.as_context());
-    let data = &mem[b as usize..(b + len) as usize];
-    let ins_name = caller.data().parse_ctx.as_ref().unwrap().get_ins_name();
-
-    let mut trace_info = None;
-    let mut off = 0;
-    let has_trace = data[off];
-    off += 1;
-
-    match has_trace {
-        0 => {}
-        1 => {
-            let mut i = TraceInfo::default();
-            if read_wasm_str(data, &mut off)
-                .and_then(|s| {
-                    if !s.is_empty() {
-                        i.trace_id = Some(s);
-                    }
-                    read_wasm_str(data, &mut off)
-                })
-                .and_then(|s| {
-                    if !s.is_empty() {
-                        i.span_id = Some(s);
-                    }
-                    read_wasm_str(data, &mut off)
-                })
-                .and_then(|s| {
-                    if !s.is_empty() {
-                        i.parent_span_id = Some(s);
-                    }
-                    Some(())
-                })
-                .is_none()
-            {
-                wasm_error!(
-                    ins_name,
-                    IMPORT_FUNC_HOST_READ_HTTP_RESULT,
-                    "read trace info fail"
-                );
-                return 0;
-            }
-            trace_info = Some(i);
-        }
-        _ => {
-            wasm_error!(
-                ins_name,
-                IMPORT_FUNC_HOST_READ_HTTP_RESULT,
-                "read http result fail, has trace is unexpected value"
-            );
-            return 0;
-        }
-    }
-
-    loop {
-        let (Some(key), Some(val)) = (read_wasm_str(data, &mut off), read_wasm_str(data, &mut off)) else {
-            break;
-        };
-        kv.push(KeyVal { key, val });
-    }
-
-    caller
-        .data_mut()
-        .parse_ctx
-        .as_mut()
-        .unwrap()
-        .get_ctx_base_mut()
-        .set_result(VmResult::HTTPResult(trace_info, kv));
     1
 }
 
@@ -470,7 +408,7 @@ pub(super) fn host_read_str_result(mut caller: Caller<'_, StoreDataType>, b: i32
     let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
     let mem = mem.data(caller.as_context());
     let data = &mem[b as usize..(b + len) as usize];
-    let Some(str) = read_wasm_str(data,&mut 0) else {
+    let Some(str) = read_wasm_str(data, &mut 0) else {
         let ins_name = caller.data().parse_ctx.as_ref().unwrap().get_ins_name();
         wasm_error!(
             ins_name,
@@ -528,15 +466,15 @@ pub(super) fn get_linker(e: Engine, store: &mut Store<StoreDataType>) -> Linker<
 
     link.func_wrap(
         WASM_MODULE_NAME,
-        IMPORT_FUNC_HOST_READ_L7_PROTOCOL_INFO,
-        host_read_l7_protocol_info,
+        IMPORT_FUNC_VM_READ_CUSTOM_MESSAGE,
+        vm_read_custom_message_info,
     )
     .unwrap();
 
     link.func_wrap(
         WASM_MODULE_NAME,
-        IMPORT_FUNC_HOST_READ_HTTP_RESULT,
-        host_read_http_result,
+        IMPORT_FUNC_HOST_READ_L7_PROTOCOL_INFO,
+        host_read_l7_protocol_info,
     )
     .unwrap();
 
@@ -576,6 +514,7 @@ fn link_wasi(
         "path_open",
         "path_readlink",
         "proc_exit",
+        "sched_yield",
     ];
 
     for f in link_func {

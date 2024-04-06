@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@ func (k *KubernetesGather) getAZ() (model.AZ, error) {
 	az := model.AZ{
 		Lcuuid:       k.azLcuuid,
 		Name:         k.Name,
-		RegionLcuuid: k.RegionUuid,
+		RegionLcuuid: k.RegionUUID,
 	}
 	log.Debug("get az complete")
 	return az, nil

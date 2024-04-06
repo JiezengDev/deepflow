@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,14 +19,14 @@ use std::{
     process::Command,
 };
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux;
 #[cfg(target_os = "windows")]
 mod windows;
 
 #[cfg(target_os = "windows")]
 pub use self::windows::*;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use linux::*;
 
 fn exec_command(program: &str, args: &[&str]) -> Result<String> {
@@ -38,10 +38,4 @@ fn exec_command(program: &str, args: &[&str]) -> Result<String> {
         Ok(String::from_utf8(output.stderr)
             .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?)
     }
-}
-
-pub fn get_hostname() -> Result<String> {
-    hostname::get()?
-        .into_string()
-        .map_err(|_| Error::new(ErrorKind::Other, "get hostname failed"))
 }

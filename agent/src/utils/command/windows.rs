@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 
 use public::utils::net::{
     get_adapters_addresses, is_global, is_link_local_multicast, is_link_local_unicast, Error,
@@ -55,4 +57,10 @@ pub fn get_ip_address() -> Result<String, Error> {
         }
     }
     Ok(link_info)
+}
+
+pub fn get_hostname() -> IoResult<String> {
+    hostname::get()?
+        .into_string()
+        .map_err(|_| IoError::new(ErrorKind::Other, "get hostname failed"))
 }

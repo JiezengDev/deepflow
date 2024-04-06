@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,7 +28,7 @@ use npb_handler::{NpbHandler, NpbMode};
 use npb_pcap_policy::{NpbTunnelType, PolicyData};
 use public::{enums::HeaderType, packet, queue::DebugSender, utils::net::MacAddr};
 
-use crate::collector::acc_flow::U16Set;
+use crate::collector::types::U16Set;
 use crate::common::meta_packet::{MetaPacket, RawPacket};
 
 pub struct IpInfo {
@@ -67,10 +67,12 @@ pub struct MiniPacket<'a> {
     header_type: HeaderType,
     l2_l3_opt_size: u16,
     packet_len: u32,
+    second_in_minute: u8,
+    if_index: isize,
 }
 
 impl<'a> MiniPacket<'a> {
-    pub fn new<P>(overlay_packet: P, meta_packet: &MetaPacket) -> MiniPacket<'a>
+    pub fn new<P>(overlay_packet: P, meta_packet: &MetaPacket, if_index: isize) -> MiniPacket<'a>
     where
         P: Into<RawPacket<'a>>,
     {
@@ -94,6 +96,19 @@ impl<'a> MiniPacket<'a> {
             header_type: meta_packet.header_type,
             l2_l3_opt_size: meta_packet.l2_l3_opt_size,
             packet_len: meta_packet.packet_len,
+            second_in_minute: meta_packet.second_in_minute,
+            if_index,
+        }
+    }
+
+    pub fn if_index(&self) -> isize {
+        self.if_index
+    }
+
+    pub fn raw(&self) -> &[u8] {
+        match &self.packet {
+            RawPacket::Borrowed(r) => *r,
+            RawPacket::Owned(r) => r.as_ref(),
         }
     }
 }
@@ -149,6 +164,7 @@ impl PacketHandler {
                     flow_id: packet.flow_id,
                     timestamp: Duration::from_nanos(packet.timestamp),
                     acl_gids: Vec::from(acl_gids.list()),
+                    second_in_minute: packet.second_in_minute,
                 };
                 if let Err(e) = sender.send(mini_packet) {
                     debug!("send mini packet to pcap assembler error: {e:?}");

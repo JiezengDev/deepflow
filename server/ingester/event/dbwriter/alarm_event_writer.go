@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -45,6 +45,7 @@ type AlarmEventStore struct {
 	Time   uint32
 	Lcuuid string
 	User   string
+	UserId uint32
 
 	PolicyId                uint32
 	PolicyName              string
@@ -59,7 +60,7 @@ type AlarmEventStore struct {
 	PolicyTargetField       string
 	PolicyEndpoints         string
 	TriggerCondition        string
-	TriggerValue            int64
+	TriggerValue            float64
 	ValueUnit               string
 	EventLevel              uint32
 	AlarmTarget             string
@@ -69,6 +70,8 @@ type AlarmEventStore struct {
 	PolicyThresholdCritical string
 	PolicyThresholdError    string
 	PolicyThresholdWarning  string
+	OrgId                   uint16
+	TeamID                  uint16
 }
 
 func AlarmEventColumns() []*ckdb.Column {
@@ -76,6 +79,7 @@ func AlarmEventColumns() []*ckdb.Column {
 		ckdb.NewColumn("time", ckdb.DateTime),
 		ckdb.NewColumn("lccuid", ckdb.String),
 		ckdb.NewColumn("user", ckdb.LowCardinalityString),
+		ckdb.NewColumn("user_id", ckdb.UInt32),
 
 		ckdb.NewColumn("policy_id", ckdb.UInt32),
 		ckdb.NewColumn("policy_name", ckdb.LowCardinalityString),
@@ -90,7 +94,7 @@ func AlarmEventColumns() []*ckdb.Column {
 		ckdb.NewColumn("policy_target_field", ckdb.String),
 		ckdb.NewColumn("policy_endpoints", ckdb.LowCardinalityString),
 		ckdb.NewColumn("trigger_condition", ckdb.String),
-		ckdb.NewColumn("trigger_value", ckdb.Int64),
+		ckdb.NewColumn("trigger_value", ckdb.Float64),
 		ckdb.NewColumn("value_unit", ckdb.LowCardinalityString),
 		ckdb.NewColumn("event_level", ckdb.UInt32),
 		ckdb.NewColumn("alarm_target", ckdb.LowCardinalityString),
@@ -100,6 +104,7 @@ func AlarmEventColumns() []*ckdb.Column {
 		ckdb.NewColumn("policy_threshold_critical", ckdb.String),
 		ckdb.NewColumn("policy_threshold_error", ckdb.String),
 		ckdb.NewColumn("policy_threshold_warning", ckdb.String),
+		ckdb.NewColumn("team_id", ckdb.UInt16),
 	}
 }
 
@@ -108,6 +113,7 @@ func (e *AlarmEventStore) WriteBlock(block *ckdb.Block) {
 	block.Write(
 		e.Lcuuid,
 		e.User,
+		e.UserId,
 		e.PolicyId,
 		e.PolicyName,
 		e.PolicyLevel,
@@ -131,11 +137,16 @@ func (e *AlarmEventStore) WriteBlock(block *ckdb.Block) {
 		e.PolicyThresholdCritical,
 		e.PolicyThresholdError,
 		e.PolicyThresholdWarning,
+		e.TeamID,
 	)
 }
 
 func (e *AlarmEventStore) Release() {
 	ReleaseAlarmEventStore(e)
+}
+
+func (e *AlarmEventStore) OrgID() uint16 {
+	return e.OrgId
 }
 
 func GenAlarmEventCKTable(cluster, storagePolicy string, ttl int, coldStorage *ckdb.ColdStorage) *ckdb.Table {
@@ -177,7 +188,7 @@ func NewAlarmEventWriter(config *config.Config) (*EventWriter, error) {
 	ckTable := GenAlarmEventCKTable(w.ckdbCluster, w.ckdbStoragePolicy, w.ttl, ckdb.GetColdStorage(w.ckdbColdStorages, EVENT_DB, common.ALARM_EVENT.TableName()))
 
 	ckwriter, err := ckwriter.NewCKWriter(w.ckdbAddrs, w.ckdbUsername, w.ckdbPassword,
-		common.ALARM_EVENT.TableName(), config.Base.CKDB.TimeZone, ckTable, w.writerConfig.QueueCount, w.writerConfig.QueueSize, w.writerConfig.BatchSize, w.writerConfig.FlushTimeout)
+		common.ALARM_EVENT.TableName(), config.Base.CKDB.TimeZone, ckTable, w.writerConfig.QueueCount, w.writerConfig.QueueSize, w.writerConfig.BatchSize, w.writerConfig.FlushTimeout, config.Base.CKDB.Watcher)
 	if err != nil {
 		return nil, err
 	}

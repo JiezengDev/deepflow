@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,6 @@
 
 //! Enterprise Edition Feature: tingyun
 
-pub fn decode_trace_id(_: &str) -> Option<String> {
+pub fn decode_trace_id(_: &str) -> Option<std::borrow::Cow<'_, str>> {
     None
 }

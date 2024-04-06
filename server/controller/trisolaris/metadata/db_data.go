@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -594,7 +594,7 @@ func (d *DBDataCache) GetDataCacheFromDB(db *gorm.DB) {
 		log.Error(err)
 	}
 
-	vtaps, err := dbmgr.DBMgr[models.VTap](db).GetFields([]string{"id", "name", "launch_server_id"})
+	vtaps, err := dbmgr.DBMgr[models.VTap](db).GetFields([]string{"id", "name", "launch_server_id", "type"})
 	if err == nil {
 		d.vtaps = vtaps
 	} else {

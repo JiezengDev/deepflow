@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,13 +29,13 @@ func GetVPCLcuuidFromUUIDGenerate(uuidGenerate string) string {
 
 func (k *KubernetesGather) getVPC() (model.VPC, error) {
 	log.Debug("get vpc starting")
-	if k.VPCUuid == "" {
-		k.VPCUuid = GetVPCLcuuidFromUUIDGenerate(k.UuidGenerate)
+	if k.VPCUUID == "" {
+		k.VPCUUID = GetVPCLcuuidFromUUIDGenerate(k.UuidGenerate)
 	}
 	vpc := model.VPC{
-		Lcuuid:       k.VPCUuid,
+		Lcuuid:       k.VPCUUID,
 		Name:         k.Name,
-		RegionLcuuid: k.RegionUuid,
+		RegionLcuuid: k.RegionUUID,
 	}
 	log.Debug("get vpc complete")
 	return vpc, nil

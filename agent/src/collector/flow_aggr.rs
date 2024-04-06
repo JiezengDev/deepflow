@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,13 +14,13 @@
  * limitations under the License.
  */
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     Arc,
 };
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use thread::JoinHandle;
 
 use arc_swap::access::Access;
@@ -30,11 +30,11 @@ use rand::prelude::{Rng, SeedableRng, SmallRng};
 
 use super::consts::*;
 
-use crate::collector::acc_flow::U16Set;
+use crate::collector::types::U16Set;
 use crate::common::Timestamp;
 use crate::common::{
     enums::TapType,
-    flow::{CloseType, Flow},
+    flow::CloseType,
     tagged_flow::{BoxedTaggedFlow, TaggedFlow},
 };
 use crate::config::handler::CollectorAccess;
@@ -47,7 +47,7 @@ use public::{
 
 const TIMESTAMP_SLOT_COUNT: usize = SECONDS_IN_MINUTE as usize;
 const QUEUE_READ_TIMEOUT: Duration = Duration::from_secs(1); // Must be less than or equal to FLUSH_TIMEOUT
-const FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Default)]
 pub struct FlowAggrCounter {
@@ -145,10 +145,11 @@ pub struct FlowAggr {
     input: Arc<Receiver<Arc<BatchedBox<TaggedFlow>>>>,
     output: ThrottlingQueue,
     slot_start_time: Duration,
-    flow_stashs: HashMap<u64, Box<TaggedFlow>>,
-    timestamp_stashs: VecDeque<HashSet<u64>>,
+    flow_stashs: VecDeque<HashMap<u64, Box<TaggedFlow>>>,
     stash_init_capacity: usize,
+    slot_count: usize,
 
+    flush_timeout: Duration,
     last_flush_time: Duration,
     config: CollectorAccess,
 
@@ -162,7 +163,6 @@ impl FlowAggr {
     // record stash size in last N flushes to determine shrinking size
     const HISTORY_RECORD_COUNT: usize = 10;
     const MIN_STASH_CAPACITY_SECOND: usize = 1024;
-    const MIN_STASH_CAPACITY: usize = Self::MIN_STASH_CAPACITY_SECOND * 60;
 
     pub fn new(
         input: Arc<Receiver<Arc<BatchedBox<TaggedFlow>>>>,
@@ -172,47 +172,30 @@ impl FlowAggr {
         ntp_diff: Arc<AtomicI64>,
         metrics: Arc<FlowAggrCounter>,
     ) -> Self {
-        let mut timestamp_stashs = VecDeque::with_capacity(TIMESTAMP_SLOT_COUNT);
-        for _ in 0..TIMESTAMP_SLOT_COUNT {
-            timestamp_stashs.push_back(HashSet::with_capacity(Self::MIN_STASH_CAPACITY_SECOND));
+        let slot_count = TIMESTAMP_SLOT_COUNT + config.load().packet_delay.as_secs() as usize + 1;
+        let mut flow_stashs = VecDeque::with_capacity(slot_count);
+        for _ in 0..slot_count {
+            flow_stashs.push_back(HashMap::with_capacity(Self::MIN_STASH_CAPACITY_SECOND));
         }
         Self {
             input,
             output: ThrottlingQueue::new(output, config.clone()),
-            flow_stashs: HashMap::with_capacity(Self::MIN_STASH_CAPACITY),
-            timestamp_stashs,
-            stash_init_capacity: Self::MIN_STASH_CAPACITY,
+            flow_stashs,
+            stash_init_capacity: Self::MIN_STASH_CAPACITY_SECOND,
             slot_start_time: Duration::ZERO,
+            flush_timeout: Duration::from_secs(slot_count as u64),
             last_flush_time: Duration::ZERO,
             config,
             running,
             metrics,
             ntp_diff,
+            slot_count,
         }
-    }
-
-    fn add(&mut self, time_slot: usize, f: &BatchedBox<TaggedFlow>) {
-        self.timestamp_stashs[time_slot].insert(f.flow.flow_id);
-        self.flow_stashs
-            .insert(f.flow.flow_id, Box::new(f.as_ref().clone()));
-    }
-
-    fn remove(&mut self, time_slot: usize, flow_id: &u64) -> Option<Box<TaggedFlow>> {
-        self.timestamp_stashs[time_slot].remove(flow_id);
-        self.flow_stashs.remove(flow_id)
-    }
-
-    fn calc_flow_start_time(f: &Flow) -> Timestamp {
-        let second_in_minute = f.start_time.as_secs() % SECONDS_IN_MINUTE;
-        Timestamp::from_secs(
-            (f.flow_stat_time.as_secs() - second_in_minute) / SECONDS_IN_MINUTE * SECONDS_IN_MINUTE
-                + second_in_minute,
-        )
     }
 
     fn minute_merge(&mut self, f: Arc<BatchedBox<TaggedFlow>>) {
         let f = f.as_ref();
-        let flow_time = Self::calc_flow_start_time(&f.flow);
+        let flow_time = Timestamp::from_secs(f.flow.start_time_in_minute());
         if flow_time < self.slot_start_time {
             debug!("flow drop before slot start time. flow stat time: {:?}, slot start time is {:?}, delay is {:?}", flow_time, self.slot_start_time, self.slot_start_time - flow_time);
             self.metrics
@@ -222,14 +205,15 @@ impl FlowAggr {
         }
 
         let mut time_slot = (flow_time - self.slot_start_time).as_secs() as usize;
-        if time_slot >= TIMESTAMP_SLOT_COUNT {
-            let flush_count = time_slot - TIMESTAMP_SLOT_COUNT + 1;
+        if time_slot >= self.slot_count {
+            let flush_count = time_slot - self.slot_count + 1;
             self.flush_slots(flush_count);
-            time_slot = TIMESTAMP_SLOT_COUNT - 1;
+            time_slot = self.slot_count - 1;
         }
 
+        let flow_stash = &mut self.flow_stashs[time_slot];
         let flow_id = f.flow.flow_id;
-        if let Some(flow) = self.flow_stashs.get_mut(&flow_id) {
+        if let Some(flow) = flow_stash.get_mut(&flow_id) {
             if flow.flow.reversed != f.flow.reversed {
                 flow.reverse();
                 if let Some(stats) = flow.flow.flow_perf_stats.as_mut() {
@@ -238,7 +222,7 @@ impl FlowAggr {
             }
             flow.sequential_merge(&f);
             if flow.flow.close_type != CloseType::ForcedReport {
-                if let Some(closed_flow) = self.remove(time_slot, &flow_id) {
+                if let Some(closed_flow) = flow_stash.remove(&flow_id) {
                     self.send_flow(closed_flow);
                 }
             }
@@ -246,7 +230,7 @@ impl FlowAggr {
             if f.flow.close_type != CloseType::ForcedReport {
                 self.send_flow(Box::new(f.as_ref().clone()));
             } else {
-                self.add(time_slot, f);
+                flow_stash.insert(f.flow.flow_id, Box::new(f.as_ref().clone()));
             }
         }
     }
@@ -274,13 +258,19 @@ impl FlowAggr {
         f.flow.acl_gids = Vec::from(acl_gids.list());
 
         if !f.flow.is_new_flow {
-            f.flow.start_time = Self::calc_flow_start_time(&f.flow);
+            f.flow.start_time = Timestamp::from_secs(f.flow.start_time_in_minute());
         }
 
         if f.flow.close_type == CloseType::ForcedReport {
-            f.flow.end_time = f.flow.start_time + Duration::from_secs(SECONDS_IN_MINUTE);
+            // Align time to seconds
+            f.flow.end_time = Timestamp::from_secs(f.flow.start_time.as_secs() + SECONDS_IN_MINUTE);
         }
+
         self.metrics.out.fetch_add(1, Ordering::Relaxed);
+
+        let now = get_timestamp(self.ntp_diff.load(Ordering::Relaxed));
+        self.output.flush_cache_with_throttling(&now);
+        self.output.flush_cache_without_throttling(&now);
         if f.flow.hit_pcap_policy() {
             self.output.send_without_throttling(f);
         } else {
@@ -293,12 +283,10 @@ impl FlowAggr {
     }
 
     fn flush_front_slot_and_rotate(&mut self) {
-        let mut slot_map = self.timestamp_stashs.pop_front().unwrap();
+        let mut flow_stash = self.flow_stashs.pop_front().unwrap();
 
-        for flow_id in slot_map.drain() {
-            if let Some(flow) = self.flow_stashs.remove(&flow_id) {
-                self.send_flow(flow);
-            }
+        for (_, flow) in flow_stash.drain() {
+            self.send_flow(flow);
         }
 
         let stash_cap = self.flow_stashs.capacity();
@@ -307,25 +295,23 @@ impl FlowAggr {
             if stash_cap > 2 * stash_len {
                 // shrink stash if its capacity is larger than 2 times of the max stash length in the past HISTORY_RECORD_COUNT flushes
                 self.metrics.stash_shrinks.fetch_add(1, Ordering::Relaxed);
-                self.flow_stashs
-                    .shrink_to(self.stash_init_capacity.max(2 * stash_len));
+                flow_stash.shrink_to(self.stash_init_capacity.max(2 * stash_len));
             }
         }
 
-        self.timestamp_stashs
-            .push_back(HashSet::with_capacity(Self::MIN_STASH_CAPACITY_SECOND));
+        self.flow_stashs.push_back(flow_stash);
         self.last_flush_time = get_timestamp(self.ntp_diff.load(Ordering::Relaxed));
         self.slot_start_time += Duration::from_secs(1);
     }
 
     fn flush_slots(&mut self, slot_count: usize) {
-        for _ in 0..slot_count.min(TIMESTAMP_SLOT_COUNT) {
+        for _ in 0..slot_count.min(self.slot_count) {
             self.flush_front_slot_and_rotate();
         }
 
         // 若移动数超过slot的数量后, 只需设置slot开始时间
-        if slot_count > TIMESTAMP_SLOT_COUNT {
-            self.slot_start_time += Duration::from_secs((slot_count - TIMESTAMP_SLOT_COUNT) as u64);
+        if slot_count > self.slot_count {
+            self.slot_start_time += Duration::from_secs((slot_count - self.slot_count) as u64);
             info!(
                 "now slot start time is {:?} have flushed minute slot count is {:?}",
                 self.slot_start_time, slot_count
@@ -363,7 +349,9 @@ impl FlowAggr {
                 }
                 Err(Error::Timeout) => {
                     let now = get_timestamp(self.ntp_diff.load(Ordering::Relaxed));
-                    if now > self.last_flush_time + FLUSH_TIMEOUT {
+                    self.output.flush_cache_with_throttling(&now);
+                    self.output.flush_cache_without_throttling(&now);
+                    if now > self.last_flush_time + self.flush_timeout {
                         self.flush_front_slot_and_rotate();
                     }
                 }
@@ -453,25 +441,22 @@ impl ThrottlingQueue {
         }
     }
 
-    fn flush_cache_with_throttling(&mut self) {
-        if let Err(_) = self.output.send_all(&mut self.cache_with_throttling) {
-            debug!("l4 flow throttle push aggred flow to sender queue failed, maybe queue have terminated");
-            self.cache_with_throttling.clear();
-        }
-    }
-
-    pub fn send_with_throttling(&mut self, f: Box<TaggedFlow>) -> bool {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-
+    fn flush_cache_with_throttling(&mut self, now: &Duration) {
         if now.as_secs() >> Self::THROTTLE_BUCKET_BITS
             != self.last_flush_cache_with_throttling_time.as_secs() >> Self::THROTTLE_BUCKET_BITS
         {
             self.update_throttle();
-            self.flush_cache_with_throttling();
-            self.last_flush_cache_with_throttling_time = now;
+            if let Err(_) = self.output.send_all(&mut self.cache_with_throttling) {
+                debug!("l4 flow throttle push aggred flow to sender queue failed, maybe queue have terminated");
+                self.cache_with_throttling.clear();
+            }
+
+            self.last_flush_cache_with_throttling_time = *now;
             self.period_count = 0;
         }
+    }
 
+    pub fn send_with_throttling(&mut self, f: Box<TaggedFlow>) -> bool {
         self.period_count += 1;
         if self.cache_with_throttling.len() < self.throttle as usize {
             self.cache_with_throttling.push(BoxedTaggedFlow(f));
@@ -485,23 +470,24 @@ impl ThrottlingQueue {
         }
     }
 
-    fn flush_cache_without_throttling(&mut self) {
-        if let Err(_) = self.output.send_all(&mut self.cache_without_throttling) {
-            debug!("l4 flow push aggred flow to sender queue failed, maybe queue have terminated");
-            self.cache_without_throttling.clear();
-        }
-    }
-
-    pub fn send_without_throttling(&mut self, f: Box<TaggedFlow>) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    fn flush_cache_without_throttling(&mut self, now: &Duration) {
         if self.cache_without_throttling.len() >= Self::CACHE_WITHOUT_THROTTLING_SIZE
             || now.as_secs() >> Self::THROTTLE_BUCKET_BITS
                 != self.last_flush_cache_without_throttling_time.as_secs()
                     >> Self::THROTTLE_BUCKET_BITS
         {
-            self.flush_cache_without_throttling();
-            self.last_flush_cache_without_throttling_time = now;
+            if let Err(_) = self.output.send_all(&mut self.cache_without_throttling) {
+                debug!(
+                    "l4 flow push aggred flow to sender queue failed, maybe queue have terminated"
+                );
+                self.cache_without_throttling.clear();
+            }
+
+            self.last_flush_cache_without_throttling_time = *now;
         }
+    }
+
+    pub fn send_without_throttling(&mut self, f: Box<TaggedFlow>) {
         self.cache_without_throttling.push(BoxedTaggedFlow(f));
     }
 

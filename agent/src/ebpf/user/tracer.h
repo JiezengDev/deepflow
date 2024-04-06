@@ -74,11 +74,19 @@
 
 #define MAX_CPU_NR      256
 
+// RHEL 7 & CentOS 7 systems that run on kernel 3.10.
+// eBPF support has been backported to kernel 3.10 since 3.10.0-940.el7.x86_64.
+// See this blog post(https://www.redhat.com/en/blog/introduction-ebpf-red-hat-enterprise-linux-7).
+#define LINUX_3_10_MIN_REV_NUM	940
+
 /*
  * timeout (100ms), use for perf reader epoll().
  */
 #define PERF_READER_TIMEOUT_DEF 100
 #define PERF_READER_NUM_MAX	16
+
+#define DEBUG_BUFF_SIZE 4096
+typedef void (*debug_callback_t)(char *data, int len);
 
 enum tracer_hook_type {
 	HOOK_ATTACH,
@@ -132,6 +140,19 @@ do {                                                        			\
 		t->ksymbols[curr_idx].func = func;                        	\
 	} else {								\
 		ebpf_error("no memory, probe (kprobe/%s) set failed", fn); 	\
+	} 									\
+} while(0)
+
+#define probes_set_exit_symbol(t, fn)						\
+do {                                                        			\
+	char *func = (char*)calloc(PROBE_NAME_SZ, 1);             		\
+	if (func != NULL) {                                       		\
+		curr_idx = index++;                  		            	\
+		t->ksymbols[curr_idx].isret = true;                 	    	\
+		snprintf(func, PROBE_NAME_SZ, "kretprobe/%s", fn);           	\
+		t->ksymbols[curr_idx].func = func;                        	\
+	} else {								\
+		ebpf_error("no memory, probe (kretprobe/%s) set failed", fn); 	\
 	} 									\
 } while(0)
 
@@ -192,7 +213,14 @@ enum {
 	SOCKOPT_SET_DATADUMP_ON,
 	SOCKOPT_SET_DATADUMP_OFF,
 	/* get */
-	SOCKOPT_GET_DATADUMP_SHOW
+	SOCKOPT_GET_DATADUMP_SHOW,
+
+	/* set */
+	SOCKOPT_SET_CPDBG_ADD = 700,
+	SOCKOPT_SET_CPDBG_ON,
+	SOCKOPT_SET_CPDBG_OFF,
+	/* get */
+	SOCKOPT_GET_CPDBG_SHOW
 };
 
 struct mem_block_head {
@@ -286,7 +314,8 @@ struct bpf_perf_reader {
 	perf_reader_raw_cb raw_cb;		// Used for perf ring-buffer receive callback.
 	perf_reader_lost_cb lost_cb;		// Callback for perf ring-buffer data loss.
 	int epoll_timeout;			// perf poll timeout (ms)
-	int epoll_fd;
+	int epoll_fds[MAX_CPU_NR];
+	int epoll_fds_count;
 	struct bpf_tracer *tracer;
 };
 
@@ -320,14 +349,14 @@ struct bpf_tracer {
 	int sample_freq; // sample frequency, Hertz.
 
 	/*
-	 * 数据分发处理worker，queues
+	 * Data distribution processing worker, queues
 	 */
-	pthread_t perf_worker[MAX_CPU_NR];	// 用户态接收perf-buffer数据主线程
-	pthread_t dispatch_workers[MAX_CPU_NR];	// 分发线程
-	int dispatch_workers_nr;		// 分发线程数量
-	struct queue queues[MAX_CPU_NR];	// 分发队列，每个分发线程都有其对应的队列。
-	void *process_fn;			// 回调应用传递过来的接口, 进行数据处理
-	void (*datadump)(void *data);		// eBPF data dump handle
+	pthread_t perf_worker[MAX_CPU_NR];      // Main thread for user-space receiving perf-buffer data
+	pthread_t dispatch_workers[MAX_CPU_NR]; // Dispatch threads
+	int dispatch_workers_nr;                // Number of dispatch threads
+	struct queue queues[MAX_CPU_NR];        // Dispatch queues, each dispatch thread has its corresponding queue.
+	void *process_fn;                       // Callback interface passed from the application for data processing
+	void (*datadump) (void *data);          // eBPF data dump handle
 
 	/*
 	 * perf ring-buffer from kernel to user.
@@ -383,6 +412,8 @@ struct period_event_op {
 	struct list_head list;
 	char name[NAME_LEN];
 	bool is_valid;
+	/* The cycle time of event triggering (unit is microseconds) */
+	uint32_t times; 
 	period_event_fun_t f;
 };
 
@@ -420,6 +451,11 @@ struct bpf_tracer_param_array {
 	struct bpf_tracer_param tracers[0];
 };
 
+struct reader_forward_info {
+	uint64_t queue_id;
+	int cpu_id;
+};
+
 extern volatile uint32_t *tracers_lock;
 
 /*
@@ -445,6 +481,40 @@ static inline void tracer_reader_lock(struct bpf_tracer *t)
 static inline void tracer_reader_unlock(struct bpf_tracer *t)
 {
 	__atomic_clear(t->lock, __ATOMIC_RELEASE);
+}
+
+struct clear_list_elem {
+	struct list_head list;
+	const char p[0];
+};
+
+static bool inline insert_list(void *elt, uint32_t len, struct list_head *h)
+{
+	struct clear_list_elem *cle;
+	cle = calloc(sizeof(*cle) + len, 1);
+	if (cle == NULL) {
+		ebpf_warning("calloc() failed.\n");
+		return false;
+	}
+	memcpy((void *)cle->p, (void *)elt, len);
+	list_add_tail(&cle->list, h);
+	return true;
+}
+
+static int inline __reclaim_map(int map_fd, struct list_head *h)
+{
+	int count = 0;
+	struct list_head *p, *n;
+	struct clear_list_elem *cle;
+	list_for_each_safe(p, n, h) {
+		cle = container_of(p, struct clear_list_elem, list);
+		if (!bpf_delete_elem(map_fd, (void *)cle->p))
+			count++;
+		list_head_del(&cle->list);
+		free(cle);
+	}
+
+	return count;
 }
 
 #define CACHE_LINE_BYTES 64
@@ -475,7 +545,9 @@ struct bpf_tracer *setup_bpf_tracer(const char *name,
 				    void *handle, int freq);
 int maps_config(struct bpf_tracer *tracer, const char *map_name, int entries);
 struct bpf_tracer *find_bpf_tracer(const char *name);
-int register_period_event_op(const char *name, period_event_fun_t f);
+int register_period_event_op(const char *name,
+			     period_event_fun_t f,
+			     uint32_t period_time);
 int set_period_event_invalid(const char *name);
 
 /**
@@ -506,8 +578,8 @@ int tracer_uprobes_update(struct bpf_tracer *tracer);
  * @lost_cb perf reader data lost callback
  * @pages_cnt How many memory pages are used for ring-buffer
  *            (system page size * pages_cnt)
+ * @thread_nr The number of threads required for the reader's work 
  * @epoll_timeout perf epoll timeout
- *
  * @returns perf_reader address on success, NULL on error
  */
 struct bpf_perf_reader*
@@ -516,11 +588,12 @@ create_perf_buffer_reader(struct bpf_tracer *t,
 			  perf_reader_raw_cb raw_cb,
 			  perf_reader_lost_cb lost_cb,
 			  unsigned int pages_cnt,
+			  int thread_nr,
 			  int epoll_timeout);
 void free_perf_buffer_reader(struct bpf_perf_reader *reader);
 int release_bpf_tracer(const char *name);
 void free_all_readers(struct bpf_tracer *t);
-int enable_tracer_reader_work(const char *name,
+int enable_tracer_reader_work(const char *name, int idx,
 			      struct bpf_tracer *tracer,
 			      void *fn);
 #endif /* DF_USER_TRACER_H */

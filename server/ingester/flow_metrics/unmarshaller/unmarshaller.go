@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,13 +28,13 @@ import (
 	"github.com/deepflowio/deepflow/server/ingester/flow_metrics/dbwriter"
 	"github.com/deepflowio/deepflow/server/libs/app"
 	"github.com/deepflowio/deepflow/server/libs/codec"
+	"github.com/deepflowio/deepflow/server/libs/flow-metrics"
+	"github.com/deepflowio/deepflow/server/libs/flow-metrics/pb"
 	"github.com/deepflowio/deepflow/server/libs/grpc"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 	"github.com/deepflowio/deepflow/server/libs/receiver"
 	"github.com/deepflowio/deepflow/server/libs/stats"
 	"github.com/deepflowio/deepflow/server/libs/utils"
-	"github.com/deepflowio/deepflow/server/libs/zerodoc"
-	"github.com/deepflowio/deepflow/server/libs/zerodoc/pb"
 )
 
 var log = logging.MustGetLogger("flow_metrics.unmarshaller")
@@ -76,21 +76,21 @@ type Unmarshaller struct {
 	platformData       *grpc.PlatformInfoTable
 	disableSecondWrite bool
 	unmarshallQueue    queue.QueueReader
-	dbwriter           *dbwriter.DbWriter
+	dbwriters          []dbwriter.DbWriter
 	queueBatchCache    QueueCache
 	counter            *Counter
-	tableCounter       [zerodoc.VTAP_TABLE_ID_MAX + 1]int64
+	tableCounter       [flow_metrics.METRICS_TABLE_ID_MAX + 1]int64
 	utils.Closable
 }
 
-func NewUnmarshaller(index int, platformData *grpc.PlatformInfoTable, disableSecondWrite bool, unmarshallQueue queue.QueueReader, dbwriter *dbwriter.DbWriter) *Unmarshaller {
+func NewUnmarshaller(index int, platformData *grpc.PlatformInfoTable, disableSecondWrite bool, unmarshallQueue queue.QueueReader, dbwriters []dbwriter.DbWriter) *Unmarshaller {
 	return &Unmarshaller{
 		index:              index,
 		platformData:       platformData,
 		disableSecondWrite: disableSecondWrite,
 		unmarshallQueue:    unmarshallQueue,
 		counter:            &Counter{MaxDelay: -3600, MinDelay: 3600},
-		dbwriter:           dbwriter,
+		dbwriters:          dbwriters,
 	}
 }
 
@@ -137,22 +137,28 @@ func (u *Unmarshaller) GetCounter() interface{} {
 		counter.MinDelay = 0
 	}
 
-	counter.FlowPortCount, u.tableCounter[zerodoc.VTAP_FLOW_PORT_1M] = u.tableCounter[zerodoc.VTAP_FLOW_PORT_1M], 0
-	counter.FlowPort1sCount, u.tableCounter[zerodoc.VTAP_FLOW_PORT_1S] = u.tableCounter[zerodoc.VTAP_FLOW_PORT_1S], 0
-	counter.FlowEdgePortCount, u.tableCounter[zerodoc.VTAP_FLOW_EDGE_PORT_1M] = u.tableCounter[zerodoc.VTAP_FLOW_EDGE_PORT_1M], 0
-	counter.FlowEdgePort1sCount, u.tableCounter[zerodoc.VTAP_FLOW_EDGE_PORT_1S] = u.tableCounter[zerodoc.VTAP_FLOW_EDGE_PORT_1S], 0
-	counter.AclCount, u.tableCounter[zerodoc.VTAP_ACL_1M] = u.tableCounter[zerodoc.VTAP_ACL_1M], 0
-	counter.OtherCount, u.tableCounter[zerodoc.VTAP_TABLE_ID_MAX] = u.tableCounter[zerodoc.VTAP_TABLE_ID_MAX], 0
+	counter.FlowPortCount, u.tableCounter[flow_metrics.NETWORK_1M] = u.tableCounter[flow_metrics.NETWORK_1M], 0
+	counter.FlowPort1sCount, u.tableCounter[flow_metrics.NETWORK_1S] = u.tableCounter[flow_metrics.NETWORK_1S], 0
+	counter.FlowEdgePortCount, u.tableCounter[flow_metrics.NETWORK_MAP_1M] = u.tableCounter[flow_metrics.NETWORK_MAP_1M], 0
+	counter.FlowEdgePort1sCount, u.tableCounter[flow_metrics.NETWORK_MAP_1S] = u.tableCounter[flow_metrics.NETWORK_MAP_1S], 0
+	counter.AclCount, u.tableCounter[flow_metrics.TRAFFIC_POLICY_1M] = u.tableCounter[flow_metrics.TRAFFIC_POLICY_1M], 0
+	counter.OtherCount, u.tableCounter[flow_metrics.METRICS_TABLE_ID_MAX] = u.tableCounter[flow_metrics.METRICS_TABLE_ID_MAX], 0
 
 	return counter
 }
 
 func (u *Unmarshaller) putStoreQueue(doc *app.Document) {
 	queueCache := &u.queueBatchCache
+	writersCount := len(u.dbwriters)
+	if writersCount-1 > 0 {
+		doc.AddReferenceCountN(int32(writersCount) - 1)
+	}
 	queueCache.values = append(queueCache.values, doc)
 
 	if len(queueCache.values) >= QUEUE_BATCH_SIZE {
-		u.dbwriter.Put(queueCache.values...)
+		for i := 0; i < writersCount; i++ {
+			u.dbwriters[i].Put(queueCache.values...)
+		}
 		queueCache.values = queueCache.values[:0]
 	}
 }
@@ -160,7 +166,9 @@ func (u *Unmarshaller) putStoreQueue(doc *app.Document) {
 func (u *Unmarshaller) flushStoreQueue() {
 	queueCache := &u.queueBatchCache
 	if len(queueCache.values) > 0 {
-		u.dbwriter.Put(queueCache.values...)
+		for i := 0; i < len(u.dbwriters); i++ {
+			u.dbwriters[i].Put(queueCache.values...)
+		}
 		queueCache.values = queueCache.values[:0]
 	}
 }

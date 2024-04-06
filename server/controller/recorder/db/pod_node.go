@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@
 package db
 
 import (
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/recorder/common"
 )
 
 type PodNode struct {
@@ -28,7 +28,7 @@ type PodNode struct {
 func NewPodNode() *PodNode {
 	operater := &PodNode{
 		OperatorBase[mysql.PodNode]{
-			resourceTypeName: common.RESOURCE_TYPE_POD_NODE_EN,
+			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_POD_NODE_EN,
 			softDelete:       true,
 			allocateID:       true,
 		},
@@ -41,27 +41,29 @@ func (a *PodNode) setDBItemID(dbItem *mysql.PodNode, id int) {
 	dbItem.ID = id
 }
 
-func (n *PodNode) DeleteBatch(lcuuids []string) bool {
+func (n *PodNode) DeleteBatch(lcuuids []string) ([]*mysql.PodNode, bool) {
 	var vmPodNodeConns []*mysql.VMPodNodeConnection
-	err := mysql.Db.Model(&mysql.VMPodNodeConnection{}).Joins("JOIN pod_node On vm_pod_node_connection.pod_node_id = pod_node.id").Where("pod_node.lcuuid IN ?", lcuuids).Scan(&vmPodNodeConns).Error
+	err := n.org.DB.Model(&mysql.VMPodNodeConnection{}).Joins("JOIN pod_node On vm_pod_node_connection.pod_node_id = pod_node.id").Where("pod_node.lcuuid IN ?", lcuuids).Scan(&vmPodNodeConns).Error
 	if err != nil {
-		log.Errorf("get %s (%s lcuuids: %+v) failed: %v", common.RESOURCE_TYPE_POD_NODE_EN, common.RESOURCE_TYPE_POD_NODE_EN, lcuuids, err)
-		return false
+		log.Error(n.org.LogPre("get %s (%s lcuuids: %+v) failed: %v", ctrlrcommon.RESOURCE_TYPE_POD_NODE_EN, ctrlrcommon.RESOURCE_TYPE_POD_NODE_EN, lcuuids, err))
+		return nil, false
 	} else {
 		for _, con := range vmPodNodeConns {
-			err = mysql.Db.Delete(con).Error
+			err = n.org.DB.Delete(con).Error
 			if err != nil {
-				log.Errorf("delete %s (info: %+v) failed: %v", common.RESOURCE_TYPE_VM_POD_NODE_CONNECTION_EN, con, err)
+				log.Error(n.org.LogPre("delete %s (info: %+v) failed: %v", ctrlrcommon.RESOURCE_TYPE_VM_POD_NODE_CONNECTION_EN, con, err))
 				continue
 			}
-			log.Infof("delete %s (info: %+v) success", common.RESOURCE_TYPE_VM_POD_NODE_CONNECTION_EN, con)
+			log.Info(n.org.LogPre("delete %s (info: %+v) success", ctrlrcommon.RESOURCE_TYPE_VM_POD_NODE_CONNECTION_EN, con))
 		}
 	}
-	err = mysql.Db.Where("lcuuid IN ?", lcuuids).Delete(&mysql.PodNode{}).Error
+
+	var dbItems []*mysql.PodNode
+	err = n.org.DB.Where("lcuuid IN ?", lcuuids).Delete(&dbItems).Error
 	if err != nil {
-		log.Errorf("delete %s (lcuuids: %v) failed: %v", common.RESOURCE_TYPE_POD_NODE_EN, lcuuids, err)
-		return false
+		log.Error(n.org.LogPre("delete %s (lcuuids: %v) failed: %v", ctrlrcommon.RESOURCE_TYPE_POD_NODE_EN, lcuuids, err))
+		return nil, false
 	}
-	log.Infof("delete %s (lcuuids: %v) success", common.RESOURCE_TYPE_POD_NODE_EN, lcuuids)
-	return true
+	log.Info(n.org.LogPre("delete %s (lcuuids: %v) success", ctrlrcommon.RESOURCE_TYPE_POD_NODE_EN, lcuuids))
+	return dbItems, true
 }

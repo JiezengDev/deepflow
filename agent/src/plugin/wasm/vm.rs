@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,29 +20,28 @@ use std::net::IpAddr;
 use crate::common::ebpf::EbpfType;
 use crate::common::flow::PacketDirection;
 use crate::common::l7_protocol_log::ParseParam;
-use crate::flow_generator::protocol_logs::pb_adapter::{KeyVal, TraceInfo};
-use crate::flow_generator::protocol_logs::HttpInfo;
+use crate::flow_generator::protocol_logs::{HttpInfo, L7ResponseStatus};
 use crate::flow_generator::{Error, Result};
+use crate::plugin::wasm::host::WasmData;
 use crate::plugin::CustomInfo;
 use crate::wasm_error;
 
 use log::error;
-use public::bytes::{write_u16_be, write_u64_be};
+use public::bytes::{write_u16_be, write_u32_be, write_u64_be};
 use public::enums::IpProtocol;
 
 // result of the vm export function after serialize
 #[derive(Debug)]
 pub(super) enum VmResult {
     // result of parse_payload
-    ParsePayloadResult(Vec<CustomInfo>),
+    L7InfoResult(Vec<CustomInfo>),
     StringResult(String),
-    // result of on_http_req and on_http_resp
-    HTTPResult(Option<TraceInfo>, Vec<KeyVal>),
 }
 
 // vm parse ctx
 pub(super) enum VmParseCtx {
     ParseCtx(VmCtxBase),
+    OnCustomMessageCtx(VmOnCustomMessageCtx),
     HttpReqCtx(VmHttpReqCtx),
     HttpRespCtx(VmHttpRespCtx),
 }
@@ -53,6 +52,7 @@ impl VmParseCtx {
             VmParseCtx::ParseCtx(c) => c,
             VmParseCtx::HttpReqCtx(c) => &c.base_ctx,
             VmParseCtx::HttpRespCtx(c) => &c.base_ctx,
+            VmParseCtx::OnCustomMessageCtx(c) => &c.base_ctx,
         }
     }
 
@@ -61,6 +61,7 @@ impl VmParseCtx {
             VmParseCtx::ParseCtx(c) => c,
             VmParseCtx::HttpReqCtx(c) => &mut c.base_ctx,
             VmParseCtx::HttpRespCtx(c) => &mut c.base_ctx,
+            VmParseCtx::OnCustomMessageCtx(c) => &mut c.base_ctx,
         }
     }
 
@@ -76,24 +77,14 @@ impl VmParseCtx {
         self.get_ctx_base_mut().result.take()
     }
 
-    pub(super) fn take_parse_payload_result(&mut self) -> Option<Vec<CustomInfo>> {
+    pub(super) fn take_l7_info_result(&mut self) -> Option<Vec<CustomInfo>> {
         self.take_result().map_or(None, |r| match r {
-            VmResult::ParsePayloadResult(info) => Some(info),
+            VmResult::L7InfoResult(info) => Some(info),
             _ => {
                 wasm_error!(
                     self.get_ins_name(),
                     "parse payload result with unexpect type",
                 );
-                None
-            }
-        })
-    }
-
-    pub(super) fn take_http_result(&mut self) -> Option<(Option<TraceInfo>, Vec<KeyVal>)> {
-        self.take_result().map_or(None, |r| match r {
-            VmResult::HTTPResult(trace, kv) => Some((trace, kv)),
-            _ => {
-                wasm_error!(self.get_ins_name(), "http result with unexpect type",);
                 None
             }
         })
@@ -175,7 +166,7 @@ impl From<(&ParseParam<'_>, u8, &[u8])> for VmCtxBase {
             time: p.time,
             direction: p.direction,
             process_kname: if let Some(ebpf_param) = p.ebpf_param.as_ref() {
-                Some(ebpf_param.process_kname.clone())
+                Some(ebpf_param.process_kname.to_owned())
             } else {
                 None
             },
@@ -273,8 +264,8 @@ impl VmCtxBase {
         off += 4;
 
         match self.l4_protocol {
-            IpProtocol::Tcp => buf[off] = 6,
-            IpProtocol::Udp => buf[off] = 17,
+            IpProtocol::TCP => buf[off] = 6,
+            IpProtocol::UDP => buf[off] = 17,
             _ => unreachable!(),
         }
         buf[off + 1] = self.proto;
@@ -377,7 +368,7 @@ impl From<(&ParseParam<'_>, &HttpInfo, &[u8])> for VmHttpReqCtx {
     fn from(value: (&ParseParam<'_>, &HttpInfo, &[u8])) -> Self {
         let (param, info, payload) = value;
         Self {
-            base_ctx: VmCtxBase::from((param, 0, payload)),
+            base_ctx: VmCtxBase::from((param, info.proto as u8, payload)),
             path: info.path.clone(),
             host: info.host.clone(),
             user_agent: info
@@ -400,19 +391,20 @@ impl From<(&ParseParam<'_>, &HttpInfo, &[u8])> for VmHttpReqCtx {
 pub struct VmHttpRespCtx {
     pub base_ctx: VmCtxBase,
     pub code: u16,
+    pub status: L7ResponseStatus,
 }
 
 impl VmHttpRespCtx {
     /*
-      code:      2bytes
+      code:      2 bytes
+      status:    1 bytes
     */
+    const BUF_SIZE: usize = 3;
     pub(super) fn serialize_to_bytes(&self, buf: &mut [u8]) -> Result<usize> {
-        let need_size = 2;
-
-        if buf.len() < need_size {
+        if buf.len() < Self::BUF_SIZE {
             return Err(Error::WasmSerializeFail(format!(
                 "serialize http resp ctx fail, need at lease {} bytes but buf only {} bytes",
-                need_size,
+                Self::BUF_SIZE,
                 buf.len()
             )));
         }
@@ -420,6 +412,8 @@ impl VmHttpRespCtx {
         let mut off = 0;
         write_u16_be(buf, self.code);
         off += 2;
+        buf[off] = self.status as u8;
+        off += 1;
         Ok(off)
     }
 }
@@ -428,8 +422,57 @@ impl From<(&ParseParam<'_>, &HttpInfo, &[u8])> for VmHttpRespCtx {
     fn from(value: (&ParseParam, &HttpInfo, &[u8])) -> Self {
         let (param, info, payload) = value;
         Self {
-            base_ctx: VmCtxBase::from((param, 0, payload)),
-            code: info.status_code.map_or(0, |c| c as u16),
+            base_ctx: VmCtxBase::from((param, info.proto as u8, payload)),
+            code: info.status_code,
+            status: info.status,
+        }
+    }
+}
+
+/*
+    correspond to go struct OnCustomMessageCtx:
+
+    type OnCustomMessageCtx struct {
+        BaseCtx ParseCtx
+        Payload string
+    }
+*/
+pub struct VmOnCustomMessageCtx {
+    pub base_ctx: VmCtxBase,
+    pub wasm_data: WasmData,
+}
+
+impl VmOnCustomMessageCtx {
+    pub(super) fn serialize_to_bytes(&self, buf: &mut [u8]) -> Result<usize> {
+        let need_size = 2 + 4 + 4 + self.wasm_data.protobuf.len();
+        if buf.len() < need_size {
+            return Err(Error::WasmSerializeFail(format!(
+                "serialize nats message ctx fail, need at lease {} bytes but buf only {} bytes",
+                need_size,
+                buf.len()
+            )));
+        }
+
+        let mut off = 0;
+        write_u16_be(buf, self.wasm_data.hook_point as u16);
+        off += 2;
+        write_u32_be(&mut buf[off..off + 4], self.wasm_data.type_code);
+        off += 4;
+        write_u32_be(&mut buf[off..off + 4], self.wasm_data.protobuf.len() as u32);
+        off += 4;
+        buf[off..off + self.wasm_data.protobuf.len()].copy_from_slice(&self.wasm_data.protobuf);
+        off += self.wasm_data.protobuf.len();
+
+        Ok(off)
+    }
+}
+
+impl From<(&ParseParam<'_>, &[u8], WasmData)> for VmOnCustomMessageCtx {
+    fn from(value: (&ParseParam<'_>, &[u8], WasmData)) -> Self {
+        let (param, l7_payload, wasm_data) = value;
+        Self {
+            base_ctx: VmCtxBase::from((param, 0, l7_payload)),
+            wasm_data,
         }
     }
 }

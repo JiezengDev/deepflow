@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,14 +14,14 @@
  * limitations under the License.
  */
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use criterion::*;
 
 use deepflow_agent::{
-    _FlowMapConfig as Config, _TcpFlags as TcpFlags,
+    _FlowMapConfig as Config, _TcpFlags as TcpFlags, _Timestamp as Timestamp,
     _new_flow_map_and_receiver as new_flow_map_and_receiver, _new_meta_packet as new_meta_packet,
-    _reverse_meta_packet as reverse_meta_packet,
+    _reverse_meta_packet as reverse_meta_packet, common::meta_packet::ProtocolData,
 };
 
 use public::proto::common::TridentType;
@@ -35,7 +35,7 @@ pub(super) fn bench(c: &mut Criterion) {
                 flow: &module_config.flow,
                 log_parser: &module_config.log_parser,
                 collector: &module_config.collector,
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 ebpf: None,
             };
             let packets = (0..iters)
@@ -63,7 +63,7 @@ pub(super) fn bench(c: &mut Criterion) {
                 flow: &module_config.flow,
                 log_parser: &module_config.log_parser,
                 collector: &module_config.collector,
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 ebpf: None,
             };
             let iters = (iters + 9) / 10 * 10;
@@ -74,25 +74,29 @@ pub(super) fn bench(c: &mut Criterion) {
                 let dst_port = (i >> 16) as u16;
 
                 let mut pkt = new_meta_packet();
-                pkt.lookup_key.timestamp += Duration::from_nanos(100 * i);
+                pkt.lookup_key.timestamp += Timestamp::from_nanos(100 * i);
                 pkt.lookup_key.src_port = src_port;
                 pkt.lookup_key.dst_port = dst_port;
                 packets.push(pkt);
 
                 let mut pkt = new_meta_packet();
-                pkt.lookup_key.timestamp += Duration::from_nanos(100 * (i + 1));
+                pkt.lookup_key.timestamp += Timestamp::from_nanos(100 * (i + 1));
                 reverse_meta_packet(&mut pkt);
                 pkt.lookup_key.src_port = dst_port;
                 pkt.lookup_key.dst_port = src_port;
-                pkt.tcp_data.flags = TcpFlags::SYN_ACK;
+                if let ProtocolData::TcpHeader(tcp_data) = &mut pkt.protocol_data {
+                    tcp_data.flags = TcpFlags::SYN_ACK;
+                }
                 packets.push(pkt);
 
                 for k in 2..10 {
                     let mut pkt = new_meta_packet();
-                    pkt.lookup_key.timestamp += Duration::from_nanos(100 * (i + k));
+                    pkt.lookup_key.timestamp += Timestamp::from_nanos(100 * (i + k));
                     pkt.lookup_key.src_port = src_port;
                     pkt.lookup_key.dst_port = dst_port;
-                    pkt.tcp_data.flags = TcpFlags::ACK;
+                    if let ProtocolData::TcpHeader(tcp_data) = &mut pkt.protocol_data {
+                        tcp_data.flags = TcpFlags::ACK;
+                    }
                     packets.push(pkt);
                 }
             }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,6 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+#ifndef SO_PLUGIN_C
+#define SO_PLUGIN_C
 
 #define EBPF_TYPE_TRACEPOINT 0
 #define EBPF_TYPE_TLS_UPROBE 1
@@ -128,3 +131,5 @@ struct parse_result on_parse_payload(struct parse_ctx *ctx,
 
 // invoke after dlopen, only call once
 void init();
+
+#endif

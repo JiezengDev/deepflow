@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/event"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 )
@@ -32,7 +33,7 @@ type NATGateway struct {
 func NewNATGateway(c *cache.Cache, eq *queue.OverwriteQueue) *NATGateway {
 	listener := &NATGateway{
 		cache:         c,
-		eventProducer: event.NewNATGateway(&c.ToolDataSet, eq),
+		eventProducer: event.NewNATGateway(c.ToolDataSet, eq),
 	}
 	return listener
 }
@@ -42,7 +43,7 @@ func (g *NATGateway) OnUpdaterAdded(addedDBItems []*mysql.NATGateway) {
 	g.cache.AddNATGateways(addedDBItems)
 }
 
-func (g *NATGateway) OnUpdaterUpdated(cloudItem *cloudmodel.NATGateway, diffBase *cache.NATGateway) {
+func (g *NATGateway) OnUpdaterUpdated(cloudItem *cloudmodel.NATGateway, diffBase *diffbase.NATGateway) {
 	g.eventProducer.ProduceByUpdate(cloudItem, diffBase)
 	diffBase.Update(cloudItem)
 	g.cache.UpdateNATGateway(cloudItem)

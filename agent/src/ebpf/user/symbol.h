@@ -50,11 +50,38 @@ struct symbol_cache_del_pids {
 };
 
 struct symbolizer_proc_info {
+	int pid;
 	/* The process creation time since
 	 * system boot, (in milliseconds) */
 	u64 stime;
+	u64 netns_id;
+	/*
+	 * Sometimes the process name set by some processes will be delayed.
+	 * When the process is just started, the name may change later. This
+	 * is used to delay confirmation.
+	 */
+	bool verified;
+	/* To mark whether it is a Java process? */
+	bool is_java;
+	/* Determine if the Java symbol file generation has been added to tasks list. */
+	bool add_task_list;
+	/* Have a new perf map file ? */
+	bool new_java_syms_file;
+	/* Java symbol cache needs updating? */
+	bool cache_need_update;
+	/* Did the generation of the Java symbol file encounter any exceptions? */
+	bool gen_java_syms_file_err;
+	/* Unknown symbols was found, and it is currently mainly used to
+	 * obtain the match of the Java process.*/
+	bool unknown_syms_found;
+	/* Expiration time (in seconds) for updating the Java symbol table */
+	u64 update_syms_table_time;
 	/* process name */
 	char comm[TASK_COMM_LEN];
+	/* container id */
+	char container_id[CONTAINER_ID_SIZE];
+	/* reference counting */
+	u64 use;
 };
 
 struct symbolizer_cache_kvp {
@@ -76,6 +103,11 @@ enum uprobe_type {
 	GO_UPROBE = 0,
 	OPENSSL_UPROBE,
 	OTHER_UPROBE
+};
+
+enum proc_act_type {
+	PROC_EXEC = 0,
+	PROC_EXIT
 };
 
 struct symbol {
@@ -129,6 +161,12 @@ cache_process_stime(struct symbolizer_cache_kvp *kv)
 	return (u64)((struct symbolizer_proc_info *)kv->v.proc_info_p)->stime;
 }
 
+static_always_inline u64
+cache_process_netns_id(struct symbolizer_cache_kvp *kv)
+{
+	return (u64)((struct symbolizer_proc_info *)kv->v.proc_info_p)->netns_id;
+}
+
 static_always_inline void
 copy_process_name(struct symbolizer_cache_kvp *kv, char *dst)
 {
@@ -151,14 +189,17 @@ struct symbol_uprobe *resolve_and_gen_uprobe_symbol(const char *bin_file,
 						    const uint64_t addr,
 						    int pid);
 uint64_t get_symbol_addr_from_binary(const char *bin, const char *symname);
-u64 get_pid_stime_and_name(pid_t pid, char *name);
-
+void get_process_info_by_pid(pid_t pid, u64 * stime, u64 * netns_id, char *name,
+			     void **ptr);
 #ifndef AARCH64_MUSL
 void *get_symbol_cache(pid_t pid, bool new_cache);
-int create_and_init_symbolizer_caches(void);
 void release_symbol_caches(void);
 u64 get_pid_stime(pid_t pid);
-void exec_symbol_cache_update(void);
+void exec_proc_info_cache_update(void);
+void set_java_syms_fetch_delay(int delay_secs);
+u64 get_java_syms_fetch_delay(void);
 #endif
-void update_symbol_cache(pid_t pid);
+int create_and_init_proc_info_caches(void);
+void get_container_id_from_procs_cache(pid_t pid, uint8_t * id, int id_size);
+void update_proc_info_cache(pid_t pid, enum proc_act_type type);
 #endif /* _BPF_SYMBOL_H_ */

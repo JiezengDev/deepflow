@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,8 +31,10 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/model"
 )
 
+const vTapPortNameLength = 256
+
 type ChVTapPort struct {
-	UpdaterBase[mysql.ChVTapPort, VtapPortKey]
+	UpdaterComponent[mysql.ChVTapPort, VtapPortKey]
 }
 
 type DeviceInfo struct {
@@ -44,11 +46,11 @@ type DeviceInfo struct {
 
 func NewChVTapPort() *ChVTapPort {
 	updater := &ChVTapPort{
-		UpdaterBase[mysql.ChVTapPort, VtapPortKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_VTAP_PORT,
-		},
+		newUpdaterComponent[mysql.ChVTapPort, VtapPortKey](
+			RESOURCE_TYPE_CH_VTAP_PORT,
+		),
 	}
-	updater.dataGenerator = updater
+	updater.updaterDG = updater
 	return updater
 }
 
@@ -147,6 +149,9 @@ func (v *ChVTapPort) generateNewData() (map[VtapPortKey]mysql.ChVTapPort, bool) 
 					log.Debugf("duplicate name: %s (id: %d)", data.TapName, data.ID)
 				}
 			}
+			if len(vTapPort.Name) > vTapPortNameLength {
+				vTapPort.Name = vTapPort.Name[:vTapPortNameLength]
+			}
 			if vTapPort.DeviceID == 0 && vTapPort.DeviceType == 0 && data.DeviceID != 0 && data.DeviceType != 0 {
 				log.Debugf("device id: %d, device type: %d ", vTapPort.DeviceID, vTapPort.DeviceType)
 				vTapPort.DeviceID = data.DeviceID
@@ -195,6 +200,9 @@ func (v *ChVTapPort) generateNewData() (map[VtapPortKey]mysql.ChVTapPort, bool) 
 						log.Debugf("duplicate name: %s (id: %d)", data.TapName, data.ID)
 					}
 				}
+				if len(vTapPort.Name) > vTapPortNameLength {
+					vTapPort.Name = vTapPort.Name[:vTapPortNameLength]
+				}
 				if vTapPort.DeviceID == 0 && vTapPort.DeviceType == 0 && data.DeviceID != 0 && data.DeviceType != 0 {
 					log.Debugf("device id: %d, device type: %d ", vTapPort.DeviceID, vTapPort.DeviceType)
 					vTapPort.DeviceID = data.DeviceID
@@ -240,6 +248,9 @@ func (v *ChVTapPort) generateNewData() (map[VtapPortKey]mysql.ChVTapPort, bool) 
 				}
 			} else if !common.Contains(nameSlice, "lo") {
 				vTapPort.Name = strings.Join([]string{"lo", vTapPort.Name}, ", ")
+			}
+			if len(vTapPort.Name) > vTapPortNameLength {
+				vTapPort.Name = vTapPort.Name[:vTapPortNameLength]
 			}
 			if vTapPort.DeviceID == 0 && vTapPort.DeviceType == 0 && deviceInfo.DeviceID != 0 && deviceInfo.DeviceType != 0 {
 				log.Debugf("device id: %d, device type: %d ", vTapPort.DeviceID, vTapPort.DeviceType)
@@ -557,8 +568,10 @@ func formatVTapVInterfaces(vifs *simplejson.Json, filter map[string]interface{},
 				case common.VIF_DEVICE_TYPE_HOST:
 					vtapVIF.DeviceName = toolDS.hostIDToName[vtapVIF.DeviceID]
 				case common.VIF_DEVICE_TYPE_VM:
-					if toolDS.vmIDToPodNodeID[vtapVIF.DeviceID] != 0 {
-						vtapVIF.DeviceName = toolDS.podNodeIDToName[vtapVIF.DeviceID]
+					if podNodeID, ok := toolDS.vmIDToPodNodeID[vtapVIF.DeviceID]; ok {
+						vtapVIF.DeviceType = common.VIF_DEVICE_TYPE_POD_NODE
+						vtapVIF.DeviceID = podNodeID
+						vtapVIF.DeviceName = toolDS.podNodeIDToName[podNodeID]
 					} else {
 						vtapVIF.DeviceName = toolDS.vmIDToName[vtapVIF.DeviceID]
 					}

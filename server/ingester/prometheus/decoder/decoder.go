@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,13 +33,13 @@ import (
 	"github.com/deepflowio/deepflow/server/libs/codec"
 	"github.com/deepflowio/deepflow/server/libs/datatype"
 	"github.com/deepflowio/deepflow/server/libs/datatype/prompb"
+	flow_metrics "github.com/deepflowio/deepflow/server/libs/flow-metrics"
+	"github.com/deepflowio/deepflow/server/libs/flow-metrics/pb"
 	"github.com/deepflowio/deepflow/server/libs/grpc"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 	"github.com/deepflowio/deepflow/server/libs/receiver"
 	"github.com/deepflowio/deepflow/server/libs/stats"
 	"github.com/deepflowio/deepflow/server/libs/utils"
-	"github.com/deepflowio/deepflow/server/libs/zerodoc"
-	"github.com/deepflowio/deepflow/server/libs/zerodoc/pb"
 )
 
 var log = logging.MustGetLogger("prometheus.decoder")
@@ -64,6 +64,7 @@ type Counter struct {
 type BuilderCounter struct {
 	TimeSeriesIn      int64 `statsd:"time-series-in"`
 	TimeSeriesInvaild int64 `statsd:"time-series-invalid"`
+	EpcMiss           int64 `statsd:"epc-miss"`
 	LabelCount        int64 `statsd:"label-in"`
 	MetricMiss        int64 `statsd:"metirc-miss"`
 	NameMiss          int64 `statsd:"name-miss"`
@@ -93,9 +94,9 @@ type PrometheusSamplesBuilder struct {
 	appLabelValueIDsBuffer  []uint32
 
 	// universal tag cache
-	podNameIDToUniversalTag  map[uint32]zerodoc.UniversalTag
-	instanceIPToUniversalTag map[uint32]zerodoc.UniversalTag
-	vtapIDToUniversalTag     map[uint16]zerodoc.UniversalTag
+	podNameIDToUniversalTag  map[uint32]flow_metrics.UniversalTag
+	instanceIPToUniversalTag map[uint32]flow_metrics.UniversalTag
+	vtapIDToUniversalTag     map[uint16]flow_metrics.UniversalTag
 
 	counter *BuilderCounter
 	utils.Closable
@@ -112,9 +113,9 @@ func NewPrometheusSamplesBuilder(name string, index int, platformData *grpc.Plat
 		name:                     name,
 		platformData:             platformData,
 		labelTable:               labelTable,
-		podNameIDToUniversalTag:  make(map[uint32]zerodoc.UniversalTag),
-		instanceIPToUniversalTag: make(map[uint32]zerodoc.UniversalTag),
-		vtapIDToUniversalTag:     make(map[uint16]zerodoc.UniversalTag),
+		podNameIDToUniversalTag:  make(map[uint32]flow_metrics.UniversalTag),
+		instanceIPToUniversalTag: make(map[uint32]flow_metrics.UniversalTag),
+		vtapIDToUniversalTag:     make(map[uint16]flow_metrics.UniversalTag),
 		appLabelColumnAlign:      appLabelColumnAlign,
 		ignoreUniversalTag:       ignoreUniversalTag,
 		counter:                  &BuilderCounter{},
@@ -267,8 +268,18 @@ func (d *Decoder) sendPrometheus(vtapID uint16, ts *prompb.TimeSeries, extraLabe
 	if d.debugEnabled {
 		log.Debugf("decoder %d vtap %d recv promtheus timeseries: %v", d.index, vtapID, ts)
 	}
-	isSlowItem, err := d.samplesBuilder.TimeSeriesToStore(vtapID, ts, extraLabels)
+
+	epcId, podClusterId, err := d.samplesBuilder.GetEpcPodClusterId(vtapID)
 	if err != nil {
+		if d.counter.TimeSeriesErr == 0 {
+			log.Warning(err)
+		}
+		d.counter.TimeSeriesErr++
+		return
+	}
+
+	isSlowItem, err := d.samplesBuilder.TimeSeriesToStore(vtapID, epcId, podClusterId, ts, extraLabels)
+	if !isSlowItem && err != nil {
 		if d.counter.TimeSeriesErr == 0 {
 			log.Warning(err)
 		}
@@ -278,7 +289,7 @@ func (d *Decoder) sendPrometheus(vtapID uint16, ts *prompb.TimeSeries, extraLabe
 	builder := d.samplesBuilder
 	if isSlowItem {
 		d.counter.TimeSeriesSlow++
-		d.slowDecodeQueue.Put(AcquireSlowItem(vtapID, ts, extraLabels))
+		d.slowDecodeQueue.Put(AcquireSlowItem(vtapID, epcId, podClusterId, ts, extraLabels))
 		return
 	}
 	d.prometheusWriter.WriteBatch(builder.samplesBuffer, builder.metricName, builder.timeSeriesBuffer, extraLabels, builder.tsLabelNameIDsBuffer, builder.tsLabelValueIDsBuffer)
@@ -286,10 +297,25 @@ func (d *Decoder) sendPrometheus(vtapID uint16, ts *prompb.TimeSeries, extraLabe
 	d.counter.TimeSeriesOut++
 }
 
-func (b *PrometheusSamplesBuilder) TimeSeriesToStore(vtapID uint16, ts *prompb.TimeSeries, extraLabels []prompb.Label) (bool, error) {
+func (b *PrometheusSamplesBuilder) GetEpcPodClusterId(vtapID uint16) (uint16, uint16, error) {
+	epcId, podClusterId := int32(0), uint16(0)
+	if vtapInfo := b.platformData.QueryVtapInfo(vtapID); vtapInfo != nil {
+		epcId, podClusterId = vtapInfo.EpcId, uint16(vtapInfo.PodClusterId)
+	}
+	if epcId == 0 || epcId == datatype.EPC_FROM_INTERNET {
+		b.counter.EpcMiss++
+		return 0, 0, fmt.Errorf("can't get the epc id of vtap(%d)", vtapID)
+	}
+	return uint16(epcId), podClusterId, nil
+}
+
+// if success,return false,nil
+// if failed, return false,err
+// if isSlow, return true,slowReason
+func (b *PrometheusSamplesBuilder) TimeSeriesToStore(vtapID, epcId, podClusterId uint16, ts *prompb.TimeSeries, extraLabels []prompb.Label) (bool, error) {
 	if len(ts.Samples) == 0 {
 		b.counter.TimeSeriesInvaild++
-		return false, nil
+		return false, fmt.Errorf("prometheum samples of time serries(%s) is empty.", ts)
 	}
 	b.counter.TimeSeriesIn++
 
@@ -312,7 +338,7 @@ func (b *PrometheusSamplesBuilder) TimeSeriesToStore(vtapID uint16, ts *prompb.T
 			metricID, ok = b.labelTable.QueryMetricID(metricName)
 			if !ok {
 				b.counter.MetricMiss++
-				return true, nil
+				return true, fmt.Errorf("metric name %s miss", metricName)
 			}
 			break
 		}
@@ -335,18 +361,18 @@ func (b *PrometheusSamplesBuilder) TimeSeriesToStore(vtapID uint16, ts *prompb.T
 		nameID, ok := b.labelTable.QueryLabelNameID(l.Name)
 		if !ok {
 			b.counter.NameMiss++
-			return true, nil
+			return true, fmt.Errorf("label name %s miss", l.Name)
 		}
 		valueID, ok := b.labelTable.QueryLabelValueID(l.Value)
 		if !ok {
 			b.counter.ValueMiss++
-			return true, nil
+			return true, fmt.Errorf("label value %s miss", l.Value)
 		}
 
 		// the Controller needs to get all the Value lists contained in the Name for filtering when querying
 		if !b.labelTable.QueryLabelNameValue(nameID, valueID) {
 			b.counter.NameValueMiss++
-			return true, nil
+			return true, fmt.Errorf("label name(%s) id(%d) value(%s) id(%d) miss", l.Name, nameID, l.Value, valueID)
 		}
 
 		if podName == "" && l.Name == PROMETHEUS_POD {
@@ -364,7 +390,7 @@ func (b *PrometheusSamplesBuilder) TimeSeriesToStore(vtapID uint16, ts *prompb.T
 			columnIndex, ok = b.labelTable.QueryColumnIndex(metricID, nameID)
 			if !ok {
 				b.counter.ColumnMiss++
-				return true, nil
+				return true, fmt.Errorf("column metric(%s) id(%d) label name(%s) id(%d) index miss", metricName, metricID, l.Name, nameID)
 			}
 		}
 
@@ -381,15 +407,27 @@ func (b *PrometheusSamplesBuilder) TimeSeriesToStore(vtapID uint16, ts *prompb.T
 		return false, fmt.Errorf("prometheum metric name(%s) is empty", metricName)
 	}
 
-	targetID, ok := b.labelTable.QueryTargetID(jobID, instanceID)
+	if jobID == 0 {
+		if jobID, ok = b.labelTable.QueryLabelValueID(""); !ok {
+			b.counter.ValueMiss++
+			return true, fmt.Errorf("label job %s miss", l.Value)
+		}
+	}
+	if instanceID == 0 {
+		if instanceID, ok = b.labelTable.QueryLabelValueID(""); !ok {
+			b.counter.ValueMiss++
+			return true, fmt.Errorf("label instance %s miss", l.Value)
+		}
+	}
+	targetID, ok := b.labelTable.QueryTargetID(epcId, podClusterId, jobID, instanceID)
 	if !ok {
 		b.counter.TargetMiss++
-		return true, nil
+		return true, fmt.Errorf("target epcId(%d) pod cluster id(%d),jobID(%d),instanceID(%d) miss", epcId, podClusterId, jobID, instanceID)
 	}
 
 	if !b.labelTable.QueryMetricTargetPair(metricID, targetID) {
 		b.counter.MetricTargetMiss++
-		return true, nil
+		return true, fmt.Errorf("metric target pair metricID(%d),targetID(%d) miss", metricID, targetID)
 	}
 
 	b.appLabelValueIDsBuffer = append(b.appLabelValueIDsBuffer,
@@ -404,7 +442,7 @@ func (b *PrometheusSamplesBuilder) TimeSeriesToStore(vtapID uint16, ts *prompb.T
 		b.appLabelValueIDsBuffer[index] = b.tsLabelValueIDsBuffer[i]
 	}
 
-	var universalTag *zerodoc.UniversalTag
+	var universalTag *flow_metrics.UniversalTag
 	for i, s := range ts.Samples {
 		v := float64(s.Value)
 		if math.IsNaN(v) || math.IsInf(v, 0) {
@@ -418,7 +456,9 @@ func (b *PrometheusSamplesBuilder) TimeSeriesToStore(vtapID uint16, ts *prompb.T
 			m.TargetID = targetID
 			m.AppLabelValueIDs = append(m.AppLabelValueIDs, b.appLabelValueIDsBuffer...)
 			m.Value = v
+			m.VtapId = vtapID
 			b.samplesBuffer = append(b.samplesBuffer, m)
+			m.OrgId, m.TeamID = b.platformData.QueryVtapOrgAndTeamID(vtapID)
 		} else {
 			m := dbwriter.AcquirePrometheusSample()
 			m.Timestamp = uint32(model.Time(s.Timestamp).Unix())
@@ -426,6 +466,7 @@ func (b *PrometheusSamplesBuilder) TimeSeriesToStore(vtapID uint16, ts *prompb.T
 			m.TargetID = targetID
 			m.AppLabelValueIDs = append(m.AppLabelValueIDs, b.appLabelValueIDsBuffer...)
 			m.Value = v
+			m.OrgId, m.TeamID = b.platformData.QueryVtapOrgAndTeamID(vtapID)
 
 			if i == 0 {
 				b.fillUniversalTag(m, vtapID, podName, instance, podNameID, instanceID, false)
@@ -451,9 +492,9 @@ func (b *PrometheusSamplesBuilder) fillUniversalTag(m *dbwriter.PrometheusSample
 				b.platformDataVersion, platformDataVersion)
 		}
 		b.platformDataVersion = platformDataVersion
-		b.podNameIDToUniversalTag = make(map[uint32]zerodoc.UniversalTag)
-		b.instanceIPToUniversalTag = make(map[uint32]zerodoc.UniversalTag)
-		b.vtapIDToUniversalTag = make(map[uint16]zerodoc.UniversalTag)
+		b.podNameIDToUniversalTag = make(map[uint32]flow_metrics.UniversalTag)
+		b.instanceIPToUniversalTag = make(map[uint32]flow_metrics.UniversalTag)
+		b.vtapIDToUniversalTag = make(map[uint16]flow_metrics.UniversalTag)
 	} else {
 		if podNameID != 0 {
 			if universalTag, ok := b.podNameIDToUniversalTag[podNameID]; ok {
@@ -493,19 +534,23 @@ func (b *PrometheusSamplesBuilder) fillUniversalTagSlow(m *dbwriter.PrometheusSa
 	var ip net.IP
 	var hasMatched bool
 	if podName != "" {
-		podInfo := b.platformData.QueryPodInfo(uint32(vtapID), podName)
+		podInfo := b.platformData.QueryPodInfo(vtapID, podName)
 		if podInfo != nil {
 			t.PodClusterID = uint16(podInfo.PodClusterId)
 			t.PodID = podInfo.PodId
 			t.L3EpcID = podInfo.EpcId
 			ip = net.ParseIP(podInfo.Ip)
+			// maybe Pod is hostnetwork mode or can't get pod IP, then get pod node IP instead
+			if ip == nil {
+				ip = net.ParseIP(podInfo.PodNodeIp)
+			}
 			hasMatched = true
 		}
 	}
 
 	if !hasMatched {
 		if instanceIP := getIPPartFromPrometheusInstanceString(instance); instanceIP != "" {
-			t.L3EpcID = b.platformData.QueryVtapEpc0(uint32(vtapID))
+			t.L3EpcID = b.platformData.QueryVtapEpc0(vtapID)
 			ip = net.ParseIP(instanceIP)
 			if ip != nil {
 				hasMatched = true
@@ -514,8 +559,8 @@ func (b *PrometheusSamplesBuilder) fillUniversalTagSlow(m *dbwriter.PrometheusSa
 	}
 
 	if !hasMatched && fillWithVtapId {
-		t.L3EpcID = b.platformData.QueryVtapEpc0(uint32(vtapID))
-		vtapInfo := b.platformData.QueryVtapInfo(uint32(vtapID))
+		t.L3EpcID = b.platformData.QueryVtapEpc0(vtapID)
+		vtapInfo := b.platformData.QueryVtapInfo(vtapID)
 		if vtapInfo != nil {
 			ip = net.ParseIP(vtapInfo.Ip)
 			t.PodClusterID = uint16(vtapInfo.PodClusterId)
@@ -539,16 +584,18 @@ func (b *PrometheusSamplesBuilder) fillUniversalTagSlow(m *dbwriter.PrometheusSa
 	} else {
 		info = b.platformData.QueryIPV4Infos(t.L3EpcID, t.IP)
 	}
+	podGroupType := uint8(0)
 	if info != nil {
 		t.RegionID = uint16(info.RegionID)
 		t.AZID = uint16(info.AZID)
 		t.HostID = uint16(info.HostID)
 		t.PodGroupID = info.PodGroupID
+		podGroupType = uint8(info.PodGroupType)
 		t.PodNSID = uint16(info.PodNSID)
 		t.PodNodeID = info.PodNodeID
 		t.SubnetID = uint16(info.SubnetID)
 		t.L3DeviceID = info.DeviceID
-		t.L3DeviceType = zerodoc.DeviceType(info.DeviceType)
+		t.L3DeviceType = flow_metrics.DeviceType(info.DeviceType)
 		if t.PodClusterID == 0 {
 			t.PodClusterID = uint16(info.PodClusterID)
 		}
@@ -561,7 +608,7 @@ func (b *PrometheusSamplesBuilder) fillUniversalTagSlow(m *dbwriter.PrometheusSa
 			t.ServiceID = b.platformData.QueryService(t.PodID, t.PodNodeID, uint32(t.PodClusterID), t.PodGroupID, t.L3EpcID, t.IsIPv6 == 1, t.IP, t.IP6, 0, 0)
 		}
 		t.AutoInstanceID, t.AutoInstanceType = common.GetAutoInstance(t.PodID, t.GPID, t.PodNodeID, t.L3DeviceID, uint8(t.L3DeviceType), t.L3EpcID)
-		t.AutoServiceID, t.AutoServiceType = common.GetAutoService(t.ServiceID, t.PodGroupID, t.GPID, t.PodNodeID, t.L3DeviceID, uint8(t.L3DeviceType), t.L3EpcID)
+		t.AutoServiceID, t.AutoServiceType = common.GetAutoService(t.ServiceID, t.PodGroupID, t.GPID, t.PodNodeID, t.L3DeviceID, uint8(t.L3DeviceType), podGroupType, t.L3EpcID)
 	}
 }
 

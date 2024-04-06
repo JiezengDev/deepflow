@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,14 +15,19 @@
  */
 
 use std::net::IpAddr;
+use std::sync::{Arc, Weak};
 
 use public::enums::IpProtocol;
 
 use crate::flow_generator::protocol_logs::pb_adapter::KeyVal;
 use crate::flow_generator::protocol_logs::LogMessageType;
+use crate::plugin::PluginCounterInfo;
 use crate::{common::l7_protocol_log::ParseParam, flow_generator::protocol_logs::L7ResponseStatus};
 
-use super::{CustomInfo, CustomInfoRequest, CustomInfoResp, CustomInfoTrace};
+use super::{
+    shared_obj::SoPluginCounter, CustomInfo, CustomInfoRequest, CustomInfoResp, CustomInfoTrace,
+};
+use public::counter::{Countable, RefCountable};
 
 pub const INIT_FUNC_SYM: &'static str = "init";
 pub const CHECK_PAYLOAD_FUNC_SYM: &'static str = "on_check_payload";
@@ -63,8 +68,8 @@ impl From<(&ParseParam<'_>, &[u8])> for ParseCtx {
             port_src: p.port_src,
             port_dst: p.port_dst,
             l4_protocol: match p.l4_protocol {
-                IpProtocol::Tcp => 6,
-                IpProtocol::Udp => 17,
+                IpProtocol::TCP => 6,
+                IpProtocol::UDP => 17,
                 _ => unreachable!(),
             },
             proto: 0,
@@ -340,10 +345,12 @@ pub type CheckPayloadCFunc = unsafe extern "C" fn(*const ParseCtx) -> CheckResul
 pub type ParsePayloadCFunc =
     unsafe extern "C" fn(*const ParseCtx, *mut ParseInfo, info_max_len: i32) -> ParseResult;
 
-#[derive(Clone, Eq)]
+#[derive(Clone)]
 pub struct SoPluginFunc {
     pub hash: String,
     pub name: String,
+    pub check_payload_counter: Arc<SoPluginCounter>,
+    pub parse_payload_counter: Arc<SoPluginCounter>,
     pub check_payload: CheckPayloadCFunc,
     // due to C can not return variable length data, use the consistent length `result_max_len` as length of ParseResult array
     // return < 0 indicate fail, >=0 assume success
@@ -353,6 +360,35 @@ pub struct SoPluginFunc {
 impl PartialEq for SoPluginFunc {
     fn eq(&self, other: &Self) -> bool {
         self.hash == other.hash
+    }
+}
+
+impl Eq for SoPluginFunc {}
+
+impl SoPluginFunc {
+    pub fn counters_in<'a>(&'a self, counters: &mut Vec<PluginCounterInfo<'a>>) {
+        counters.push(PluginCounterInfo {
+            plugin_name: self.name.as_str(),
+            plugin_type: "so",
+            function_name: CHECK_PAYLOAD_FUNC_SYM,
+            counter: Countable::Ref(
+                Arc::downgrade(&self.check_payload_counter) as Weak<dyn RefCountable>
+            ),
+        });
+        counters.push(PluginCounterInfo {
+            plugin_name: self.name.as_str(),
+            plugin_type: "so",
+            function_name: PARSE_PAYLOAD_FUNC_SYM,
+            counter: Countable::Ref(
+                Arc::downgrade(&self.parse_payload_counter) as Weak<dyn RefCountable>
+            ),
+        });
+    }
+
+    pub fn counters<'a>(&'a self) -> Vec<PluginCounterInfo<'a>> {
+        let mut info = vec![];
+        self.counters_in(&mut info);
+        info
     }
 }
 
@@ -372,13 +408,13 @@ fn read_attr(attr_bytes: &[u8], mut attr_len: u32) -> Vec<KeyVal> {
     let mut attr = vec![];
     let mut off = 0;
     while off < attr_bytes.len() && attr_len > 0 {
-        let Some(key_idx) = (&attr_bytes[off..]).iter().position(|b| *b==0) else {
+        let Some(key_idx) = (&attr_bytes[off..]).iter().position(|b| *b == 0) else {
             break;
         };
         let key = String::from_utf8_lossy(&attr_bytes[off..off + key_idx]).to_string();
         off += key_idx + 1;
         if off < attr_bytes.len() {
-            let Some(val_idx) = &attr_bytes[off..].iter().position(|b| *b==0) else {
+            let Some(val_idx) = &attr_bytes[off..].iter().position(|b| *b == 0) else {
                 break;
             };
             let val = String::from_utf8_lossy(&attr_bytes[off..off + val_idx]).to_string();

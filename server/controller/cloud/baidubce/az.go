@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -41,8 +41,7 @@ func (b *BaiduBce) getRegionAndAZs() ([]model.Region, []model.AZ, map[string]str
 		log.Error(err)
 		return nil, nil, nil, err
 	}
-	b.cloudStatsd.APICost["ListZone"] = []int{int(time.Now().Sub(startTime).Milliseconds())}
-	b.cloudStatsd.APICount["ListZone"] = []int{len(result.Zones)}
+	b.cloudStatsd.RefreshAPIMoniter("ListZone", len(result.Zones), startTime)
 	b.debugger.WriteJson("ListZone", " ", structToJson(result.Zones))
 	zones := result.Zones
 

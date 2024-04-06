@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -66,7 +66,7 @@ func NewPrometheusHandler(config *config.Config, recv *receiver.Receiver, platfo
 
 	recv.RegistHandler(msgType, decodeQueues, queueCount)
 
-	prometheusLabelTable := decoder.NewPrometheusLabelTable(config.Base.ControllerIPs, int(config.Base.ControllerPort), config.LabelMsgMaxSize)
+	prometheusLabelTable := decoder.NewPrometheusLabelTable(config.Base.ControllerIPs, int(config.Base.ControllerPort), config.LabelMsgMaxSize, config.LabelCacheExpiration)
 
 	prometheusLabelTable.RequestAllLabelIDs()
 	currentColumnIndexMax := prometheusLabelTable.GetMaxAppLabelColumnIndex()

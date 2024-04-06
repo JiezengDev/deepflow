@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,6 +40,7 @@ var log = logging.MustGetLogger("profile")
 var InstanceProfileEventType = []string{"inuse_objects", "alloc_objects", "inuse_space", "alloc_space", "goroutines"}
 
 func Tracing(args model.ProfileTracing, cfg *config.QuerierConfig) (result []*model.ProfileTreeNode, debug interface{}, err error) {
+	debugs := model.ProfileDebug{}
 	whereSlice := []string{}
 	whereSlice = append(whereSlice, fmt.Sprintf(" time>=%d", args.TimeStart))
 	whereSlice = append(whereSlice, fmt.Sprintf(" time<=%d", args.TimeEnd))
@@ -56,7 +57,7 @@ func Tracing(args model.ProfileTracing, cfg *config.QuerierConfig) (result []*mo
 		common.PROFILE_LOCATION_STR, common.PROFILE_VALUE, common.TABLE_PROFILE, whereSql, limitSql,
 	)
 
-	if slices.Contains[string](InstanceProfileEventType, args.ProfileEventType) {
+	if slices.Contains[[]string, string](InstanceProfileEventType, args.ProfileEventType) {
 		timeSql := fmt.Sprintf(
 			"SELECT time FROM %s WHERE %s ORDER BY time DESC LIMIT 1",
 			common.TABLE_PROFILE, whereSql,
@@ -74,6 +75,14 @@ func Tracing(args model.ProfileTracing, cfg *config.QuerierConfig) (result []*mo
 			log.Errorf("ExecuteQuery failed: %v", timeDebug, timeError)
 			return
 		}
+		profileTimeDebug := model.Debug{}
+		profileTimeDebug.Sql = timeSql
+		profileTimeDebug.IP = timeDebug["ip"].(string)
+		profileTimeDebug.QueryUUID = timeDebug["query_uuid"].(string)
+		profileTimeDebug.SqlCH = timeDebug["sql"].(string)
+		profileTimeDebug.Error = timeDebug["error"].(string)
+		profileTimeDebug.QueryTime = timeDebug["query_time"].(string)
+		debugs.QuerierDebug = append(debugs.QuerierDebug, profileTimeDebug)
 		var timeValue int64
 		timeValues := timeResult.Values
 		for _, value := range timeValues {
@@ -113,6 +122,7 @@ func Tracing(args model.ProfileTracing, cfg *config.QuerierConfig) (result []*mo
 	profileDebug.SqlCH = querierDebug["sql"].(string)
 	profileDebug.Error = querierDebug["error"].(string)
 	profileDebug.QueryTime = querierDebug["query_time"].(string)
+	debugs.QuerierDebug = append(debugs.QuerierDebug, profileDebug)
 	formatStartTime := time.Now()
 	profileLocationStrIndex := -1
 	profileValueIndex := -1
@@ -130,7 +140,7 @@ func Tracing(args model.ProfileTracing, cfg *config.QuerierConfig) (result []*mo
 			}
 		}
 	}
-	indexOK := slices.Contains[int]([]int{profileLocationStrIndex, profileValueIndex}, -1)
+	indexOK := slices.Contains[[]int, int]([]int{profileLocationStrIndex, profileValueIndex}, -1)
 	if indexOK {
 		log.Error("Not all fields found")
 		err = errors.New("Not all fields found")
@@ -193,7 +203,7 @@ func Tracing(args model.ProfileTracing, cfg *config.QuerierConfig) (result []*mo
 
 	}
 	// format root node
-	rootNode := NewProfileTreeNode("root", "", 0)
+	rootNode := NewProfileTreeNode(args.AppService, "", 0)
 	rootNode.ParentNodeID = "-1"
 	rootNode.TotalValue = rootTotalValue
 
@@ -203,8 +213,8 @@ func Tracing(args model.ProfileTracing, cfg *config.QuerierConfig) (result []*mo
 	}
 	formatEndTime := int64(time.Since(formatStartTime))
 	formatTime := fmt.Sprintf("%.9fs", float64(formatEndTime)/1e9)
-	profileDebug.FormatTime = formatTime
-	debug = profileDebug
+	debugs.FormatTime = formatTime
+	debug = debugs
 	return
 }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/prometheus"
 	"github.com/deepflowio/deepflow/server/controller/recorder"
 	"github.com/deepflowio/deepflow/server/controller/tagrecorder"
+	tagrecordercheck "github.com/deepflowio/deepflow/server/controller/tagrecorder/check"
 )
 
 func IsMasterRegion(cfg *config.ControllerConfig) bool {
@@ -63,16 +64,16 @@ func IsMasterController(cfg *config.ControllerConfig) bool {
 
 // migrate db by master region master controller
 func migrateMySQL(cfg *config.ControllerConfig) {
-	ok := migrator.MigrateMySQL(cfg.MySqlCfg)
-	if !ok {
-		log.Error("migrate mysql failed")
+	err := migrator.Migrate(cfg.MySqlCfg)
+	if err != nil {
+		log.Errorf("migrate mysql failed: %s", err.Error())
 		time.Sleep(time.Second)
 		os.Exit(0)
 	}
 }
 
 func checkAndStartMasterFunctions(
-	cfg *config.ControllerConfig, ctx context.Context, tr *tagrecorder.TagRecorder,
+	cfg *config.ControllerConfig, ctx context.Context,
 	controllerCheck *monitor.ControllerCheck, analyzerCheck *monitor.AnalyzerCheck,
 ) {
 
@@ -82,7 +83,10 @@ func checkAndStartMasterFunctions(
 	// - 控制器和数据节点检查
 	// - license分配和检查
 	// - resource id manager
-	// - clean deleted resources
+	// - clean deleted/dirty resource data
+	// - prometheus encoder
+	// - prometheus app label layout updater
+	// - http resource refresh task manager
 
 	// 从区域控制器无需判断是否为master controller
 	if !IsMasterRegion(cfg) {
@@ -92,10 +96,15 @@ func checkAndStartMasterFunctions(
 	vtapCheck := vtap.NewVTapCheck(cfg.MonitorCfg, ctx)
 	vtapRebalanceCheck := vtap.NewRebalanceCheck(cfg.MonitorCfg, ctx)
 	vtapLicenseAllocation := license.NewVTapLicenseAllocation(cfg.MonitorCfg, ctx)
-	recorderResource := recorder.GetSingletonResource()
+	recorderResource := recorder.GetResource()
 	domainChecker := resoureservice.NewDomainCheck(ctx)
 	prometheus := prometheus.GetSingleton()
+	tagRecorder := tagrecorder.GetSingleton()
+
 	httpService := http.GetSingleton()
+
+	tagrecordercheck.GetSingleton().Init(ctx, *cfg)
+	tr := tagrecordercheck.GetSingleton()
 
 	masterController := ""
 	thisIsMasterController := false
@@ -112,15 +121,17 @@ func checkAndStartMasterFunctions(
 				migrateMySQL(cfg)
 
 				// 启动资源ID管理器
-				err := recorderResource.IDManager.Start()
+				err := recorderResource.IDManagers.Start()
 				if err != nil {
-					log.Error("resource id mananger start failed")
+					log.Errorf("resource id manager start failed: %s", err.Error())
 					time.Sleep(time.Second)
 					os.Exit(0)
 				}
 
 				// 启动tagrecorder
-				tr.Start()
+				tagRecorder.UpdaterManager.Start()
+				tr.Check()
+				// tagRecorder.SubscriberManager.HealthCheck()
 
 				// 控制器检查
 				controllerCheck.Start()
@@ -140,12 +151,14 @@ func checkAndStartMasterFunctions(
 				}
 
 				// 资源数据清理
-				recorderResource.Cleaner.Start()
+				recorderResource.Cleaners.Start()
 
 				// domain检查及自愈
 				domainChecker.Start()
 
 				prometheus.Encoder.Start()
+				prometheus.APPLabelLayoutUpdater.Start()
+				prometheus.Clear.Start()
 
 				if cfg.DFWebService.Enabled {
 					httpService.TaskManager.Start(ctx, cfg.FPermit, cfg.RedisCfg)
@@ -155,6 +168,7 @@ func checkAndStartMasterFunctions(
 				log.Infof("I am not the master controller anymore, new master controller is %s", newMasterController)
 
 				// stop tagrecorder
+				tagRecorder.UpdaterManager.Stop()
 				tr.Stop()
 
 				// stop controller check
@@ -169,13 +183,15 @@ func checkAndStartMasterFunctions(
 				// stop vtap license allocation and check
 				vtapLicenseAllocation.Stop()
 
-				recorderResource.Cleaner.Stop()
+				recorderResource.Cleaners.Stop()
 
 				domainChecker.Stop()
 
-				recorderResource.IDManager.Stop()
+				recorderResource.IDManagers.Stop()
 
 				prometheus.Encoder.Stop()
+				prometheus.APPLabelLayoutUpdater.Stop()
+				prometheus.Clear.Stop()
 
 				if cfg.DFWebService.Enabled {
 					httpService.TaskManager.Stop()
@@ -191,7 +207,8 @@ func checkAndStartMasterFunctions(
 	}
 }
 
-func checkAndStartAllRegionMasterFunctions(tr *tagrecorder.TagRecorder) {
+func checkAndStartAllRegionMasterFunctions() {
+	tr := tagrecorder.GetSingleton()
 	masterController := ""
 	thisIsMasterController := false
 	for range time.Tick(time.Minute) {
@@ -203,7 +220,7 @@ func checkAndStartAllRegionMasterFunctions(tr *tagrecorder.TagRecorder) {
 			if newThisIsMasterController {
 				thisIsMasterController = true
 				log.Infof("I am the master controller now, previous master controller is %s", masterController)
-				go tr.StartChDictionaryUpdate()
+				go tr.Dictionary.Start()
 			} else if thisIsMasterController {
 				thisIsMasterController = false
 				log.Infof("I am not the master controller anymore, new master controller is %s", newMasterController)

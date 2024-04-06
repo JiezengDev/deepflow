@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ package ctl
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -41,6 +42,7 @@ func Execute(version string) {
 	root.PersistentFlags().Uint32P("api-port", "", 30417, "deepflow-server service node port")
 	root.PersistentFlags().Uint32P("rpc-port", "", 30035, "deepflow-server service grpc port")
 	root.PersistentFlags().Uint32P("svc-port", "", 20417, "deepflow-server service http port")
+	root.PersistentFlags().DurationP("timeout", "", time.Second*30, "deepflow-ctl timeout")
 	root.ParseFlags(os.Args[1:])
 
 	// support output version
@@ -63,7 +65,7 @@ func Execute(version string) {
 	root.AddCommand(RegisterServerCommand())
 	root.AddCommand(RegisterRepoCommand())
 	root.AddCommand(RegisterPluginCommand())
-	root.AddCommand(RegisterPrometheusCacheCommand())
+	root.AddCommand(RegisterPrometheusCommand())
 	root.AddCommand(RegisterPromQLCommand())
 
 	cmd.RegisterIngesterCommand(root)

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,17 +17,19 @@
 package kubernetes_gather
 
 import (
+	"regexp"
+	"strings"
+	"time"
+
+	simplejson "github.com/bitly/go-simplejson"
+	mapset "github.com/deckarep/golang-set"
+	cloudcommon "github.com/deepflowio/deepflow/server/controller/cloud/common"
 	"github.com/deepflowio/deepflow/server/controller/cloud/config"
 	"github.com/deepflowio/deepflow/server/controller/cloud/kubernetes_gather/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/genesis"
 	"github.com/deepflowio/deepflow/server/controller/statsd"
-
-	"regexp"
-
-	simplejson "github.com/bitly/go-simplejson"
-	mapset "github.com/deckarep/golang-set"
 	logging "github.com/op/go-logging"
 )
 
@@ -43,14 +45,18 @@ type KubernetesGather struct {
 	Lcuuid                       string
 	UuidGenerate                 string
 	ClusterID                    string
-	RegionUuid                   string
-	VPCUuid                      string
+	RegionUUID                   string
+	VPCUUID                      string
 	PortNameRegex                string
 	PodNetIPv4CIDRMaxMask        int
 	PodNetIPv6CIDRMaxMask        int
 	customTagLenMax              int
 	isSubDomain                  bool
 	azLcuuid                     string
+	podClusterLcuuid             string
+	labelRegex                   *regexp.Regexp
+	envRegex                     *regexp.Regexp
+	annotationRegex              *regexp.Regexp
 	podGroupLcuuids              mapset.Set
 	podNetworkLcuuidCIDRs        networkLcuuidCIDRs
 	nodeNetworkLcuuidCIDRs       networkLcuuidCIDRs
@@ -60,6 +66,7 @@ type KubernetesGather struct {
 	rsLcuuidToPodGroupLcuuid     map[string]string
 	serviceLcuuidToIngressLcuuid map[string]string
 	k8sInfo                      map[string][]string
+	pgLcuuidToPSLcuuids          map[string][]string
 	nsLabelToGroupLcuuids        map[string]mapset.Set
 	pgLcuuidTopodTargetPorts     map[string]map[string]int
 	namespaceToExLabels          map[string]map[string]interface{}
@@ -119,9 +126,9 @@ func NewKubernetesGather(domain *mysql.Domain, subDomain *mysql.SubDomain, cfg c
 		return nil
 	}
 
-	_, regxErr := regexp.Compile(portNameRegex)
-	if regxErr != nil {
-		log.Errorf("newkubernetesgather portnameregex (%s) compile error: (%s)", portNameRegex, regxErr.Error())
+	_, err = regexp.Compile(portNameRegex)
+	if err != nil {
+		log.Errorf("port name regex compile error: (%s)", err.Error())
 		return nil
 	}
 
@@ -135,17 +142,48 @@ func NewKubernetesGather(domain *mysql.Domain, subDomain *mysql.SubDomain, cfg c
 		podNetIPv6CIDRMaxMask = common.K8S_POD_IPV6_NETMASK
 	}
 
+	labelRegString := configJson.Get("label_regex").MustString()
+	if labelRegString == "" {
+		labelRegString = common.DEFAULT_ALL_MATCH_REGEX
+	}
+	labelR, err := regexp.Compile(labelRegString)
+	if err != nil {
+		log.Errorf("label regex compile error: (%s)", err.Error())
+		return nil
+	}
+	envRegString := configJson.Get("env_regex").MustString()
+	if envRegString == "" {
+		envRegString = common.DEFAULT_NOT_MATCH_REGEX
+	}
+	envR, err := regexp.Compile(envRegString)
+	if err != nil {
+		log.Errorf("env regex compile error: (%s)", err.Error())
+		return nil
+	}
+	annotationRegString := configJson.Get("annotation_regex").MustString()
+	if annotationRegString == "" {
+		annotationRegString = common.DEFAULT_NOT_MATCH_REGEX
+	}
+	annotationR, err := regexp.Compile(annotationRegString)
+	if err != nil {
+		log.Errorf("annotation regex compile error: (%s)", err.Error())
+		return nil
+	}
+
 	return &KubernetesGather{
 		// TODO: display_name后期需要修改为uuid_generate
 		Name:                  name,
 		Lcuuid:                lcuuid,
 		UuidGenerate:          displayName,
 		ClusterID:             clusterID,
-		RegionUuid:            configJson.Get("region_uuid").MustString(),
-		VPCUuid:               configJson.Get("vpc_uuid").MustString(),
+		RegionUUID:            configJson.Get("region_uuid").MustString(),
+		VPCUUID:               configJson.Get("vpc_uuid").MustString(),
 		PodNetIPv4CIDRMaxMask: podNetIPv4CIDRMaxMask,
 		PodNetIPv6CIDRMaxMask: podNetIPv6CIDRMaxMask,
 		PortNameRegex:         portNameRegex,
+		labelRegex:            labelR,
+		envRegex:              envR,
+		annotationRegex:       annotationR,
 
 		// 以下属性为获取资源所用的关联关系
 		azLcuuid:                     "",
@@ -160,15 +198,12 @@ func NewKubernetesGather(domain *mysql.Domain, subDomain *mysql.SubDomain, cfg c
 		rsLcuuidToPodGroupLcuuid:     map[string]string{},
 		serviceLcuuidToIngressLcuuid: map[string]string{},
 		k8sInfo:                      map[string][]string{},
+		pgLcuuidToPSLcuuids:          map[string][]string{},
 		nsLabelToGroupLcuuids:        map[string]mapset.Set{},
 		pgLcuuidTopodTargetPorts:     map[string]map[string]int{},
 		namespaceToExLabels:          map[string]map[string]interface{}{},
 		nsServiceNameToService:       map[string]map[string]map[string]int{},
-		cloudStatsd: statsd.CloudStatsd{
-			APICount: make(map[string][]int),
-			APICost:  make(map[string][]int),
-			ResCount: make(map[string][]int),
-		},
+		cloudStatsd:                  statsd.NewCloudStatsd(),
 	}
 }
 
@@ -179,11 +214,8 @@ func (k *KubernetesGather) getKubernetesInfo() (map[string][]string, error) {
 	}
 
 	for key, v := range kData {
-		// resource from genesis , so api cost is 0 ms
-		k.cloudStatsd.APICost[key] = []int{0}
-
-		k.cloudStatsd.APICount[key] = []int{len(v)}
-
+		// resource from genesis , so api start is 0
+		k.cloudStatsd.RefreshAPIMoniter(key, len(v), time.Time{})
 	}
 	return kData, nil
 }
@@ -201,6 +233,11 @@ func (k *KubernetesGather) GetStatter() statsd.StatsdStatter {
 	}
 }
 
+func (k *KubernetesGather) GetLabel(labelMap map[string]interface{}) string {
+	labelSlice := cloudcommon.GenerateCustomTag(labelMap, k.labelRegex, k.customTagLenMax, ":")
+	return strings.Join(labelSlice, ", ")
+}
+
 func (k *KubernetesGather) GetKubernetesGatherData() (model.KubernetesGatherResource, error) {
 	// 任务循环的是同一个实例，所以这里要对关联关系进行初始化
 	k.azLcuuid = ""
@@ -208,17 +245,17 @@ func (k *KubernetesGather) GetKubernetesGatherData() (model.KubernetesGatherReso
 	k.podNetworkLcuuidCIDRs = networkLcuuidCIDRs{}
 	k.nodeNetworkLcuuidCIDRs = networkLcuuidCIDRs{}
 	k.podGroupLcuuids = mapset.NewSet()
+	k.podIPToLcuuid = map[string]string{}
 	k.nodeIPToLcuuid = map[string]string{}
 	k.namespaceToLcuuid = map[string]string{}
 	k.rsLcuuidToPodGroupLcuuid = map[string]string{}
 	k.serviceLcuuidToIngressLcuuid = map[string]string{}
 	k.nsLabelToGroupLcuuids = map[string]mapset.Set{}
+	k.pgLcuuidToPSLcuuids = map[string][]string{}
 	k.pgLcuuidTopodTargetPorts = map[string]map[string]int{}
 	k.namespaceToExLabels = map[string]map[string]interface{}{}
 	k.nsServiceNameToService = map[string]map[string]map[string]int{}
-	k.cloudStatsd.APICount = map[string][]int{}
-	k.cloudStatsd.APICost = map[string][]int{}
-	k.cloudStatsd.ResCount = map[string][]int{}
+	k.cloudStatsd = statsd.NewCloudStatsd()
 
 	region, err := k.getRegion()
 	if err != nil {
@@ -245,10 +282,12 @@ func (k *KubernetesGather) GetKubernetesGatherData() (model.KubernetesGatherReso
 	}
 	k.k8sInfo = k8sInfo
 
-	prometheusTargets, err := genesis.GenesisService.GetPrometheusResponse(k.ClusterID)
+	prometheusTargets, err := k.getPrometheusTargets()
 	if err != nil {
-		// TODO: 可能会因为采集器版本的问题阻塞正常对接，暂时只记录问题，后续调整为和k8s info相同的处理方式
-		log.Debug(err.Error())
+		return model.KubernetesGatherResource{
+			ErrorState:   common.RESOURCE_STATE_CODE_WARNING,
+			ErrorMessage: err.Error(),
+		}, err
 	}
 
 	podCluster, err := k.getPodCluster()
@@ -300,11 +339,10 @@ func (k *KubernetesGather) GetKubernetesGatherData() (model.KubernetesGatherReso
 		}
 	}
 
-	pods, abstractNodes, err := k.getPods()
+	pods, err := k.getPods()
 	if err != nil {
 		return model.KubernetesGatherResource{}, err
 	}
-	podNodes = append(podNodes, abstractNodes...)
 
 	nodeSubnets, podSubnets, nodeVInterfaces, podVInterfaces, nodeIPs, podIPs, err := k.getVInterfacesAndIPs()
 	if err != nil {
@@ -342,8 +380,7 @@ func (k *KubernetesGather) GetKubernetesGatherData() (model.KubernetesGatherReso
 		PrometheusTargets:      prometheusTargets,
 	}
 
-	k.cloudStatsd.APICost["PrometheusTarget"] = []int{0}
-	k.cloudStatsd.APICount["PrometheusTarget"] = []int{len(prometheusTargets)}
+	k.cloudStatsd.RefreshAPIMoniter("PrometheusTarget", len(prometheusTargets), time.Time{})
 	k.cloudStatsd.ResCount = statsd.GetResCount(resource)
 	statsd.MetaStatsd.RegisterStatsdTable(k)
 	return resource, nil

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -49,6 +49,28 @@ func (c *Cloud) getSubDomainData(cResource model.Resource) map[string]model.SubD
 		// 取集群中某个容器节点的az信息作为集群的az，当前不支持附属容器集群跨可用区
 		azLcuuid := podNodes[0].AZLcuuid
 
+		// 获取主云平台vm的ip和mac在附属容器中排除，以免重复添加
+		vmLcuuids := map[string]bool{}
+		for _, vm := range cResource.VMs {
+			vmLcuuids[vm.Lcuuid] = false
+		}
+		existMacs := map[string]bool{}
+		vinterfaceLcuuids := map[string]bool{}
+		for _, v := range cResource.VInterfaces {
+			if _, ok := vmLcuuids[v.DeviceLcuuid]; !ok {
+				continue
+			}
+			existMacs[v.Mac] = false
+			vinterfaceLcuuids[v.Lcuuid] = false
+		}
+		existIPs := map[string]bool{}
+		for _, ip := range cResource.IPs {
+			if _, ok := vinterfaceLcuuids[ip.VInterfaceLcuuid]; !ok {
+				continue
+			}
+			existIPs[ip.IP] = false
+		}
+
 		// 容器集群
 		podClusters := c.getSubDomainPodClusters(lcuuid, &kubernetesGatherResource, azLcuuid)
 
@@ -76,11 +98,11 @@ func (c *Cloud) getSubDomainData(cResource model.Resource) map[string]model.SubD
 
 		// IP
 		ips, reservedPodSubnetLcuuidToIPNum, updatedVInterfaceLcuuidToNetworkLcuuid :=
-			c.getSubDomainIPs(lcuuid, cResource, &kubernetesGatherResource)
+			c.getSubDomainIPs(lcuuid, cResource, &kubernetesGatherResource, existIPs)
 
 		// vinterfaces
 		vinterfaces := c.getSubDomainVInterfaces(
-			lcuuid, &kubernetesGatherResource, updatedVInterfaceLcuuidToNetworkLcuuid,
+			lcuuid, &kubernetesGatherResource, updatedVInterfaceLcuuidToNetworkLcuuid, existMacs,
 		)
 
 		// subnets
@@ -448,9 +470,7 @@ func (c *Cloud) getSubDomainPods(
 	return retPods
 }
 
-func (c *Cloud) getSubDomainIPs(
-	subDomainLcuuid string, cResource model.Resource, kResource *kubernetes_model.KubernetesGatherResource,
-) ([]model.IP, map[string]int, map[string]string) {
+func (c *Cloud) getSubDomainIPs(subDomainLcuuid string, cResource model.Resource, kResource *kubernetes_model.KubernetesGatherResource, existNodeIPs map[string]bool) ([]model.IP, map[string]int, map[string]string) {
 	var retIPs []model.IP
 	var reservedPodSubnetLcuuidToIPNum map[string]int
 	var updatedVInterfaceLcuuidToNetworkLcuuid map[string]string
@@ -482,6 +502,11 @@ func (c *Cloud) getSubDomainIPs(
 		subnets = append(subnets, subnet)
 	}
 	for _, ip := range kResource.PodNodeIPs {
+		// 过滤掉主云平台已经存在的node ip
+		if _, ok := existNodeIPs[ip.IP]; ok {
+			log.Debugf("subdomain node ip (%s) already exists on the vm ip", ip.IP)
+			continue
+		}
 		ipAddr, _ := netaddr.ParseIP(ip.IP)
 		subnetLcuuid := ""
 		for _, subnet := range subnets {
@@ -511,7 +536,7 @@ func (c *Cloud) getSubDomainIPs(
 
 func (c *Cloud) getSubDomainVInterfaces(
 	subDomainLcuuid string, resource *kubernetes_model.KubernetesGatherResource,
-	updatedVInterfaceLcuuidToNetworkLcuuid map[string]string,
+	updatedVInterfaceLcuuidToNetworkLcuuid map[string]string, existNodeMacs map[string]bool,
 ) []model.VInterface {
 	var retVInterfaces []model.VInterface
 
@@ -525,6 +550,8 @@ func (c *Cloud) getSubDomainVInterfaces(
 				Name:            vinterface.Name,
 				Type:            vinterface.Type,
 				Mac:             vinterface.Mac,
+				NetnsID:         vinterface.NetnsID,
+				VTapID:          vinterface.VTapID,
 				TapMac:          vinterface.TapMac,
 				DeviceType:      vinterface.DeviceType,
 				DeviceLcuuid:    vinterface.DeviceLcuuid,
@@ -537,15 +564,26 @@ func (c *Cloud) getSubDomainVInterfaces(
 	}
 	// 检查容器节点接口是否需要更新子网信息，并补充subDomainLcuuid
 	for _, vinterface := range resource.PodNodeVInterfaces {
+		// 过滤掉主云平台已经存在的node mac
+		if _, ok := existNodeMacs[vinterface.Mac]; ok {
+			log.Debugf("subdomain node mac (%s) already exists on the vm mac", vinterface.Mac)
+			continue
+		}
 		networkLcuuid := vinterface.NetworkLcuuid
+		networkType := vinterface.Type
 		if updateNetworkLcuuid, ok := updatedVInterfaceLcuuidToNetworkLcuuid[vinterface.Lcuuid]; ok {
 			networkLcuuid = updateNetworkLcuuid
+		} else {
+			// for addtional route interface, set type = LAN
+			networkType = common.VIF_TYPE_LAN
 		}
 		retVInterfaces = append(retVInterfaces, model.VInterface{
 			Lcuuid:          vinterface.Lcuuid,
 			Name:            vinterface.Name,
-			Type:            vinterface.Type,
+			Type:            networkType,
 			Mac:             vinterface.Mac,
+			NetnsID:         vinterface.NetnsID,
+			VTapID:          vinterface.VTapID,
 			TapMac:          vinterface.TapMac,
 			DeviceType:      vinterface.DeviceType,
 			DeviceLcuuid:    vinterface.DeviceLcuuid,
@@ -607,13 +645,27 @@ func (c *Cloud) getSubDomainNetworks(
 
 	// 遍历Networks，更新az和subDomain信息
 	for _, network := range []model.Network{
-		resource.PodNetwork, resource.PodServiceNetwork, resource.PodNodeNetwork,
+		resource.PodNetwork, resource.PodServiceNetwork,
 	} {
 		retNetworks = append(retNetworks, model.Network{
 			Lcuuid:          network.Lcuuid,
 			Name:            network.Name,
 			Label:           network.Label,
 			NetType:         network.NetType,
+			VPCLcuuid:       network.VPCLcuuid,
+			AZLcuuid:        azLcuuid,
+			RegionLcuuid:    network.RegionLcuuid,
+			SubDomainLcuuid: subDomainLcuuid,
+		})
+	}
+
+	// set podNodeNetwork netType = LAN
+	for _, network := range []model.Network{resource.PodNodeNetwork} {
+		retNetworks = append(retNetworks, model.Network{
+			Lcuuid:          network.Lcuuid,
+			Name:            network.Name,
+			Label:           network.Label,
+			NetType:         common.NETWORK_TYPE_LAN,
 			VPCLcuuid:       network.VPCLcuuid,
 			AZLcuuid:        azLcuuid,
 			RegionLcuuid:    network.RegionLcuuid,
@@ -636,6 +688,7 @@ func (c *Cloud) getSubDomainPrometheusTargets(
 			Instance:        p.Instance,
 			Job:             p.Job,
 			OtherLabels:     p.OtherLabels,
+			VPCLcuuid:       p.VPCLcuuid,
 			SubDomainLcuuid: subDomainLcuuid,
 		})
 	}

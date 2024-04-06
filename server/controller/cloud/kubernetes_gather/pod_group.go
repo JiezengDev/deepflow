@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,12 +19,10 @@ package kubernetes_gather
 import (
 	"strings"
 
-	cloudcommon "github.com/deepflowio/deepflow/server/controller/cloud/common"
-	"github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/common"
-
 	"github.com/bitly/go-simplejson"
 	mapset "github.com/deckarep/golang-set"
+	"github.com/deepflowio/deepflow/server/controller/cloud/model"
+	"github.com/deepflowio/deepflow/server/controller/common"
 	uuid "github.com/satori/go.uuid"
 )
 
@@ -167,7 +165,7 @@ func (k *KubernetesGather) getPodGroups() (podGroups []model.PodGroup, err error
 			for key, v := range labels {
 				vString, ok := v.(string)
 				if !ok {
-					vString = ""
+					continue
 				}
 				nsL := namespace + key + "_" + vString
 				_, ok = k.nsLabelToGroupLcuuids[nsL]
@@ -179,8 +177,7 @@ func (k *KubernetesGather) getPodGroups() (podGroups []model.PodGroup, err error
 					k.nsLabelToGroupLcuuids[nsL] = nsGIDsSet
 				}
 			}
-			labelSlice := cloudcommon.StringInterfaceMapKVs(labels, ":", 0)
-			labelString := strings.Join(labelSlice, ", ")
+
 			containers := cData.Get("spec").Get("template").Get("spec").Get("containers")
 			for i := range containers.MustArray() {
 				container := containers.GetIndex(i)
@@ -200,13 +197,13 @@ func (k *KubernetesGather) getPodGroups() (podGroups []model.PodGroup, err error
 			podGroup := model.PodGroup{
 				Lcuuid:             uID,
 				Name:               name,
-				Label:              labelString,
+				Label:              k.GetLabel(labels),
 				Type:               serviceType,
 				PodNum:             replicas,
 				PodNamespaceLcuuid: namespaceLcuuid,
 				AZLcuuid:           k.azLcuuid,
-				RegionLcuuid:       k.RegionUuid,
-				PodClusterLcuuid:   common.GetUUID(k.UuidGenerate, uuid.Nil),
+				RegionLcuuid:       k.RegionUUID,
+				PodClusterLcuuid:   k.podClusterLcuuid,
 			}
 			podGroups = append(podGroups, podGroup)
 			k.podGroupLcuuids.Add(uID)
@@ -262,7 +259,7 @@ func (k *KubernetesGather) getPodReplicationControllers() (podRCs []model.PodGro
 		for key, v := range labels {
 			vString, ok := v.(string)
 			if !ok {
-				vString = ""
+				continue
 			}
 			nsLabel := namespace + key + "_" + vString
 			_, ok = k.nsLabelToGroupLcuuids[nsLabel]
@@ -290,19 +287,18 @@ func (k *KubernetesGather) getPodReplicationControllers() (podRCs []model.PodGro
 				podTargetPorts[cPortName] = cPort.Get("containerPort").MustInt()
 			}
 		}
-		labelSlice := cloudcommon.StringInterfaceMapKVs(labels, ":", 0)
-		labelString := strings.Join(labelSlice, ", ")
+
 		podNum := rData.Get("spec").Get("replicas").MustInt()
 		podRC := model.PodGroup{
 			Lcuuid:             uID,
 			Name:               name,
-			Label:              labelString,
+			Label:              k.GetLabel(labels),
 			Type:               serviceType,
 			PodNum:             podNum,
-			RegionLcuuid:       k.RegionUuid,
+			RegionLcuuid:       k.RegionUUID,
 			AZLcuuid:           k.azLcuuid,
 			PodNamespaceLcuuid: namespaceLcuuid,
-			PodClusterLcuuid:   common.GetUUID(k.UuidGenerate, uuid.Nil),
+			PodClusterLcuuid:   k.podClusterLcuuid,
 		}
 		podRCs = append(podRCs, podRC)
 		k.podGroupLcuuids.Add(uID)

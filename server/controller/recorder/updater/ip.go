@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,9 +18,9 @@ package updater
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/common"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
-	rcommon "github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 )
 
 type IP struct {
@@ -30,7 +30,7 @@ type IP struct {
 	lanIPUpdater *LANIP
 }
 
-func NewIP(cache *cache.Cache, cloudData []cloudmodel.IP, domainToolDataSet *cache.ToolDataSet) *IP {
+func NewIP(cache *cache.Cache, cloudData []cloudmodel.IP, domainToolDataSet *tool.DataSet) *IP {
 	return &IP{
 		cache:        cache,
 		cloudData:    cloudData,
@@ -66,6 +66,10 @@ func (i *IP) GetChanged() bool {
 	return i.wanIPUpdater.Changed || i.lanIPUpdater.Changed
 }
 
+func (i *IP) GetResourceType() string {
+	return ctrlrcommon.RESOURCE_TYPE_IP_EN
+}
+
 func (i *IP) GetMySQLModelString() []string {
 	return []string{i.wanIPUpdater.GetMySQLModelString()[0], i.lanIPUpdater.GetMySQLModelString()[0]}
 }
@@ -77,12 +81,12 @@ func (i *IP) splitToWANAndLAN(cloudData []cloudmodel.IP) ([]cloudmodel.IP, []clo
 		vt, exists := i.cache.ToolDataSet.GetVInterfaceTypeByLcuuid(cloudItem.VInterfaceLcuuid)
 		if !exists {
 			log.Error(resourceAForResourceBNotFound(
-				rcommon.RESOURCE_TYPE_VINTERFACE_EN, cloudItem.VInterfaceLcuuid,
+				ctrlrcommon.RESOURCE_TYPE_VINTERFACE_EN, cloudItem.VInterfaceLcuuid,
 				"cloud ip", cloudItem.Lcuuid,
 			))
 			continue
 		}
-		if vt == common.VIF_TYPE_WAN {
+		if vt == ctrlrcommon.VIF_TYPE_WAN {
 			wanCloudData = append(wanCloudData, cloudItem)
 		} else {
 			lanCloudData = append(lanCloudData, cloudItem)

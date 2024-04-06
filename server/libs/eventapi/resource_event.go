@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -53,6 +53,7 @@ type ResourceEvent struct {
 	PodNodeID    uint32
 	PodServiceID uint32
 	PodGroupID   uint32
+	PodGroupType uint8
 	PodID        uint32
 	SubnetID     uint32
 	IP           string

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package clickhouse
 
 import (
 	"context"
+
 	"github.com/deepflowio/deepflow/server/querier/common"
 	chCommon "github.com/deepflowio/deepflow/server/querier/engine/clickhouse/common"
 )
@@ -33,21 +34,18 @@ func GetDatabases() *common.Result {
 	}
 }
 
-func GetTables(db string, ctx context.Context) *common.Result {
+func GetTables(db, queryCacheTTL string, useQueryCache bool, ctx context.Context) *common.Result {
 	var values []interface{}
 	tables, ok := chCommon.DB_TABLE_MAP[db]
 	if !ok {
 		return nil
 	}
 	if db == "ext_metrics" || db == "deepflow_system" {
-		values = append(values, chCommon.GetExtTables(db, ctx)...)
+		values = append(values, chCommon.GetExtTables(db, queryCacheTTL, useQueryCache, ctx)...)
 	} else if db == chCommon.DB_NAME_PROMETHEUS {
-		values = append(values, chCommon.GetPrometheusTables(db, ctx)...)
+		values = append(values, chCommon.GetPrometheusTables(db, queryCacheTTL, useQueryCache, ctx)...)
 	} else {
 		for _, table := range tables {
-			if table == "vtap_acl" {
-				continue
-			}
 			datasource, err := chCommon.GetDatasources(db, table)
 			if err != nil {
 				log.Error(err)

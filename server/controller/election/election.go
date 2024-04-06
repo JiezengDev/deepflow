@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,8 +36,22 @@ import (
 
 	"github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/config"
+	"github.com/deepflowio/deepflow/server/controller/trisolaris/utils"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/utils/atomicbool"
 )
+
+var (
+	acquireTime = int64(0)
+	startTime   = time.Now().Unix()
+)
+
+func GetAcquireTime() int64 {
+	if common.IsStandaloneRunningMode() {
+		// in standalone mode, the local machine is the master node because of all in one deployment
+		return startTime
+	}
+	return acquireTime
+}
 
 const (
 	ID_ITEM_NUM = 4
@@ -100,6 +114,10 @@ func getID() string {
 }
 
 func GetLeader() string {
+	if common.IsStandaloneRunningMode() {
+		// in standalone mode, the local machine is the master node because of all in one deployment
+		return getID()
+	}
 	return leaderData.GetLeader()
 }
 
@@ -142,6 +160,7 @@ func checkLeaderValid(ctx context.Context, lock *resourcelock.LeaseLock) {
 				continue
 			}
 			if !record.RenewTime.Equal(&observedTime) {
+				acquireTime = record.AcquireTime.Unix()
 				leaderData.setValide()
 				leaderData.SetLeader(record.HolderIdentity)
 				log.Infof("check leader finish, leader is %s", record.HolderIdentity)
@@ -194,9 +213,9 @@ func Start(ctx context.Context, cfg *config.ControllerConfig) {
 		// get elected before your background loop finished, violating
 		// the stated goal of the lease.
 		ReleaseOnCancel: true,
-		LeaseDuration:   60 * time.Second,
-		RenewDeadline:   15 * time.Second,
-		RetryPeriod:     5 * time.Second,
+		LeaseDuration:   15 * time.Second,
+		RenewDeadline:   10 * time.Second,
+		RetryPeriod:     2 * time.Second,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
 				// we're notified when we start - this is where you would
@@ -223,5 +242,8 @@ func Start(ctx context.Context, cfg *config.ControllerConfig) {
 		time.Sleep(1 * time.Second)
 		os.Exit(1)
 	}
+	wg := utils.GetWaitGroupInCtx(ctx)
+	wg.Add(1)
+	defer wg.Done()
 	wait.UntilWithContext(ctx, le.Run, 0)
 }

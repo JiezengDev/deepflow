@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,31 +17,59 @@
 package updater
 
 import (
+	"encoding/json"
+
+	cloudcommon "github.com/deepflowio/deepflow/server/controller/cloud/common"
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
-	"github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type PodNamespace struct {
-	UpdaterBase[cloudmodel.PodNamespace, mysql.PodNamespace, *cache.PodNamespace]
+	UpdaterBase[
+		cloudmodel.PodNamespace,
+		mysql.PodNamespace,
+		*diffbase.PodNamespace,
+		*message.PodNamespaceAdd,
+		message.PodNamespaceAdd,
+		*message.PodNamespaceUpdate,
+		message.PodNamespaceUpdate,
+		*message.PodNamespaceFieldsUpdate,
+		message.PodNamespaceFieldsUpdate,
+		*message.PodNamespaceDelete,
+		message.PodNamespaceDelete]
 }
 
 func NewPodNamespace(wholeCache *cache.Cache, cloudData []cloudmodel.PodNamespace) *PodNamespace {
 	updater := &PodNamespace{
-		UpdaterBase[cloudmodel.PodNamespace, mysql.PodNamespace, *cache.PodNamespace]{
-			cache:        wholeCache,
-			dbOperator:   db.NewPodNamespace(),
-			diffBaseData: wholeCache.PodNamespaces,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.PodNamespace,
+			mysql.PodNamespace,
+			*diffbase.PodNamespace,
+			*message.PodNamespaceAdd,
+			message.PodNamespaceAdd,
+			*message.PodNamespaceUpdate,
+			message.PodNamespaceUpdate,
+			*message.PodNamespaceFieldsUpdate,
+			message.PodNamespaceFieldsUpdate,
+			*message.PodNamespaceDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_POD_NAMESPACE_EN,
+			wholeCache,
+			db.NewPodNamespace().SetORG(wholeCache.GetORG()),
+			wholeCache.DiffBaseDataSet.PodNamespaces,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
 }
 
-func (n *PodNamespace) getDiffBaseByCloudItem(cloudItem *cloudmodel.PodNamespace) (diffBase *cache.PodNamespace, exists bool) {
+func (n *PodNamespace) getDiffBaseByCloudItem(cloudItem *cloudmodel.PodNamespace) (diffBase *diffbase.PodNamespace, exists bool) {
 	diffBase, exists = n.diffBaseData[cloudItem.Lcuuid]
 	return
 }
@@ -49,11 +77,15 @@ func (n *PodNamespace) getDiffBaseByCloudItem(cloudItem *cloudmodel.PodNamespace
 func (n *PodNamespace) generateDBItemToAdd(cloudItem *cloudmodel.PodNamespace) (*mysql.PodNamespace, bool) {
 	podClusterID, exists := n.cache.ToolDataSet.GetPodClusterIDByLcuuid(cloudItem.PodClusterLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
-			common.RESOURCE_TYPE_POD_CLUSTER_EN, cloudItem.PodClusterLcuuid,
-			common.RESOURCE_TYPE_POD_NAMESPACE_EN, cloudItem.Lcuuid,
-		))
+		log.Error(n.org.LogPre(resourceAForResourceBNotFound(
+			ctrlrcommon.RESOURCE_TYPE_POD_CLUSTER_EN, cloudItem.PodClusterLcuuid,
+			ctrlrcommon.RESOURCE_TYPE_POD_NAMESPACE_EN, cloudItem.Lcuuid,
+		)))
 		return nil, false
+	}
+	cloudTags := map[string]string{}
+	if cloudItem.CloudTags != nil {
+		cloudTags = cloudItem.CloudTags
 	}
 	dbItem := &mysql.PodNamespace{
 		Name:         cloudItem.Name,
@@ -62,26 +94,32 @@ func (n *PodNamespace) generateDBItemToAdd(cloudItem *cloudmodel.PodNamespace) (
 		Domain:       n.cache.DomainLcuuid,
 		Region:       cloudItem.RegionLcuuid,
 		AZ:           cloudItem.AZLcuuid,
-		CloudTags:    cloudItem.CloudTags,
+		CloudTags:    cloudTags,
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true
 }
 
-func (n *PodNamespace) generateUpdateInfo(diffBase *cache.PodNamespace, cloudItem *cloudmodel.PodNamespace) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (n *PodNamespace) generateUpdateInfo(diffBase *diffbase.PodNamespace, cloudItem *cloudmodel.PodNamespace) (*message.PodNamespaceFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.PodNamespaceFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.RegionLcuuid != cloudItem.RegionLcuuid {
-		updateInfo["region"] = cloudItem.RegionLcuuid
+		mapInfo["region"] = cloudItem.RegionLcuuid
+		structInfo.RegionLcuuid.Set(diffBase.RegionLcuuid, cloudItem.RegionLcuuid)
 	}
 	if diffBase.AZLcuuid != cloudItem.AZLcuuid {
-		updateInfo["az"] = cloudItem.AZLcuuid
+		mapInfo["az"] = cloudItem.AZLcuuid
+		structInfo.AZLcuuid.Set(diffBase.AZLcuuid, cloudItem.AZLcuuid)
 	}
-	if diffBase.CloudTags != cloudItem.CloudTags {
-		updateInfo["cloud_tags"] = cloudItem.CloudTags
+	if cloudcommon.DiffMap(diffBase.CloudTags, cloudItem.CloudTags) {
+		updateTags := map[string]string{}
+		if cloudItem.CloudTags != nil {
+			updateTags = cloudItem.CloudTags
+		}
+		tagsJson, _ := json.Marshal(updateTags)
+		mapInfo["cloud_tags"] = tagsJson
+		structInfo.CloudTags.Set(diffBase.CloudTags, cloudItem.CloudTags)
 	}
 
-	if len(updateInfo) > 0 {
-		return updateInfo, true
-	}
-	return nil, false
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

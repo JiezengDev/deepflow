@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-use std::io;
-use std::net::ToSocketAddrs;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Weak,
@@ -24,8 +22,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use log::{debug, error, info};
+use md5::{Digest, Md5};
 use parking_lot::RwLock;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 
 use crate::{
     common::{DEFAULT_CONTROLLER_PORT, DEFAULT_CONTROLLER_TLS_PORT},
@@ -33,6 +32,7 @@ use crate::{
     trident::AgentId,
     utils::stats::{self, AtomicTimeStats, StatsOption},
 };
+use grpc::dial as grpc_dial;
 use public::proto::trident::{self, Exception, Status};
 use public::{
     counter::{Countable, Counter, CounterType, CounterValue, RefCountable},
@@ -73,7 +73,7 @@ struct Config {
     proxy_ip: Option<String>,
     proxy_port: u16,
     timeout: Duration,
-    controller_cert_file_prefix: String,
+    enable_tls: bool,
 }
 
 impl Default for Config {
@@ -85,7 +85,7 @@ impl Default for Config {
             tls_port: DEFAULT_CONTROLLER_TLS_PORT,
             proxy_port: DEFAULT_CONTROLLER_PORT,
             timeout: DEFAULT_TIMEOUT,
-            controller_cert_file_prefix: "".to_string(),
+            enable_tls: false,
         }
     }
 }
@@ -95,7 +95,7 @@ impl Config {
         if is_proxy {
             return self.proxy_port;
         }
-        if self.controller_cert_file_prefix.len() > 0 {
+        if self.enable_tls {
             return self.tls_port;
         }
         return self.port;
@@ -112,6 +112,7 @@ impl Config {
 
 pub struct Session {
     config: Arc<RwLock<Config>>,
+    controller_cert_file_prefix: String,
 
     server_dispatcher: RwLock<ServerDispatcher>,
 
@@ -210,7 +211,7 @@ impl Session {
             port,
             tls_port,
             timeout,
-            controller_cert_file_prefix,
+            enable_tls: controller_cert_file_prefix.len() > 0,
             ..Default::default()
         }));
 
@@ -221,6 +222,7 @@ impl Session {
             client: RwLock::new(None),
             exception_handler,
             counters,
+            controller_cert_file_prefix,
         }
     }
 
@@ -235,45 +237,13 @@ impl Session {
         self.server_dispatcher.write().reset();
     }
 
-    async fn dial(&self, remote: &str, remote_port: u16) {
-        // TODO: tls
-        let socket_address = match (remote, remote_port)
-            .to_socket_addrs()
-            .and_then(|mut iter| {
-                iter.next()
-                    .ok_or(io::Error::new(io::ErrorKind::InvalidData, "result is empty").into())
-            }) {
-            Ok(addr) => addr,
-            Err(e) => {
-                self.exception_handler.set(Exception::ControllerSocketError);
-                self.set_request_failed(true);
-                error!(
-                    "resolve socket address remote({}) port({}) failed: {}",
-                    remote, remote_port, e
-                );
-                return;
-            }
-        };
-        let endpoint = match Endpoint::from_shared(format!("http://{}", socket_address)) {
-            Ok(ep) => ep,
-            Err(e) => {
-                self.exception_handler.set(Exception::ControllerSocketError);
-                self.set_request_failed(true);
-                error!("create endpoint http://{} failed {}", socket_address, e);
-                return;
-            }
-        };
-        match endpoint
-            .connect_timeout(DEFAULT_TIMEOUT)
-            .timeout(SESSION_TIMEOUT)
-            .connect()
-            .await
-        {
+    async fn dial(&self, remote: &str, remote_port: u16, controller_cert_file_prefix: String) {
+        match grpc_dial(remote, remote_port, controller_cert_file_prefix).await {
             Ok(channel) => *self.client.write() = Some(channel),
             Err(e) => {
                 self.exception_handler.set(Exception::ControllerSocketError);
                 self.set_request_failed(true);
-                error!("dial server({} {}) failed {}", remote, remote_port, e);
+                error!("{}", e);
             }
         }
     }
@@ -290,7 +260,8 @@ impl Session {
         let changed = self.server_dispatcher.write().update_current_ip();
         if changed || self.get_client().is_none() {
             let (ip, port) = self.server_dispatcher.read().get_current_ip();
-            self.dial(&ip, port).await;
+            self.dial(&ip, port, self.controller_cert_file_prefix.clone())
+                .await;
             self.version.fetch_add(1, Ordering::SeqCst);
         }
         changed
@@ -454,12 +425,14 @@ impl Session {
                 ctrl_mac: Some(agent_id.mac.to_string()),
                 plugin_type: Some(plugin_type as i32),
                 plugin_name: Some(name.into()),
+                team_id: Some(agent_id.team_id.clone()),
             })
             .await?;
 
         let mut data = vec![];
         let mut msg = s.into_inner();
         let mut total_len = 0u64;
+        let mut msg_md5 = String::new();
         while let Some(message) = msg.message().await? {
             if message.status.unwrap_or_default() != Status::Success as i32 {
                 return Err(anyhow!("fetch wasm prog fail, server return non success"));
@@ -468,10 +441,29 @@ impl Session {
                 data.extend(d);
             }
             total_len = message.total_len.unwrap_or_default();
+            if msg_md5.is_empty() {
+                msg_md5 = message.md5.unwrap_or_default();
+            }
         }
         if data.is_empty() || data.len() != total_len as usize {
             return Err(anyhow!("fetch wasm prog fail, length incorrect"));
         }
+        let md5_digest = Md5::new().chain_update(&data[..]).finalize();
+        match hex::decode(msg_md5.as_bytes()) {
+            Ok(bs) if &bs[..] != md5_digest.as_slice() => {
+                return Err(anyhow!("fetch wasm prog fail, md5 checksum incorrect"))
+            }
+            Err(_) => {
+                return Err(anyhow!(
+                    "fetch wasm prog fail, invalid md5 checksum in message"
+                ))
+            }
+            _ => (),
+        }
+        debug!(
+            "pulled {:?} plugin {} with len {} checksum {}",
+            plugin_type, name, total_len, msg_md5
+        );
         Ok(data)
     }
 

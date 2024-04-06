@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,18 +21,18 @@ import (
 )
 
 type ChTapType struct {
-	UpdaterBase[mysql.ChTapType, TapTypeKey]
+	UpdaterComponent[mysql.ChTapType, TapTypeKey]
 	resourceTypeToIconID map[IconKey]int
 }
 
 func NewChTapType(resourceTypeToIconID map[IconKey]int) *ChTapType {
 	updater := &ChTapType{
-		UpdaterBase[mysql.ChTapType, TapTypeKey]{
-			resourceTypeName: RESOURCE_TYPE_TAP_TYPE,
-		},
+		newUpdaterComponent[mysql.ChTapType, TapTypeKey](
+			RESOURCE_TYPE_TAP_TYPE,
+		),
 		resourceTypeToIconID,
 	}
-	updater.dataGenerator = updater
+	updater.updaterDG = updater
 	return updater
 }
 

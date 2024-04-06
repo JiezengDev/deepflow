@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,13 +14,13 @@
  * limitations under the License.
  */
 
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, RwLock,
 };
 
+use ahash::AHashMap;
 use log::{debug, warn};
 use pnet::datalink;
 use public::enums::IpProtocol;
@@ -37,11 +37,11 @@ use crate::common::flow::{PacketDirection, SignalSource};
 use crate::common::lookup_key::LookupKey;
 use crate::common::platform_data::PlatformData;
 use crate::common::policy::{
-    gpid_key, Acl, Cidr, GpidEntry, GpidProtocol, IpGroupData, PeerConnection,
+    gpid_key, Acl, Cidr, Container, GpidEntry, GpidProtocol, IpGroupData, PeerConnection,
 };
-use crate::common::FlowAclListener;
 use crate::common::MetaPacket;
 use crate::common::TapPort;
+use crate::common::{FlowAclListener, FlowAclListenerId};
 use npb_pcap_policy::PolicyData;
 use public::proto::common::TridentType;
 use public::proto::trident::RoleType;
@@ -62,7 +62,7 @@ impl PolicyMonitor {
     ) {
         if self.enabled.load(Ordering::Relaxed) {
             let _ = self.sender.send(format!(
-                "{}\n\t{:?}\n\t{:?}\n\tSOCKET: {:?}",
+                "{}\n\t{:?}\n\t{}\n\tSOCKET: {:?}",
                 key, endpoints, policy, gpid_entries,
             ));
         }
@@ -92,9 +92,8 @@ pub struct Policy {
     table: FirstPath,
     forward: Forward,
 
-    nat: RwLock<Vec<HashMap<u128, GpidEntry>>>,
+    nat: RwLock<Vec<AHashMap<u128, GpidEntry>>>,
 
-    queue_count: usize,
     first_hit: usize,
     fast_hit: usize,
 
@@ -115,8 +114,7 @@ impl Policy {
             labeler: Labeler::default(),
             table: FirstPath::new(queue_count, level, map_size, fast_disable),
             forward: Forward::new(queue_count, forward_capacity),
-            nat: RwLock::new(vec![HashMap::new(), HashMap::new()]),
-            queue_count,
+            nat: RwLock::new(vec![AHashMap::new(), AHashMap::new()]),
             first_hit: 0,
             fast_hit: 0,
             monitor: None,
@@ -383,6 +381,10 @@ impl Policy {
         (endpoints, entry)
     }
 
+    pub fn lookup_pod_id(&self, container_id: &String) -> u32 {
+        self.labeler.lookup_pod_id(container_id)
+    }
+
     pub fn update_interfaces(
         &mut self,
         trident_type: TridentType,
@@ -412,6 +414,10 @@ impl Policy {
         self.labeler.update_cidr_table(cidrs);
     }
 
+    pub fn update_container(&mut self, cidrs: &Vec<Arc<Container>>) {
+        self.labeler.update_container(cidrs);
+    }
+
     pub fn update_acl(&mut self, acls: &Vec<Arc<Acl>>, check: bool) -> PResult<()> {
         self.table.update_acl(acls, check)?;
 
@@ -421,7 +427,7 @@ impl Policy {
     }
 
     fn lookup_gpid_entry(&self, key: &mut LookupKey, _endpoints: &EndpointData) -> GpidEntry {
-        if !key.is_ipv4() || (key.proto != IpProtocol::Udp && key.proto != IpProtocol::Tcp) {
+        if !key.is_ipv4() || (key.proto != IpProtocol::UDP && key.proto != IpProtocol::TCP) {
             return GpidEntry::default();
         }
         let protocol = u8::from(GpidProtocol::try_from(key.proto).unwrap()) as usize;
@@ -462,8 +468,8 @@ impl Policy {
 
     pub fn update_gpids(&mut self, gpid_entries: &Vec<GpidEntry>) {
         let mut table = vec![
-            HashMap::with_capacity(gpid_entries.len()),
-            HashMap::with_capacity(gpid_entries.len() >> 2),
+            AHashMap::with_capacity(gpid_entries.len()),
+            AHashMap::with_capacity(gpid_entries.len() >> 2),
         ];
         for gpid_entry in gpid_entries.iter() {
             let protocol = u8::from(gpid_entry.protocol) as usize;
@@ -503,6 +509,10 @@ impl Policy {
     pub fn set_memory_limit(&self, limit: u64) {
         self.table.set_memory_limit(limit);
     }
+
+    pub fn reset_queue_size(&mut self, queue_count: usize) {
+        self.table.reset_queue_size(queue_count);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -539,6 +549,10 @@ impl PolicyGetter {
 
     pub fn lookup_epc_by_epc(&mut self, src: IpAddr, dst: IpAddr, l3_epc_id_src: i32) -> i32 {
         self.policy().lookup_epc_by_epc(src, dst, l3_epc_id_src)
+    }
+
+    pub fn lookup_pod_id(&self, container_id: &String) -> u32 {
+        self.policy().lookup_pod_id(container_id)
     }
 }
 
@@ -589,19 +603,18 @@ impl FlowAclListener for PolicySetter {
         Ok(())
     }
 
-    // TODO: 用于区别于不同的FlowAclListener
+    fn containers_change(&mut self, containers: &Vec<Arc<Container>>) {
+        self.update_container(containers);
+    }
+
     fn id(&self) -> usize {
-        return 0;
+        u16::from(FlowAclListenerId::Policy) as usize
     }
 }
 
 impl PolicySetter {
     fn policy(&self) -> &mut Policy {
         unsafe { &mut *self.policy }
-    }
-
-    pub fn update_map_size(&mut self, map_size: usize) {
-        self.policy().table.update_map_size(map_size);
     }
 
     pub fn update_local_epc(&mut self, local_epc: i32) {
@@ -626,6 +639,10 @@ impl PolicySetter {
 
     pub fn update_cidr(&mut self, cidrs: &Vec<Arc<Cidr>>) {
         self.policy().update_cidr(cidrs);
+    }
+
+    pub fn update_container(&mut self, containers: &Vec<Arc<Container>>) {
+        self.policy().update_container(containers);
     }
 
     pub fn update_acl(&mut self, acls: &Vec<Arc<Acl>>, check: bool) -> PResult<()> {
@@ -660,6 +677,10 @@ impl PolicySetter {
 
     pub fn set_memory_limit(&self, limit: u64) {
         self.policy().set_memory_limit(limit)
+    }
+
+    pub fn reset_queue_size(&self, queue_count: usize) {
+        self.policy().reset_queue_size(queue_count);
     }
 }
 
@@ -710,7 +731,7 @@ mod test {
         let result = getter.lookup_all_by_key(&mut key);
         assert_eq!(result.is_some(), true);
         if let Some((p, e, _)) = result {
-            assert_eq!(Arc::strong_count(&p), 1);
+            assert_eq!(Arc::strong_count(&p), 2);
             assert_eq!(2, e.src_info.l3_epc_id);
             assert_eq!(10, e.dst_info.l3_epc_id);
         }

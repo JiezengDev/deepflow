@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 use serde::Serialize;
 
 use super::pb_adapter::{ExtendedInfo, L7ProtocolSendLog, L7Request, L7Response};
@@ -24,6 +25,7 @@ use crate::{
         enums::IpProtocol,
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
         l7_protocol_log::{L7ProtocolParserInterface, ParseParam},
+        meta_packet::EbpfFlags,
         IPV4_ADDR_LEN, IPV6_ADDR_LEN,
     },
     flow_generator::error::{Error, Result},
@@ -65,7 +67,10 @@ impl L7ProtocolInfoInterface for DnsInfo {
         Some(self.trans_id as u32)
     }
 
-    fn merge_log(&mut self, other: crate::common::l7_protocol_info::L7ProtocolInfo) -> Result<()> {
+    fn merge_log(
+        &mut self,
+        other: &mut crate::common::l7_protocol_info::L7ProtocolInfo,
+    ) -> Result<()> {
         if let L7ProtocolInfo::DnsInfo(other) = other {
             self.merge(other);
         }
@@ -83,11 +88,25 @@ impl L7ProtocolInfoInterface for DnsInfo {
     fn is_tls(&self) -> bool {
         self.is_tls
     }
+
+    fn get_endpoint(&self) -> Option<String> {
+        if self.query_name.is_empty() {
+            return None;
+        }
+        Some(self.query_name.clone())
+    }
+
+    fn get_request_resource_length(&self) -> usize {
+        self.query_name.len()
+    }
 }
 
 impl DnsInfo {
-    pub fn merge(&mut self, other: Self) {
-        self.answers = other.answers;
+    const QUERY_IPV4: u16 = 1;
+    const QUERY_IPV6: u16 = 28;
+
+    pub fn merge(&mut self, other: &mut Self) {
+        std::mem::swap(&mut self.answers, &mut other.answers);
         if other.status != L7ResponseStatus::default() {
             self.status = other.status;
         }
@@ -97,6 +116,10 @@ impl DnsInfo {
                 self.status_code = Some(code);
             }
         }
+    }
+
+    fn is_query_address(&self) -> bool {
+        self.domain_type == Self::QUERY_IPV4 || self.domain_type == Self::QUERY_IPV6
     }
 
     pub fn get_domain_str(&self) -> &'static str {
@@ -120,10 +143,21 @@ impl DnsInfo {
 impl From<DnsInfo> for L7ProtocolSendLog {
     fn from(f: DnsInfo) -> Self {
         let req_type = String::from(f.get_domain_str());
+        let flags = if f.is_tls {
+            EbpfFlags::TLS.bits()
+        } else {
+            EbpfFlags::NONE.bits()
+        };
         let log = L7ProtocolSendLog {
             req: L7Request {
                 req_type,
-                resource: f.query_name,
+                resource: f.query_name.clone(),
+                domain: if f.is_query_address() {
+                    f.query_name.clone()
+                } else {
+                    String::new()
+                },
+                endpoint: f.query_name,
                 ..Default::default()
             },
             resp: L7Response {
@@ -136,6 +170,7 @@ impl From<DnsInfo> for L7ProtocolSendLog {
                 request_id: Some(f.trans_id as u32),
                 ..Default::default()
             }),
+            flags,
             ..Default::default()
         };
 
@@ -143,7 +178,7 @@ impl From<DnsInfo> for L7ProtocolSendLog {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Default)]
 pub struct DnsLog {
     perf_stats: Option<L7PerfStats>,
 }
@@ -155,7 +190,9 @@ impl L7ProtocolParserInterface for DnsLog {
             return false;
         }
         let mut info = DnsInfo::default();
-        self.parse(payload, &mut info, param).is_ok() && info.msg_type == LogMessageType::Request
+        self.parse(payload, &mut info, param).is_ok()
+            && info.msg_type == LogMessageType::Request
+            && !info.query_name.is_empty()
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
@@ -165,6 +202,7 @@ impl L7ProtocolParserInterface for DnsLog {
             info.rrt = rrt;
             self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
         });
+        info.is_tls = param.is_tls();
         if param.parse_log {
             Ok(L7ParseResult::Single(L7ProtocolInfo::DnsInfo(info)))
         } else {
@@ -452,8 +490,8 @@ impl DnsLog {
             self.perf_stats = Some(L7PerfStats::default())
         };
         match proto {
-            IpProtocol::Udp => self.decode_payload(payload, info),
-            IpProtocol::Tcp => {
+            IpProtocol::UDP => self.decode_payload(payload, info),
+            IpProtocol::TCP => {
                 if payload.len() <= DNS_TCP_PAYLOAD_OFFSET {
                     let err_msg = format!("dns payload length error:{}", payload.len());
                     return Err(Error::DNSLogParseFailed(err_msg));
@@ -517,19 +555,27 @@ mod tests {
             };
 
             let mut dns = DnsLog::default();
-            let param = &ParseParam::new(packet as &MetaPacket, log_cache.clone(), true, true);
+            let param = &ParseParam::new(
+                packet as &MetaPacket,
+                log_cache.clone(),
+                Default::default(),
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Default::default(),
+                true,
+                true,
+            );
             let is_dns = dns.check_payload(payload, param);
             dns.reset();
             let info = dns.parse_payload(payload, param);
             if let Ok(info) = info {
                 match info.unwrap_single() {
                     L7ProtocolInfo::DnsInfo(i) => {
-                        output.push_str(&format!("{:?} is_dns: {}\r\n", i, is_dns));
+                        output.push_str(&format!("{:?} is_dns: {}\n", i, is_dns));
                     }
                     _ => unreachable!(),
                 }
             } else {
-                output.push_str(&format!("{:?} is_dns: {}\r\n", DnsInfo::default(), is_dns));
+                output.push_str(&format!("{:?} is_dns: {}\n", DnsInfo::default(), is_dns));
             }
         }
         output
@@ -572,6 +618,7 @@ mod tests {
                 rrt_count: 2,
                 rrt_sum: 181558,
                 rrt_max: 176754,
+                ..Default::default()
             },
         )];
 
@@ -598,7 +645,15 @@ mod tests {
             }
             let _ = dns.parse_payload(
                 packet.get_l4_payload().unwrap(),
-                &ParseParam::new(&*packet, rrt_cache.clone(), true, true),
+                &ParseParam::new(
+                    &*packet,
+                    rrt_cache.clone(),
+                    Default::default(),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    Default::default(),
+                    true,
+                    true,
+                ),
             );
         }
         dns.perf_stats.unwrap()

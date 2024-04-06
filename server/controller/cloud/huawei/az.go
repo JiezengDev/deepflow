@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,11 +27,10 @@ import (
 func (h *HuaWei) getAZs() ([]model.AZ, error) {
 	var azs []model.AZ
 	for project, token := range h.projectTokenMap {
-		jAZs, err := h.getRawData(
-			fmt.Sprintf("https://ecs.%s.%s/v2.1/%s/os-availability-zone", project.name, h.config.Domain, project.id), token.token, "availabilityZoneInfo",
-		)
+		jAZs, err := h.getRawData(newRawDataGetContext(
+			fmt.Sprintf("https://ecs.%s.%s/v2.1/%s/os-availability-zone", project.name, h.config.Domain, project.id), token.token, "availabilityZoneInfo", pageQueryMethodNotPage,
+		))
 		if err != nil {
-			log.Errorf("request failed: %v", err)
 			return nil, err
 		}
 

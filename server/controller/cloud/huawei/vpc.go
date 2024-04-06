@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,11 +30,10 @@ func (h *HuaWei) getVPCs() ([]model.VPC, []model.VRouter, []model.RoutingTable, 
 	var vrouters []model.VRouter
 	var routingTables []model.RoutingTable
 	for project, token := range h.projectTokenMap {
-		jvpcs, err := h.getRawData(
-			fmt.Sprintf("https://vpc.%s.%s/v1/%s/vpcs", project.name, h.config.Domain, project.id), token.token, "vpcs",
-		)
+		jvpcs, err := h.getRawData(newRawDataGetContext(
+			fmt.Sprintf("https://vpc.%s.%s/v1/%s/vpcs", project.name, h.config.Domain, project.id), token.token, "vpcs", pageQueryMethodMarker,
+		))
 		if err != nil {
-			log.Errorf("request failed: %v", err)
 			return nil, nil, nil, err
 		}
 
@@ -118,11 +117,10 @@ func (h *HuaWei) formatRoutingTables(jVPC *simplejson.Json, vpcLcuuid, vrouterLc
 }
 
 func (h *HuaWei) getPartialRoutingTables(projectName, token string) (routingTables []model.RoutingTable, err error) {
-	jRoutes, err := h.getRawData(
-		fmt.Sprintf("https://vpc.%s.%s/v2.0/vpc/routes", projectName, h.config.Domain), token, "routes",
-	)
+	jRoutes, err := h.getRawData(newRawDataGetContext(
+		fmt.Sprintf("https://vpc.%s.%s/v2.0/vpc/routes", projectName, h.config.Domain), token, "routes", pageQueryMethodMarker,
+	))
 	if err != nil {
-		log.Errorf("request failed: %v", err)
 		return
 	}
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,14 +17,26 @@
 package common
 
 import (
+	"bytes"
+	"compress/zlib"
+	"crypto/tls"
 	. "encoding/binary"
 	"encoding/csv"
 	"encoding/xml"
+	"errors"
+	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
+
+	simplejson "github.com/bitly/go-simplejson"
+	"gopkg.in/yaml.v3"
+	"inet.af/netaddr"
 
 	"github.com/deepflowio/deepflow/server/controller/common"
 )
@@ -132,6 +144,15 @@ type XMLVM struct {
 	Label      string
 	VPC        XMLVPC
 	Interfaces []XMLInterface
+}
+
+type scrapeConfig struct {
+	JobName     string `yaml:"job_name"`
+	HonorLabels bool   `yaml:"honor_labels"`
+}
+
+type prometheusConfig struct {
+	ScrapeConfigs []scrapeConfig `yaml:"scrape_configs"`
 }
 
 var IfaceRegex = regexp.MustCompile("^(\\d+):\\s+([^@:]+)(@.*)?\\:")
@@ -389,8 +410,87 @@ func ParseVMXml(s string) ([]XMLVM, error) {
 	return vms, nil
 }
 
+func ParseYMAL(y string) (prometheusConfig, error) {
+	pConfig := prometheusConfig{}
+	err := yaml.Unmarshal([]byte(y), &pConfig)
+	if err != nil {
+		return prometheusConfig{}, err
+	}
+	return pConfig, nil
+}
+
+func ParseCompressedInfo(cInfo []byte) (bytes.Buffer, error) {
+	reader := bytes.NewReader(cInfo)
+	var out bytes.Buffer
+	r, err := zlib.NewReader(reader)
+	if err != nil {
+		return bytes.Buffer{}, err
+	}
+	_, err = out.ReadFrom(r)
+	if err != nil {
+		return bytes.Buffer{}, err
+	}
+	return out, nil
+}
+
 func Uint64ToMac(v uint64) net.HardwareAddr {
 	bytes := [8]byte{}
 	BigEndian.PutUint64(bytes[:], v)
 	return net.HardwareAddr(bytes[2:])
+}
+
+func IPInRanges(ip string, ipRanges ...netaddr.IPPrefix) bool {
+	ipObj, err := netaddr.ParseIP(ip)
+	if err != nil {
+		return false
+	}
+	for _, ipRange := range ipRanges {
+		if ipRange.Contains(ipObj) {
+			return true
+		}
+	}
+	return false
+}
+
+func RequestGet(url string, timeout int, queryStrings map[string]string) error {
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+		Timeout: time.Duration(timeout) * time.Second,
+	}
+
+	request, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	queryData := request.URL.Query()
+	for k, v := range queryStrings {
+		queryData.Add(k, v)
+	}
+	request.URL.RawQuery = queryData.Encode()
+
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusOK {
+		return errors.New(fmt.Sprintf("http status failed: (%d)", response.StatusCode))
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return err
+	}
+	respJson, err := simplejson.NewJson(body)
+	if err != nil {
+		return errors.New(fmt.Sprintf("response body (%s) serializer to json failed: (%s)", string(body), err.Error()))
+	}
+	optStatus := respJson.Get("OPT_STATUS").MustString()
+	if optStatus != "" && optStatus != "SUCCESS" {
+		description := respJson.Get("DESCRIPTION").MustString()
+		return errors.New(fmt.Sprintf("curl (%s) failed, (%v)", request.URL, description))
+	}
+
+	return nil
 }

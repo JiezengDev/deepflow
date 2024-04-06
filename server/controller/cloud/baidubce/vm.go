@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -51,8 +51,7 @@ func (b *BaiduBce) getVMs(
 			log.Error(err)
 			return nil, nil, nil, err
 		}
-		b.cloudStatsd.APICost["ListInstances"] = append(b.cloudStatsd.APICost["ListInstances"], int(time.Now().Sub(startTime).Milliseconds()))
-		b.cloudStatsd.APICount["ListInstances"] = append(b.cloudStatsd.APICount["ListInstances"], len(result.Instances))
+		b.cloudStatsd.RefreshAPIMoniter("ListInstances", len(result.Instances), startTime)
 		results = append(results, result)
 		if !result.IsTruncated {
 			break
@@ -87,12 +86,23 @@ func (b *BaiduBce) getVMs(
 			} else if vm.Status == "Stopped" {
 				vmState = common.VM_STATE_STOPPED
 			}
+
+			var pIP string
+			for _, nic := range vm.NicInfo.Ips {
+				if nic.Primary == "true" {
+					pIP = nic.PrivateIp
+					break
+				}
+			}
+
 			retVM := model.VM{
 				Lcuuid:       vmLcuuid,
 				Name:         vm.InstanceName,
+				Label:        vm.InstanceId,
 				HType:        common.VM_HTYPE_VM_C,
 				VPCLcuuid:    vpcLcuuid,
 				State:        vmState,
+				IP:           pIP,
 				AZLcuuid:     azLcuuid,
 				RegionLcuuid: region.Lcuuid,
 			}
@@ -199,8 +209,7 @@ func (b *BaiduBce) getVMEnis(
 				log.Error(err)
 				return nil, nil, err
 			}
-			b.cloudStatsd.APICost["ListEni"] = append(b.cloudStatsd.APICost["ListEni"], int(time.Now().Sub(startTime).Milliseconds()))
-			b.cloudStatsd.APICount["ListEni"] = append(b.cloudStatsd.APICount["ListEni"], len(result.Eni))
+			b.cloudStatsd.RefreshAPIMoniter("ListEni", len(result.Eni), startTime)
 			results = append(results, result)
 			if !result.IsTruncated {
 				break

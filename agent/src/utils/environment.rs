@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,25 +16,23 @@
 
 use std::{
     env::{self, VarError},
-    io,
+    fs, io,
     iter::Iterator,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
-    process, thread,
+    thread,
     time::Duration,
 };
 #[cfg(target_os = "windows")]
 use std::{ffi::OsString, os::windows::ffi::OsStringExt, ptr};
-#[cfg(target_os = "linux")]
-use std::{fs, io::Read, os::unix::fs::MetadataExt};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::{io::Read, os::unix::fs::MetadataExt};
 
 use bytesize::ByteSize;
-#[cfg(target_os = "linux")]
-use elf::{file::FileHeader, gabi::ET_CORE};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use log::info;
 use log::{error, warn};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use nom::AsBytes;
 use sysinfo::{DiskExt, System, SystemExt};
 #[cfg(target_os = "windows")]
@@ -44,6 +42,7 @@ use winapi::{
 };
 
 use crate::common::PROCESS_NAME;
+use crate::config::K8S_CA_CRT_PATH;
 use crate::error::{Error, Result};
 use crate::exception::ExceptionHandler;
 use public::proto::{common::TridentType, trident::Exception};
@@ -51,7 +50,7 @@ use public::proto::{common::TridentType, trident::Exception};
 #[cfg(target_os = "windows")]
 use super::process::get_memory_rss;
 use super::process::get_process_num_by_name;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use public::utils::net::get_link_enabled_features;
 use public::utils::net::{
     addr_list, get_mac_by_ip, get_route_src_ip_and_mac, is_global, link_by_name, link_list,
@@ -65,16 +64,17 @@ const K8S_NODE_IP_FOR_DEEPFLOW: &str = "K8S_NODE_IP_FOR_DEEPFLOW";
 const ENV_INTERFACE_NAME: &str = "CTRL_NETWORK_INTERFACE";
 const K8S_POD_IP_FOR_DEEPFLOW: &str = "K8S_POD_IP_FOR_DEEPFLOW";
 const IN_CONTAINER: &str = "IN_CONTAINER";
-const K8S_MEM_LIMIT_FOR_DEEPFLOW: &str = "K8S_MEM_LIMIT_FOR_DEEPFLOW";
+pub const K8S_MEM_LIMIT_FOR_DEEPFLOW: &str = "K8S_MEM_LIMIT_FOR_DEEPFLOW";
+pub const K8S_NODE_NAME_FOR_DEEPFLOW: &str = "K8S_NODE_NAME_FOR_DEEPFLOW";
 const ONLY_WATCH_K8S_RESOURCE: &str = "ONLY_WATCH_K8S_RESOURCE";
 
 const BYTES_PER_MEGABYTE: u64 = 1024 * 1024;
 const MIN_MEMORY_LIMIT_MEGABYTE: u64 = 128; // uint: Megabyte
 const MAX_MEMORY_LIMIT_MEGABYTE: u64 = 100000; // uint: Megabyte
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const CORE_FILE_CONFIG: &str = "/proc/sys/kernel/core_pattern";
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const CORE_FILE_LIMIT: usize = 3;
 const DNS_HOST_IPV4: IpAddr = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
 const DNS_HOST_IPV6: IpAddr = IpAddr::V6(Ipv6Addr::new(0x240c, 0, 0, 0, 0, 0, 0, 0x6666));
@@ -99,7 +99,7 @@ pub fn kernel_check() {
         return;
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         use nix::sys::utsname::uname;
         const RECOMMENDED_KERNEL_VERSION: &str = "4.19.17";
@@ -130,7 +130,7 @@ pub fn tap_interface_check(tap_interfaces: &[String]) {
         return error!("static-config: tap-interfaces is none in analyzer-mode");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     for name in tap_interfaces {
         let features = match get_link_enabled_features(name) {
             Ok(f) => f,
@@ -148,7 +148,7 @@ pub fn tap_interface_check(tap_interfaces: &[String]) {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn free_memory_check(_required: u64, _exception_handler: &ExceptionHandler) -> Result<()> {
     return Ok(()); // fixme: The way to obtain free memory is different in earlier versions of Linux, which requires adaptation
 }
@@ -253,11 +253,10 @@ pub fn controller_ip_check(ips: &[String]) {
         ips
     );
 
-    thread::sleep(Duration::from_secs(1));
-    process::exit(-1);
+    crate::utils::notify_exit(-1);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn core_file_check() {
     let core_path = fs::read(CORE_FILE_CONFIG);
     if core_path.is_err() {
@@ -329,12 +328,12 @@ pub fn core_file_check() {
         let elf_data = &mut elf_data[..n.unwrap()];
 
         // Check whether the file is a core file
-        let elf_header = FileHeader::parse(&mut elf_data.as_bytes());
+        let elf_header = elf::file::FileHeader::parse(&mut elf_data.as_bytes());
         if elf_header.is_err() {
             continue;
         }
         let elf_header = elf_header.unwrap();
-        if elf_header.elftype.0 != ET_CORE {
+        if elf_header.elftype.0 != elf::gabi::ET_CORE {
             continue;
         }
 
@@ -398,8 +397,7 @@ pub fn trident_process_check(process_threshold: u32) {
                     "the number of process exceeds the limit({} > {}), deepflow-agent restart...",
                     num, process_threshold
                 );
-                thread::sleep(Duration::from_secs(1));
-                process::exit(-1);
+                crate::utils::notify_exit(-1);
             }
         }
         Err(e) => {
@@ -459,7 +457,25 @@ pub fn running_in_container() -> bool {
     env::var_os(IN_CONTAINER).is_some()
 }
 
-pub fn k8s_mem_limit_for_deepflow() -> Option<u64> {
+fn running_in_k8s() -> bool {
+    // Judge whether Agent is running in k8s according to the existence of K8S_CA_CRT_PATH
+    fs::metadata(K8S_CA_CRT_PATH).is_ok()
+}
+
+fn container_mem_limit() -> Option<u64> {
+    let limit_files = [
+        "/sys/fs/cgroup/memory.max", // If the docker image uses cgroups v2
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes", // If the docker image uses cgroups v1
+    ];
+
+    limit_files.iter().find_map(|limit_file| {
+        fs::read_to_string(limit_file)
+            .ok()
+            .and_then(|content| content.trim().parse().ok())
+    })
+}
+
+fn k8s_mem_limit() -> Option<u64> {
     // Environment variable "K8S_MEM_LIMIT_FOR_DEEPFLOW" is set from container fields
     // https://kubernetes.io/docs/tasks/inject-data-application/environment-variable-expose-pod-information/#use-container-fields-as-values-for-environment-variables
     env::var(K8S_MEM_LIMIT_FOR_DEEPFLOW).ok().and_then(|v| {
@@ -472,6 +488,14 @@ pub fn k8s_mem_limit_for_deepflow() -> Option<u64> {
             }
         })
     })
+}
+
+pub fn get_container_mem_limit() -> Option<u64> {
+    if running_in_k8s() {
+        k8s_mem_limit()
+    } else {
+        container_mem_limit()
+    }
 }
 
 pub fn get_env() -> String {
@@ -494,13 +518,13 @@ pub fn running_in_only_watch_k8s_mode() -> bool {
     running_in_container() && env::var_os(ONLY_WATCH_K8S_RESOURCE).is_some()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn get_executable_path() -> Result<PathBuf, io::Error> {
     let possible_paths = vec![
         "/proc/self/exe".to_owned(),
         "/proc/curproc/exe".to_owned(),
         "/proc/curproc/file".to_owned(),
-        format!("/proc/{}/path/a.out", process::id()),
+        format!("/proc/{}/path/a.out", std::process::id()),
     ];
     for path in possible_paths {
         if let Ok(path) = fs::read_link(path) {
@@ -544,7 +568,7 @@ pub fn get_mac_by_name(src_interface: String) -> u32 {
     }
 }
 
-pub fn get_ctrl_ip_and_mac(dest: &IpAddr) -> (IpAddr, MacAddr) {
+pub fn get_ctrl_ip_and_mac(dest: &IpAddr) -> Result<(IpAddr, MacAddr)> {
     // Steps to find ctrl ip and mac:
     // 1. If environment variable `ENV_INTERFACE_NAME` exists, use it as ctrl interface
     //    a) Use environment variable `K8S_POD_IP_FOR_DEEPFLOW` as ctrl ip if it exists
@@ -553,9 +577,10 @@ pub fn get_ctrl_ip_and_mac(dest: &IpAddr) -> (IpAddr, MacAddr) {
     // 3. Find ctrl ip and mac from controller address
     if let Ok(name) = env::var(ENV_INTERFACE_NAME) {
         let Ok(link) = link_by_name(&name) else {
-            warn!("interface {} in env {} not found", name, ENV_INTERFACE_NAME);
-            thread::sleep(Duration::from_secs(1));
-            process::exit(-1);
+            return Err(Error::Environment(format!(
+                "interface {} in env {} not found",
+                name, ENV_INTERFACE_NAME
+            )));
         };
         let ips = match env::var(K8S_POD_IP_FOR_DEEPFLOW) {
             Ok(ips) => ips
@@ -584,20 +609,18 @@ pub fn get_ctrl_ip_and_mac(dest: &IpAddr) -> (IpAddr, MacAddr) {
         };
         for ip in ips {
             if is_global(&ip) {
-                return (ip, link.mac_addr);
+                return Ok((ip, link.mac_addr));
             }
         }
-        warn!(
+        return Err(Error::Environment(format!(
             "interface {} in env {} does not have valid ip address",
             name, ENV_INTERFACE_NAME
-        );
-        thread::sleep(Duration::from_secs(1));
-        process::exit(-1);
+        )));
     };
     if let Some(ip) = get_k8s_local_node_ip() {
         let ctrl_mac = get_mac_by_ip(ip);
         if let Ok(mac) = ctrl_mac {
-            return (ip, mac);
+            return Ok((ip, mac));
         }
     }
 
@@ -638,17 +661,17 @@ pub fn get_ctrl_ip_and_mac(dest: &IpAddr) -> (IpAddr, MacAddr) {
                         warn!("failed getting control ip and mac from {}, because: {:?}, wait 1 second", dest, tuple);
                         continue 'outer;
                     }
-                    return tuple.unwrap();
+                    return Ok(tuple.unwrap());
                 }
                 break;
             }
         }
 
-        return (ip, mac);
+        return Ok((ip, mac));
     }
-    error!("failed getting control ip and mac, deepflow-agent restart...");
-    thread::sleep(Duration::from_secs(1));
-    process::exit(-1);
+    Err(Error::Environment(
+        "failed getting control ip and mac, deepflow-agent restart...".to_owned(),
+    ))
 }
 
 //TODO Windows 相关

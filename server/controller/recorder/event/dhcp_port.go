@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,10 +18,10 @@ package event
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/common"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
-	. "github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 	"github.com/deepflowio/deepflow/server/libs/eventapi"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 )
@@ -31,14 +31,14 @@ type DHCPPort struct {
 	deviceType int
 }
 
-func NewDHCPPort(toolDS *cache.ToolDataSet, eq *queue.OverwriteQueue) *DHCPPort {
+func NewDHCPPort(toolDS *tool.DataSet, eq *queue.OverwriteQueue) *DHCPPort {
 	mng := &DHCPPort{
-		EventManagerBase{
-			resourceType: RESOURCE_TYPE_DHCP_PORT_EN,
-			ToolDataSet:  toolDS,
-			Queue:        eq,
-		},
-		common.VIF_DEVICE_TYPE_DHCP_PORT,
+		newEventManagerBase(
+			ctrlrcommon.RESOURCE_TYPE_DHCP_PORT_EN,
+			toolDS,
+			eq,
+		),
+		ctrlrcommon.VIF_DEVICE_TYPE_DHCP_PORT,
 	}
 	return mng
 }
@@ -72,7 +72,7 @@ func (p *DHCPPort) ProduceByAdd(items []*mysql.DHCPPort) {
 	}
 }
 
-func (p *DHCPPort) ProduceByUpdate(cloudItem *cloudmodel.DHCPPort, diffBase *cache.DHCPPort) {
+func (p *DHCPPort) ProduceByUpdate(cloudItem *cloudmodel.DHCPPort, diffBase *diffbase.DHCPPort) {
 }
 
 func (p *DHCPPort) ProduceByDelete(lcuuids []string) {
@@ -84,7 +84,7 @@ func (p *DHCPPort) ProduceByDelete(lcuuids []string) {
 			var err error
 			name, err = p.ToolDataSet.GetDHCPPortNameByID(id)
 			if err != nil {
-				log.Errorf("%v, %v", idByLcuuidNotFound(p.resourceType, lcuuid), err)
+				log.Error(p.org.LogPre("%v, %v", idByLcuuidNotFound(p.resourceType, lcuuid), err))
 			}
 		} else {
 			log.Error(nameByIDNotFound(p.resourceType, id))

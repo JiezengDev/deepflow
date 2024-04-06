@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,16 +25,16 @@ import (
 )
 
 type ChStringEnum struct {
-	UpdaterBase[mysql.ChStringEnum, StringEnumTagKey]
+	UpdaterComponent[mysql.ChStringEnum, StringEnumTagKey]
 }
 
 func NewChStringEnum() *ChStringEnum {
 	updater := &ChStringEnum{
-		UpdaterBase[mysql.ChStringEnum, StringEnumTagKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_STRING_ENUM,
-		},
+		newUpdaterComponent[mysql.ChStringEnum, StringEnumTagKey](
+			RESOURCE_TYPE_CH_STRING_ENUM,
+		),
 	}
-	updater.dataGenerator = updater
+	updater.updaterDG = updater
 	return updater
 }
 

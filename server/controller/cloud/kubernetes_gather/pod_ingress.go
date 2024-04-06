@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,11 +17,11 @@
 package kubernetes_gather
 
 import (
-	"github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/common"
 	"strconv"
 
 	"github.com/bitly/go-simplejson"
+	"github.com/deepflowio/deepflow/server/controller/cloud/model"
+	"github.com/deepflowio/deepflow/server/controller/common"
 	uuid "github.com/satori/go.uuid"
 )
 
@@ -69,8 +69,8 @@ func (k *KubernetesGather) getPodIngresses() (ingresses []model.PodIngress, ingr
 			Name:               name,
 			PodNamespaceLcuuid: namespaceLcuuid,
 			AZLcuuid:           k.azLcuuid,
-			RegionLcuuid:       k.RegionUuid,
-			PodClusterLcuuid:   common.GetUUID(k.UuidGenerate, uuid.Nil),
+			RegionLcuuid:       k.RegionUUID,
+			PodClusterLcuuid:   k.podClusterLcuuid,
 		}
 		ingresses = append(ingresses, ingress)
 		rules := iData.Get("spec").Get("rules")

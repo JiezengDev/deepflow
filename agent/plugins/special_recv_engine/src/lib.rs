@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,6 @@
 use std::sync::Arc;
 
 use public::counter;
-#[cfg(target_os = "linux")]
 use public::debug::QueueDebugger;
 use public::error::Result;
 use public::packet;
@@ -36,13 +35,7 @@ impl counter::RefCountable for LibpcapCounter {
 pub struct Libpcap;
 
 impl Libpcap {
-    #[cfg(target_os = "linux")]
     pub fn new(_: Vec<(&str, isize)>, _: usize, _: usize, _: &QueueDebugger) -> Result<Self> {
-        unimplemented!();
-    }
-
-    #[cfg(target_os = "windows")]
-    pub fn new(_: Vec<(&str, isize)>, _: usize, _: usize) -> Result<Self> {
         unimplemented!();
     }
 
@@ -51,6 +44,22 @@ impl Libpcap {
     }
 
     pub fn set_bpf(&mut self, _: &str) -> Result<()> {
+        unimplemented!();
+    }
+
+    pub fn get_counter_handle(&self) -> Arc<dyn counter::RefCountable> {
+        unimplemented!();
+    }
+}
+
+pub struct Dpdk;
+
+impl Dpdk {
+    pub fn new(_: Option<String>, _: Option<String>, _: usize) -> Self {
+        unimplemented!();
+    }
+
+    pub unsafe fn read(&mut self) -> Result<packet::Packet> {
         unimplemented!();
     }
 

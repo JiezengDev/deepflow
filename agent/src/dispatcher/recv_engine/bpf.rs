@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,9 +16,9 @@
 
 use std::net::IpAddr;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use super::af_packet::bpf::*;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::common::{
     enums::EthernetType, ETH_TYPE_LEN, ETH_TYPE_OFFSET, GRE4_PROTO_OFFSET, GRE6_PROTO_OFFSET,
     GRE_PROTO_LEN, IPV4_ADDR_LEN, IPV4_DST_OFFSET, IPV4_FLAGS_FRAG_OFFSET_LEN, IPV4_FLAGS_OFFSET,
@@ -28,20 +28,20 @@ use crate::common::{
     VLAN_HEADER_SIZE, VXLAN6_FLAGS_OFFSET, VXLAN_FLAGS_OFFSET,
 };
 use crate::common::{enums::IpProtocol, erspan::GRE_PROTO_ERSPAN_III};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use public::enums::LinuxSllPacketType::Outgoing;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 type JumpModifier = fn(jumpIf: JumpIf, index: usize, total: usize) -> JumpIf;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[derive(Default)]
 struct BpfBuilder {
     ins: Vec<BpfSyntax>,
     modifiers: Vec<Option<JumpModifier>>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl BpfBuilder {
     fn appends(&mut self, syntaxs: &mut Vec<BpfSyntax>) -> &mut Self {
         for syntax in syntaxs {
@@ -90,7 +90,7 @@ pub(crate) struct Builder {
     pub analyzer_source_ip: IpAddr,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl Builder {
     fn drop_modifier(mut jump_if: JumpIf, index: usize, total: usize) -> JumpIf {
         let remain = total - (index + 1);
@@ -111,9 +111,9 @@ impl Builder {
     fn skip_ethernet(&self) -> BpfBuilder {
         let mut bpf_builder = BpfBuilder::default();
         let eth_type = if self.is_ipv6 {
-            u16::from(EthernetType::Ipv6) as u32
+            u16::from(EthernetType::IPV6) as u32
         } else {
-            u16::from(EthernetType::Ipv4) as u32
+            u16::from(EthernetType::IPV4) as u32
         };
 
         bpf_builder
@@ -123,7 +123,7 @@ impl Builder {
             }))
             .append(BpfSyntax::JumpIf(JumpIf {
                 cond: JumpTest::JumpNotEqual,
-                val: u16::from(EthernetType::Dot1Q) as u32,
+                val: u16::from(EthernetType::DOT1Q) as u32,
                 skip_true: 2,
                 skip_false: 0,
             }))
@@ -175,7 +175,7 @@ impl Builder {
             }))
             .append(BpfSyntax::JumpIf(JumpIf {
                 cond: JumpTest::JumpNotEqual,
-                val: u8::from(IpProtocol::Udp) as u32,
+                val: u8::from(IpProtocol::UDP) as u32,
                 skip_true: 4,
                 ..Default::default()
             }))
@@ -203,7 +203,7 @@ impl Builder {
             }))
             .append(BpfSyntax::JumpIf(JumpIf {
                 cond: JumpTest::JumpNotEqual,
-                val: u8::from(IpProtocol::Gre) as u32,
+                val: u8::from(IpProtocol::GRE) as u32,
                 skip_true: 2,
                 ..Default::default()
             }))
@@ -220,7 +220,7 @@ impl Builder {
             .branch(
                 JumpIf {
                     cond: JumpTest::JumpNotEqual,
-                    val: u8::from(IpProtocol::Tcp) as u32,
+                    val: u8::from(IpProtocol::TCP) as u32,
                     ..Default::default()
                 },
                 Self::bypass_modifier,
@@ -260,7 +260,7 @@ impl Builder {
             }))
             .append(BpfSyntax::JumpIf(JumpIf {
                 cond: JumpTest::JumpNotEqual,
-                val: u8::from(IpProtocol::Udp) as u32,
+                val: u8::from(IpProtocol::UDP) as u32,
                 skip_true: 4,
                 ..Default::default()
             }))
@@ -288,7 +288,7 @@ impl Builder {
             }))
             .append(BpfSyntax::JumpIf(JumpIf {
                 cond: JumpTest::JumpNotEqual,
-                val: u8::from(IpProtocol::Gre) as u32,
+                val: u8::from(IpProtocol::GRE) as u32,
                 skip_true: 2,
                 ..Default::default()
             }))
@@ -305,7 +305,7 @@ impl Builder {
             .branch(
                 JumpIf {
                     cond: JumpTest::JumpNotEqual,
-                    val: u8::from(IpProtocol::Tcp) as u32,
+                    val: u8::from(IpProtocol::TCP) as u32,
                     ..Default::default()
                 },
                 Self::bypass_modifier,
@@ -358,14 +358,14 @@ impl Builder {
             }))
             .append(BpfSyntax::JumpIf(JumpIf {
                 cond: JumpTest::JumpNotEqual,
-                val: u8::from(IpProtocol::Tcp) as u32,
+                val: u8::from(IpProtocol::TCP) as u32,
                 skip_false: 1,
                 ..Default::default()
             }))
             .branch(
                 JumpIf {
                     cond: JumpTest::JumpNotEqual,
-                    val: u8::from(IpProtocol::Udp) as u32,
+                    val: u8::from(IpProtocol::UDP) as u32,
                     ..Default::default()
                 },
                 Self::bypass_modifier,
@@ -462,7 +462,7 @@ impl Builder {
             }))
             .append(BpfSyntax::JumpIf(JumpIf {
                 cond: JumpTest::JumpNotEqual,
-                val: u8::from(IpProtocol::Tcp) as u32,
+                val: u8::from(IpProtocol::TCP) as u32,
                 skip_true: 2,
                 ..Default::default()
             }))
@@ -479,7 +479,7 @@ impl Builder {
             .branch(
                 JumpIf {
                     cond: JumpTest::JumpNotEqual,
-                    val: u8::from(IpProtocol::Udp) as u32,
+                    val: u8::from(IpProtocol::UDP) as u32,
                     ..Default::default()
                 },
                 Self::bypass_modifier,
@@ -523,7 +523,7 @@ impl Builder {
             }))
             .append(BpfSyntax::JumpIf(JumpIf {
                 cond: JumpTest::JumpNotEqual,
-                val: u8::from(IpProtocol::Tcp) as u32,
+                val: u8::from(IpProtocol::TCP) as u32,
                 skip_true: 2,
                 ..Default::default()
             }))
@@ -540,7 +540,7 @@ impl Builder {
             .branch(
                 JumpIf {
                     cond: JumpTest::JumpNotEqual,
-                    val: u8::from(IpProtocol::Udp) as u32,
+                    val: u8::from(IpProtocol::UDP) as u32,
                     ..Default::default()
                 },
                 Self::bypass_modifier,
@@ -591,7 +591,7 @@ impl Builder {
             }))
             .append(BpfSyntax::JumpIf(JumpIf {
                 cond: JumpTest::JumpNotEqual,
-                val: u8::from(IpProtocol::Tcp) as u32,
+                val: u8::from(IpProtocol::TCP) as u32,
                 skip_true: 2,
                 ..Default::default()
             }))
@@ -608,7 +608,7 @@ impl Builder {
             .branch(
                 JumpIf {
                     cond: JumpTest::JumpNotEqual,
-                    val: u8::from(IpProtocol::Udp) as u32,
+                    val: u8::from(IpProtocol::UDP) as u32,
                     ..Default::default()
                 },
                 Self::bypass_modifier,
@@ -648,7 +648,7 @@ impl Builder {
             }))
             .append(BpfSyntax::JumpIf(JumpIf {
                 cond: JumpTest::JumpNotEqual,
-                val: u8::from(IpProtocol::Tcp) as u32,
+                val: u8::from(IpProtocol::TCP) as u32,
                 skip_true: 2,
                 ..Default::default()
             }))
@@ -665,7 +665,7 @@ impl Builder {
             .branch(
                 JumpIf {
                     cond: JumpTest::JumpNotEqual,
-                    val: u8::from(IpProtocol::Udp) as u32,
+                    val: u8::from(IpProtocol::UDP) as u32,
                     ..Default::default()
                 },
                 Self::bypass_modifier,
@@ -791,12 +791,12 @@ impl Builder {
         // 不采集分发的ERSPANIII
         conditions.push(format!(
             "not (ip[9:1]={:#x} and ip[22:2]={:#x})",
-            u8::from(IpProtocol::Gre),
+            u8::from(IpProtocol::GRE),
             GRE_PROTO_ERSPAN_III
         ));
         conditions.push(format!(
             "not (ip6[6:1]={:#x} and ip6[42:2]={:#x})",
-            u8::from(IpProtocol::Gre),
+            u8::from(IpProtocol::GRE),
             GRE_PROTO_ERSPAN_III
         ));
 
@@ -804,7 +804,7 @@ impl Builder {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[cfg(test)]
 mod tests {
     use super::*;

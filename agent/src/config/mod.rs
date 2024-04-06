@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,11 +18,21 @@ mod config;
 pub mod handler;
 
 pub use config::{
-    Config, ConfigError, FlowGeneratorConfig, KubernetesPollerType, KubernetesResourceConfig,
-    OsProcRegexp, PcapConfig, PrometheusExtraConfig, RuntimeConfig, TripleMapConfig,
-    UprobeProcRegExp, XflowGeneratorConfig, YamlConfig, OS_PROC_REGEXP_MATCH_ACTION_ACCEPT,
+    AgentIdType, Config, ConfigError, KubernetesPollerType, OracleParseConfig, PcapConfig,
+    PrometheusExtraConfig, RuntimeConfig, YamlConfig, K8S_CA_CRT_PATH,
+};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use config::{
+    KubernetesResourceConfig, OsProcRegexp, OS_PROC_REGEXP_MATCH_ACTION_ACCEPT,
     OS_PROC_REGEXP_MATCH_ACTION_DROP, OS_PROC_REGEXP_MATCH_TYPE_CMD,
     OS_PROC_REGEXP_MATCH_TYPE_PARENT_PROC_NAME, OS_PROC_REGEXP_MATCH_TYPE_PROC_NAME,
     OS_PROC_REGEXP_MATCH_TYPE_TAG,
 };
-pub use handler::{DispatcherConfig, FlowAccess, FlowConfig, ModuleConfig, NpbConfig};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use handler::FlowAccess;
+pub use handler::{DispatcherConfig, FlowConfig, ModuleConfig, NpbConfig};
+
+#[cfg(test)]
+pub use config::{ExtraLogFields, HttpEndpointExtraction, MatchRule};
+#[cfg(test)]
+pub use handler::HttpEndpointTrie;

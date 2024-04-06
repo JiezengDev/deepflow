@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,7 +20,6 @@ import (
 	"io/ioutil"
 	"os"
 
-	"github.com/deepflowio/deepflow/server/ingester/common"
 	"github.com/deepflowio/deepflow/server/ingester/config"
 
 	logging "github.com/op/go-logging"
@@ -30,12 +29,16 @@ import (
 var log = logging.MustGetLogger("config")
 
 const (
-	DefaultUnmarshallQueueCount = 4
-	DefaultUnmarshallQueueSize  = 10240
-	DefaultReceiverWindowSize   = 1024
-	DefaultCKReadTimeout        = 300
-	DefaultFlowMetrics1MTTL     = 168 // hour
-	DefaultFlowMetrics1STTL     = 24  // hour
+	DefaultUnmarshallQueueCount   = 4
+	DefaultUnmarshallQueueSize    = 10240
+	DefaultReceiverWindowSize     = 1024
+	DefaultCKReadTimeout          = 300
+	DefaultFlowMetrics1MTTL       = 168 // hour
+	DefaultFlowMetrics1STTL       = 24  // hour
+	DefaultPromWriterQueueCount   = 2
+	DefaultPromWriterQueueSize    = 100000
+	DefaultPromWriterBatchSize    = 2048
+	DefaultPromWriterFlushTimeout = 5
 )
 
 type PCapConfig struct {
@@ -49,11 +52,22 @@ type FlowMetricsTTL struct {
 	VtapApp1S  int `yaml:"vtap-app-1s"`
 }
 
+type PromWriterConfig struct {
+	Enabled       bool              `yaml:"enabled"`
+	Endpoint      string            `yaml:"endpoint"`
+	Headers       map[string]string `yaml:"headers"`
+	BatchSize     int               `yaml:"batch-size"`
+	FlushTimeout  int               `yaml:"flush-timeout"`
+	QueueCount    int               `yaml:"queue-count"`
+	QueueSize     int               `yaml:"queue-size"`
+	MetricsFilter []string          `yaml:"metrics-filter"`
+}
+
 type Config struct {
 	Base                 *config.Config
 	CKReadTimeout        int                   `yaml:"ck-read-timeout"`
 	CKWriterConfig       config.CKWriterConfig `yaml:"metrics-ck-writer"`
-	Pcap                 PCapConfig            `yaml:"pcap"`
+	PromWriterConfig     PromWriterConfig      `yaml:"metrics-prom-writer"`
 	DisableSecondWrite   bool                  `yaml:"disable-second-write"`
 	UnmarshallQueueCount int                   `yaml:"unmarshall-queue-count"`
 	UnmarshallQueueSize  int                   `yaml:"unmarshall-queue-size"`
@@ -86,6 +100,21 @@ func (c *Config) Validate() error {
 		c.FlowMetricsTTL.VtapApp1S = DefaultFlowMetrics1STTL
 	}
 
+	if c.PromWriterConfig.QueueCount <= 0 {
+		c.PromWriterConfig.QueueCount = DefaultPromWriterQueueCount
+	}
+	if c.PromWriterConfig.QueueSize <= 0 {
+		c.PromWriterConfig.QueueCount = DefaultPromWriterQueueSize
+	}
+
+	if c.PromWriterConfig.BatchSize <= 0 {
+		c.PromWriterConfig.BatchSize = DefaultPromWriterBatchSize
+	}
+
+	if c.PromWriterConfig.FlushTimeout <= 0 {
+		c.PromWriterConfig.FlushTimeout = DefaultPromWriterFlushTimeout
+	}
+
 	return nil
 }
 
@@ -94,13 +123,12 @@ func Load(base *config.Config, path string) *Config {
 		FlowMetrics: Config{
 			Base:                 base,
 			CKWriterConfig:       config.CKWriterConfig{QueueCount: 1, QueueSize: 1000000, BatchSize: 512000, FlushTimeout: 10},
+			PromWriterConfig:     PromWriterConfig{},
 			CKReadTimeout:        DefaultCKReadTimeout,
 			UnmarshallQueueCount: DefaultUnmarshallQueueCount,
 			UnmarshallQueueSize:  DefaultUnmarshallQueueSize,
 			ReceiverWindowSize:   DefaultReceiverWindowSize,
 			FlowMetricsTTL:       FlowMetricsTTL{DefaultFlowMetrics1MTTL, DefaultFlowMetrics1STTL, DefaultFlowMetrics1MTTL, DefaultFlowMetrics1STTL},
-
-			Pcap: PCapConfig{common.DEFAULT_PCAP_DATA_PATH},
 		},
 	}
 	if _, err := os.Stat(path); os.IsNotExist(err) {

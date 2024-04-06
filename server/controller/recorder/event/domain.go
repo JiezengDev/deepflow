@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 package event
 
 import (
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 )
 
@@ -25,15 +25,17 @@ type Domain struct {
 	SubDomain
 }
 
-func NewDomain(domainLcuuid string, toolDS *cache.ToolDataSet, eq *queue.OverwriteQueue) *Domain {
+func NewDomain(domainLcuuid string, toolDS *tool.DataSet, eq *queue.OverwriteQueue) *Domain {
 	return &Domain{
 		SubDomain{
 			domainLcuuid,
 			"",
-			EventManagerBase{
-				ToolDataSet: toolDS,
-				Queue:       eq,
-			},
+			newEventManagerBase(
+				"",
+				toolDS,
+				eq,
+			),
+			newTool(toolDS),
 		},
 	}
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,10 +18,10 @@ package event
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/common"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
-	. "github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 	"github.com/deepflowio/deepflow/server/libs/eventapi"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 )
@@ -31,14 +31,14 @@ type LB struct {
 	deviceType int
 }
 
-func NewLB(toolDS *cache.ToolDataSet, eq *queue.OverwriteQueue) *LB {
+func NewLB(toolDS *tool.DataSet, eq *queue.OverwriteQueue) *LB {
 	mng := &LB{
-		EventManagerBase{
-			resourceType: RESOURCE_TYPE_LB_EN,
-			ToolDataSet:  toolDS,
-			Queue:        eq,
-		},
-		common.VIF_DEVICE_TYPE_LB,
+		newEventManagerBase(
+			ctrlrcommon.RESOURCE_TYPE_LB_EN,
+			toolDS,
+			eq,
+		),
+		ctrlrcommon.VIF_DEVICE_TYPE_LB,
 	}
 	return mng
 }
@@ -71,7 +71,7 @@ func (l *LB) ProduceByAdd(items []*mysql.LB) {
 	}
 }
 
-func (l *LB) ProduceByUpdate(cloudItem *cloudmodel.LB, diffBase *cache.LB) {
+func (l *LB) ProduceByUpdate(cloudItem *cloudmodel.LB, diffBase *diffbase.LB) {
 }
 
 func (l *LB) ProduceByDelete(lcuuids []string) {
@@ -83,7 +83,7 @@ func (l *LB) ProduceByDelete(lcuuids []string) {
 			var err error
 			name, err = l.ToolDataSet.GetLBNameByID(id)
 			if err != nil {
-				log.Errorf("%v, %v", idByLcuuidNotFound(l.resourceType, lcuuid), err)
+				log.Error(l.org.LogPre("%v, %v", idByLcuuidNotFound(l.resourceType, lcuuid), err))
 			}
 		} else {
 			log.Error(nameByIDNotFound(l.resourceType, id))

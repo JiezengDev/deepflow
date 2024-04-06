@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,9 +17,12 @@
 package trisolaris
 
 import (
+	"time"
+
 	"github.com/op/go-logging"
 	"gorm.io/gorm"
 
+	"github.com/deepflowio/deepflow/server/controller/election"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/config"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/kubernetes"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/metadata"
@@ -54,8 +57,17 @@ func GetGNodeInfo() *node.NodeInfo {
 	return trisolaris.nodeInfo
 }
 
-func GetGKubernetesInfo() *kubernetes.KubernetesInfo {
-	return trisolaris.kubernetesInfo
+// TODO support org
+func TeamIDToTrisolaris(teamID string) *Trisolaris {
+	return trisolaris
+}
+
+func GetGKubernetesInfo(teamID string) *kubernetes.KubernetesInfo {
+	tri := TeamIDToTrisolaris(teamID)
+	if tri == nil {
+		return nil
+	}
+	return tri.kubernetesInfo
 }
 
 func GetConfig() *config.Config {
@@ -102,8 +114,25 @@ func PutGroup() {
 	trisolaris.metaData.PutChGroup()
 }
 
+func (t *Trisolaris) getStartTime() int64 {
+	startTime := int64(0)
+	for {
+		startTime = election.GetAcquireTime()
+		if startTime == 0 {
+			log.Errorf("get start time(%d) failed", startTime)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		break
+	}
+
+	log.Infof("get start time(%d) success", startTime)
+
+	return startTime
+}
+
 func (t *Trisolaris) Start() {
-	t.metaData.InitData() // 需要先初始化
+	t.metaData.InitData(t.getStartTime()) // 需要先初始化
 	go t.metaData.TimedRefreshMetaData()
 	go t.kubernetesInfo.TimedRefreshClusterID()
 	go t.vTapInfo.TimedRefreshVTapCache()

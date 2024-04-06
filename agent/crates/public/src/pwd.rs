@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,7 +36,12 @@ impl PasswordInfo {
                 continue;
             }
             let Ok(uid) = fields[2].parse::<u32>() else {
-                error!("read pwd file {:?} fail, line `{}` can not parse, uid {} is not integer", file.as_ref().as_os_str(), line, fields[2]);
+                error!(
+                    "read pwd file {:?} fail, line `{}` can not parse, uid {} is not integer",
+                    file.as_ref().as_os_str(),
+                    line,
+                    fields[2]
+                );
                 continue;
             };
             v.push((uid, fields[0].to_string()));

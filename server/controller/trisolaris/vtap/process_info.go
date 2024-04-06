@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -241,6 +241,7 @@ func (d EntryData) addData(agentId uint32, entry *trident.GPIDSyncEntry, p *Proc
 		if pid1 > 0 {
 			entry.setPid1(pid1, agentId)
 		}
+		releasePidPair(value)
 	}
 }
 

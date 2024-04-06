@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -45,8 +45,7 @@ func (b *BaiduBce) getVPCs(region model.Region) ([]model.VPC, map[string]string,
 			log.Error(err)
 			return nil, nil, nil, err
 		}
-		b.cloudStatsd.APICost["ListVPC"] = append(b.cloudStatsd.APICost["ListVPC"], int(time.Now().Sub(startTime).Milliseconds()))
-		b.cloudStatsd.APICount["ListVPC"] = append(b.cloudStatsd.APICount["ListVPC"], len(result.VPCs))
+		b.cloudStatsd.RefreshAPIMoniter("ListVPC", len(result.VPCs), startTime)
 		results = append(results, result)
 		if !result.IsTruncated {
 			break
@@ -72,6 +71,6 @@ func (b *BaiduBce) getVPCs(region model.Region) ([]model.VPC, map[string]string,
 			b.regionLcuuidToResourceNum[retVPC.RegionLcuuid]++
 		}
 	}
-	log.Debug("Get vpcs complete")
+	log.Debug("get vpcs complete")
 	return retVPCs, vpcIdToLcuuid, vpcIdToName, nil
 }

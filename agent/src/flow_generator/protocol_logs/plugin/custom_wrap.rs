@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,13 +15,12 @@
  */
 
 use public::l7_protocol::L7Protocol;
-use serde::Serialize;
 
 use crate::common::l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface};
 
 use super::{all_plugin_log_parser, CustomLog};
 
-#[derive(Default, Debug, Serialize)]
+#[derive(Default)]
 pub struct CustomWrapLog {
     pub(super) parser: Option<CustomLog>,
 }

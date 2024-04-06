@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,18 +27,18 @@ import (
 )
 
 type ChIPResource struct {
-	UpdaterBase[mysql.ChIPResource, IPResourceKey]
+	UpdaterComponent[mysql.ChIPResource, IPResourceKey]
 	ctx context.Context
 }
 
 func NewChIPResource(ctx context.Context) *ChIPResource {
 	updater := &ChIPResource{
-		UpdaterBase[mysql.ChIPResource, IPResourceKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_IP_RESOURCE,
-		},
+		newUpdaterComponent[mysql.ChIPResource, IPResourceKey](
+			RESOURCE_TYPE_CH_IP_RESOURCE,
+		),
 		ctx,
 	}
-	updater.dataGenerator = updater
+	updater.updaterDG = updater
 	return updater
 }
 
@@ -166,7 +166,7 @@ func (i *ChIPResource) generateNewData() (map[IPResourceKey]mysql.ChIPResource, 
 			return nil, false
 		}
 		for _, tag := range CH_IP_RESOURCE_TAGS {
-			multiIDTag := strings.ReplaceAll(tag, "vpc", "epc")
+			multiIDTag := strings.ReplaceAll(tag, "l3_epc", "epc")
 			multiIDTag = strings.ReplaceAll(multiIDTag, "router", "vgw")
 			multiIDTag = strings.ReplaceAll(multiIDTag, "chost", "vm")
 			multiIDTag = strings.ReplaceAll(multiIDTag, "natgw", "nat_gateway")

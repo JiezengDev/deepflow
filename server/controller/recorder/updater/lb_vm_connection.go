@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,48 +18,73 @@ package updater
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
-	"github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type LBVMConnection struct {
-	UpdaterBase[cloudmodel.LBVMConnection, mysql.LBVMConnection, *cache.LBVMConnection]
+	UpdaterBase[
+		cloudmodel.LBVMConnection,
+		mysql.LBVMConnection,
+		*diffbase.LBVMConnection,
+		*message.LBVMConnectionAdd,
+		message.LBVMConnectionAdd,
+		*message.LBVMConnectionUpdate,
+		message.LBVMConnectionUpdate,
+		*message.LBVMConnectionFieldsUpdate,
+		message.LBVMConnectionFieldsUpdate,
+		*message.LBVMConnectionDelete,
+		message.LBVMConnectionDelete]
 }
 
 func NewLBVMConnection(wholeCache *cache.Cache, cloudData []cloudmodel.LBVMConnection) *LBVMConnection {
 	updater := &LBVMConnection{
-		UpdaterBase[cloudmodel.LBVMConnection, mysql.LBVMConnection, *cache.LBVMConnection]{
-			cache:        wholeCache,
-			dbOperator:   db.NewLBVMConnection(),
-			diffBaseData: wholeCache.LBVMConnections,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.LBVMConnection,
+			mysql.LBVMConnection,
+			*diffbase.LBVMConnection,
+			*message.LBVMConnectionAdd,
+			message.LBVMConnectionAdd,
+			*message.LBVMConnectionUpdate,
+			message.LBVMConnectionUpdate,
+			*message.LBVMConnectionFieldsUpdate,
+			message.LBVMConnectionFieldsUpdate,
+			*message.LBVMConnectionDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_LB_VM_CONNECTION_EN,
+			wholeCache,
+			db.NewLBVMConnection().SetORG(wholeCache.GetORG()),
+			wholeCache.DiffBaseDataSet.LBVMConnections,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
 }
 
-func (c *LBVMConnection) getDiffBaseByCloudItem(cloudItem *cloudmodel.LBVMConnection) (diffBase *cache.LBVMConnection, exists bool) {
+func (c *LBVMConnection) getDiffBaseByCloudItem(cloudItem *cloudmodel.LBVMConnection) (diffBase *diffbase.LBVMConnection, exists bool) {
 	diffBase, exists = c.diffBaseData[cloudItem.Lcuuid]
 	return
 }
 
 func (c *LBVMConnection) generateDBItemToAdd(cloudItem *cloudmodel.LBVMConnection) (*mysql.LBVMConnection, bool) {
-	vmID, exists := c.cache.GetVMIDByLcuuid(cloudItem.VMLcuuid)
+	vmID, exists := c.cache.ToolDataSet.GetVMIDByLcuuid(cloudItem.VMLcuuid)
 	if !exists {
 		log.Error(resourceAForResourceBNotFound(
-			common.RESOURCE_TYPE_VM_EN, cloudItem.VMLcuuid,
-			common.RESOURCE_TYPE_LB_VM_CONNECTION_EN, cloudItem.Lcuuid,
+			ctrlrcommon.RESOURCE_TYPE_VM_EN, cloudItem.VMLcuuid,
+			ctrlrcommon.RESOURCE_TYPE_LB_VM_CONNECTION_EN, cloudItem.Lcuuid,
 		))
 		return nil, false
 	}
-	lbID, exists := c.cache.GetLBIDByLcuuid(cloudItem.LBLcuuid)
+	lbID, exists := c.cache.ToolDataSet.GetLBIDByLcuuid(cloudItem.LBLcuuid)
 	if !exists {
 		log.Error(resourceAForResourceBNotFound(
-			common.RESOURCE_TYPE_LB_EN, cloudItem.LBLcuuid,
-			common.RESOURCE_TYPE_LB_VM_CONNECTION_EN, cloudItem.Lcuuid,
+			ctrlrcommon.RESOURCE_TYPE_LB_EN, cloudItem.LBLcuuid,
+			ctrlrcommon.RESOURCE_TYPE_LB_VM_CONNECTION_EN, cloudItem.Lcuuid,
 		))
 		return nil, false
 	}
@@ -74,6 +99,6 @@ func (c *LBVMConnection) generateDBItemToAdd(cloudItem *cloudmodel.LBVMConnectio
 }
 
 // 保留接口
-func (c *LBVMConnection) generateUpdateInfo(diffBase *cache.LBVMConnection, cloudItem *cloudmodel.LBVMConnection) (map[string]interface{}, bool) {
-	return nil, false
+func (c *LBVMConnection) generateUpdateInfo(diffBase *diffbase.LBVMConnection, cloudItem *cloudmodel.LBVMConnection) (*message.LBVMConnectionFieldsUpdate, map[string]interface{}, bool) {
+	return nil, nil, false
 }

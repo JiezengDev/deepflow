@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,8 +25,10 @@ use crate::{
     common::l7_protocol_log::LogCache,
     flow_generator::{
         protocol_logs::{
-            pb_adapter::L7ProtocolSendLog, DnsInfo, DubboInfo, HttpInfo, KafkaInfo, MqttInfo,
-            MysqlInfo, PostgreInfo, ProtobufRpcInfo, RedisInfo, SofaRpcInfo,
+            fastcgi::FastCGIInfo, pb_adapter::L7ProtocolSendLog, AmqpInfo, BrpcInfo, DnsInfo,
+            DubboInfo, HttpInfo, KafkaInfo, MongoDBInfo, MqttInfo, MysqlInfo, NatsInfo,
+            OpenWireInfo, OracleInfo, PostgreInfo, PulsarInfo, RedisInfo, SofaRpcInfo, TlsInfo,
+            ZmtpInfo,
         },
         AppProtoHead, LogMessageType, Result,
     },
@@ -37,6 +39,7 @@ use super::{ebpf::EbpfType, l7_protocol_log::ParseParam};
 
 macro_rules! all_protocol_info {
     ($($name:ident($info_struct:ident)),+$(,)?) => {
+
         #[derive(Serialize, Debug, Clone)]
         #[enum_dispatch]
         #[serde(untagged)]
@@ -63,13 +66,22 @@ all_protocol_info!(
     HttpInfo(HttpInfo),
     MysqlInfo(MysqlInfo),
     RedisInfo(RedisInfo),
+    MongoDBInfo(MongoDBInfo),
     DubboInfo(DubboInfo),
+    FastCGIInfo(FastCGIInfo),
+    BrpcInfo(BrpcInfo),
     KafkaInfo(KafkaInfo),
     MqttInfo(MqttInfo),
+    AmqpInfo(AmqpInfo),
+    NatsInfo(NatsInfo),
+    PulsarInfo(PulsarInfo),
+    ZmtpInfo(ZmtpInfo),
     PostgreInfo(PostgreInfo),
-    ProtobufRpcInfo(ProtobufRpcInfo),
+    OracleInfo(OracleInfo),
     SofaRpcInfo(SofaRpcInfo),
+    TlsInfo(TlsInfo),
     CustomInfo(CustomInfo),
+    OpenWireInfo(OpenWireInfo),
     // add new protocol info below
 );
 
@@ -83,7 +95,7 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
     // 返回的错误暂时无视
     // =============================================================
     // merge request and response. now return err will have no effect.
-    fn merge_log(&mut self, other: L7ProtocolInfo) -> Result<()>;
+    fn merge_log(&mut self, other: &mut L7ProtocolInfo) -> Result<()>;
 
     fn app_proto_head(&self) -> Option<AppProtoHead>;
 
@@ -91,6 +103,10 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
 
     fn get_endpoint(&self) -> Option<String> {
         None
+    }
+
+    fn get_biz_type(&self) -> u8 {
+        0
     }
 
     fn skip_send(&self) -> bool {
@@ -171,7 +187,7 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
                         msg_type: param.direction.into(),
                         time: param.time,
                         kafka_info,
-                        multi_merge_info:None,
+                        multi_merge_info: None,
                     },
                 );
 
@@ -180,7 +196,6 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
                         .swap(perf_cache.rrt_cache.len() as u64, Ordering::Relaxed);
                     f.l7_timeout_cache_len
                         .swap(perf_cache.timeout_cache.len() as u64, Ordering::Relaxed)
-
                 });
                 return None;
             };
@@ -309,7 +324,7 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
         };
 
         let Some(mut previous_log_info) = previous_log_info else {
-            if msg_type == LogMessageType::Request{
+            if msg_type == LogMessageType::Request {
                 *in_cached_req += 1;
             }
             perf_cache.put(
@@ -318,7 +333,7 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
                     msg_type: param.direction.into(),
                     time: param.time,
                     kafka_info: None,
-                    multi_merge_info: Some((req_end,resp_end,false)),
+                    multi_merge_info: Some((req_end, resp_end, false)),
                 },
             );
 
@@ -327,13 +342,24 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
                     .swap(perf_cache.rrt_cache.len() as u64, Ordering::Relaxed);
                 f.l7_timeout_cache_len
                     .swap(perf_cache.timeout_cache.len() as u64, Ordering::Relaxed)
-
             });
             return None;
         };
 
-        let (cache_req_end, cache_resp_end, merged) =
-            previous_log_info.multi_merge_info.as_mut().unwrap();
+        let Some((cache_req_end, cache_resp_end, merged)) =
+            previous_log_info.multi_merge_info.as_mut()
+        else {
+            error!(
+                "{:?}:{} -> {:?}:{} flow_id: {} ebpf_type: {:?} rrt cal fail, multi_merge_info is none",
+                param.ip_src,
+                param.port_src,
+                param.ip_dst,
+                param.port_dst,
+                param.flow_id,
+                param.ebpf_type
+            );
+            return None;
+        };
 
         if req_end {
             *cache_req_end = true;
@@ -386,6 +412,18 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
             }
             None
         }
+    }
+
+    fn tcp_seq_offset(&self) -> u32 {
+        return 0;
+    }
+
+    fn get_request_domain(&self) -> String {
+        String::default()
+    }
+
+    fn get_request_resource_length(&self) -> usize {
+        0
     }
 }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan PodClusters
+ * Copyright (c) 2024 Yunshan PodClusters
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 )
 
 type PodCluster struct {
@@ -37,7 +38,7 @@ func (c *PodCluster) OnUpdaterAdded(addedDBItems []*mysql.PodCluster) {
 	c.cache.AddPodClusters(addedDBItems)
 }
 
-func (c *PodCluster) OnUpdaterUpdated(cloudItem *cloudmodel.PodCluster, diffBase *cache.PodCluster) {
+func (c *PodCluster) OnUpdaterUpdated(cloudItem *cloudmodel.PodCluster, diffBase *diffbase.PodCluster) {
 	diffBase.Update(cloudItem)
 }
 

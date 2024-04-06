@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,6 +25,8 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/deepflowio/deepflow/cli/ctl/common"
+	"github.com/deepflowio/deepflow/cli/ctl/common/printutil"
+	"github.com/deepflowio/deepflow/cli/ctl/common/table"
 )
 
 func RegisterAgentGroupConfigCommand() *cobra.Command {
@@ -98,7 +100,7 @@ func RegisterAgentGroupConfigCommand() *cobra.Command {
 func exampleAgentGroupConfig(cmd *cobra.Command, args []string) {
 	server := common.GetServerInfo(cmd)
 	url := fmt.Sprintf("http://%s:%d/v1/vtap-group-configuration/example/", server.IP, server.Port)
-	response, err := common.CURLPerform("GET", url, nil, "")
+	response, err := common.CURLPerform("GET", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -121,7 +123,7 @@ func listAgentGroupConfig(cmd *cobra.Command, args []string, output string) {
 			url += "advanced/"
 		}
 
-		response, err := common.CURLPerform("GET", url, nil, "")
+		response, err := common.CURLPerform("GET", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return
@@ -135,24 +137,27 @@ func listAgentGroupConfig(cmd *cobra.Command, args []string, output string) {
 			}
 		}
 	} else {
-		response, err := common.CURLPerform("GET", url, nil, "")
+		response, err := common.CURLPerform("GET", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return
 		}
 
-		cmdFormat := "%-46s %s\n"
-		fmt.Printf(cmdFormat, "NAME", "AGENT_GROUP_ID")
+		t := table.New()
+		t.SetHeader([]string{"NAME", "AGENT_GROUP_ID"})
+		tableItems := [][]string{}
 		for i := range response.Get("DATA").MustArray() {
 			config := response.Get("DATA").GetIndex(i)
 			if agentGroupShortUUID != "" && config.Get("VTAP_GROUP_ID").MustString() != agentGroupShortUUID {
 				continue
 			}
-			fmt.Printf(
-				cmdFormat, config.Get("VTAP_GROUP_NAME").MustString(),
+			tableItems = append(tableItems, []string{
+				config.Get("VTAP_GROUP_NAME").MustString(),
 				config.Get("VTAP_GROUP_ID").MustString(),
-			)
+			})
 		}
+		t.AppendBulk(tableItems)
+		t.Render()
 	}
 }
 
@@ -163,7 +168,7 @@ func createAgentGroupConfig(cmd *cobra.Command, args []string, createFilename st
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 	}
-	_, err = common.CURLPerform("POST", url, nil, string(yamlFile))
+	_, err = common.CURLPerform("POST", url, nil, string(yamlFile), []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -171,7 +176,7 @@ func createAgentGroupConfig(cmd *cobra.Command, args []string, createFilename st
 }
 
 func updateAgentGroupConfig(cmd *cobra.Command, args []string, updateFilename string) {
-	yamlFile, err := ioutil.ReadFile(updateFilename)
+	yamlFile, err := os.ReadFile(updateFilename)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -184,16 +189,23 @@ func updateAgentGroupConfig(cmd *cobra.Command, args []string, updateFilename st
 		return
 	}
 
-	vtapGroupID, ok := updateMap["vtap_group_id"]
-	if !ok {
-		fmt.Fprintln(os.Stderr, "must specify vtap_group_id")
+	var agentGroupID interface{}
+	if id, ok := updateMap["vtap_group_id"]; ok {
+		agentGroupID = id
+		printutil.WarnWithColor("use agent_group_id instead of vtap_group_id")
+	}
+	id, ok := updateMap["agent_group_id"]
+	if ok {
+		agentGroupID = id
+	}
+	if agentGroupID == nil {
+		fmt.Fprintln(os.Stderr, "must specify agent_group_id")
 		return
 	}
-
 	server := common.GetServerInfo(cmd)
-	url := fmt.Sprintf("http://%s:%d/v1/vtap-group-configuration/?vtap_group_id=%s", server.IP, server.Port, vtapGroupID)
+	url := fmt.Sprintf("http://%s:%d/v1/vtap-group-configuration/?vtap_group_id=%s", server.IP, server.Port, agentGroupID)
 	// call vtap-group api, get lcuuid
-	response, err := common.CURLPerform("GET", url, nil, "")
+	response, err := common.CURLPerform("GET", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -207,7 +219,7 @@ func updateAgentGroupConfig(cmd *cobra.Command, args []string, updateFilename st
 
 	// call vtap-group config update api
 	url = fmt.Sprintf("http://%s:%d/v1/vtap-group-configuration/advanced/%s/", server.IP, server.Port, lcuuid)
-	_, err = common.CURLPerform("PATCH", url, nil, string(yamlFile))
+	_, err = common.CURLPerform("PATCH", url, nil, string(yamlFile), []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -225,7 +237,7 @@ func deleteAgentGroupConfig(cmd *cobra.Command, args []string) {
 		"http://%s:%d/v1/vtap-group-configuration/filter/?vtap_group_id=%s",
 		server.IP, server.Port, args[0],
 	)
-	_, err := common.CURLPerform("DELETE", url, nil, "")
+	_, err := common.CURLPerform("DELETE", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return

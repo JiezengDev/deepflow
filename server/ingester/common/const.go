@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,5 @@
 package common
 
 const (
-	CK_VERSION             = "v6.3.5.4" // 用于表示clickhouse的表版本号
-	DEFAULT_PCAP_DATA_PATH = "/var/lib/pcap"
+	CK_VERSION = "v6.5.3.1" // 用于表示clickhouse的表版本号
 )

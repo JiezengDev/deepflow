@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023 Yunshan Networks
+* Copyright (c) 2024 Yunshan Networks
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -21,17 +21,17 @@ import (
 )
 
 type ChPrometheusMetricAPPLabelLayout struct {
-	UpdaterBase[mysql.ChPrometheusMetricAPPLabelLayout, IDKey]
+	UpdaterComponent[mysql.ChPrometheusMetricAPPLabelLayout, IDKey]
 }
 
 func NewChPrometheusMetricAPPLabelLayout() *ChPrometheusMetricAPPLabelLayout {
 	updater := &ChPrometheusMetricAPPLabelLayout{
-		UpdaterBase[mysql.ChPrometheusMetricAPPLabelLayout, IDKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_PROMETHEUS_METRIC_APP_LABEL_LAYOUT,
-		},
+		newUpdaterComponent[mysql.ChPrometheusMetricAPPLabelLayout, IDKey](
+			RESOURCE_TYPE_CH_PROMETHEUS_METRIC_APP_LABEL_LAYOUT,
+		),
 	}
 
-	updater.dataGenerator = updater
+	updater.updaterDG = updater
 	return updater
 }
 

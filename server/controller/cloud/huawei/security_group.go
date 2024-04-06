@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan SecurityGroups
+ * Copyright (c) 2024 Yunshan SecurityGroups
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,11 +31,10 @@ func (h *HuaWei) getSecurityGroups() ([]model.SecurityGroup, []model.SecurityGro
 	var securityGroups []model.SecurityGroup
 	var sgRules []model.SecurityGroupRule
 	for project, token := range h.projectTokenMap {
-		jSecurityGroups, err := h.getRawData(
-			fmt.Sprintf("https://vpc.%s.%s/v1/%s/security-groups", project.name, h.config.Domain, project.id), token.token, "security_groups",
-		)
+		jSecurityGroups, err := h.getRawData(newRawDataGetContext(
+			fmt.Sprintf("https://vpc.%s.%s/v1/%s/security-groups", project.name, h.config.Domain, project.id), token.token, "security_groups", pageQueryMethodMarker,
+		))
 		if err != nil {
-			log.Errorf("request failed: %v", err)
 			return nil, nil, err
 		}
 

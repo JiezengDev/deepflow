@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
 
 use std::fmt::Debug;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use neli::err::{NlError, SerError};
 use thiserror::Error;
 
@@ -32,7 +32,7 @@ pub enum Error {
     LinkNotFoundIndex(u32),
     #[error("link regex invalid")]
     LinkRegexInvalid(#[from] regex::Error),
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[error("netlink error: {0}")]
     NetlinkError(String),
     #[error("IO error")]
@@ -43,21 +43,21 @@ pub enum Error {
     Windows(String),
     #[error("{0}")]
     LinkIdxNotFoundByIP(String),
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[error(transparent)]
     Errno(#[from] nix::errno::Errno),
     #[error("ethtool: {0}")]
     Ethtool(String),
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl<T: Debug, P: Debug> From<NlError<T, P>> for Error {
     fn from(e: NlError<T, P>) -> Self {
         Self::NetlinkError(format!("{}", e))
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl From<SerError> for Error {
     fn from(e: SerError) -> Self {
         Self::NetlinkError(format!("{}", e))

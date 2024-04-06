@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@ import (
 
 	"github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/http/service"
+	"github.com/deepflowio/deepflow/server/controller/http/service/rebalance"
 	"github.com/deepflowio/deepflow/server/controller/monitor/config"
 )
 
@@ -47,9 +48,26 @@ func (r *RebalanceCheck) Start() {
 		if !r.cfg.AutoRebalanceVTap {
 			return
 		}
+
 		for range time.Tick(time.Duration(r.cfg.RebalanceCheckInterval) * time.Second) {
 			r.controllerRebalance()
-			r.analyzerRebalance()
+			if r.cfg.IngesterLoadBalancingConfig.Algorithm == common.ANALYZER_ALLOC_BY_AGENT_COUNT {
+				r.analyzerRebalance()
+			}
+		}
+	}()
+
+	go func() {
+		if !r.cfg.AutoRebalanceVTap {
+			return
+		}
+
+		if r.cfg.IngesterLoadBalancingConfig.Algorithm == common.ANALYZER_ALLOC_BY_INGESTED_DATA {
+			duration := r.cfg.IngesterLoadBalancingConfig.DataDuration
+			r.analyzerRebalanceByTraffic(duration)
+			for range time.Tick(time.Duration(r.cfg.IngesterLoadBalancingConfig.RebalanceInterval) * time.Second) {
+				r.analyzerRebalanceByTraffic(duration)
+			}
 		}
 	}()
 }
@@ -62,7 +80,7 @@ func (r *RebalanceCheck) Stop() {
 }
 
 func (r *RebalanceCheck) controllerRebalance() {
-	controllers, err := service.GetControllers(map[string]string{})
+	controllers, err := service.GetControllers(common.DEFAULT_ORG_ID, map[string]string{})
 	if err != nil {
 		log.Errorf("get controllers failed, (%v)", err)
 		return
@@ -77,7 +95,7 @@ func (r *RebalanceCheck) controllerRebalance() {
 				"check": false,
 				"type":  "controller",
 			}
-			if result, err := service.VTapRebalance(args); err != nil {
+			if result, err := service.VTapRebalance(args, r.cfg.IngesterLoadBalancingConfig); err != nil {
 				log.Error(err)
 			} else {
 				data, _ := json.Marshal(result)
@@ -90,7 +108,7 @@ func (r *RebalanceCheck) controllerRebalance() {
 
 func (r *RebalanceCheck) analyzerRebalance() {
 	// check if need rebalance
-	analyzers, err := service.GetAnalyzers(map[string]interface{}{})
+	analyzers, err := service.GetAnalyzers(common.DEFAULT_ORG_ID, map[string]interface{}{})
 	if err != nil {
 		log.Errorf("get analyzers failed, (%v)", err)
 		return
@@ -104,7 +122,7 @@ func (r *RebalanceCheck) analyzerRebalance() {
 				"check": false,
 				"type":  "analyzer",
 			}
-			if result, err := service.VTapRebalance(args); err != nil {
+			if result, err := service.VTapRebalance(args, r.cfg.IngesterLoadBalancingConfig); err != nil {
 				log.Error(err)
 			} else {
 				data, _ := json.Marshal(result)
@@ -112,5 +130,22 @@ func (r *RebalanceCheck) analyzerRebalance() {
 			}
 			break
 		}
+	}
+}
+
+func (r *RebalanceCheck) analyzerRebalanceByTraffic(dataDuration int) {
+	log.Infof("check analyzer rebalance, traffic duration(%vs)", dataDuration)
+	analyzerInfo := rebalance.NewAnalyzerInfo()
+	result, err := analyzerInfo.RebalanceAnalyzerByTraffic(true, dataDuration)
+	if err != nil {
+		log.Errorf("fail to rebalance analyzer by data(if check: true): %v", err)
+		return
+	}
+	if result.TotalSwitchVTapNum != 0 {
+		log.Infof("need rebalance, total switch vtap num(%d)", result.TotalSwitchVTapNum)
+		if _, err := analyzerInfo.RebalanceAnalyzerByTraffic(false, dataDuration); err != nil {
+			log.Errorf("fail to rebalance analyzer by data(if check: false): %v", err)
+		}
+		return
 	}
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -95,7 +95,7 @@ func SendToServer(module ModuleId, operate ModuleOperate, args *bytes.Buffer) (*
 	}
 	sendBuffer := bytes.Buffer{}
 
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(time.Minute))
 	msg := DebugMessage{Module: uint16(module), Operate: uint16(operate), Result: 0}
 	if args != nil {
 		msg.Args = args.Bytes()

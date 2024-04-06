@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,11 +17,8 @@
 package kubernetes_gather
 
 import (
-	"github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/common"
-
 	"github.com/bitly/go-simplejson"
-	uuid "github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 )
 
 func (k *KubernetesGather) getPodNamespaces() ([]model.PodNamespace, error) {
@@ -56,8 +53,8 @@ func (k *KubernetesGather) getPodNamespaces() ([]model.PodNamespace, error) {
 		podNamespace := model.PodNamespace{
 			Lcuuid:           uID,
 			Name:             name,
-			PodClusterLcuuid: common.GetUUID(k.UuidGenerate, uuid.Nil),
-			RegionLcuuid:     k.RegionUuid,
+			PodClusterLcuuid: k.podClusterLcuuid,
+			RegionLcuuid:     k.RegionUUID,
 			AZLcuuid:         k.azLcuuid,
 		}
 		podNamespaces = append(podNamespaces, podNamespace)

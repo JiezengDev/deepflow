@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,9 +17,6 @@
 package router
 
 import (
-	"bytes"
-	"io"
-
 	"github.com/gin-gonic/gin"
 
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
@@ -55,20 +52,19 @@ func createVtapRepo(c *gin.Context) {
 	}
 
 	// get file
-	file, _, err := c.Request.FormFile("IMAGE")
+	file, fileHeader, err := c.Request.FormFile("IMAGE")
 	if err != nil {
 		JsonResponse(c, nil, err)
 		return
 	}
 	defer file.Close()
 
-	buf := bytes.NewBuffer(nil)
-	_, err = io.Copy(buf, file)
+	vtapRepo.Image = make([]byte, fileHeader.Size)
+	_, err = file.Read(vtapRepo.Image)
 	if err != nil {
 		JsonResponse(c, nil, err)
 		return
 	}
-	vtapRepo.Image = buf.Bytes()
 
 	data, err := service.CreateVtapRepo(vtapRepo)
 	JsonResponse(c, data, err)

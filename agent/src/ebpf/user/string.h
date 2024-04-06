@@ -131,7 +131,10 @@ memcpy_s_inline(void *__restrict__ dest, rsize_t dmax,
 	 * n == 0 isn't really "bad", so check first in the
 	 * "wall-of-shame" department...
 	 */
-	bad = (dest == 0) + (src == 0) + (n > dmax) + (dest == src) + (n == 0);
+	if (n > dmax)
+		n = dmax;
+
+	bad = (dest == 0) + (src == 0) + (dest == src) + (n == 0);
 	if (PREDICT_FALSE(bad != 0)) {
 		/* Not actually trying to copy anything is OK */
 		if (n == 0)
@@ -140,8 +143,6 @@ memcpy_s_inline(void *__restrict__ dest, rsize_t dmax,
 			ebpf_error("dest NULL");
 		if (src == NULL)
 			ebpf_error("src NULL");
-		if (n > dmax)
-			ebpf_error("n > dmax");
 		if (dest == src)
 			ebpf_error("dest == src");
 		return -1;
@@ -165,11 +166,18 @@ strcpy_s_inline(void *__restrict__ dest, rsize_t dmax,
 		const void *__restrict__ src, rsize_t n)
 {
 	errno_t err;
+
+	if (n > dmax)
+		n = dmax;
+
 	err = memcpy_s_inline(dest, dmax, src, n);
 	if (err == 0) {
 		rsize_t no_use_n = dmax - n;
 		if (no_use_n > 0) {
 			memset(dest + n, 0, no_use_n);
+		} else {
+			char *_d = dest;
+			_d[dmax - 1] = '\0';
 		}
 	}
 

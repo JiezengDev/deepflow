@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,6 @@
 
 use std::fmt;
 use std::sync::{atomic::Ordering, Arc};
-use std::time::Duration;
 
 use bitflags::bitflags;
 use log::debug;
@@ -28,7 +27,7 @@ use crate::{
         enums::TcpFlags,
         flow::{FlowPerfStats, L4Protocol},
         lookup_key::LookupKey,
-        meta_packet::{MetaPacket, MetaPacketTcpHeader},
+        meta_packet::{MetaPacket, MetaPacketTcpHeader, ProtocolData},
         Timestamp,
     },
     flow_generator::error::{Error, Result},
@@ -86,7 +85,7 @@ pub(crate) struct SessionPeer {
     seq_list_len: isize,
 
     timestamp: Timestamp,
-    first_syn_timestamp: Timestamp,
+    first_handshake_timestamp: Timestamp, // Client: First SYN; Server: First SYN_ACK
 
     seq_threshold: u32, // fast syn_retrans check
     seq: u32,
@@ -110,15 +109,24 @@ impl SessionPeer {
     const SEQ_NUMBER_HIGH_THRESHOLD: u32 = 0xc0000000;
 
     fn is_sync_ack_ack_packet(&self, p: &MetaPacket) -> bool {
-        p.is_ack() && p.tcp_data.ack == self.seq_threshold
+        if let ProtocolData::TcpHeader(tcp_data) = &p.protocol_data {
+            return p.is_ack() && tcp_data.ack == self.seq_threshold;
+        }
+        false
     }
 
     fn is_reply_packet(&self, p: &MetaPacket) -> bool {
-        p.tcp_data.ack == self.seq.overflowing_add(self.payload_len).0
+        if let ProtocolData::TcpHeader(tcp_data) = &p.protocol_data {
+            return tcp_data.ack == self.seq.overflowing_add(self.payload_len).0;
+        }
+        false
     }
 
     fn is_next_packet(&self, p: &MetaPacket) -> bool {
-        p.tcp_data.seq == self.seq.overflowing_add(self.payload_len).0
+        if let ProtocolData::TcpHeader(tcp_data) = &p.protocol_data {
+            return tcp_data.seq == self.seq.overflowing_add(self.payload_len).0;
+        }
+        false
     }
 
     // merge array[index+1] into array[index]
@@ -337,14 +345,18 @@ impl SessionPeer {
 
     // 在TCP_STATE_ESTABLISHED阶段更新数据
     fn update_data(&mut self, p: &MetaPacket) {
-        let header = &p.tcp_data;
+        let tcp_data = if let ProtocolData::TcpHeader(tcp_data) = &p.protocol_data {
+            tcp_data
+        } else {
+            unreachable!();
+        };
         self.timestamp = p.lookup_key.timestamp.into();
         self.payload_len = p.payload_len as u32;
-        if header.flags.contains(TcpFlags::SYN) {
+        if tcp_data.flags.contains(TcpFlags::SYN) {
             self.payload_len = 1;
         }
-        self.seq = header.seq;
-        self.win_size = header.win_size;
+        self.seq = tcp_data.seq;
+        self.win_size = tcp_data.win_size;
         // winScale不能在这里更新p.winScale = tcpHeader.WinScale
     }
 }
@@ -383,8 +395,8 @@ impl TimeStats {
 // 后2个包是server端的应答包，art表示后2个包之间的时间间隔
 #[derive(Default, Debug, PartialEq, Eq)]
 pub(crate) struct PerfData {
-    rtt_0: TimeStats,
-    rtt_1: TimeStats,
+    rtt_0: TimeStats, // The time difference between the first SYN and the last SYN_ACK
+    rtt_1: TimeStats, // The time difference between the first SYN_ACK and the last ACK
     art_0: TimeStats,
     art_1: TimeStats,
     srt_0: TimeStats,
@@ -610,6 +622,11 @@ impl TcpPerf {
 
     // fpd for first packet direction
     fn is_invalid_retrans_packet(&mut self, p: &MetaPacket, fpd: bool) -> (bool, bool) {
+        let tcp_data = if let ProtocolData::TcpHeader(tcp_data) = &p.protocol_data {
+            tcp_data
+        } else {
+            unreachable!();
+        };
         let (same_dir, oppo_dir) = if fpd {
             (&mut self.ctrl_info.0, &mut self.ctrl_info.1)
         } else {
@@ -618,8 +635,8 @@ impl TcpPerf {
         if p.is_syn() {
             if same_dir.seq_threshold == 0 {
                 // first SYN
-                same_dir.seq_threshold = p.tcp_data.seq + 1;
-                same_dir.first_syn_timestamp = p.lookup_key.timestamp.into();
+                same_dir.seq_threshold = tcp_data.seq + 1;
+                same_dir.first_handshake_timestamp = p.lookup_key.timestamp.into();
                 self.handshaking = true;
             } else if same_dir.syn_transmitted {
                 self.perf_data.calc_retrans_syn(fpd);
@@ -632,10 +649,11 @@ impl TcpPerf {
         if p.is_syn_ack() {
             if same_dir.seq_threshold == 0 {
                 // first
-                same_dir.seq_threshold = p.tcp_data.seq + 1;
+                same_dir.first_handshake_timestamp = p.lookup_key.timestamp.into();
+                same_dir.seq_threshold = tcp_data.seq + 1;
                 if oppo_dir.seq_threshold == 0 {
                     // no syn before first syn/ack
-                    oppo_dir.seq_threshold = p.tcp_data.ack;
+                    oppo_dir.seq_threshold = tcp_data.ack;
                 } else {
                     oppo_dir.rtt_full_precondition = true;
                 }
@@ -659,7 +677,7 @@ impl TcpPerf {
         }
 
         // 连接建立后，即ESTABLISHED阶段，用SeqArray判断包重传
-        match same_dir.assert_seq_number(&p.tcp_data, p.payload_len) {
+        match same_dir.assert_seq_number(tcp_data, p.payload_len) {
             PacketSeqType::Retrans => {
                 // established retrans
                 self.perf_data.calc_retrans(fpd);
@@ -705,7 +723,10 @@ impl TcpPerf {
         oppo_dir: &mut SessionPeer,
         p: &MetaPacket,
     ) -> bool {
-        p.is_ack() && oppo_dir.seq_threshold == p.tcp_data.ack
+        if let ProtocolData::TcpHeader(tcp_data) = &p.protocol_data {
+            return p.is_ack() && oppo_dir.seq_threshold == tcp_data.ack;
+        }
+        false
     }
 
     fn flow_opening(&mut self, p: &MetaPacket, fpd: bool) -> bool {
@@ -714,44 +735,57 @@ impl TcpPerf {
         } else {
             (&mut self.ctrl_info.1, &mut self.ctrl_info.0)
         };
-        let mut is_opening = false;
 
         if same_dir.rtt_calculable {
-            // 不考虑SYN, SYN/ACK, PSH/ACK的情况
-            // rtt0 = Time(SYN/ACK) - Time(SYN)
-            // rtt1 = Time(SYN/ACK/ACK) - Time(SYN/ACK)
-            if (Self::is_handshake_ack_packet(same_dir, oppo_dir, p) || p.is_syn_ack())
-                && oppo_dir.is_reply_packet(p)
-            {
-                let rtt = adjust_rtt(
-                    (p.lookup_key.timestamp - oppo_dir.timestamp).into(),
-                    RTT_MAX,
-                );
-                if !rtt.is_zero() {
-                    self.perf_data.calc_rtt(rtt, fpd);
+            if oppo_dir.is_reply_packet(p) {
+                // rtt0 = Time(Last SYN_ACK) - Time(First SYN)
+                // rtt1 = Time(Last ACK) - Time(First SYN_ACK)
+                // Example:
+                // Packet：
+                // - A: SYN
+                // - B: SYN
+                // - C: SYN_ACK
+                // - D: SYN_ACK
+                // - E: ACK
+                // - F: ACK
+                // rtt0: TimeStats{Count: 2, Sum: (C-A)+(D-A), Max: D-A}
+                // rtt1: TimeStats{Count: 2, Sum: (E-C)+(F-C), Max: F-C}
+                if (Self::is_handshake_ack_packet(same_dir, oppo_dir, p) || p.is_syn_ack())
+                    && !oppo_dir.first_handshake_timestamp.is_zero()
+                {
+                    let rtt = adjust_rtt(
+                        (p.lookup_key.timestamp - oppo_dir.first_handshake_timestamp).into(),
+                        RTT_MAX,
+                    );
+                    if !rtt.is_zero() {
+                        self.perf_data.calc_rtt(rtt, fpd);
+                    }
                 }
-                is_opening = true;
             }
         }
         if same_dir.rtt_full_calculable {
             if oppo_dir.is_sync_ack_ack_packet(p) {
                 let rtt_full = adjust_rtt(
-                    (p.lookup_key.timestamp - same_dir.first_syn_timestamp).into(),
+                    (p.lookup_key.timestamp - same_dir.first_handshake_timestamp).into(),
                     RTT_FULL_MAX,
                 );
                 if !rtt_full.is_zero() {
                     self.perf_data.calc_rtt_full(rtt_full);
                 }
-                same_dir.rtt_full_calculable = false;
             }
         }
 
-        if p.is_syn() || p.is_syn_ack() {
-            if p.tcp_data.win_scale > 0 {
-                same_dir.win_scale = WIN_SCALE_FLAG | p.tcp_data.win_scale.min(WIN_SCALE_MAX);
+        let tcp_data = if let ProtocolData::TcpHeader(tcp_data) = &p.protocol_data {
+            tcp_data
+        } else {
+            unreachable!();
+        };
+        let is_opening = if p.is_syn() || p.is_syn_ack() {
+            if tcp_data.win_scale > 0 {
+                same_dir.win_scale = WIN_SCALE_FLAG | tcp_data.win_scale.min(WIN_SCALE_MAX);
             }
 
-            same_dir.rtt_calculable = false;
+            same_dir.rtt_calculable = true;
             same_dir.srt_calculable = false;
             same_dir.art_calculable = false;
 
@@ -759,15 +793,19 @@ impl TcpPerf {
             oppo_dir.srt_calculable = false;
             oppo_dir.art_calculable = false;
 
-            is_opening = true;
-
             if p.is_syn_ack() && oppo_dir.rtt_full_precondition {
                 oppo_dir.rtt_full_calculable = true;
             }
+
+            true
         } else {
-            same_dir.rtt_calculable = false;
-            oppo_dir.rtt_calculable = false;
-        }
+            if !p.is_ack() {
+                same_dir.rtt_calculable = false;
+                oppo_dir.rtt_calculable = false;
+                same_dir.rtt_full_calculable = false;
+            }
+            p.is_ack()
+        };
 
         if Self::is_handshake_ack_packet(same_dir, oppo_dir, p) {
             same_dir.is_handshake_ack_packet = true;
@@ -832,9 +870,13 @@ impl TcpPerf {
             oppo_dir.srt_calculable = false;
             oppo_dir.art_calculable = false;
         }
-
+        let tcp_data = if let ProtocolData::TcpHeader(tcp_data) = &p.protocol_data {
+            tcp_data
+        } else {
+            unreachable!();
+        };
         // zero_win, psh_urg_count_0
-        let mut win_size = p.tcp_data.win_size as u32;
+        let mut win_size = tcp_data.win_size as u32;
         if same_dir.win_scale & oppo_dir.win_scale & WIN_SCALE_FLAG > 0 {
             win_size <<= (same_dir.win_scale & WIN_SCALE_MASK) as u32;
         }
@@ -844,7 +886,7 @@ impl TcpPerf {
         }
 
         // PSH/URG
-        if p.tcp_data.flags & TcpFlags::MASK == TcpFlags::PSH_ACK_URG {
+        if tcp_data.flags & TcpFlags::MASK == TcpFlags::PSH_ACK_URG {
             self.perf_data.calc_psh_urg(fpd);
         }
         // calculate client waiting time
@@ -915,12 +957,17 @@ impl TcpPerf {
     // 异常flag判断，方向识别，payload_len计算等
     // 去除功能不相关报文
     fn is_interested_packet(&self, p: &MetaPacket) -> bool {
-        if p.tcp_data.data_offset == 0 {
+        let tcp_data = if let ProtocolData::TcpHeader(tcp_data) = &p.protocol_data {
+            tcp_data
+        } else {
+            unreachable!();
+        };
+        if tcp_data.data_offset == 0 {
             // invalid tcp header or ip fragment
             return false;
         }
 
-        if !Self::is_interested_tcp_flags(p.tcp_data.flags) {
+        if !Self::is_interested_tcp_flags(tcp_data.flags) {
             self.counter
                 .ignored_packet_count
                 .fetch_add(1, Ordering::Relaxed);
@@ -1103,15 +1150,15 @@ struct MiniMetaPacket {
 impl<'a> From<MiniMetaPacket> for MetaPacket<'_> {
     fn from(m: MiniMetaPacket) -> Self {
         let mut packet = MetaPacket::empty();
-        packet.tcp_data = MetaPacketTcpHeader {
+        packet.protocol_data = ProtocolData::TcpHeader(MetaPacketTcpHeader {
             data_offset: m.data_offset,
             flags: m.flags,
             seq: m.seq,
             ack: m.ack,
             ..Default::default()
-        };
+        });
         packet.lookup_key = LookupKey {
-            timestamp: Duration::from_secs(m.timestamp),
+            timestamp: Timestamp::from_secs(m.timestamp),
             ..Default::default()
         };
         packet.payload_len = m.payload_len;
@@ -1887,8 +1934,13 @@ mod tests {
 
         let first_packet = &packets[0];
         for (i, packet) in packets.iter().enumerate() {
+            let tcp_data = if let ProtocolData::TcpHeader(tcp_data) = &packet.protocol_data {
+                tcp_data
+            } else {
+                unreachable!();
+            };
             assert!(
-                packet.tcp_data.data_offset > 0,
+                tcp_data.data_offset > 0,
                 "raw packet is not tcp, packet#{} is {}",
                 i,
                 packet
@@ -1956,7 +2008,12 @@ mod tests {
             assert!(n < packets.len());
             for i in 0..n {
                 let packet = &packets[i];
-                assert!(packet.tcp_data.data_offset != 0);
+                let tcp_data = if let ProtocolData::TcpHeader(tcp_data) = &packet.protocol_data {
+                    tcp_data
+                } else {
+                    unreachable!();
+                };
+                assert!(tcp_data.data_offset != 0);
                 perf.parse(&packet, first_packet_src_ip == packet.lookup_key.src_ip)
                     .unwrap();
             }
@@ -1968,11 +2025,16 @@ mod tests {
         }
 
         for (i, packet) in packets.iter_mut().enumerate() {
-            packet.lookup_key.timestamp += Duration::from_secs(60);
+            packet.lookup_key.timestamp += Timestamp::from_secs(60);
             if i + 1 == ignore_nth_packet {
                 continue;
             }
-            assert!(packet.tcp_data.data_offset != 0);
+            let tcp_data = if let ProtocolData::TcpHeader(tcp_data) = &packet.protocol_data {
+                tcp_data
+            } else {
+                unreachable!();
+            };
+            assert!(tcp_data.data_offset != 0);
             let _ = perf.parse(&*packet, first_packet_src_ip == packet.lookup_key.src_ip);
 
             if first_report_moment == i as isize + 1 {

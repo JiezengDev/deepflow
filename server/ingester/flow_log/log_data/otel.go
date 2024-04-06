@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,17 +24,19 @@ import (
 	"time"
 
 	"github.com/deepflowio/deepflow/server/ingester/common"
+	flowlogCfg "github.com/deepflowio/deepflow/server/ingester/flow_log/config"
 	"github.com/deepflowio/deepflow/server/libs/datatype"
+	flow_metrics "github.com/deepflowio/deepflow/server/libs/flow-metrics"
 	"github.com/deepflowio/deepflow/server/libs/grpc"
 	"github.com/deepflowio/deepflow/server/libs/utils"
-	"github.com/deepflowio/deepflow/server/libs/zerodoc"
 
+	json "github.com/goccy/go-json"
 	"github.com/google/gopacket/layers"
 	v11 "go.opentelemetry.io/proto/otlp/common/v1"
 	v1 "go.opentelemetry.io/proto/otlp/trace/v1"
 )
 
-func OTelTracesDataToL7FlowLogs(vtapID uint16, l *v1.TracesData, platformData *grpc.PlatformInfoTable) []*L7FlowLog {
+func OTelTracesDataToL7FlowLogs(vtapID uint16, l *v1.TracesData, platformData *grpc.PlatformInfoTable, cfg *flowlogCfg.Config) []*L7FlowLog {
 	ret := []*L7FlowLog{}
 	for _, resourceSpan := range l.GetResourceSpans() {
 		var resAttributes []*v11.KeyValue
@@ -44,18 +46,18 @@ func OTelTracesDataToL7FlowLogs(vtapID uint16, l *v1.TracesData, platformData *g
 		}
 		for _, scopeSpan := range resourceSpan.GetScopeSpans() {
 			for _, span := range scopeSpan.GetSpans() {
-				ret = append(ret, spanToL7FlowLog(vtapID, span, resAttributes, platformData))
+				ret = append(ret, spanToL7FlowLog(vtapID, span, resAttributes, platformData, cfg))
 			}
 		}
 	}
 	return ret
 }
 
-func spanToL7FlowLog(vtapID uint16, span *v1.Span, resAttributes []*v11.KeyValue, platformData *grpc.PlatformInfoTable) *L7FlowLog {
+func spanToL7FlowLog(vtapID uint16, span *v1.Span, resAttributes []*v11.KeyValue, platformData *grpc.PlatformInfoTable, cfg *flowlogCfg.Config) *L7FlowLog {
 	h := AcquireL7FlowLog()
 	h._id = genID(uint32(span.EndTimeUnixNano/uint64(time.Second)), &L7FlowLogCounter, platformData.QueryAnalyzerID())
 	h.VtapID = vtapID
-	h.FillOTel(span, resAttributes, platformData)
+	h.FillOTel(span, resAttributes, platformData, cfg)
 	return h
 }
 
@@ -280,33 +282,24 @@ func (h *L7FlowLog) fillAttributes(spanAttributes, resAttributes []*v11.KeyValue
 	}
 
 	if len(h.L7ProtocolStr) > 0 {
-		if strings.Contains(strings.ToLower(h.L7ProtocolStr), "http") {
-			if strings.HasPrefix(h.Version, "2") {
-				if strings.Contains(strings.ToLower(h.L7ProtocolStr), "https") {
-					h.L7Protocol = uint8(datatype.L7_PROTOCOL_HTTP_2_TLS)
-				} else {
-					h.L7Protocol = uint8(datatype.L7_PROTOCOL_HTTP_2)
-				}
-			} else {
-				if strings.Contains(strings.ToLower(h.L7ProtocolStr), "https") {
-					h.L7Protocol = uint8(datatype.L7_PROTOCOL_HTTP_1_TLS)
-				} else {
-					h.L7Protocol = uint8(datatype.L7_PROTOCOL_HTTP_1)
-				}
-			}
-		} else {
-			for l7ProtocolStr, l7Protocol := range datatype.L7ProtocolStringMap {
-				if strings.Contains(strings.ToLower(l7ProtocolStr), strings.ToLower(h.L7ProtocolStr)) {
-					h.L7Protocol = uint8(l7Protocol)
-					break
-				}
+		l7ProtocolStrLower := strings.ToLower(h.L7ProtocolStr)
+		if strings.Contains(l7ProtocolStrLower, "https") {
+			h.IsTLS = 1
+		}
+		for l7ProtocolStr, l7Protocol := range datatype.L7ProtocolStringMap {
+			if strings.Contains(l7ProtocolStr, l7ProtocolStrLower) {
+				h.L7Protocol = uint8(l7Protocol)
+				break
 			}
 		}
-	}
-
-	// Unrecognized protocols in OTEL are set to Other protocol
-	if h.L7Protocol == uint8(datatype.L7_PROTOCOL_UNKNOWN) {
-		h.L7Protocol = uint8(datatype.L7_PROTOCOL_OTHER)
+		// If the protocol name is 'http', it may be randomly matched to 'http1' or 'http2' and needs to be corrected.
+		if h.L7Protocol == uint8(datatype.L7_PROTOCOL_HTTP_1) || h.L7Protocol == uint8(datatype.L7_PROTOCOL_HTTP_2) {
+			if strings.HasPrefix(h.Version, "2") {
+				h.L7Protocol = uint8(datatype.L7_PROTOCOL_HTTP_2)
+			} else {
+				h.L7Protocol = uint8(datatype.L7_PROTOCOL_HTTP_1)
+			}
+		}
 	}
 
 	h.AttributeNames = attributeNames
@@ -315,7 +308,7 @@ func (h *L7FlowLog) fillAttributes(spanAttributes, resAttributes []*v11.KeyValue
 	h.MetricsValues = metricsValues
 }
 
-func (h *L7FlowLog) FillOTel(l *v1.Span, resAttributes []*v11.KeyValue, platformData *grpc.PlatformInfoTable) {
+func (h *L7FlowLog) FillOTel(l *v1.Span, resAttributes []*v11.KeyValue, platformData *grpc.PlatformInfoTable, cfg *flowlogCfg.Config) {
 	// OTel data net protocol always set to TCP
 	h.Protocol = uint8(layers.IPProtocolTCP)
 	h.TapType = uint8(datatype.TAP_CLOUD)
@@ -323,6 +316,7 @@ func (h *L7FlowLog) FillOTel(l *v1.Span, resAttributes []*v11.KeyValue, platform
 	h.TapPortType = datatype.TAPPORT_FROM_OTEL
 	h.SignalSource = uint16(datatype.SIGNAL_SOURCE_OTEL)
 	h.TraceId = hex.EncodeToString(l.TraceId)
+	h.TraceIdIndex = parseTraceIdIndex(h.TraceId, &cfg.Base.TraceIdWithIndex)
 	h.SpanId = hex.EncodeToString(l.SpanId)
 	h.ParentSpanId = hex.EncodeToString(l.ParentSpanId)
 	h.TapSide = spanKindToTapSide(l.Kind)
@@ -333,6 +327,10 @@ func (h *L7FlowLog) FillOTel(l *v1.Span, resAttributes []*v11.KeyValue, platform
 	h.L7Base.EndTime = int64(l.EndTimeUnixNano) / int64(time.Microsecond)
 	if h.L7Base.EndTime > h.L7Base.StartTime {
 		h.ResponseDuration = uint64(h.L7Base.EndTime - h.L7Base.StartTime)
+	}
+
+	if eventsJSON, err := json.Marshal(l.Events); err == nil {
+		h.Events = string(eventsJSON)
 	}
 
 	h.fillAttributes(l.GetAttributes(), resAttributes, l.GetLinks())
@@ -358,7 +356,7 @@ func (h *L7FlowLog) FillOTel(l *v1.Span, resAttributes []*v11.KeyValue, platform
 	}
 	h.L7Base.KnowledgeGraph.FillOTel(h, platformData)
 	// only show data for services as 'server side'
-	if h.TapSide == zerodoc.ServerApp.String() && h.ServerPort == 0 {
+	if h.TapSide == flow_metrics.ServerApp.String() && h.ServerPort == 0 {
 		h.ServerPort = 65535
 	}
 }
@@ -367,17 +365,17 @@ func (k *KnowledgeGraph) FillOTel(l *L7FlowLog, platformData *grpc.PlatformInfoT
 	switch l.TapSide {
 	case "c-app":
 		// fill Epc0 with the Epc the Vtap belongs to
-		k.L3EpcID0 = platformData.QueryVtapEpc0(uint32(l.VtapID))
+		k.L3EpcID0 = platformData.QueryVtapEpc0(l.VtapID)
 		// fill in Epc1 with other rules, see function description for details
-		k.L3EpcID1 = platformData.QueryVtapEpc1(uint32(l.VtapID), l.IsIPv4, l.IP41, l.IP61)
+		k.L3EpcID1 = platformData.QueryVtapEpc1(l.VtapID, l.IsIPv4, l.IP41, l.IP61)
 	case "s-app":
 		// fill Epc1 with the Epc the Vtap belongs to
-		k.L3EpcID1 = platformData.QueryVtapEpc0(uint32(l.VtapID))
+		k.L3EpcID1 = platformData.QueryVtapEpc0(l.VtapID)
 		// fill in Epc0 with other rules, see function description for details
-		k.L3EpcID0 = platformData.QueryVtapEpc1(uint32(l.VtapID), l.IsIPv4, l.IP40, l.IP60)
+		k.L3EpcID0 = platformData.QueryVtapEpc1(l.VtapID, l.IsIPv4, l.IP40, l.IP60)
 	default: // "app" or others
 		// fill Epc0 and Epc1 with the Epc the Vtap belongs to
-		k.L3EpcID0 = platformData.QueryVtapEpc0(uint32(l.VtapID))
+		k.L3EpcID0 = platformData.QueryVtapEpc0(l.VtapID)
 		k.L3EpcID1 = k.L3EpcID0
 	}
 	k.fill(
@@ -390,7 +388,7 @@ func (k *KnowledgeGraph) FillOTel(l *L7FlowLog, platformData *grpc.PlatformInfoT
 		l.GPID0, l.GPID1,
 		0, 0, 0,
 		uint16(l.ServerPort),
-		zerodoc.Rest,
+		flow_metrics.Rest,
 		layers.IPProtocol(l.Protocol),
 	)
 

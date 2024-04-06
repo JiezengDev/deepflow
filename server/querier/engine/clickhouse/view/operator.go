@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,6 +36,8 @@ const (
 	NREGEXP
 	GT
 	LT
+	IN
+	NIN
 )
 
 type Operator struct {
@@ -71,6 +73,10 @@ func (n *Operator) ToString() string {
 		return " > "
 	case LT:
 		return " < "
+	case IN:
+		return " IN "
+	case NIN:
+		return " NOT IN "
 	}
 	return ""
 }
@@ -110,6 +116,10 @@ func GetOperator(op string) (*Operator, int) {
 		opType = GT
 	case "<":
 		opType = LT
+	case "in":
+		opType = IN
+	case "not in":
+		opType = NIN
 	}
 	return &Operator{Type: opType}, opType
 }

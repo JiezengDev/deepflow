@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,9 +21,9 @@ mod base_dispatcher;
 
 mod analyzer_mode_dispatcher;
 mod local_mode_dispatcher;
+mod local_plus_mode_dispatcher;
 mod mirror_mode_dispatcher;
 
-use std::process;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use std::{
@@ -34,55 +34,55 @@ use std::{
     },
 };
 
-#[cfg(target_os = "linux")]
-use libc::c_int;
-use log::{debug, error, info, warn};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use log::error;
+use log::{debug, info, warn};
 use packet_dedup::*;
-#[cfg(target_os = "linux")]
-use pcap_sys::bpf_insn;
-#[cfg(target_os = "linux")]
-use pcap_sys::{bpf_program, pcap_compile_nopcap};
 use public::debug::QueueDebugger;
 #[cfg(target_os = "linux")]
-use public::enums::LinuxSllPacketType::Outgoing;
+use special_recv_engine::Dpdk;
 use special_recv_engine::Libpcap;
 
 use analyzer_mode_dispatcher::{AnalyzerModeDispatcher, AnalyzerModeDispatcherListener}; // Enterprise Edition Feature: analyzer_mode
 use base_dispatcher::{BaseDispatcher, TapTypeHandler};
 use error::{Error, Result};
 use local_mode_dispatcher::{LocalModeDispatcher, LocalModeDispatcherListener};
+use local_plus_mode_dispatcher::{LocalPlusModeDispatcher, LocalPlusModeDispatcherListener};
 use mirror_mode_dispatcher::{MirrorModeDispatcher, MirrorModeDispatcherListener};
 pub use recv_engine::RecvEngine;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use recv_engine::{
     af_packet::{self, bpf::*, BpfSyntax, OptTpacketVersion, RawInstruction, Tpacket},
     DEFAULT_BLOCK_SIZE, FRAME_SIZE_MAX, FRAME_SIZE_MIN, POLL_TIMEOUT,
 };
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use self::base_dispatcher::TapInterfaceWhitelist;
-use crate::config::handler::CollectorAccess;
+
 #[cfg(target_os = "linux")]
-use crate::platform::GenericPoller;
-use crate::utils::environment::get_mac_by_name;
+use crate::platform::LibvirtXmlExtractor;
 use crate::{
-    common::{enums::TapType, flow::L7Stats, FlowAclListener, TaggedFlow, TapTyper},
+    common::{
+        enums::TapType, flow::L7Stats, FlowAclListener, FlowAclListenerId, TaggedFlow, TapTyper,
+    },
     config::{
-        handler::{FlowAccess, LogParserAccess},
+        handler::{CollectorAccess, FlowAccess, LogParserAccess},
         DispatcherConfig,
     },
     exception::ExceptionHandler,
-    flow_generator::MetaAppProto,
+    flow_generator::AppProto,
     handler::{PacketHandler, PacketHandlerBuilder},
-    platform::LibvirtXmlExtractor,
     policy::PolicyGetter,
-    utils::stats::{self, Collector},
+    utils::{
+        environment::get_mac_by_name,
+        stats::{self, Collector},
+    },
 };
+
 #[cfg(target_os = "linux")]
-use public::netns;
+use public::netns::NsFile;
 use public::{
     buffer::BatchedBox,
-    netns::NsFile,
     proto::{
         common::TridentType,
         trident::{IfMacSource, TapMode},
@@ -95,38 +95,42 @@ use public::{
 enum DispatcherFlavor {
     Analyzer(AnalyzerModeDispatcher), // Enterprise Edition Feature: analyzer_mode
     Local(LocalModeDispatcher),
+    LocalPlus(LocalPlusModeDispatcher),
     Mirror(MirrorModeDispatcher),
 }
 
 impl DispatcherFlavor {
-    fn init(&mut self) {
+    fn init(&mut self) -> Result<()> {
         match self {
-            DispatcherFlavor::Analyzer(d) => d.base.init(), // Enterprise Edition Feature: analyzer_mode
             DispatcherFlavor::Local(d) => d.base.init(),
+            DispatcherFlavor::LocalPlus(d) => d.base.init(),
             DispatcherFlavor::Mirror(d) => d.init(),
+            DispatcherFlavor::Analyzer(d) => d.base.init(), // Enterprise Edition Feature: analyzer_mode
         }
     }
 
     fn run(&mut self) {
         match self {
-            DispatcherFlavor::Analyzer(d) => d.run(), // Enterprise Edition Feature: analyzer_mode
             DispatcherFlavor::Local(d) => d.run(),
+            DispatcherFlavor::LocalPlus(d) => d.run(),
             DispatcherFlavor::Mirror(d) => d.run(),
+            DispatcherFlavor::Analyzer(d) => d.run(), // Enterprise Edition Feature: analyzer_mode
         }
     }
 
     fn listener(&self) -> DispatcherListener {
         match self {
+            DispatcherFlavor::Local(d) => DispatcherListener::Local(d.listener()),
+            DispatcherFlavor::LocalPlus(d) => DispatcherListener::LocalPlus(d.listener()),
+            DispatcherFlavor::Mirror(d) => DispatcherListener::Mirror(d.listener()),
             // Enterprise Edition Feature: analyzer_mode
             DispatcherFlavor::Analyzer(d) => DispatcherListener::Analyzer(d.listener()),
-            DispatcherFlavor::Local(d) => DispatcherListener::Local(d.listener()),
-            DispatcherFlavor::Mirror(d) => DispatcherListener::Mirror(d.listener()),
         }
     }
 
-    fn switch_recv_engine(&mut self, pcap_interfaces: Vec<Link>) -> Result<()> {
+    fn switch_recv_engine(&mut self, config: &DispatcherConfig) -> Result<()> {
         match self {
-            DispatcherFlavor::Local(d) => d.switch_recv_engine(pcap_interfaces),
+            DispatcherFlavor::Local(d) => d.switch_recv_engine(config),
             _ => todo!(),
         }
     }
@@ -182,21 +186,16 @@ impl Dispatcher {
 }
 
 impl Dispatcher {
-    pub fn switch_recv_engine(&self, pcap_interfaces: Vec<Link>) {
+    pub fn switch_recv_engine(&self, config: &DispatcherConfig) -> Result<()> {
         self.stop();
-        if let Err(e) = self
-            .flavor
+        self.flavor
             .lock()
             .unwrap()
             .as_mut()
-            .ok_or(Error::DispatcherFlavorEmpty)
-            .and_then(|d| d.switch_recv_engine(pcap_interfaces))
-        {
-            error!("switch RecvEngine error: {}, deepflow-agent restart...", e);
-            thread::sleep(Duration::from_secs(1));
-            process::exit(-1);
-        }
+            .ok_or(Error::DispatcherFlavorEmpty)?
+            .switch_recv_engine(config)?;
         self.start();
+        Ok(())
     }
 }
 
@@ -204,6 +203,7 @@ impl Dispatcher {
 pub enum DispatcherListener {
     Analyzer(AnalyzerModeDispatcherListener), // Enterprise Edition Feature: analyzer_mode
     Local(LocalModeDispatcherListener),
+    LocalPlus(LocalPlusModeDispatcherListener),
     Mirror(MirrorModeDispatcherListener),
 }
 
@@ -220,6 +220,7 @@ impl FlowAclListener for DispatcherListener {
     ) -> Result<(), String> {
         match self {
             DispatcherListener::Local(a) => a.flow_acl_change(),
+            DispatcherListener::LocalPlus(a) => a.flow_acl_change(),
             DispatcherListener::Mirror(a) => a.flow_acl_change(),
             DispatcherListener::Analyzer(a) => a.flow_acl_change(),
         }
@@ -229,34 +230,56 @@ impl FlowAclListener for DispatcherListener {
     fn id(&self) -> usize {
         let id = match self {
             DispatcherListener::Local(a) => a.id(),
+            DispatcherListener::LocalPlus(a) => a.id(),
             DispatcherListener::Mirror(a) => a.id(),
             DispatcherListener::Analyzer(a) => a.id(),
         };
-        2 + id
+        u16::from(FlowAclListenerId::Dispatcher) as usize + id
     }
 }
 
 impl DispatcherListener {
-    pub(super) fn netns(&self) -> NsFile {
+    #[cfg(target_os = "linux")]
+    pub(super) fn netns(&self) -> &NsFile {
         match self {
-            Self::Local(l) => l.netns(),
-            _ => NsFile::Root,
+            Self::Local(a) => a.netns(),
+            Self::LocalPlus(a) => a.netns(),
+            Self::Mirror(a) => a.netns(),
+            Self::Analyzer(a) => a.netns(),
+        }
+    }
+
+    fn id(&self) -> usize {
+        match self {
+            Self::Local(a) => a.id(),
+            Self::LocalPlus(a) => a.id(),
+            Self::Mirror(a) => a.id(),
+            Self::Analyzer(a) => a.id(),
+        }
+    }
+
+    fn local_dispatcher_count(&self) -> usize {
+        match self {
+            Self::Local(a) => a.local_dispatcher_count(),
+            Self::LocalPlus(a) => a.local_dispatcher_count(),
+            _ => 1,
         }
     }
 
     pub(super) fn on_config_change(&mut self, config: &DispatcherConfig) {
         match self {
             Self::Local(l) => l.on_config_change(config),
+            Self::LocalPlus(l) => l.on_config_change(config),
             Self::Analyzer(l) => l.on_config_change(config), // Enterprise Edition Feature: analyzer_mode
             Self::Mirror(l) => l.on_config_change(config),
         }
     }
 
-    pub fn on_vm_change(&self, vm_mac_addrs: &[MacAddr]) {
+    pub fn on_vm_change(&self, vm_mac_addrs: &[MacAddr], gateway_vmac_addrs: &[MacAddr]) {
         match self {
             // Enterprise Edition Feature: analyzer_mode
             Self::Analyzer(l) => {
-                l.on_vm_change(vm_mac_addrs);
+                l.on_vm_change(vm_mac_addrs, gateway_vmac_addrs);
             }
             Self::Mirror(l) => {
                 l.on_vm_change(vm_mac_addrs);
@@ -265,17 +288,57 @@ impl DispatcherListener {
         }
     }
 
+    // When interfaces.len() is greater than local_dispatcher_count, interfaces is evenly distributed among each dispatcher;
+    // otherwise interfaces is evenly distributed among the preceding dispatcher, and the following dispatcher does not work
+    fn get_interfaces<'a>(&self, interfaces: &'a [Link]) -> &'a [Link] {
+        if self.local_dispatcher_count() == 1 {
+            return interfaces;
+        }
+        let id = self.id();
+        if interfaces.len() < self.local_dispatcher_count() {
+            if id < interfaces.len() {
+                return &interfaces[id..id + 1];
+            } else {
+                return &interfaces[0..0];
+            }
+        }
+        let width = interfaces.len() / self.local_dispatcher_count();
+        let remain = interfaces.len() % self.local_dispatcher_count();
+        let (start, width) = if id >= remain {
+            ((id * width) + remain, width)
+        } else {
+            (id * width + id, width + 1)
+        };
+
+        let interfaces = if id == self.local_dispatcher_count() - 1 {
+            &interfaces[start..]
+        } else {
+            &interfaces[start..start + width]
+        };
+
+        interfaces
+    }
+
     pub fn on_tap_interface_change(
         &self,
-        interfaces: &Vec<Link>,
+        interfaces: &[Link],
         if_mac_source: IfMacSource,
         trident_type: TridentType,
         blacklist: &Vec<u64>,
     ) {
         match self {
-            Self::Local(l) => {
-                l.on_tap_interface_change(interfaces, if_mac_source, trident_type, blacklist)
-            }
+            Self::LocalPlus(l) => l.on_tap_interface_change(
+                self.get_interfaces(interfaces),
+                if_mac_source,
+                trident_type,
+                blacklist,
+            ),
+            Self::Local(l) => l.on_tap_interface_change(
+                self.get_interfaces(interfaces),
+                if_mac_source,
+                trident_type,
+                blacklist,
+            ),
             // Enterprise Edition Feature: analyzer_mode
             Self::Analyzer(l) => {
                 l.on_tap_interface_change(interfaces, if_mac_source);
@@ -287,16 +350,9 @@ impl DispatcherListener {
     }
 }
 
-#[derive(Default)]
-pub struct DpdkRingPortConf {
-    pub enabled: bool,
-    pub core_id: u32,
-    pub port_name: String,
-}
-
 pub struct BpfOptions {
     pub capture_bpf: String,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub bpf_syntax: Vec<BpfSyntax>,
     pub bpf_syntax_str: String,
 }
@@ -305,7 +361,7 @@ impl Default for BpfOptions {
     fn default() -> Self {
         Self {
             capture_bpf: "".to_string(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             bpf_syntax: Vec::new(),
             bpf_syntax_str: "".to_string(),
         }
@@ -315,11 +371,11 @@ impl Default for BpfOptions {
 impl BpfOptions {
     // When using the default BPF filtering rules, it can support collecting traffic
     // from up to 950 network ports simultaneously.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     const MAX_TAP_INTERFACES: usize = 950;
 
     // When tap_interfaces.len() exceeds 950, set bpf will report an error.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn skip_tap_interface(
         &self,
         tap_interfaces: &Vec<Link>,
@@ -394,16 +450,16 @@ impl BpfOptions {
         return bpf_syntax;
     }
 
-    #[cfg(target_os = "linux")]
-    fn to_pcap_bpf_prog(&self) -> Option<bpf_program> {
-        let mut prog: bpf_program = bpf_program {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn to_pcap_bpf_prog(&self) -> Option<pcap_sys::bpf_program> {
+        let mut prog = pcap_sys::bpf_program {
             bf_len: 0,
             bf_insns: std::ptr::null_mut(),
         };
         unsafe {
             #[cfg(target_arch = "x86_64")]
-            let ret = pcap_compile_nopcap(
-                0xffff as c_int,
+            let ret = pcap_sys::pcap_compile_nopcap(
+                0xffff as libc::c_int,
                 1,
                 &mut prog,
                 self.capture_bpf.as_ptr() as *const i8,
@@ -411,8 +467,8 @@ impl BpfOptions {
                 0xffffffff,
             );
             #[cfg(target_arch = "aarch64")]
-            let ret = pcap_compile_nopcap(
-                0xffff as c_int,
+            let ret = pcap_sys::pcap_compile_nopcap(
+                0xffff as libc::c_int,
                 1,
                 &mut prog,
                 self.capture_bpf.as_ptr() as *const u8,
@@ -427,7 +483,7 @@ impl BpfOptions {
         return Some(prog);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn get_bpf_instructions(
         &self,
         tap_interfaces: &Vec<Link>,
@@ -458,7 +514,7 @@ impl BpfOptions {
                         } else if pcap_ins[bf_len - 2].code & OP_CLS_RETURN == OP_CLS_RETURN {
                             // RetConstant 65535
                             // RetConstant 0
-                            pcap_ins[bf_len - 2] = bpf_insn {
+                            pcap_ins[bf_len - 2] = pcap_sys::bpf_insn {
                                 code: OP_CLS_JUMP | OP_JUMP_EQUAL,
                                 jt: 1,
                                 jf: 1,
@@ -511,12 +567,13 @@ impl BpfOptions {
 #[derive(Default)]
 pub struct Options {
     pub packet_blocks: usize,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub af_packet_version: OptTpacketVersion,
     pub snap_len: usize,
     pub tap_mode: TapMode,
-    pub dpdk_conf: DpdkRingPortConf,
+    pub dpdk_enabled: bool,
     pub libpcap_enabled: bool,
+    pub dispatcher_queue: bool,
     pub tap_mac_script: String,
     pub is_ipv6: bool,
     pub vxlan_flags: u8,
@@ -623,6 +680,8 @@ impl stats::RefCountable for PacketCounter {
 #[derive(Default)]
 pub struct DispatcherBuilder {
     id: Option<usize>,
+    local_dispatcher_count: usize,
+    pause: Option<bool>,
     src_interface: Option<String>,
     ctrl_mac: Option<MacAddr>,
     leaky_bucket: Option<Arc<LeakyBucket>>,
@@ -633,10 +692,11 @@ pub struct DispatcherBuilder {
     mirror_traffic_pcp: Option<u16>,
     tap_typer: Option<Arc<TapTyper>>,
     analyzer_dedup_disabled: Option<bool>,
+    #[cfg(target_os = "linux")]
     libvirt_xml_extractor: Option<Arc<LibvirtXmlExtractor>>,
     flow_output_queue: Option<DebugSender<Arc<BatchedBox<TaggedFlow>>>>,
     l7_stats_output_queue: Option<DebugSender<BatchedBox<L7Stats>>>,
-    log_output_queue: Option<DebugSender<Box<MetaAppProto>>>,
+    log_output_queue: Option<DebugSender<Box<AppProto>>>,
     packet_sequence_output_queue:
         Option<DebugSender<Box<packet_sequence_block::PacketSequenceBlock>>>, // Enterprise Edition Feature: packet-sequence
     stats_collector: Option<Arc<Collector>>,
@@ -645,10 +705,11 @@ pub struct DispatcherBuilder {
     collector_config: Option<CollectorAccess>,
     policy_getter: Option<PolicyGetter>,
     #[cfg(target_os = "linux")]
-    platform_poller: Option<Arc<GenericPoller>>,
+    platform_poller: Option<Arc<crate::platform::GenericPoller>>,
     exception_handler: Option<ExceptionHandler>,
     ntp_diff: Option<Arc<AtomicI64>>,
     pcap_interfaces: Option<Vec<Link>>,
+    #[cfg(target_os = "linux")]
     netns: Option<NsFile>,
     trident_type: Option<TridentType>,
     queue_debugger: Option<Arc<QueueDebugger>>,
@@ -663,6 +724,11 @@ impl DispatcherBuilder {
 
     pub fn id(mut self, v: usize) -> Self {
         self.id = Some(v);
+        self
+    }
+
+    pub fn pause(mut self, pause: bool) -> Self {
+        self.pause = Some(pause);
         self
     }
 
@@ -716,6 +782,7 @@ impl DispatcherBuilder {
         self
     }
 
+    #[cfg(target_os = "linux")]
     pub fn libvirt_xml_extractor(mut self, v: Arc<LibvirtXmlExtractor>) -> Self {
         self.libvirt_xml_extractor = Some(v);
         self
@@ -731,7 +798,7 @@ impl DispatcherBuilder {
         self
     }
 
-    pub fn log_output_queue(mut self, v: DebugSender<Box<MetaAppProto>>) -> Self {
+    pub fn log_output_queue(mut self, v: DebugSender<Box<AppProto>>) -> Self {
         self.log_output_queue = Some(v);
         self
     }
@@ -785,6 +852,7 @@ impl DispatcherBuilder {
         self
     }
 
+    #[cfg(target_os = "linux")]
     pub fn netns(mut self, v: NsFile) -> Self {
         self.netns = Some(v);
         self
@@ -810,11 +878,17 @@ impl DispatcherBuilder {
         self
     }
 
+    pub fn local_dispatcher_count(mut self, v: usize) -> Self {
+        self.local_dispatcher_count = v;
+        self
+    }
+
     pub fn build(mut self) -> Result<Dispatcher> {
+        #[cfg(target_os = "linux")]
         let netns = self.netns.unwrap_or_default();
         // set ns before creating af packet socket
         #[cfg(target_os = "linux")]
-        let _ = netns::open_named_and_setns(&netns)?;
+        let _ = public::netns::open_named_and_setns(&netns)?;
         let options = self
             .options
             .ok_or(Error::ConfigIncomplete("no options".into()))?;
@@ -823,6 +897,7 @@ impl DispatcherBuilder {
         let queue_debugger = self
             .queue_debugger
             .ok_or(Error::ConfigIncomplete("no queue debugger".into()))?;
+        let dispatcher_queue = options.lock().unwrap().dispatcher_queue;
         let engine = Self::get_engine(
             &self.pcap_interfaces,
             &mut self.src_interface,
@@ -855,7 +930,9 @@ impl DispatcherBuilder {
                 let mut lid = vec![id.to_string()];
                 if &src_interface != "" {
                     lid.push(src_interface.clone());
-                } else if netns != NsFile::Root {
+                }
+                #[cfg(target_os = "linux")]
+                if &src_interface == "" && netns != NsFile::Root {
                     lid.push(netns.to_string());
                 }
                 format!("({})", lid.join(", "))
@@ -863,6 +940,7 @@ impl DispatcherBuilder {
             engine,
 
             id,
+            local_dispatcher_count: self.local_dispatcher_count,
             src_interface: src_interface.clone(),
             src_interface_index: 0,
             ctrl_mac: self
@@ -948,9 +1026,10 @@ impl DispatcherBuilder {
                 .packet_sequence_output_queue
                 .take()
                 .ok_or(Error::ConfigIncomplete("no packet_sequence_block".into()))?,
+            #[cfg(target_os = "linux")]
             netns,
             npb_dedup_enabled: Arc::new(AtomicBool::new(false)),
-            pause: Arc::new(AtomicBool::new(true)),
+            pause: Arc::new(AtomicBool::new(self.pause.unwrap())),
             queue_debugger: queue_debugger.clone(),
         };
         collector.register_countable(
@@ -964,11 +1043,31 @@ impl DispatcherBuilder {
                 let extractor = self
                     .libvirt_xml_extractor
                     .ok_or(Error::ConfigIncomplete("no libvirt xml extractor".into()))?;
-                DispatcherFlavor::Local(LocalModeDispatcher {
-                    base,
-                    #[cfg(target_os = "linux")]
-                    extractor,
-                })
+                if dispatcher_queue {
+                    DispatcherFlavor::LocalPlus(LocalPlusModeDispatcher {
+                        base,
+                        #[cfg(target_os = "linux")]
+                        extractor,
+                        queue_debugger,
+                        stats_collector: collector.clone(),
+                        flow_generator_thread_handler: None,
+                        pipeline_thread_handler: None,
+                        pool_raw_size: snap_len,
+                        inner_queue_size: self
+                            .analyzer_queue_size
+                            .take()
+                            .ok_or(Error::ConfigIncomplete("no analyzer-queue-size".into()))?,
+                        raw_packet_block_size: self.analyzer_raw_packet_block_size.take().ok_or(
+                            Error::ConfigIncomplete("no analyzer-raw-packet-block-size".into()),
+                        )?,
+                    })
+                } else {
+                    DispatcherFlavor::Local(LocalModeDispatcher {
+                        base,
+                        #[cfg(target_os = "linux")]
+                        extractor,
+                    })
+                }
             }
             TapMode::Mirror => DispatcherFlavor::Mirror(MirrorModeDispatcher {
                 base,
@@ -1003,7 +1102,7 @@ impl DispatcherBuilder {
                         .bpf_syntax
                         .push(BpfSyntax::JumpIf(JumpIf {
                             cond: JumpTest::JumpNotEqual,
-                            val: Outgoing as u32,
+                            val: public::enums::LinuxSllPacketType::Outgoing as u32,
                             skip_true: 1,
                             ..Default::default()
                         }));
@@ -1042,9 +1141,9 @@ impl DispatcherBuilder {
                 )))
             }
         };
-        dispatcher.init();
+        dispatcher.init()?;
         #[cfg(target_os = "linux")]
-        let _ = netns::reset_netns()?;
+        let _ = public::netns::reset_netns()?;
         Ok(Dispatcher {
             flavor: Mutex::new(Some(dispatcher)),
             terminated,
@@ -1076,7 +1175,7 @@ impl DispatcherBuilder {
                     .iter()
                     .map(|src_iface| (src_iface.device_name.as_str(), src_iface.if_index as isize))
                     .collect();
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 let src_ifaces = pcap_interfaces
                     .as_ref()
                     .unwrap()
@@ -1087,7 +1186,6 @@ impl DispatcherBuilder {
                     "Libpcap init with: {:?} {} {}",
                     &src_ifaces, options.packet_blocks, options.snap_len
                 );
-                #[cfg(target_os = "linux")]
                 let libpcap = Libpcap::new(
                     src_ifaces,
                     options.packet_blocks,
@@ -1095,23 +1193,20 @@ impl DispatcherBuilder {
                     queue_debugger,
                 )
                 .map_err(|e| error::Error::Libpcap(e.to_string()))?;
-                #[cfg(target_os = "windows")]
-                let libpcap = Libpcap::new(src_ifaces, options.packet_blocks, options.snap_len)
-                    .map_err(|e| error::Error::Libpcap(e.to_string()))?;
                 Ok(RecvEngine::Libpcap(Some(libpcap)))
             }
-            #[cfg(target_os = "linux")]
-            TapMode::Mirror if options.dpdk_conf.enabled => {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            TapMode::Mirror if options.dpdk_enabled => {
                 #[cfg(target_arch = "s390x")]
                 return Err(Error::ConfigInvalid(
                     "cpu arch s390x does not support DPDK!".into(),
                 ));
                 #[cfg(not(target_arch = "s390x"))]
                 {
-                    Ok(RecvEngine::Dpdk())
+                    Ok(RecvEngine::Dpdk(Dpdk::new(None, None, options.snap_len)))
                 }
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             TapMode::Local | TapMode::Mirror | TapMode::Analyzer => {
                 let afp = af_packet::Options {
                     frame_size: if options.tap_mode == TapMode::Analyzer {
@@ -1138,7 +1233,7 @@ impl DispatcherBuilder {
 
 #[cfg(target_os = "linux")]
 impl DispatcherBuilder {
-    pub fn platform_poller(mut self, v: Arc<GenericPoller>) -> Self {
+    pub fn platform_poller(mut self, v: Arc<crate::platform::GenericPoller>) -> Self {
         self.platform_poller = Some(v);
         self
     }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
+	"github.com/deepflowio/deepflow/server/controller/cloud/tencent/expand"
 	"github.com/deepflowio/deepflow/server/controller/common"
 	uuid "github.com/satori/go.uuid"
 )
@@ -74,6 +75,7 @@ func (t *Tencent) getVMs(region tencentRegion) ([]model.VM, []model.VMSecurityGr
 			HType:        common.VM_HTYPE_VM_C,
 			State:        state,
 			CreatedAt:    createAt,
+			CloudTags:    expand.GetVMTags(vData),
 			VPCLcuuid:    common.GetUUID(vpcID, uuid.Nil),
 			AZLcuuid:     azLcuuid,
 			RegionLcuuid: t.getRegionLcuuid(region.lcuuid),

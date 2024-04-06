@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -43,8 +43,7 @@ func (b *BaiduBce) getSubDomains(region model.Region, vpcIdToLcuuid map[string]s
 			log.Error(err)
 			return nil, err
 		}
-		b.cloudStatsd.APICost["ListClusters"] = append(b.cloudStatsd.APICost["ListClusters"], int(time.Now().Sub(startTime).Milliseconds()))
-		b.cloudStatsd.APICount["ListClusters"] = append(b.cloudStatsd.APICount["ListClusters"], len(result.Clusters))
+		b.cloudStatsd.RefreshAPIMoniter("ListClusters", len(result.Clusters), startTime)
 		results = append(results, result)
 		if !result.IsTruncated {
 			break

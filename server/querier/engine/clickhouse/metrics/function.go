@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,60 +22,69 @@ import (
 )
 
 type Function struct {
-	Name                  string
-	Type                  int
-	SupportMetricsTypes   []int  // 支持的指标量类型
-	UnitOverwrite         string // 单位替换
-	AdditionnalParamCount int    // 额外参数数量
+	Name                    string
+	Type                    int
+	SupportMetricsTypes     []int  // 支持的指标量类型
+	UnitOverwrite           string // 单位替换
+	AdditionnalParamCount   int    // 额外参数数量
+	IsSupportOtherOperators bool   // 是否支持前置或后置算子
+	ValueType               string // 指标量返回的数据类型
 }
 
-func NewFunction(name string, functionType int, supportMetricsTypes []int, unitOverwrite string, additionnalParamCount int) *Function {
+func NewFunction(name string, functionType int, supportMetricsTypes []int, unitOverwrite string, additionnalParamCount int, isSupportOtherOperators bool, valueType string) *Function {
 	return &Function{
-		Name:                  name,
-		Type:                  functionType,
-		SupportMetricsTypes:   supportMetricsTypes,
-		UnitOverwrite:         unitOverwrite,
-		AdditionnalParamCount: additionnalParamCount,
+		Name:                    name,
+		Type:                    functionType,
+		SupportMetricsTypes:     supportMetricsTypes,
+		UnitOverwrite:           unitOverwrite,
+		AdditionnalParamCount:   additionnalParamCount,
+		IsSupportOtherOperators: isSupportOtherOperators,
+		ValueType:               valueType,
 	}
 }
 
 var METRICS_FUNCTIONS = []string{
-	view.FUNCTION_AVG, view.FUNCTION_SUM, view.FUNCTION_MAX, view.FUNCTION_MIN,
+	view.FUNCTION_AVG, view.FUNCTION_AAVG, view.FUNCTION_SUM, view.FUNCTION_MAX, view.FUNCTION_MIN,
 	view.FUNCTION_PCTL, view.FUNCTION_PCTL_EXACT, view.FUNCTION_SPREAD,
 	view.FUNCTION_RSPREAD, view.FUNCTION_STDDEV, view.FUNCTION_APDEX,
 	view.FUNCTION_UNIQ, view.FUNCTION_UNIQ_EXACT, view.FUNCTION_PERCENTAG,
 	view.FUNCTION_PERSECOND, view.FUNCTION_HISTOGRAM, view.FUNCTION_LAST, view.FUNCTION_COUNT,
+	view.FUNCTION_TOPK, view.FUNCTION_ANY,
 }
 
 var METRICS_FUNCTIONS_MAP = map[string]*Function{
-	view.FUNCTION_COUNT:      NewFunction(view.FUNCTION_COUNT, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_OTHER}, "$unit", 0),
-	view.FUNCTION_SUM:        NewFunction(view.FUNCTION_SUM, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_COUNTER}, "$unit", 0),
-	view.FUNCTION_AVG:        NewFunction(view.FUNCTION_AVG, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_COUNTER, METRICS_TYPE_GAUGE, METRICS_TYPE_DELAY, METRICS_TYPE_PERCENTAGE, METRICS_TYPE_QUOTIENT}, "$unit", 0),
-	view.FUNCTION_MAX:        NewFunction(view.FUNCTION_MAX, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_COUNTER, METRICS_TYPE_GAUGE, METRICS_TYPE_DELAY, METRICS_TYPE_PERCENTAGE, METRICS_TYPE_QUOTIENT}, "$unit", 0),
-	view.FUNCTION_MIN:        NewFunction(view.FUNCTION_MIN, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_COUNTER, METRICS_TYPE_GAUGE, METRICS_TYPE_DELAY, METRICS_TYPE_PERCENTAGE, METRICS_TYPE_QUOTIENT}, "$unit", 0),
-	view.FUNCTION_STDDEV:     NewFunction(view.FUNCTION_STDDEV, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_COUNTER, METRICS_TYPE_GAUGE, METRICS_TYPE_DELAY, METRICS_TYPE_PERCENTAGE, METRICS_TYPE_QUOTIENT}, "$unit", 0),
-	view.FUNCTION_SPREAD:     NewFunction(view.FUNCTION_SPREAD, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_COUNTER, METRICS_TYPE_GAUGE, METRICS_TYPE_DELAY, METRICS_TYPE_PERCENTAGE, METRICS_TYPE_QUOTIENT}, "$unit", 0),
-	view.FUNCTION_RSPREAD:    NewFunction(view.FUNCTION_RSPREAD, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_COUNTER, METRICS_TYPE_GAUGE, METRICS_TYPE_DELAY, METRICS_TYPE_PERCENTAGE, METRICS_TYPE_QUOTIENT}, "", 0),
-	view.FUNCTION_APDEX:      NewFunction(view.FUNCTION_APDEX, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_DELAY}, "%", 1),
-	view.FUNCTION_PCTL:       NewFunction(view.FUNCTION_PCTL, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_COUNTER, METRICS_TYPE_GAUGE, METRICS_TYPE_DELAY, METRICS_TYPE_PERCENTAGE, METRICS_TYPE_QUOTIENT}, "$unit", 1),
-	view.FUNCTION_PCTL_EXACT: NewFunction(view.FUNCTION_PCTL_EXACT, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_COUNTER, METRICS_TYPE_GAUGE, METRICS_TYPE_DELAY, METRICS_TYPE_PERCENTAGE, METRICS_TYPE_QUOTIENT}, "$unit", 1),
-	view.FUNCTION_UNIQ:       NewFunction(view.FUNCTION_UNIQ, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_TAG}, "$unit", 0),
-	view.FUNCTION_UNIQ_EXACT: NewFunction(view.FUNCTION_UNIQ_EXACT, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_TAG}, "$unit", 0),
-	view.FUNCTION_PERCENTAG:  NewFunction(view.FUNCTION_PERCENTAG, FUNCTION_TYPE_MATH, nil, "%", 0),
-	view.FUNCTION_PERSECOND:  NewFunction(view.FUNCTION_PERSECOND, FUNCTION_TYPE_MATH, nil, "$unit/s", 0),
-	view.FUNCTION_HISTOGRAM:  NewFunction(view.FUNCTION_HISTOGRAM, FUNCTION_TYPE_MATH, nil, "", 1),
-	view.FUNCTION_LAST:       NewFunction(view.FUNCTION_LAST, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_COUNTER, METRICS_TYPE_GAUGE, METRICS_TYPE_DELAY, METRICS_TYPE_PERCENTAGE, METRICS_TYPE_QUOTIENT}, "", 0),
+	view.FUNCTION_COUNT:      NewFunction(view.FUNCTION_COUNT, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_OTHER}, "$unit", 0, true, "Number"),
+	view.FUNCTION_SUM:        NewFunction(view.FUNCTION_SUM, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_COUNTER}, "$unit", 0, true, "Number"),
+	view.FUNCTION_AVG:        NewFunction(view.FUNCTION_AVG, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_COUNTER, METRICS_TYPE_GAUGE, METRICS_TYPE_DELAY, METRICS_TYPE_PERCENTAGE, METRICS_TYPE_QUOTIENT, METRICS_TYPE_BOUNDED_GAUGE}, "$unit", 0, true, "Number"),
+	view.FUNCTION_AAVG:       NewFunction(view.FUNCTION_AAVG, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_COUNTER, METRICS_TYPE_GAUGE, METRICS_TYPE_DELAY, METRICS_TYPE_PERCENTAGE, METRICS_TYPE_QUOTIENT, METRICS_TYPE_BOUNDED_GAUGE}, "$unit", 0, true, "Number"),
+	view.FUNCTION_MAX:        NewFunction(view.FUNCTION_MAX, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_COUNTER, METRICS_TYPE_GAUGE, METRICS_TYPE_DELAY, METRICS_TYPE_PERCENTAGE, METRICS_TYPE_QUOTIENT, METRICS_TYPE_BOUNDED_GAUGE}, "$unit", 0, true, "Number"),
+	view.FUNCTION_MIN:        NewFunction(view.FUNCTION_MIN, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_COUNTER, METRICS_TYPE_GAUGE, METRICS_TYPE_DELAY, METRICS_TYPE_PERCENTAGE, METRICS_TYPE_QUOTIENT, METRICS_TYPE_BOUNDED_GAUGE}, "$unit", 0, true, "Number"),
+	view.FUNCTION_STDDEV:     NewFunction(view.FUNCTION_STDDEV, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_COUNTER, METRICS_TYPE_GAUGE, METRICS_TYPE_DELAY, METRICS_TYPE_PERCENTAGE, METRICS_TYPE_QUOTIENT, METRICS_TYPE_BOUNDED_GAUGE}, "$unit", 0, true, "Number"),
+	view.FUNCTION_SPREAD:     NewFunction(view.FUNCTION_SPREAD, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_COUNTER, METRICS_TYPE_GAUGE, METRICS_TYPE_DELAY, METRICS_TYPE_PERCENTAGE, METRICS_TYPE_QUOTIENT, METRICS_TYPE_BOUNDED_GAUGE}, "$unit", 0, true, "Number"),
+	view.FUNCTION_RSPREAD:    NewFunction(view.FUNCTION_RSPREAD, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_COUNTER, METRICS_TYPE_GAUGE, METRICS_TYPE_DELAY, METRICS_TYPE_PERCENTAGE, METRICS_TYPE_QUOTIENT, METRICS_TYPE_BOUNDED_GAUGE}, "", 0, true, "Number"),
+	view.FUNCTION_APDEX:      NewFunction(view.FUNCTION_APDEX, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_DELAY}, "%", 1, true, "Number"),
+	view.FUNCTION_PCTL:       NewFunction(view.FUNCTION_PCTL, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_COUNTER, METRICS_TYPE_GAUGE, METRICS_TYPE_DELAY, METRICS_TYPE_PERCENTAGE, METRICS_TYPE_QUOTIENT, METRICS_TYPE_BOUNDED_GAUGE}, "$unit", 1, true, "Number"),
+	view.FUNCTION_PCTL_EXACT: NewFunction(view.FUNCTION_PCTL_EXACT, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_COUNTER, METRICS_TYPE_GAUGE, METRICS_TYPE_DELAY, METRICS_TYPE_PERCENTAGE, METRICS_TYPE_QUOTIENT, METRICS_TYPE_BOUNDED_GAUGE}, "$unit", 1, true, "Number"),
+	view.FUNCTION_UNIQ:       NewFunction(view.FUNCTION_UNIQ, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_TAG}, "$unit", 0, false, "Number"),
+	view.FUNCTION_UNIQ_EXACT: NewFunction(view.FUNCTION_UNIQ_EXACT, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_TAG}, "$unit", 0, false, "Number"),
+	view.FUNCTION_PERCENTAG:  NewFunction(view.FUNCTION_PERCENTAG, FUNCTION_TYPE_MATH, nil, "%", 0, true, "Number"),
+	view.FUNCTION_PERSECOND:  NewFunction(view.FUNCTION_PERSECOND, FUNCTION_TYPE_MATH, nil, "$unit/s", 0, true, "Number"),
+	view.FUNCTION_HISTOGRAM:  NewFunction(view.FUNCTION_HISTOGRAM, FUNCTION_TYPE_MATH, nil, "", 1, true, "Number"),
+	view.FUNCTION_LAST:       NewFunction(view.FUNCTION_LAST, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_COUNTER, METRICS_TYPE_GAUGE, METRICS_TYPE_DELAY, METRICS_TYPE_PERCENTAGE, METRICS_TYPE_QUOTIENT, METRICS_TYPE_BOUNDED_GAUGE}, "", 0, true, "Number"),
+	view.FUNCTION_TOPK:       NewFunction(view.FUNCTION_TOPK, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_TAG}, "$unit", 1, false, "String"),
+	view.FUNCTION_ANY:        NewFunction(view.FUNCTION_ANY, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_TAG}, "$unit", 0, false, "String"),
+	view.FUNCTION_DERIVATIVE: NewFunction(view.FUNCTION_DERIVATIVE, FUNCTION_TYPE_AGG, []int{METRICS_TYPE_COUNTER}, "$unit", 0, true, "Number"),
 }
 
 func GetFunctionDescriptions() (*common.Result, error) {
 	columns := []interface{}{
-		"name", "type", "support_metric_types", "unit_overwrite", "additional_param_count",
+		"name", "type", "support_metric_types", "unit_overwrite", "additional_param_count", "is_support_other_operators", "value_type",
 	}
 	var values []interface{}
 	for _, name := range METRICS_FUNCTIONS {
 		f := METRICS_FUNCTIONS_MAP[name]
 		values = append(values, []interface{}{
-			f.Name, f.Type, f.SupportMetricsTypes, f.UnitOverwrite, f.AdditionnalParamCount,
+			f.Name, f.Type, f.SupportMetricsTypes, f.UnitOverwrite, f.AdditionnalParamCount, f.IsSupportOtherOperators, f.ValueType,
 		})
 	}
 	return &common.Result{

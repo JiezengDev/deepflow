@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -88,7 +88,9 @@ impl PassivePoller {
     fn get_ignored_interface_indice() -> HashSet<u32> {
         let mut ignored = HashSet::new();
 
-        let Ok(addrs) = addr_list() else { return ignored; };
+        let Ok(addrs) = addr_list() else {
+            return ignored;
+        };
         for addr in addrs {
             if addr.scope != RT_SCOPE_LINK {
                 ignored.insert(addr.if_index);
@@ -123,7 +125,7 @@ impl PassivePoller {
             }),
             BpfSyntax::JumpIf(JumpIf {
                 cond: JumpTest::JumpNotEqual,
-                val: u16::from(EthernetType::Dot1Q) as u32,
+                val: u16::from(EthernetType::DOT1Q) as u32,
                 skip_false: 0,
                 skip_true: 2,
             }),
@@ -138,7 +140,7 @@ impl PassivePoller {
             // ARP
             BpfSyntax::JumpIf(JumpIf {
                 cond: JumpTest::JumpEqual,
-                val: u16::from(EthernetType::Arp) as u32,
+                val: u16::from(EthernetType::ARP) as u32,
                 skip_false: 1,
                 skip_true: 0,
             }),
@@ -146,7 +148,7 @@ impl PassivePoller {
             // IPv6
             BpfSyntax::JumpIf(JumpIf {
                 cond: JumpTest::JumpEqual,
-                val: u16::from(EthernetType::Ipv6) as u32,
+                val: u16::from(EthernetType::IPV6) as u32,
                 skip_true: 1,
                 skip_false: 0,
             }),
@@ -158,13 +160,13 @@ impl PassivePoller {
             }),
             BpfSyntax::JumpIf(JumpIf {
                 cond: JumpTest::JumpEqual,
-                val: u8::from(IpProtocol::Icmpv6) as u32,
+                val: u8::from(IpProtocol::ICMPV6) as u32,
                 skip_true: 8,
                 skip_false: 0,
             }),
             BpfSyntax::JumpIf(JumpIf {
                 cond: JumpTest::JumpEqual,
-                val: u8::from(IpProtocol::Ipv6Fragment) as u32,
+                val: u8::from(IpProtocol::IPV6_FRAGMENT) as u32,
                 skip_true: 1,
                 skip_false: 0,
             }),
@@ -182,7 +184,7 @@ impl PassivePoller {
             }),
             BpfSyntax::JumpIf(JumpIf {
                 cond: JumpTest::JumpEqual,
-                val: u8::from(IpProtocol::Icmpv6) as u32,
+                val: u8::from(IpProtocol::ICMPV6) as u32,
                 skip_true: 1,
                 skip_false: 0,
             }),
@@ -256,7 +258,7 @@ impl PassivePoller {
             let now = SystemTime::now();
             // 每分钟移除超时的记录
             // Remove timed out records every minute
-            if now.duration_since(last_expire).unwrap() > MINUTE {
+            if now < last_expire || now.duration_since(last_expire).unwrap() > MINUTE {
                 ignored_indice = Self::get_ignored_interface_indice();
                 let mut entries_gurad = entries.lock().unwrap();
                 let old_len = entries_gurad.len();
@@ -283,10 +285,10 @@ impl PassivePoller {
 
             let mut eth_type = read_u16_be(&packet_data[ETH_TYPE_OFFSET..]);
             let mut extra_offset = 0;
-            if eth_type == EthernetType::Dot1Q {
+            if eth_type == EthernetType::DOT1Q {
                 extra_offset += VLAN_HEADER_SIZE;
                 eth_type = read_u16_be(&packet_data[ETH_TYPE_OFFSET + extra_offset..]);
-                if eth_type == EthernetType::Dot1Q {
+                if eth_type == EthernetType::DOT1Q {
                     extra_offset += VLAN_HEADER_SIZE;
                     eth_type = read_u16_be(&packet_data[ETH_TYPE_OFFSET + extra_offset..]);
                 }
@@ -301,7 +303,7 @@ impl PassivePoller {
             };
 
             let entry = match eth_type {
-                EthernetType::Arp => {
+                EthernetType::ARP => {
                     if packet_len < ARP_SPA_OFFSET + extra_offset + 4 {
                         debug!("ignore short arp packet, size={packet_len}");
                         continue;
@@ -320,14 +322,14 @@ impl PassivePoller {
                         ),
                     }
                 }
-                EthernetType::Ipv6 => {
+                EthernetType::IPV6 => {
                     if packet_len < IPV6_PROTO_OFFSET + extra_offset + 1 {
                         debug!("ignore short ipv6 packet, size={packet_len}");
                         continue;
                     }
 
                     let mut protocol = packet_data[IPV6_PROTO_OFFSET + extra_offset];
-                    if protocol == IpProtocol::Ipv6 {
+                    if protocol == IpProtocol::IPV6 {
                         extra_offset += IPV6_FRAGMENT_LEN;
                         protocol = packet_data[IPV6_PROTO_OFFSET + extra_offset];
                     }
@@ -335,7 +337,7 @@ impl PassivePoller {
                         debug!("ignore short icmpv6 packet, size={packet_len}");
                         continue;
                     }
-                    if protocol != IpProtocol::Icmpv6
+                    if protocol != IpProtocol::ICMPV6
                         || packet_data[ICMPV6_TYPE_OFFSET + extra_offset]
                             != Icmpv6Types::NeighborAdvert.0
                     {
@@ -370,7 +372,9 @@ impl PassivePoller {
             }
             let new_version = version.load(Ordering::Relaxed);
             if last_version != new_version {
-                if now.duration_since(last_version_log).unwrap() > MINUTE {
+                // Local timestamp may be modified
+                if now < last_version_log || now.duration_since(last_version_log).unwrap() > MINUTE
+                {
                     info!("kubernetes poller updated to version {new_version}");
                     last_version_log = now;
                     if log_enabled!(Level::Debug) {
@@ -404,19 +408,19 @@ impl Poller for PassivePoller {
         let mut info = InterfaceInfo {
             tap_idx: entries[0].tap_index,
             mac: entries[0].mac,
-            ips: vec![entries[0].ip],
+            ips: vec![entries[0].ip.into()],
             device_id: "1".to_string(),
             ..Default::default()
         };
         for entry in entries.iter().skip(1) {
             if entry.tap_index == info.tap_idx && entry.mac == info.mac {
-                info.ips.push(entry.ip);
+                info.ips.push(entry.ip.into());
             } else {
                 info_slice.push(info.clone());
                 info = InterfaceInfo {
                     tap_idx: entry.tap_index,
                     mac: entry.mac,
-                    ips: vec![entry.ip],
+                    ips: vec![entry.ip.into()],
                     device_id: "1".to_string(),
                     ..Default::default()
                 };

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,51 +14,48 @@
  * limitations under the License.
  */
 
+use std::borrow::Cow;
 use std::cmp::{max, min};
-#[cfg(target_os = "linux")]
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
-use std::process;
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
 use arc_swap::{access::Map, ArcSwap};
+use base64::{prelude::BASE64_STANDARD, Engine};
 use bytesize::ByteSize;
 use flexi_logger::{
     writers::FileLogWriter, Age, Cleanup, Criterion, FileSpec, FlexiLoggerError, LoggerHandle,
     Naming,
 };
-#[cfg(target_os = "linux")]
-use libc::{c_int, setpriority, PRIO_PROCESS};
-use log::{error, info, warn, Level};
-#[cfg(target_os = "linux")]
+use http2::get_expected_headers;
+use log::{info, warn, Level};
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use nix::{
     sched::{sched_setaffinity, CpuSet},
     unistd::Pid,
 };
-#[cfg(target_os = "linux")]
-use regex::Regex;
-#[cfg(target_os = "linux")]
-use sysinfo::System;
 use sysinfo::SystemExt;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use sysinfo::{CpuRefreshKind, RefreshKind, System};
 use tokio::runtime::Runtime;
 
-#[cfg(target_os = "linux")]
+use super::config::{ExtraLogFields, OracleParseConfig};
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use super::{
     config::EbpfYamlConfig, OsProcRegexp, OS_PROC_REGEXP_MATCH_ACTION_ACCEPT,
     OS_PROC_REGEXP_MATCH_TYPE_PROC_NAME,
 };
 use super::{
-    config::{Config, KubernetesResourceConfig, PcapConfig, PortConfig, YamlConfig},
+    config::{
+        Config, HttpEndpointExtraction, KubernetesResourceConfig, MatchRule, PcapConfig,
+        PortConfig, YamlConfig,
+    },
     ConfigError, KubernetesPollerType, RuntimeConfig,
 };
-use crate::plugin::c_ffi::SoPluginFunc;
-#[cfg(target_os = "linux")]
-use crate::plugin::shared_obj::load_plugin;
 use crate::rpc::Session;
 use crate::{
     common::{decapsulate::TunnelTypeBitmap, enums::TapType, l7_protocol_log::L7ProtocolBitmap},
@@ -68,17 +65,19 @@ use crate::{
     handler::PacketHandlerBuilder,
     metric::document::TapSide,
     trident::{AgentComponents, RunningMode},
-    utils::{
-        environment::{free_memory_check, k8s_mem_limit_for_deepflow, running_in_container},
-        logger::RemoteLogConfig,
-    },
+    utils::environment::{free_memory_check, get_container_mem_limit, running_in_container},
 };
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::{
     dispatcher::recv_engine::af_packet::OptTpacketVersion,
     ebpf::CAP_LEN_MAX,
-    platform::{kubernetes::Poller, ApiWatcher, ProcRegRewrite},
-    utils::environment::{get_ctrl_ip_and_mac, is_tt_pod, is_tt_workload},
+    platform::ProcRegRewrite,
+    utils::environment::{get_ctrl_ip_and_mac, is_tt_workload},
+};
+#[cfg(target_os = "linux")]
+use crate::{
+    platform::{kubernetes::Poller, ApiWatcher},
+    utils::environment::is_tt_pod,
 };
 
 use public::bitmap::Bitmap;
@@ -86,19 +85,11 @@ use public::proto::{
     common::TridentType,
     trident::{self, CaptureSocketType, Exception, IfMacSource, SocketType, TapMode},
 };
-#[cfg(target_os = "linux")]
-use public::{
-    consts::NORMAL_EXIT_WITH_RESTART,
-    netns::{self, NsFile},
-};
 
 use crate::{trident::AgentId, utils::cgroups::is_kernel_available_for_cgroups};
-#[cfg(target_os = "windows")]
-use public::utils::net::links_by_name_regex;
 use public::utils::net::MacAddr;
 
 const MB: u64 = 1048576;
-const MINUTE: Duration = Duration::from_secs(60);
 
 type Access<C> = Map<Arc<ArcSwap<ModuleConfig>>, ModuleConfig, fn(&ModuleConfig) -> &C>;
 
@@ -130,7 +121,7 @@ pub type DebugAccess = Access<DebugConfig>;
 
 pub type SynchronizerAccess = Access<SynchronizerConfig>;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub type EbpfAccess = Access<EbpfConfig>;
 
 pub type MetricServerAccess = Access<MetricServerConfig>;
@@ -150,6 +141,7 @@ pub struct CollectorConfig {
     pub trident_type: TridentType,
     pub vtap_id: u16,
     pub cloud_gateway_traffic: bool,
+    pub packet_delay: Duration,
 }
 
 impl fmt::Debug for CollectorConfig {
@@ -194,11 +186,12 @@ impl fmt::Debug for CollectorConfig {
             .field("trident_type", &self.trident_type)
             .field("vtap_id", &self.vtap_id)
             .field("cloud_gateway_traffic", &self.cloud_gateway_traffic)
+            .field("packet_delay", &self.packet_delay)
             .finish()
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct EnvironmentConfig {
     pub max_memory: u64,
     pub max_cpus: u32,
@@ -207,6 +200,9 @@ pub struct EnvironmentConfig {
     pub sys_free_memory_limit: u32,
     pub log_file_size: u32,
     pub tap_mode: TapMode,
+    pub system_load_circuit_breaker_threshold: f32,
+    pub system_load_circuit_breaker_recover: f32,
+    pub system_load_circuit_breaker_metric: trident::SystemLoadMetric,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -258,7 +254,7 @@ impl Default for NpbConfig {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct OsProcScanConfig {
     pub os_proc_root: String,
@@ -297,6 +293,7 @@ pub struct PlatformConfig {
     pub thread_threshold: u32,
     pub tap_mode: TapMode,
     pub os_proc_scan_conf: OsProcScanConfig,
+    pub agent_enabled: bool,
 }
 
 #[derive(Clone, PartialEq, Debug, Eq)]
@@ -325,13 +322,15 @@ pub struct DispatcherConfig {
     pub capture_bpf: String,
     pub max_memory: u64,
     pub af_packet_blocks: usize,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub af_packet_version: OptTpacketVersion,
     pub tap_mode: TapMode,
     pub region_id: u32,
     pub pod_cluster_id: u32,
     pub enabled: bool,
     pub npb_dedup_enabled: bool,
+    pub dpdk_enabled: bool,
+    pub dispatcher_queue: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -341,8 +340,73 @@ pub struct LogConfig {
     pub log_retention: u32,
     pub rsyslog_enabled: bool,
     pub host: String,
-    pub analyzer_ip: String,
-    pub analyzer_port: u16,
+}
+
+#[derive(Clone)]
+pub struct PluginConfig {
+    pub last_updated: u32,
+    pub digest: u64, // for change detection
+    pub names: Vec<(String, trident::PluginType)>,
+    // name, data
+    pub wasm_plugins: Vec<(String, Vec<u8>)>,
+    pub so_plugins: Vec<(String, Vec<u8>)>,
+}
+
+impl PartialEq for PluginConfig {
+    fn eq(&self, other: &PluginConfig) -> bool {
+        self.last_updated == other.last_updated
+            && self.digest == other.digest
+            && self.names == other.names
+    }
+}
+
+impl Eq for PluginConfig {}
+
+impl fmt::Debug for PluginConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PluginConfig")
+            .field("last_updated", &self.last_updated)
+            .field("digest", &self.digest)
+            .field("names", &self.names)
+            .finish()
+    }
+}
+
+impl PluginConfig {
+    fn fill_plugin_prog_from_server(
+        &mut self,
+        rt: &Runtime,
+        session: &Session,
+        agent_id: &AgentId,
+    ) {
+        self.wasm_plugins.clear();
+        self.so_plugins.clear();
+
+        rt.block_on(async {
+            for (name, ptype) in self.names.iter() {
+                log::trace!("get {:?} plugin {}", ptype, name);
+                match session.get_plugin(name, *ptype, agent_id).await {
+                    Ok(prog) => match ptype {
+                        trident::PluginType::Wasm => self.wasm_plugins.push((name.clone(), prog)),
+                        #[cfg(any(target_os = "linux", target_os = "android"))]
+                        trident::PluginType::So => self.so_plugins.push((name.clone(), prog)),
+                        #[cfg(any(target_os = "windows"))]
+                        _ => (),
+                    },
+                    Err(err) => {
+                        warn!("get {:?} plugin {} fail: {}", ptype, name, err);
+                        continue;
+                    }
+                }
+            }
+        });
+
+        info!(
+            "{} wasm and {} so plugins pulled from server",
+            self.wasm_plugins.len(),
+            self.so_plugins.len()
+        );
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -381,14 +445,16 @@ pub struct FlowConfig {
     // vec<protocolName, port bitmap>
     pub l7_protocol_parse_port_bitmap: Arc<Vec<(String, Bitmap)>>,
 
-    // name, data
-    pub wasm_plugins: Vec<(String, Vec<u8>)>,
-    pub so_plugins: Vec<SoPluginFunc>,
+    pub plugins: PluginConfig,
 
     pub rrt_tcp_timeout: usize, //micro sec
     pub rrt_udp_timeout: usize, //micro sec
 
     pub batched_buffer_size_limit: usize,
+
+    pub oracle_parse_conf: OracleParseConfig,
+
+    pub obfuscate_enabled_protocols: L7ProtocolBitmap,
 }
 
 impl From<&RuntimeConfig> for FlowConfig {
@@ -415,10 +481,10 @@ impl From<&RuntimeConfig> for FlowConfig {
             packet_delay: conf.yaml_config.packet_delay,
             flush_interval: flow_config.flush_interval,
             flow_timeout: FlowTimeout::from(TcpTimeout {
-                established: flow_config.established_timeout,
-                closing_rst: flow_config.closing_rst_timeout,
-                others: flow_config.others_timeout,
-                opening_rst: flow_config.opening_rst_timeout,
+                established: flow_config.established_timeout.into(),
+                closing_rst: flow_config.closing_rst_timeout.into(),
+                others: flow_config.others_timeout.into(),
+                opening_rst: flow_config.opening_rst_timeout.into(),
             }),
             ignore_tor_mac: flow_config.ignore_tor_mac,
             ignore_l2_end: flow_config.ignore_l2_end,
@@ -440,11 +506,56 @@ impl From<&RuntimeConfig> for FlowConfig {
             l7_protocol_parse_port_bitmap: Arc::new(
                 (&conf.yaml_config).get_protocol_port_parse_bitmap(),
             ),
-            wasm_plugins: vec![],
-            so_plugins: vec![],
+            plugins: PluginConfig {
+                last_updated: conf
+                    .plugins
+                    .as_ref()
+                    .and_then(|p| p.update_time)
+                    .unwrap_or_default(),
+                digest: {
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    if let Some(plugins) = &conf.plugins {
+                        plugins.update_time.hash(&mut hasher);
+                        for plugin in plugins.wasm_plugins.iter() {
+                            plugin.hash(&mut hasher);
+                            trident::PluginType::Wasm.hash(&mut hasher);
+                        }
+                        for plugin in plugins.so_plugins.iter() {
+                            plugin.hash(&mut hasher);
+                            trident::PluginType::So.hash(&mut hasher);
+                        }
+                    }
+                    hasher.finish()
+                },
+                names: {
+                    let mut plugins = vec![];
+                    if let Some(p) = &conf.plugins {
+                        plugins.extend(
+                            p.wasm_plugins
+                                .iter()
+                                .map(|p| (p.clone(), trident::PluginType::Wasm)),
+                        );
+                        plugins.extend(
+                            p.so_plugins
+                                .iter()
+                                .map(|p| (p.clone(), trident::PluginType::So)),
+                        );
+                    }
+                    plugins
+                },
+                wasm_plugins: vec![],
+                so_plugins: vec![],
+            },
             rrt_tcp_timeout: conf.yaml_config.rrt_tcp_timeout.as_micros() as usize,
             rrt_udp_timeout: conf.yaml_config.rrt_udp_timeout.as_micros() as usize,
             batched_buffer_size_limit: conf.yaml_config.batched_buffer_size_limit,
+            oracle_parse_conf: conf.yaml_config.oracle_parse_config,
+            obfuscate_enabled_protocols: L7ProtocolBitmap::from(
+                &conf
+                    .yaml_config
+                    .l7_protocol_advanced_features
+                    .obfuscate_enabled_protocols,
+            ),
         }
     }
 }
@@ -492,7 +603,86 @@ impl fmt::Debug for FlowConfig {
             )
             // FIXME: this field is too long to log
             // .field("l7_protocol_parse_port_bitmap", &self.l7_protocol_parse_port_bitmap)
+            .field("plugins", &self.plugins)
             .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct TrieNode {
+    children: HashMap<char, Box<TrieNode>>,
+    keep_segments: Option<usize>,
+}
+
+impl TrieNode {
+    fn new() -> Self {
+        TrieNode {
+            children: HashMap::new(),
+            keep_segments: None,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct HttpEndpointTrie {
+    root: TrieNode,
+}
+
+impl HttpEndpointTrie {
+    pub fn new() -> Self {
+        Self {
+            root: TrieNode::new(),
+        }
+    }
+
+    pub fn insert(&mut self, rule: &MatchRule) {
+        let mut node = &mut self.root;
+        for ch in rule.prefix.chars() {
+            node = node
+                .children
+                .entry(ch)
+                .or_insert_with(|| Box::new(TrieNode::new()));
+        }
+        node.keep_segments = Some(rule.keep_segments);
+    }
+
+    pub fn find_matching_rule(&self, input: &str) -> usize {
+        const DEFAULT_KEEP_SEGMENTS: usize = 2;
+        let mut node = &self.root;
+        let mut keep_segments = if node.keep_segments.is_some() {
+            node.keep_segments.unwrap()
+        } else {
+            DEFAULT_KEEP_SEGMENTS
+        };
+        let has_rules = node.keep_segments.is_some() || !node.children.is_empty();
+        let mut matched = node.keep_segments.is_some() && node.children.is_empty(); // if it has a rule, and the prefix is "", any path is matched
+        for c in input.chars() {
+            if let Some(child) = node.children.get(&c) {
+                keep_segments = child.keep_segments.unwrap_or(keep_segments);
+                if !matched {
+                    matched = child.keep_segments.is_some(); // if the child is a leaf, then matched
+                }
+                node = child.as_ref();
+            } else {
+                break;
+            }
+        }
+        if !matched && has_rules {
+            0
+        } else {
+            keep_segments
+        }
+    }
+}
+
+impl From<&HttpEndpointExtraction> for HttpEndpointTrie {
+    fn from(v: &HttpEndpointExtraction) -> Self {
+        let mut t = Self::new();
+        v.match_rules
+            .iter()
+            .filter(|r| r.keep_segments > 0)
+            .for_each(|r| t.insert(r));
+        t
     }
 }
 
@@ -500,8 +690,12 @@ impl fmt::Debug for FlowConfig {
 pub struct LogParserConfig {
     pub l7_log_collect_nps_threshold: u64,
     pub l7_log_session_aggr_timeout: Duration,
+    pub l7_log_session_slot_capacity: usize,
     pub l7_log_dynamic: L7LogDynamicConfig,
     pub l7_log_ignore_tap_sides: [bool; TapSide::MAX as usize + 1],
+    pub http_endpoint_disabled: bool,
+    pub http_endpoint_trie: HttpEndpointTrie,
+    pub obfuscate_enabled_protocols: L7ProtocolBitmap,
 }
 
 impl Default for LogParserConfig {
@@ -509,8 +703,12 @@ impl Default for LogParserConfig {
         Self {
             l7_log_collect_nps_threshold: 0,
             l7_log_session_aggr_timeout: Duration::ZERO,
+            l7_log_session_slot_capacity: 1024,
             l7_log_dynamic: L7LogDynamicConfig::default(),
             l7_log_ignore_tap_sides: [false; TapSide::MAX as usize + 1],
+            http_endpoint_disabled: false,
+            http_endpoint_trie: HttpEndpointTrie::new(),
+            obfuscate_enabled_protocols: L7ProtocolBitmap::default(),
         }
     }
 }
@@ -525,6 +723,10 @@ impl fmt::Debug for LogParserConfig {
             .field(
                 "l7_log_session_aggr_timeout",
                 &self.l7_log_session_aggr_timeout,
+            )
+            .field(
+                "l7_log_session_slot_capacity",
+                &self.l7_log_session_slot_capacity,
             )
             .field("l7_log_dynamic", &self.l7_log_dynamic)
             .field(
@@ -578,7 +780,7 @@ pub struct SynchronizerConfig {
     pub output_vlan: u16,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[derive(Clone, PartialEq, Eq)]
 pub struct EbpfConfig {
     // 动态配置
@@ -595,11 +797,11 @@ pub struct EbpfConfig {
     pub ctrl_mac: MacAddr,
     pub l7_protocol_enabled_bitmap: L7ProtocolBitmap,
     pub l7_protocol_parse_port_bitmap: Arc<Vec<(String, Bitmap)>>,
-    pub l7_protocol_ports: HashMap<String, String>,
+    pub l7_protocol_ports: std::collections::HashMap<String, String>,
     pub ebpf: EbpfYamlConfig,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl fmt::Debug for EbpfConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EbpfConfig")
@@ -634,7 +836,7 @@ impl fmt::Debug for EbpfConfig {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl EbpfConfig {
     pub fn l7_log_enabled(&self) -> bool {
         // disabled when metrics collection is turned off
@@ -654,6 +856,7 @@ pub enum TraceType {
     XB3,
     XB3Span,
     Uber,
+    Sw3,
     Sw6,
     Sw8,
     TraceParent,
@@ -666,6 +869,7 @@ pub enum TraceType {
 const TRACE_TYPE_XB3: &str = "x-b3-traceid";
 const TRACE_TYPE_XB3SPAN: &str = "x-b3-spanid";
 const TRACE_TYPE_UBER: &str = "uber-trace-id";
+const TRACE_TYPE_SW3: &str = "sw3";
 const TRACE_TYPE_SW6: &str = "sw6";
 const TRACE_TYPE_SW8: &str = "sw8";
 const TRACE_TYPE_TRACE_PARENT: &str = "traceparent";
@@ -680,80 +884,171 @@ impl From<&str> for TraceType {
     // Example 1: "sw8"
     // Example 2: " sw8"
     fn from(t: &str) -> TraceType {
-        let format_t = Self::format_str(t);
-        match format_t.to_lowercase().as_str() {
+        let tag_lowercase = t.trim().to_lowercase();
+        match tag_lowercase.as_str() {
             TRACE_TYPE_XB3 => TraceType::XB3,
             TRACE_TYPE_XB3SPAN => TraceType::XB3Span,
             TRACE_TYPE_UBER => TraceType::Uber,
+            TRACE_TYPE_SW3 => TraceType::Sw3,
             TRACE_TYPE_SW6 => TraceType::Sw6,
             TRACE_TYPE_SW8 => TraceType::Sw8,
             TRACE_TYPE_TRACE_PARENT => TraceType::TraceParent,
             SOFA_NEW_RPC_TRACE_CTX_KEY => TraceType::NewRpcTraceContext,
             TRACE_TYPE_X_TINGYUN => TraceType::XTingyun,
-            _ if t.len() > 0 => TraceType::Customize(format_t.to_string()),
+            _ if tag_lowercase.len() > 0 => TraceType::Customize(tag_lowercase),
             _ => TraceType::Disabled,
         }
     }
 }
 
 impl TraceType {
-    // 删除有效位前的所有空格
-    // ============================================
-    // Remove all spaces before significant digits
-    fn format_str(t: &str) -> &str {
-        let bytes = t.as_bytes();
-        for i in 0..bytes.len() {
-            if bytes[i] != b' ' as u8 {
-                return &t[i..];
-            }
-        }
-        return t;
-    }
-
-    fn check(&self, context: &str) -> bool {
+    pub fn check(&self, context: &str) -> bool {
         match &*self {
-            TraceType::XB3 => context.to_ascii_lowercase() == TRACE_TYPE_XB3,
-            TraceType::XB3Span => context.to_ascii_lowercase() == TRACE_TYPE_XB3SPAN,
-            TraceType::Uber => context.to_ascii_lowercase() == TRACE_TYPE_UBER,
-            TraceType::Sw6 => context.to_ascii_lowercase() == TRACE_TYPE_SW6,
-            TraceType::Sw8 => context.to_ascii_lowercase() == TRACE_TYPE_SW8,
-            TraceType::TraceParent => context.to_ascii_lowercase() == TRACE_TYPE_TRACE_PARENT,
+            TraceType::XB3 => context.eq_ignore_ascii_case(TRACE_TYPE_XB3),
+            TraceType::XB3Span => context.eq_ignore_ascii_case(TRACE_TYPE_XB3SPAN),
+            TraceType::Uber => context.eq_ignore_ascii_case(TRACE_TYPE_UBER),
+            TraceType::Sw3 => context.eq_ignore_ascii_case(TRACE_TYPE_SW3),
+            TraceType::Sw6 => context.eq_ignore_ascii_case(TRACE_TYPE_SW6),
+            TraceType::Sw8 => context.eq_ignore_ascii_case(TRACE_TYPE_SW8),
+            TraceType::TraceParent => context.eq_ignore_ascii_case(TRACE_TYPE_TRACE_PARENT),
             TraceType::NewRpcTraceContext => {
-                context.to_ascii_lowercase() == SOFA_NEW_RPC_TRACE_CTX_KEY
+                context.eq_ignore_ascii_case(SOFA_NEW_RPC_TRACE_CTX_KEY)
             }
-            TraceType::XTingyun => context.to_ascii_lowercase() == TRACE_TYPE_X_TINGYUN,
-            TraceType::Customize(tag) => context.to_ascii_lowercase() == tag.to_ascii_lowercase(),
+            TraceType::XTingyun => context.eq_ignore_ascii_case(TRACE_TYPE_X_TINGYUN),
+            TraceType::Customize(tag) => context.eq_ignore_ascii_case(&tag),
             _ => false,
         }
     }
 
-    pub fn to_checker_string(&self) -> String {
+    pub fn as_str(&self) -> &str {
         match self {
-            &TraceType::XB3 => TRACE_TYPE_XB3.into(),
-            &TraceType::XB3Span => TRACE_TYPE_XB3SPAN.into(),
-            &TraceType::Uber => TRACE_TYPE_UBER.into(),
-            &TraceType::Sw6 => TRACE_TYPE_SW6.into(),
-            &TraceType::Sw8 => TRACE_TYPE_SW8.into(),
-            &TraceType::TraceParent => TRACE_TYPE_TRACE_PARENT.into(),
-            &TraceType::NewRpcTraceContext => SOFA_NEW_RPC_TRACE_CTX_KEY.into(),
-            &TraceType::XTingyun => TRACE_TYPE_X_TINGYUN.into(),
-            &TraceType::Customize(ref tag) => tag.to_ascii_lowercase(),
-            _ => "".into(),
+            TraceType::XB3 => TRACE_TYPE_XB3,
+            TraceType::XB3Span => TRACE_TYPE_XB3SPAN,
+            TraceType::Uber => TRACE_TYPE_UBER,
+            TraceType::Sw3 => TRACE_TYPE_SW3,
+            TraceType::Sw6 => TRACE_TYPE_SW6,
+            TraceType::Sw8 => TRACE_TYPE_SW8,
+            TraceType::TraceParent => TRACE_TYPE_TRACE_PARENT,
+            TraceType::NewRpcTraceContext => SOFA_NEW_RPC_TRACE_CTX_KEY,
+            TraceType::XTingyun => TRACE_TYPE_X_TINGYUN,
+            TraceType::Customize(tag) => &tag,
+            _ => "",
         }
     }
 
-    pub fn to_string(&self) -> String {
-        match &*self {
-            TraceType::XB3 => TRACE_TYPE_XB3.to_string(),
-            TraceType::XB3Span => TRACE_TYPE_XB3SPAN.to_string(),
-            TraceType::Uber => TRACE_TYPE_UBER.to_string(),
-            TraceType::Sw6 => TRACE_TYPE_SW6.to_string(),
-            TraceType::Sw8 => TRACE_TYPE_SW8.to_string(),
-            TraceType::TraceParent => TRACE_TYPE_TRACE_PARENT.to_string(),
-            TraceType::XTingyun => TRACE_TYPE_X_TINGYUN.to_string(),
-            TraceType::Customize(tag) => tag.to_string(),
-            _ => "".to_string(),
+    const TRACE_ID: u8 = 0;
+    const SPAN_ID: u8 = 1;
+
+    // uber-trace-id: TRACEID:SPANID:PARENTSPANID:FLAGS
+    // separeted by ':'
+    // extract TRACEID from the first field and SPANID from the third field
+    fn decode_uber_id(value: &str, id_type: u8) -> Option<&str> {
+        let mut segs = value.split(":");
+        if id_type == Self::TRACE_ID {
+            segs.nth(0)
+        } else if id_type == Self::SPAN_ID {
+            segs.nth(2)
+        } else {
+            unreachable!()
         }
+    }
+
+    // sw3: SEGMENTID|SPANID|100|100|#IPPORT|#PARENT_ENDPOINT|#ENDPOINT|TRACEID|SAMPLING
+    // sw3 values are separeted by '|'
+    // extract "SEGMENTID-SPANID" as span_id
+    fn decode_skywalking3_id(value: &str, id_type: u8) -> Option<Cow<'_, str>> {
+        let mut segs = value.split("|");
+        if id_type == Self::TRACE_ID {
+            segs.nth(7).map(|s| s.into())
+        } else if id_type == Self::SPAN_ID {
+            let seg0 = segs.next();
+            let seg1 = segs.next();
+            seg0.zip(seg1)
+                .map(|(seg_id, span_id)| format!("{}-{}", seg_id, span_id).into())
+        } else {
+            unreachable!()
+        }
+    }
+
+    // sw6: 1-TRACEID-SEGMENTID-3-5-2-IPPORT-ENTRYURI-PARENTURI
+    // sw8: 1-TRACEID-SEGMENTID-3-PARENT_SERVICE-PARENT_INSTANCE-PARENT_ENDPOINT-IPPORT
+    // sw6 and sw8 values are separeted by '-'
+    // trace id and segment id are encoded in base64
+    // extract "SEGMENTID-SPANID" as span_id
+    fn decode_skywalking_id(value: &str, id_type: u8) -> Option<Cow<'_, str>> {
+        let mut segs = value.split("-");
+        if id_type == Self::TRACE_ID {
+            let id = segs.nth(1)?;
+            Some(
+                BASE64_STANDARD
+                    .decode(id)
+                    .ok()
+                    .and_then(|v| String::from_utf8(v).ok())
+                    .map(|s| Cow::Owned(s))
+                    .unwrap_or(Cow::Borrowed(id)),
+            )
+        } else if id_type == Self::SPAN_ID {
+            let seg_id = segs.nth(2)?;
+            let span_id = segs.next()?;
+            let mut result = Vec::new();
+            if BASE64_STANDARD.decode_vec(seg_id, &mut result).is_err() {
+                result.clear();
+                result.extend_from_slice(seg_id.as_bytes());
+            };
+            let Ok(mut s) = String::from_utf8(result) else {
+                return Some(format!("{}-{}", seg_id, span_id).into());
+            };
+            s.push('-');
+            s.push_str(span_id);
+            Some(s.into())
+        } else {
+            unreachable!()
+        }
+    }
+
+    // OTel HTTP Trace format:
+    // traceparent: 00-TRACEID-SPANID-01
+    fn decode_traceparent(value: &str, id_type: u8) -> Option<&str> {
+        let mut segs = value.split("-");
+        if id_type == Self::TRACE_ID {
+            segs.nth(1)
+        } else if id_type == Self::SPAN_ID {
+            segs.nth(2)
+        } else {
+            unreachable!()
+        }
+    }
+
+    fn decode_tingyun(value: &str, id_type: u8) -> Option<Cow<'_, str>> {
+        if id_type == Self::TRACE_ID {
+            cloud_platform::tingyun::decode_trace_id(value)
+        } else {
+            None
+        }
+    }
+
+    fn decode_id<'a>(&self, value: &'a str, id_type: u8) -> Option<Cow<'a, str>> {
+        let value = value.trim();
+        match self {
+            TraceType::Disabled => None,
+            TraceType::XB3
+            | TraceType::XB3Span
+            | TraceType::NewRpcTraceContext
+            | TraceType::Customize(_) => Some(value.into()),
+            TraceType::Uber => Self::decode_uber_id(value, id_type).map(|s| s.into()),
+            TraceType::Sw3 => Self::decode_skywalking3_id(value, id_type),
+            TraceType::Sw6 | TraceType::Sw8 => Self::decode_skywalking_id(value, id_type),
+            TraceType::TraceParent => Self::decode_traceparent(value, id_type).map(|s| s.into()),
+            TraceType::XTingyun => Self::decode_tingyun(value, id_type),
+        }
+    }
+
+    pub fn decode_trace_id<'a>(&self, value: &'a str) -> Option<Cow<'a, str>> {
+        self.decode_id(value, Self::TRACE_ID)
+    }
+
+    pub fn decode_span_id<'a>(&self, value: &'a str) -> Option<Cow<'a, str>> {
+        self.decode_id(value, Self::SPAN_ID)
     }
 }
 
@@ -768,13 +1063,15 @@ pub struct L7LogDynamicConfig {
     // in lowercase
     pub proxy_client: String,
     // in lowercase
-    pub x_request_id: String,
+    pub x_request_id: HashSet<String>,
 
     pub trace_types: Vec<TraceType>,
     pub span_types: Vec<TraceType>,
 
     trace_set: HashSet<String>,
     span_set: HashSet<String>,
+    pub expected_headers_set: Arc<HashSet<Vec<u8>>>,
+    pub extra_log_fields: ExtraLogFields,
 }
 
 impl PartialEq for L7LogDynamicConfig {
@@ -783,6 +1080,7 @@ impl PartialEq for L7LogDynamicConfig {
             && self.x_request_id == other.x_request_id
             && self.trace_types == other.trace_types
             && self.span_types == other.span_types
+            && self.extra_log_fields == other.extra_log_fields
     }
 }
 
@@ -791,30 +1089,51 @@ impl Eq for L7LogDynamicConfig {}
 impl L7LogDynamicConfig {
     pub fn new(
         mut proxy_client: String,
-        mut x_request_id: String,
+        x_request_id: Vec<String>,
         trace_types: Vec<TraceType>,
         span_types: Vec<TraceType>,
+        mut extra_log_fields: ExtraLogFields,
     ) -> Self {
         proxy_client.make_ascii_lowercase();
-        x_request_id.make_ascii_lowercase();
+
+        let mut expected_headers_set = get_expected_headers();
+        expected_headers_set.insert(proxy_client.as_bytes().to_vec());
+        let mut x_request_id_set = HashSet::new();
+        for t in x_request_id.iter() {
+            let t = t.trim();
+            expected_headers_set.insert(t.as_bytes().to_vec());
+            x_request_id_set.insert(t.to_string());
+        }
 
         let mut trace_set = HashSet::new();
         for t in trace_types.iter() {
-            trace_set.insert(t.to_checker_string());
+            let t = t.as_str();
+            expected_headers_set.insert(t.as_bytes().to_vec());
+            trace_set.insert(t.to_owned());
         }
 
         let mut span_set = HashSet::new();
         for t in span_types.iter() {
-            span_set.insert(t.to_checker_string());
+            let t = t.as_str();
+            expected_headers_set.insert(t.as_bytes().to_vec());
+            span_set.insert(t.to_owned());
+        }
+
+        extra_log_fields.deduplicate();
+
+        for f in extra_log_fields.http2.iter() {
+            expected_headers_set.insert(f.field_name.as_bytes().to_vec());
         }
 
         Self {
             proxy_client,
-            x_request_id,
+            x_request_id: x_request_id_set,
             trace_types,
             span_types,
             trace_set,
             span_set,
+            expected_headers_set: Arc::new(expected_headers_set),
+            extra_log_fields,
         }
     }
 
@@ -834,7 +1153,7 @@ pub struct MetricServerConfig {
     pub compressed: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ModuleConfig {
     pub enabled: bool,
     pub tap_mode: TapMode,
@@ -854,7 +1173,7 @@ pub struct ModuleConfig {
     pub handler: HandlerConfig,
     pub log: LogConfig,
     pub synchronizer: SynchronizerConfig,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub ebpf: EbpfConfig,
     pub trident_type: TridentType,
     pub metric_server: MetricServerConfig,
@@ -879,9 +1198,8 @@ impl TryFrom<(Config, RuntimeConfig)> for ModuleConfig {
 
     fn try_from(conf: (Config, RuntimeConfig)) -> Result<Self, Self::Error> {
         let (static_config, mut conf) = conf;
-        if let Some(k8s_mem_limit) = k8s_mem_limit_for_deepflow() {
-            // If the environment variable K8S_MEM_LIMIT_FOR_DEEPFLOW is set, its value is preferred as the memory limit
-            conf.max_memory = k8s_mem_limit;
+        if running_in_container() {
+            conf.max_memory = get_container_mem_limit().unwrap_or(conf.max_memory);
         }
         let controller_ip = static_config.controller_ips[0].parse::<IpAddr>().unwrap();
         let dest_ip = if conf.analyzer_ip.len() > 0 {
@@ -914,6 +1232,9 @@ impl TryFrom<(Config, RuntimeConfig)> for ModuleConfig {
                 sys_free_memory_limit: conf.sys_free_memory_limit,
                 log_file_size: conf.log_file_size,
                 tap_mode: conf.tap_mode,
+                system_load_circuit_breaker_threshold: conf.system_load_circuit_breaker_threshold,
+                system_load_circuit_breaker_recover: conf.system_load_circuit_breaker_recover,
+                system_load_circuit_breaker_metric: conf.system_load_circuit_breaker_metric,
             },
             synchronizer: SynchronizerConfig {
                 sync_interval: Duration::from_secs(conf.sync_interval),
@@ -930,6 +1251,8 @@ impl TryFrom<(Config, RuntimeConfig)> for ModuleConfig {
             dispatcher: DispatcherConfig {
                 global_pps_threshold: conf.global_pps_threshold,
                 capture_packet_size: conf.capture_packet_size,
+                dpdk_enabled: conf.yaml_config.dpdk_enabled,
+                dispatcher_queue: conf.yaml_config.dispatcher_queue,
                 l7_log_packet_size: conf.l7_log_packet_size,
                 tunnel_type_bitmap: TunnelTypeBitmap::new(&conf.decap_types),
                 trident_type: conf.trident_type,
@@ -948,7 +1271,7 @@ impl TryFrom<(Config, RuntimeConfig)> for ModuleConfig {
                 af_packet_blocks: conf
                     .yaml_config
                     .get_af_packet_blocks(conf.tap_mode, conf.max_memory),
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 af_packet_version: conf.capture_socket_type.into(),
                 tap_mode: conf.tap_mode,
                 region_id: conf.region_id,
@@ -1016,6 +1339,7 @@ impl TryFrom<(Config, RuntimeConfig)> for ModuleConfig {
                     tap_sides
                 },
                 cloud_gateway_traffic: conf.yaml_config.cloud_gateway_traffic,
+                packet_delay: conf.yaml_config.packet_delay,
             },
             handler: HandlerConfig {
                 npb_dedup_enabled: conf.npb_dedup_enabled,
@@ -1023,7 +1347,7 @@ impl TryFrom<(Config, RuntimeConfig)> for ModuleConfig {
             },
             pcap: conf.yaml_config.pcap.clone(),
             platform: PlatformConfig {
-                sync_interval: MINUTE,
+                sync_interval: Duration::from_secs(conf.platform_sync_interval),
                 kubernetes_cluster_id: static_config.kubernetes_cluster_id.clone(),
                 libvirt_xml_path: conf.libvirt_xml_path.parse().unwrap_or_default(),
                 kubernetes_poller_type: conf.yaml_config.kubernetes_poller_type,
@@ -1043,7 +1367,7 @@ impl TryFrom<(Config, RuntimeConfig)> for ModuleConfig {
                 },
                 thread_threshold: conf.thread_threshold,
                 tap_mode: conf.tap_mode,
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 os_proc_scan_conf: OsProcScanConfig {
                     os_proc_root: conf.yaml_config.os_proc_root.clone(),
                     os_proc_socket_sync_interval: conf.yaml_config.os_proc_socket_sync_interval,
@@ -1076,14 +1400,19 @@ impl TryFrom<(Config, RuntimeConfig)> for ModuleConfig {
                 #[cfg(target_os = "windows")]
                 os_proc_scan_conf: OsProcScanConfig {},
                 prometheus_http_api_addresses: conf.prometheus_http_api_addresses.clone(),
+                agent_enabled: conf.enabled,
             },
             flow: (&conf).into(),
             log_parser: LogParserConfig {
                 l7_log_collect_nps_threshold: conf.l7_log_collect_nps_threshold,
                 l7_log_session_aggr_timeout: conf.yaml_config.l7_log_session_aggr_timeout,
+                l7_log_session_slot_capacity: conf.yaml_config.l7_log_session_slot_capacity,
                 l7_log_dynamic: L7LogDynamicConfig::new(
                     conf.http_log_proxy_client.to_string().to_ascii_lowercase(),
-                    conf.http_log_x_request_id.to_string().to_ascii_lowercase(),
+                    conf.http_log_x_request_id
+                        .split(',')
+                        .map(|x| x.to_lowercase())
+                        .collect(),
                     conf.http_log_trace_id
                         .split(',')
                         .map(|item| TraceType::from(item))
@@ -1092,6 +1421,10 @@ impl TryFrom<(Config, RuntimeConfig)> for ModuleConfig {
                         .split(',')
                         .map(|item| TraceType::from(item))
                         .collect(),
+                    conf.yaml_config
+                        .l7_protocol_advanced_features
+                        .extra_log_fields
+                        .clone(),
                 ),
                 l7_log_ignore_tap_sides: {
                     let mut tap_sides = [false; TapSide::MAX as usize + 1];
@@ -1101,6 +1434,23 @@ impl TryFrom<(Config, RuntimeConfig)> for ModuleConfig {
                     }
                     tap_sides
                 },
+                http_endpoint_disabled: conf
+                    .yaml_config
+                    .l7_protocol_advanced_features
+                    .http_endpoint_extraction
+                    .disabled,
+                http_endpoint_trie: HttpEndpointTrie::from(
+                    &conf
+                        .yaml_config
+                        .l7_protocol_advanced_features
+                        .http_endpoint_extraction,
+                ),
+                obfuscate_enabled_protocols: L7ProtocolBitmap::from(
+                    &conf
+                        .yaml_config
+                        .l7_protocol_advanced_features
+                        .obfuscate_enabled_protocols,
+                ),
             },
             debug: DebugConfig {
                 vtap_id: conf.vtap_id as u16,
@@ -1118,12 +1468,19 @@ impl TryFrom<(Config, RuntimeConfig)> for ModuleConfig {
                 log_level: conf.log_level,
                 log_threshold: conf.log_threshold,
                 log_retention: conf.log_retention,
-                rsyslog_enabled: conf.rsyslog_enabled,
+                rsyslog_enabled: {
+                    if dest_ip == Ipv4Addr::UNSPECIFIED.to_string()
+                        || dest_ip == Ipv6Addr::UNSPECIFIED.to_string()
+                    {
+                        info!("analyzer_ip not set, remote log disabled");
+                        false
+                    } else {
+                        conf.rsyslog_enabled
+                    }
+                },
                 host: conf.host.clone(),
-                analyzer_ip: dest_ip.clone(),
-                analyzer_port: conf.analyzer_port,
             },
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             ebpf: EbpfConfig {
                 collector_enabled: conf.collector_enabled,
                 l7_metrics_enabled: conf.l7_metrics_enabled,
@@ -1147,21 +1504,37 @@ impl TryFrom<(Config, RuntimeConfig)> for ModuleConfig {
                     .l7_protocol_inference_max_fail_count,
                 l7_protocol_inference_ttl: conf.yaml_config.l7_protocol_inference_ttl,
                 ctrl_mac: if is_tt_workload(conf.trident_type) {
-                    // use host mac
-                    if let Err(e) = netns::open_named_and_setns(&NsFile::Root) {
-                        warn!("agent must have CAP_SYS_ADMIN to run without 'hostNetwork: true'.");
-                        warn!("setns error: {}", e);
-                        thread::sleep(Duration::from_secs(1));
-                        process::exit(-1);
+                    fn get_ctrl_mac(ip: &IpAddr) -> MacAddr {
+                        // use host mac
+                        #[cfg(target_os = "linux")]
+                        if let Err(e) =
+                            public::netns::open_named_and_setns(&public::netns::NsFile::Root)
+                        {
+                            warn!(
+                                "agent must have CAP_SYS_ADMIN to run without 'hostNetwork: true'."
+                            );
+                            warn!("setns error: {}", e);
+                            crate::utils::notify_exit(-1);
+                            return MacAddr::ZERO;
+                        }
+                        let ctrl_mac = match get_ctrl_ip_and_mac(ip) {
+                            Ok((_, mac)) => mac,
+                            Err(e) => {
+                                warn!("get_ctrl_ip_and_mac error: {}", e);
+                                crate::utils::notify_exit(-1);
+                                return MacAddr::ZERO;
+                            }
+                        };
+                        #[cfg(target_os = "linux")]
+                        if let Err(e) = public::netns::reset_netns() {
+                            warn!("reset setns error: {}", e);
+                            crate::utils::notify_exit(-1);
+                            return MacAddr::ZERO;
+                        };
+                        ctrl_mac
                     }
-                    let (_, ctrl_mac) =
-                        get_ctrl_ip_and_mac(&static_config.controller_ips[0].parse().unwrap());
-                    if let Err(e) = netns::reset_netns() {
-                        warn!("reset setns error: {}", e);
-                        thread::sleep(Duration::from_secs(1));
-                        process::exit(-1);
-                    };
-                    ctrl_mac
+
+                    get_ctrl_mac(&static_config.controller_ips[0].parse().unwrap())
                 } else {
                     MacAddr::ZERO
                 },
@@ -1171,7 +1544,7 @@ impl TryFrom<(Config, RuntimeConfig)> for ModuleConfig {
                 l7_protocol_parse_port_bitmap: Arc::new(
                     (&conf.yaml_config).get_protocol_port_parse_bitmap(),
                 ),
-                l7_protocol_ports: conf.yaml_config.l7_protocol_ports.clone(),
+                l7_protocol_ports: conf.yaml_config.get_protocol_port(),
                 ebpf: conf.yaml_config.ebpf.clone(),
             },
             metric_server: MetricServerConfig {
@@ -1192,8 +1565,7 @@ impl TryFrom<(Config, RuntimeConfig)> for ModuleConfig {
 pub struct ConfigHandler {
     pub ctrl_ip: IpAddr,
     pub ctrl_mac: MacAddr,
-    pub logger_handle: LoggerHandle,
-    pub remote_log_config: RemoteLogConfig,
+    pub logger_handle: Option<LoggerHandle>,
     // need update
     pub static_config: Config,
     pub candidate_config: ModuleConfig,
@@ -1201,13 +1573,7 @@ pub struct ConfigHandler {
 }
 
 impl ConfigHandler {
-    pub fn new(
-        config: Config,
-        ctrl_ip: IpAddr,
-        ctrl_mac: MacAddr,
-        logger_handle: LoggerHandle,
-        remote_log_config: RemoteLogConfig,
-    ) -> Self {
+    pub fn new(config: Config, ctrl_ip: IpAddr, ctrl_mac: MacAddr) -> Self {
         let candidate_config =
             ModuleConfig::try_from((config.clone(), RuntimeConfig::default())).unwrap();
         let current_config = Arc::new(ArcSwap::from_pointee(candidate_config.clone()));
@@ -1218,9 +1584,12 @@ impl ConfigHandler {
             ctrl_mac,
             candidate_config,
             current_config,
-            logger_handle,
-            remote_log_config,
+            logger_handle: None,
         }
+    }
+
+    pub fn set_logger_handle(&mut self, handle: LoggerHandle) {
+        self.logger_handle.replace(handle);
     }
 
     pub fn collector(&self) -> CollectorAccess {
@@ -1309,7 +1678,7 @@ impl ConfigHandler {
         )
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn ebpf(&self) -> EbpfAccess {
         Map::new(self.current_config.clone(), |config| -> &EbpfConfig {
             &config.ebpf
@@ -1335,6 +1704,9 @@ impl ConfigHandler {
         exception_handler: &ExceptionHandler,
         mut components: Option<&mut AgentComponents>,
         #[cfg(target_os = "linux")] api_watcher: &Arc<ApiWatcher>,
+        runtime: &Runtime,
+        session: &Session,
+        agent_id: &AgentId,
     ) -> Vec<fn(&ConfigHandler, &mut AgentComponents)> {
         let candidate_config = &mut self.candidate_config;
         let static_config = &self.static_config;
@@ -1346,6 +1718,9 @@ impl ConfigHandler {
         if candidate_config.tap_mode != new_config.tap_mode {
             info!("tap_mode set to {:?}", new_config.tap_mode);
             candidate_config.tap_mode = new_config.tap_mode;
+            if let Some(c) = components.as_mut() {
+                c.clear_dispatcher_components();
+            }
         }
 
         if candidate_config.tap_mode != TapMode::Analyzer
@@ -1360,18 +1735,8 @@ impl ConfigHandler {
             }
         }
 
-        if !yaml_config
-            .src_interfaces
-            .eq(&new_config.yaml_config.src_interfaces)
-        {
-            yaml_config
-                .src_interfaces
-                .clone_from(&new_config.yaml_config.src_interfaces);
-            info!("src_interfaces set to {:?}", yaml_config.src_interfaces);
-        }
-
-        if candidate_config.tap_mode != TapMode::Local && yaml_config.src_interfaces.is_empty() {
-            warn!("src_interfaces should be set in Analyzer mode or Mirror mode");
+        if !new_config.yaml_config.src_interfaces.is_empty() {
+            warn!("src_interfaces is not empty, but this has already been deprecated, instead, the tap_interface_regex should be set");
         }
 
         if yaml_config.analyzer_dedup_disabled != new_config.yaml_config.analyzer_dedup_disabled {
@@ -1397,7 +1762,7 @@ impl ConfigHandler {
             );
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if yaml_config.process_scheduling_priority
             != new_config.yaml_config.process_scheduling_priority
         {
@@ -1405,12 +1770,12 @@ impl ConfigHandler {
                 "Process scheduling priority set to {}.",
                 new_config.yaml_config.process_scheduling_priority
             );
-            let pid = process::id();
+            let pid = std::process::id();
             unsafe {
-                if setpriority(
-                    PRIO_PROCESS,
+                if libc::setpriority(
+                    libc::PRIO_PROCESS,
                     pid,
-                    new_config.yaml_config.process_scheduling_priority as c_int,
+                    new_config.yaml_config.process_scheduling_priority as libc::c_int,
                 ) != 0
                 {
                     warn!(
@@ -1421,7 +1786,7 @@ impl ConfigHandler {
             }
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if yaml_config.cpu_affinity != new_config.yaml_config.cpu_affinity {
             info!(
                 "CPU Affinity set to {}.",
@@ -1430,19 +1795,30 @@ impl ConfigHandler {
             let mut cpu_set = CpuSet::new();
             let splits = new_config.yaml_config.cpu_affinity.split(',');
             let mut invalid_config = false;
+            let system = System::new_with_specifics(
+                RefreshKind::new().with_cpu(CpuRefreshKind::everything()),
+            );
+            let cpu_count = system.cpus().len() as usize;
             if new_config.yaml_config.cpu_affinity.len() > 0 {
                 for id in splits.into_iter() {
-                    if let Ok(id) = id.parse::<usize>() {
-                        let _ = cpu_set.set(id);
-                    } else {
-                        invalid_config = true;
-                        break;
-                    }
+                    match id.parse::<usize>() {
+                        Ok(id) if id < cpu_count => {
+                            if let Err(e) = cpu_set.set(id) {
+                                warn!(
+                                    "Invalid CPU Affinity config {}, error: {:?}",
+                                    new_config.yaml_config.cpu_affinity, e
+                                );
+                                invalid_config = true;
+                            }
+                        }
+                        _ => {
+                            invalid_config = true;
+                            break;
+                        }
+                    };
                 }
             } else {
-                let sys = System::new();
-                let n = sys.cpus().len() as usize;
-                for i in 0..n {
+                for i in 0..cpu_count {
                     let _ = cpu_set.set(i);
                 }
             }
@@ -1453,7 +1829,7 @@ impl ConfigHandler {
                     new_config.yaml_config.cpu_affinity
                 );
             } else {
-                let pid = process::id() as i32;
+                let pid = std::process::id() as i32;
                 if let Err(e) = sched_setaffinity(Pid::from_raw(pid), &cpu_set) {
                     warn!("CPU Affinity({:?}) bind error: {:?}.", &cpu_set, e);
                 }
@@ -1500,14 +1876,14 @@ impl ConfigHandler {
                 );
                 if let Some(c) = components.as_ref() {
                     let old_regex = if candidate_config.dispatcher.extra_netns_regex != "" {
-                        Regex::new(&candidate_config.dispatcher.extra_netns_regex).ok()
+                        regex::Regex::new(&candidate_config.dispatcher.extra_netns_regex).ok()
                     } else {
                         None
                     };
 
                     let regex = new_config.dispatcher.extra_netns_regex.as_ref();
                     let regex = if regex != "" {
-                        match Regex::new(regex) {
+                        match regex::Regex::new(regex) {
                             Ok(re) => {
                                 info!("platform monitoring extra netns: /{}/", regex);
                                 Some(re)
@@ -1522,12 +1898,14 @@ impl ConfigHandler {
                         None
                     };
 
-                    let old_netns = old_regex.map(|re| netns::find_ns_files_by_regex(&re));
-                    let new_netns = regex.as_ref().map(|re| netns::find_ns_files_by_regex(&re));
+                    let old_netns = old_regex.map(|re| public::netns::find_ns_files_by_regex(&re));
+                    let new_netns = regex
+                        .as_ref()
+                        .map(|re| public::netns::find_ns_files_by_regex(&re));
                     if old_netns != new_netns {
                         info!("query net namespaces changed from {:?} to {:?}, restart agent to create dispatcher for extra namespaces, deepflow-agent restart...", old_netns, new_netns);
-                        thread::sleep(Duration::from_secs(1));
-                        process::exit(NORMAL_EXIT_WITH_RESTART);
+                        crate::utils::notify_exit(public::consts::NORMAL_EXIT_WITH_RESTART);
+                        return vec![];
                     }
 
                     c.platform_synchronizer.set_netns_regex(regex.clone());
@@ -1550,17 +1928,18 @@ impl ConfigHandler {
                     != new_config.dispatcher.tap_interface_regex
             {
                 fn switch_recv_engine(handler: &ConfigHandler, comp: &mut AgentComponents) {
-                    let pcap_interfaces = match links_by_name_regex(
-                        &handler.candidate_config.dispatcher.tap_interface_regex,
-                    ) {
-                        Err(e) => {
-                            warn!("get interfaces by name regex failed: {}", e);
-                            vec![]
+                    for d in comp.dispatcher_components.iter() {
+                        if let Err(e) = d
+                            .dispatcher
+                            .switch_recv_engine(&handler.candidate_config.dispatcher)
+                        {
+                            log::error!(
+                                "switch RecvEngine error: {}, deepflow-agent restart...",
+                                e
+                            );
+                            crate::utils::notify_exit(-1);
+                            return;
                         }
-                        Ok(links) => links,
-                    };
-                    for dispatcher in comp.dispatchers.iter() {
-                        dispatcher.switch_recv_engine(pcap_interfaces.clone());
                     }
                 }
                 callbacks.push(switch_recv_engine);
@@ -1573,8 +1952,8 @@ impl ConfigHandler {
                     new_config.dispatcher.capture_packet_size;
                 if !components.is_none() {
                     info!("Capture packet size update, deepflow-agent restart...");
-                    thread::sleep(Duration::from_secs(1));
-                    process::exit(1);
+                    crate::utils::notify_exit(1);
+                    return vec![];
                 }
             }
 
@@ -1590,8 +1969,8 @@ impl ConfigHandler {
                     fn start_dispatcher(handler: &ConfigHandler, components: &mut AgentComponents) {
                         match handler.candidate_config.tap_mode {
                             TapMode::Analyzer => {
-                                for dispatcher in components.dispatchers.iter() {
-                                    dispatcher.start();
+                                for d in components.dispatcher_components.iter_mut() {
+                                    d.start();
                                 }
                             }
                             _ => {
@@ -1603,8 +1982,8 @@ impl ConfigHandler {
                                         &components.exception_handler,
                                     ) {
                                         Ok(()) => {
-                                            for dispatcher in components.dispatchers.iter() {
-                                                dispatcher.start();
+                                            for d in components.dispatcher_components.iter_mut() {
+                                                d.start();
                                             }
                                         }
                                         Err(e) => {
@@ -1618,8 +1997,8 @@ impl ConfigHandler {
                     callbacks.push(start_dispatcher);
                 } else {
                     fn stop_dispatcher(_: &ConfigHandler, components: &mut AgentComponents) {
-                        for dispatcher in components.dispatchers.iter() {
-                            dispatcher.stop();
+                        for d in components.dispatcher_components.iter_mut() {
+                            d.stop();
                         }
                     }
                     callbacks.push(stop_dispatcher);
@@ -1693,67 +2072,61 @@ impl ConfigHandler {
                 } else {
                     info!("Disable rsyslog");
                 }
-                self.remote_log_config
-                    .set_enabled(new_config.log.rsyslog_enabled);
             }
             if candidate_config.log.log_level != new_config.log.log_level {
-                match self
-                    .logger_handle
-                    .parse_and_push_temp_spec(new_config.log.log_level.as_str().to_lowercase())
-                {
-                    Ok(_) => {
-                        candidate_config.log.log_level = new_config.log.log_level;
-                        info!("log level set to {}", new_config.log.log_level);
-                    }
-                    Err(e) => warn!("failed to set log_level: {}", e),
+                match self.logger_handle.as_mut() {
+                    Some(h) => match h
+                        .parse_and_push_temp_spec(new_config.log.log_level.as_str().to_lowercase())
+                    {
+                        Ok(_) => {
+                            candidate_config.log.log_level = new_config.log.log_level;
+                            info!("log level set to {}", new_config.log.log_level);
+                        }
+                        Err(e) => warn!("failed to set log_level: {}", e),
+                    },
+                    None => warn!("logger_handle not set"),
                 }
             }
             if candidate_config.log.host != new_config.log.host {
-                self.remote_log_config
-                    .set_hostname(new_config.log.host.clone());
+                info!(
+                    "remote log hostname {} -> {}",
+                    candidate_config.log.host, new_config.log.host
+                )
             }
             if candidate_config.log.log_threshold != new_config.log.log_threshold {
-                info!("LogThreshold set to {}", new_config.log.log_threshold);
-                self.remote_log_config
-                    .set_threshold(new_config.log.log_threshold);
+                info!(
+                    "remote log threshold {} -> {}",
+                    candidate_config.log.log_threshold, new_config.log.log_threshold
+                )
             }
             if candidate_config.log.log_retention != new_config.log.log_retention {
-                match self.logger_handle.flw_config() {
-                    Err(FlexiLoggerError::NoFileLogger) => {
-                        info!("no file logger, skipped log_retention change")
-                    }
-                    _ => match self.logger_handle.reset_flw(
-                        &FileLogWriter::builder(
-                            FileSpec::try_from(&static_config.log_file).unwrap(),
-                        )
-                        .rotate(
-                            Criterion::Age(Age::Day),
-                            Naming::Timestamps,
-                            Cleanup::KeepLogFiles(new_config.log.log_retention as usize),
-                        )
-                        .create_symlink(&static_config.log_file)
-                        .append(),
-                    ) {
-                        Ok(_) => {
-                            info!("log_retention set to {}", new_config.log.log_retention);
+                match self.logger_handle.as_mut() {
+                    Some(h) => match h.flw_config() {
+                        Err(FlexiLoggerError::NoFileLogger) => {
+                            info!("no file logger, skipped log_retention change")
                         }
-                        Err(e) => {
-                            warn!("failed to set log_retention: {}", e);
-                        }
+                        _ => match h.reset_flw(
+                            &FileLogWriter::builder(
+                                FileSpec::try_from(&static_config.log_file).unwrap(),
+                            )
+                            .rotate(
+                                Criterion::Age(Age::Day),
+                                Naming::Timestamps,
+                                Cleanup::KeepLogFiles(new_config.log.log_retention as usize),
+                            )
+                            .create_symlink(&static_config.log_file)
+                            .append(),
+                        ) {
+                            Ok(_) => {
+                                info!("log_retention set to {}", new_config.log.log_retention);
+                            }
+                            Err(e) => {
+                                warn!("failed to set log_retention: {}", e);
+                            }
+                        },
                     },
+                    None => warn!("logger_handle not set"),
                 }
-            }
-            if candidate_config.log.analyzer_ip != new_config.log.analyzer_ip
-                || candidate_config.log.analyzer_port != new_config.log.analyzer_port
-            {
-                info!(
-                    "Rsyslog client connect to {} {}",
-                    &new_config.log.analyzer_ip, new_config.log.analyzer_port
-                );
-                self.remote_log_config.set_remotes(
-                    &vec![new_config.log.analyzer_ip.clone()],
-                    new_config.log.analyzer_port,
-                );
             }
             candidate_config.log = new_config.log;
         }
@@ -1878,6 +2251,51 @@ impl ConfigHandler {
             candidate_config.environment.log_file_size = new_config.environment.log_file_size;
         }
 
+        if candidate_config
+            .environment
+            .system_load_circuit_breaker_metric
+            != new_config.environment.system_load_circuit_breaker_metric
+        {
+            info!(
+                "system_load_circuit_breaker_metric set to {:?}",
+                new_config.environment.system_load_circuit_breaker_metric
+            );
+            candidate_config
+                .environment
+                .system_load_circuit_breaker_metric =
+                new_config.environment.system_load_circuit_breaker_metric;
+        }
+
+        if candidate_config
+            .environment
+            .system_load_circuit_breaker_recover
+            != new_config.environment.system_load_circuit_breaker_recover
+        {
+            info!(
+                "system_load_circuit_breaker_recover set to {:?}",
+                new_config.environment.system_load_circuit_breaker_recover
+            );
+            candidate_config
+                .environment
+                .system_load_circuit_breaker_recover =
+                new_config.environment.system_load_circuit_breaker_recover;
+        }
+
+        if candidate_config
+            .environment
+            .system_load_circuit_breaker_threshold
+            != new_config.environment.system_load_circuit_breaker_threshold
+        {
+            info!(
+                "system_load_circuit_breaker_threshold set to {}",
+                new_config.environment.system_load_circuit_breaker_threshold
+            );
+            candidate_config
+                .environment
+                .system_load_circuit_breaker_threshold =
+                new_config.environment.system_load_circuit_breaker_threshold;
+        }
+
         if candidate_config.flow != new_config.flow {
             if candidate_config.flow.collector_enabled != new_config.flow.collector_enabled {
                 restart_dispatcher = true;
@@ -1886,6 +2304,16 @@ impl ConfigHandler {
                 "flow_generator config change from {:#?} to {:#?}",
                 candidate_config.flow, new_config.flow
             );
+            if candidate_config.flow.plugins.digest != new_config.flow.plugins.digest {
+                info!(
+                    "plugins changed, pulling {} plugins from server",
+                    new_config.flow.plugins.names.len()
+                );
+                new_config
+                    .flow
+                    .plugins
+                    .fill_plugin_prog_from_server(runtime, session, agent_id);
+            }
             candidate_config.flow = new_config.flow;
         }
 
@@ -1947,12 +2375,33 @@ impl ConfigHandler {
                 }
             }
 
-            fn quadruple_generator_callback(_: &ConfigHandler, components: &mut AgentComponents) {
-                for collector in components.collectors.iter().as_ref() {
-                    collector.quadruple_generator.update_config();
-                }
+            if candidate_config.collector.l7_metrics_enabled
+                != new_config.collector.l7_metrics_enabled
+            {
+                info!(
+                    "quadruple generator update l7_metrics_enabled to {}",
+                    new_config.collector.l7_metrics_enabled
+                );
+                candidate_config.collector.l7_metrics_enabled =
+                    new_config.collector.l7_metrics_enabled;
             }
-            callbacks.push(quadruple_generator_callback);
+            if candidate_config.collector.vtap_flow_1s_enabled
+                != new_config.collector.vtap_flow_1s_enabled
+            {
+                info!(
+                    "quadruple generator update vtap_flow_1s_enabled to {}",
+                    new_config.collector.vtap_flow_1s_enabled
+                );
+                candidate_config.collector.vtap_flow_1s_enabled =
+                    new_config.collector.vtap_flow_1s_enabled;
+            }
+            if candidate_config.collector.enabled != new_config.collector.enabled {
+                info!(
+                    "quadruple generator update collector_enabled to {}",
+                    new_config.collector.enabled
+                );
+                candidate_config.collector.enabled = new_config.collector.enabled;
+            }
 
             info!(
                 "collector config change from {:#?} to {:#?}",
@@ -2047,9 +2496,8 @@ impl ConfigHandler {
                 fn platform_callback(handler: &ConfigHandler, components: &mut AgentComponents) {
                     let conf = &handler.candidate_config.platform;
 
-                    if handler.candidate_config.enabled
-                        && (handler.candidate_config.tap_mode == TapMode::Local
-                            || is_tt_pod(conf.trident_type))
+                    if conf.agent_enabled
+                        && (conf.tap_mode == TapMode::Local || is_tt_pod(conf.trident_type))
                     {
                         if is_tt_pod(conf.trident_type) {
                             components.kubernetes_poller.start();
@@ -2200,7 +2648,7 @@ impl ConfigHandler {
             candidate_config.synchronizer = new_config.synchronizer;
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if candidate_config.ebpf != new_config.ebpf
             && candidate_config.tap_mode != TapMode::Analyzer
         {
@@ -2211,8 +2659,9 @@ impl ConfigHandler {
             candidate_config.ebpf = new_config.ebpf;
 
             fn ebpf_callback(handler: &ConfigHandler, components: &mut AgentComponents) {
-                if let Some(ebpf_collector) = components.ebpf_collector.as_mut() {
-                    ebpf_collector.on_config_change(&handler.candidate_config.ebpf);
+                if let Some(d) = components.ebpf_dispatcher_component.as_mut() {
+                    d.ebpf_collector
+                        .on_config_change(&handler.candidate_config.ebpf);
                 }
             }
             callbacks.push(ebpf_callback);
@@ -2230,9 +2679,9 @@ impl ConfigHandler {
             if candidate_config.metric_server.enabled != new_config.metric_server.enabled {
                 if let Some(c) = components.as_mut() {
                     if new_config.metric_server.enabled {
-                        c.external_metrics_server.start();
+                        c.metrics_server_component.start();
                     } else {
-                        c.external_metrics_server.stop();
+                        c.metrics_server_component.stop();
                     }
                 }
             }
@@ -2240,7 +2689,8 @@ impl ConfigHandler {
             // 当端口更新后，在enabled情况下需要重启服务器重新监听
             if candidate_config.metric_server.port != new_config.metric_server.port {
                 if let Some(c) = components.as_mut() {
-                    c.external_metrics_server
+                    c.metrics_server_component
+                        .external_metrics_server
                         .set_port(new_config.metric_server.port);
                 }
             }
@@ -2250,6 +2700,7 @@ impl ConfigHandler {
                     components: &mut AgentComponents,
                 ) {
                     components
+                        .metrics_server_component
                         .external_metrics_server
                         .enable_compressed(handler.candidate_config.metric_server.compressed);
                 }
@@ -2264,9 +2715,9 @@ impl ConfigHandler {
 
         if candidate_config.npb != new_config.npb {
             fn dispatcher_callback(handler: &ConfigHandler, components: &mut AgentComponents) {
-                let dispatcher_builders = &components.handler_builders;
+                let dispatcher_builders = &components.dispatcher_components;
                 for e in dispatcher_builders {
-                    let mut builders = e.lock().unwrap();
+                    let mut builders = e.handler_builders.lock().unwrap();
                     for e in builders.iter_mut() {
                         match e {
                             PacketHandlerBuilder::Npb(n) => {
@@ -2297,8 +2748,8 @@ impl ConfigHandler {
         // avoid first config changed to restart dispatcher
         if components.is_some() && restart_dispatcher && candidate_config.dispatcher.enabled {
             fn dispatcher_callback(handler: &ConfigHandler, components: &mut AgentComponents) {
-                for dispatcher in components.dispatchers.iter() {
-                    dispatcher.stop();
+                for d in components.dispatcher_components.iter_mut() {
+                    d.stop();
                 }
                 if handler.candidate_config.tap_mode != TapMode::Analyzer
                     && !running_in_container()
@@ -2311,8 +2762,8 @@ impl ConfigHandler {
                         &components.exception_handler,
                     ) {
                         Ok(()) => {
-                            for dispatcher in components.dispatchers.iter() {
-                                dispatcher.start();
+                            for d in components.dispatcher_components.iter_mut() {
+                                d.start();
                             }
                         }
                         Err(e) => {
@@ -2320,8 +2771,8 @@ impl ConfigHandler {
                         }
                     }
                 } else {
-                    for dispatcher in components.dispatchers.iter() {
-                        dispatcher.start();
+                    for d in components.dispatcher_components.iter_mut() {
+                        d.start();
                     }
                 }
             }
@@ -2334,13 +2785,6 @@ impl ConfigHandler {
         exception_handler.clear(Exception::InvalidConfiguration);
 
         callbacks
-    }
-
-    pub fn load_plugin(&mut self, rt: &Arc<Runtime>, session: &Arc<Session>, agent_id: &AgentId) {
-        self.candidate_config
-            .fill_plugin_prog_from_server(rt, session, agent_id);
-        self.current_config
-            .store(Arc::new(self.candidate_config.clone()));
     }
 }
 
@@ -2360,57 +2804,6 @@ impl ModuleConfig {
 
         min((mem_size / MB / 128 * 65536) as usize, 1 << 30)
     }
-
-    pub fn fill_plugin_prog_from_server(
-        &mut self,
-        rt: &Arc<Runtime>,
-        session: &Arc<Session>,
-        agent_id: &AgentId,
-    ) {
-        let mut wasm = vec![];
-        #[cfg(target_os = "windows")]
-        let so = vec![];
-        #[cfg(target_os = "linux")]
-        let mut so = vec![];
-        rt.block_on(async {
-            for i in self.yaml_config.wasm_plugins.iter() {
-                match session
-                    .get_plugin(i.as_str(), trident::PluginType::Wasm, agent_id)
-                    .await
-                {
-                    Ok(prog) => wasm.push((i.clone(), prog)),
-                    Err(err) => {
-                        error!("get wasm plugin {} fail: {}", i, err);
-                        continue;
-                    }
-                }
-            }
-        });
-
-        #[cfg(target_os = "linux")]
-        rt.block_on(async {
-            for i in self.yaml_config.so_plugins.iter() {
-                match session
-                    .get_plugin(i.as_str(), trident::PluginType::So, agent_id)
-                    .await
-                {
-                    Ok(prog) => match load_plugin(prog.as_slice(), i) {
-                        Ok(p) => {
-                            so.push(p);
-                        }
-                        Err(e) => error!("load so plugin {} fail: {}", i, e),
-                    },
-                    Err(err) => {
-                        error!("get so plugin {} fail: {}", i, err);
-                        continue;
-                    }
-                }
-            }
-        });
-
-        self.flow.wasm_plugins = wasm;
-        self.flow.so_plugins = so;
-    }
 }
 
 impl YamlConfig {
@@ -2427,6 +2820,105 @@ impl YamlConfig {
             self.af_packet_blocks.max(8)
         } else {
             (mem_size as usize / recv_engine::DEFAULT_BLOCK_SIZE / 16).min(128)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_trie() {
+        let trie = HttpEndpointTrie::new();
+        assert!(trie.root.children.is_empty());
+        assert_eq!(trie.root.keep_segments, None);
+    }
+
+    #[test]
+    fn test_insert_trie_node() {
+        let mut trie = HttpEndpointTrie::new();
+        let rule1 = MatchRule {
+            prefix: "/a".to_string(),
+            keep_segments: 1,
+        };
+        let rule2 = MatchRule {
+            prefix: "/a/b/c/d".to_string(),
+            keep_segments: 3,
+        };
+        let rule3 = MatchRule {
+            prefix: "/d/e/f".to_string(),
+            keep_segments: 3,
+        };
+        trie.insert(&rule1);
+        assert_eq!(trie.root.children.len(), 1);
+        trie.insert(&rule2);
+        assert_eq!(trie.root.children.len(), 1);
+        trie.insert(&rule3);
+        assert_eq!(trie.root.children.get(&'/').unwrap().children.len(), 2);
+    }
+
+    #[test]
+    fn test_find_matching_rule() {
+        let mut trie = HttpEndpointTrie::new();
+        let rule1 = MatchRule {
+            prefix: "/a/b/c".to_string(),
+            keep_segments: 1,
+        };
+        let rule2 = MatchRule {
+            prefix: "/a/b/c/d".to_string(),
+            keep_segments: 3,
+        };
+        let rule3 = MatchRule {
+            prefix: "/d/e/f".to_string(),
+            keep_segments: 3,
+        };
+        trie.insert(&rule1);
+        trie.insert(&rule2);
+        trie.insert(&rule3);
+        assert_eq!(trie.find_matching_rule("/a/b/c"), 1);
+        assert_eq!(trie.find_matching_rule("/d/e/f"), 3);
+        assert_eq!(trie.find_matching_rule("/a/b/c/d"), 3);
+        assert_eq!(trie.find_matching_rule("/x/y/z"), 0);
+    }
+
+    #[test]
+    fn trace_type_id_parse() {
+        let testcases = vec![
+            (
+                TraceType::Uber,
+                "trace_id:xxx:span_id:xxx",
+                Some("trace_id"),
+                Some("span_id"),
+            ),
+            (
+                TraceType::Sw3,
+                "span|id|x|x|x|x|x|trace_id|x",
+                Some("trace_id"),
+                Some("span-id"),
+            ),
+            (
+                TraceType::Sw6,
+                "1-dHJhY2VfaWQ=-c3Bhbg==-id-x-x-x-x-",
+                Some("trace_id"),
+                Some("span-id"),
+            ),
+            (
+                TraceType::Sw8,
+                "1-dHJhY2VfaWQ=-c3Bhbg==-id-x-x-x-x-",
+                Some("trace_id"),
+                Some("span-id"),
+            ),
+            (
+                TraceType::TraceParent,
+                "00-trace_id-span_id-01",
+                Some("trace_id"),
+                Some("span_id"),
+            ),
+        ];
+        for (tt, value, tid, sid) in testcases {
+            assert_eq!(tt.decode_trace_id(value).as_ref().map(|s| s.as_ref()), tid);
+            assert_eq!(tt.decode_span_id(value).as_ref().map(|s| s.as_ref()), sid);
         }
     }
 }

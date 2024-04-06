@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,13 +23,15 @@ import (
 )
 
 type QuerierParams struct {
-	Debug      string
-	QueryUUID  string
-	DB         string
-	Sql        string
-	DataSource string
-	Context    context.Context
-	NoPreWhere bool
+	Debug         string
+	UseQueryCache bool
+	QueryCacheTTL string
+	QueryUUID     string
+	DB            string
+	Sql           string
+	DataSource    string
+	Context       context.Context
+	NoPreWhere    bool
 }
 
 type TempoParams struct {

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,7 +21,8 @@ pub use libc::c_int;
 pub use libc::c_uchar; // u8
 pub use libc::c_uint; // u32
 pub use libc::c_ulonglong;
-pub use std::ffi::{CStr, CString};
+use log::info;
+pub use std::ffi::CStr;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -30,6 +31,7 @@ pub const CAP_LEN_MAX: usize = 8192;
 
 // process_kname is up to 16 bytes, if the length of process_kname exceeds 15, the ending char is '\0'
 pub const PACKET_KNAME_MAX_PADDING: usize = 15;
+pub const CONTAINER_ID_SIZE: usize = 65;
 
 //方向
 #[allow(dead_code)]
@@ -57,17 +59,35 @@ pub const SOCK_DATA_SOFARPC: u16 = 43;
 #[allow(dead_code)]
 pub const SOCK_DATA_FASTCGI: u16 = 44;
 #[allow(dead_code)]
+pub const SOCK_DATA_BRPC: u16 = 45;
+#[allow(dead_code)]
 pub const SOCK_DATA_MYSQL: u16 = 60;
 #[allow(dead_code)]
 pub const SOCK_DATA_POSTGRESQL: u16 = 61;
 #[allow(dead_code)]
+pub const SOCK_DATA_ORACLE: u16 = 62;
+#[allow(dead_code)]
 pub const SOCK_DATA_REDIS: u16 = 80;
+#[allow(dead_code)]
+pub const SOCK_DATA_MONGO: u16 = 81;
 #[allow(dead_code)]
 pub const SOCK_DATA_KAFKA: u16 = 100;
 #[allow(dead_code)]
 pub const SOCK_DATA_MQTT: u16 = 101;
 #[allow(dead_code)]
+pub const SOCK_DATA_AMQP: u16 = 102;
+#[allow(dead_code)]
+pub const SOCK_DATA_OPENWIRE: u16 = 103;
+#[allow(dead_code)]
+pub const SOCK_DATA_NATS: u16 = 104;
+#[allow(dead_code)]
+pub const SOCK_DATA_PULSAR: u16 = 105;
+#[allow(dead_code)]
+pub const SOCK_DATA_ZMTP: u16 = 106;
+#[allow(dead_code)]
 pub const SOCK_DATA_DNS: u16 = 120;
+#[allow(dead_code)]
+pub const SOCK_DATA_TLS: u16 = 121;
 
 // Feature
 #[allow(dead_code)]
@@ -110,6 +130,10 @@ pub const DATA_SOURCE_GO_HTTP2_UPROBE: u8 = 2;
 pub const DATA_SOURCE_OPENSSL_UPROBE: u8 = 3;
 #[allow(dead_code)]
 pub const DATA_SOURCE_IO_EVENT: u8 = 4;
+#[allow(dead_code)]
+pub const DATA_SOURCE_GO_HTTP2_DATAFRAME_UPROBE: u8 = 5;
+#[allow(dead_code)]
+pub const DATA_SOURCE_CLOSE: u8 = 6;
 
 // 消息类型
 // 目前除了 source=EBPF_TYPE_GO_HTTP2_UPROBE 以外,都不能保证这个方向的正确性.
@@ -159,8 +183,8 @@ pub struct SK_BPF_DATA {
     pub source: u8,        // Value is DATA_SOURCE_*
 
     pub process_kname: [u8; PACKET_KNAME_MAX_PADDING + 1], // comm in task_struct, always 16 bytes
-
-    pub tuple: tuple_t, // Socket五元组信息
+    pub container_id: [u8; CONTAINER_ID_SIZE],             // container id
+    pub tuple: tuple_t,                                    // Socket五元组信息
 
     /*
      * 为每一个数据通信的套接字创建唯一的ID，可用于流标识。
@@ -180,6 +204,7 @@ pub struct SK_BPF_DATA {
     pub msg_type: u8, // 信息类型，值为MSG_REQUEST(1), MSG_RESPONSE(2), 需要应用层分析进一步确认。
     pub need_reconfirm: bool, // true: 表示eBPF程序对L7协议类型的判断并不确定需要上层重新核实。
     // false: 表示eBPF程序对L7协议类型的判断是有把握的不需要上层重新核实。
+    pub is_tls: bool,
 
     /* trace info */
     pub tcp_seq: u64, // 收发cap_data数据时TCP协议栈将会用到的TCP SEQ，可用于关联eBPF DATA与网络中的TCP Packet
@@ -215,6 +240,7 @@ pub struct SK_BPF_DATA {
     pub syscall_len: u64,      // 本次系统调用读、写数据的总长度
     pub cap_len: u32,          // 返回的cap_data长度
     pub cap_seq: u64, // cap_data在Socket中的相对顺序号，在所在socket下从0开始自增，用于数据乱序排序
+    pub socket_role: u8, // this message is created by: 0:unkonwn 1:client(connect) 2:server(accept)
     pub cap_data: *mut c_char, // 内核送到用户空间的数据地址
 }
 
@@ -265,7 +291,7 @@ impl fmt::Display for SK_BPF_DATA {
             write!(
                 f,
                 "Timestamp: {} Socket: {} CapSeq: {} Process: {}:{} Thread: {} MsgType: {} Direction: {} \n \
-                \t{}_{} -> {}_{} Seq: {} Trace-ID: {} L7: {} Data {:?}",
+                \t{}_{} -> {}_{} Seq: {} Trace-ID: {} L7: {} TLS: {:?} Data {:?}",
                 self.timestamp,
                 self.socket_id,
                 self.cap_seq,
@@ -281,6 +307,7 @@ impl fmt::Display for SK_BPF_DATA {
                 self.tcp_seq,
                 self.syscall_trace_id_call,
                 self.l7_protocol_hint,
+                self.is_tls,
                 data_bytes
             )
         }
@@ -351,6 +378,7 @@ pub struct stack_profile_data {
      */
     pub tid: u32,
     pub stime: u64,      // The start time of the process is measured in milliseconds.
+    pub netns_id: u64,   // Fetch from /proc/<PID>/ns/net
     pub u_stack_id: u32, // User space stackID.
     pub k_stack_id: u32, // Kernel space stackID.
     pub cpu: u32,        // The captured stack trace data is generated on which CPU?
@@ -367,6 +395,7 @@ pub struct stack_profile_data {
      */
     pub comm: [u8; PACKET_KNAME_MAX_PADDING + 1],
     pub process_name: [u8; PACKET_KNAME_MAX_PADDING + 1], // process name
+    pub container_id: [u8; CONTAINER_ID_SIZE],            // container id
     pub stack_data_len: u32,                              // stack data length
 
     /*
@@ -383,7 +412,7 @@ pub struct stack_profile_data {
 
 extern "C" {
     /*
-     * Set maximum amount of data passed to the agent by eBPF programe.
+     * Set maximum amount of data passed to the agent by eBPF program.
      * @limit_size : The maximum length of data. If @limit_size exceeds 8192,
      *               it will automatically adjust to 8192 bytes.
      *               If limit_size is 0, use the default values 4096.
@@ -398,6 +427,36 @@ extern "C" {
     pub fn set_bypass_port_bitmap(bitmap: *const c_uchar) -> c_int;
     pub fn enable_ebpf_protocol(protocol: c_int) -> c_int;
     pub fn set_feature_regex(idx: c_int, pattern: *const c_char) -> c_int;
+    /*
+     * Configuring application layer protocol ports
+     *
+     * When 'l7-protocol-enabled' includes application layer protocol types,
+     * 'l7-protocol-ports' specifies the port numbers or port number ranges
+     * for these protocols. eBPF will perform protocol inference on the
+     * specified port numbers for a given protocol. If a protocol's port number
+     * is not within the configured range, inference for that protocol will not
+     * be performed.
+     *
+     * Parameters:
+     * @proto_type: Protocol type, e.g., SOCK_DATA_HTTP1/SOCK_DATA_HTTP2 ...
+     * @ports: Port range, e.g., "443, 4467-5678"
+     *
+     * @return: Returns 0 on success, a non-zero value on error.
+     *
+     * For example, with the following configuration:
+     * ```
+     * l7-protocol-enabled:
+     *    TLS
+     * l7-protocol-ports:
+     *    "TLS": "443, 4467-5678"
+     * ```
+     * During the eBPF protocol inference phase, TLS protocol inference will be
+     * performed on the port numbers and range "443, 4467-5678." If the inference
+     * fails, data will be discarded.
+     *
+     * Note: that the default value for 'TLS' in 'l7-protocol-ports' is "443".
+     */
+    pub fn set_protocol_ports_bitmap(proto_type: c_int, ports: *const c_char) -> c_int;
 
     // 初始化tracer用于设置eBPF环境初始化。
     // 参数：
@@ -458,11 +517,22 @@ extern "C" {
     /*
      * start continuous profiler
      * @freq sample frequency, Hertz. (e.g. 99 profile stack traces at 99 Hertz)
+     * @java_syms_space_limit The maximum space occupied by the Java symbol files
+     *   in the '/' directory of the target POD container.The recommended range for
+     *   values is [2, 100], which means it falls within the interval of 2Mi to 100Mi.
+     *   If the configuration value is outside this range, the default value of
+     *   10(10Mi), will be used.
+     * @java_syms_update_delay To allow Java to run for an extended period and gather
+     *   more symbol information, we delay symbol retrieval when encountering unknown
+     *   symbols. The unit of measurement used is seconds.
+     *   The recommended range for values is [5, 3600], default valuse is 60.
      * @callback Profile data processing callback interface
      * @returns 0 on success, < 0 on error
      */
     pub fn start_continuous_profiler(
         freq: c_int,
+        java_syms_space_limit: c_int,
+        java_syms_update_delay: c_int,
         callback: extern "C" fn(_data: *mut stack_profile_data),
     ) -> c_int;
 
@@ -535,4 +605,54 @@ extern "C" {
      */
     pub fn process_stack_trace_data_for_flame_graph(_data: *mut stack_profile_data);
     pub fn release_flame_graph_hash();
+
+    /*
+     * Configure and enable datadump - Send socket data obtained by eBPF to the controller.
+     *
+     * @pid
+     *   Specifying a process ID or thread ID. If set to '0', it indicates
+     *   all processes or threads.
+     * @comm
+     *   Specifying a process name or thread name. If set to an empty string(""),
+     *   it indicates all processes or threads.
+     * @proto
+     *   Specifying the L7 protocol number. If set to '0', it indicates all
+     *   L7 protocols.
+     * @timeout
+     *   Specifying the timeout duration. If the elapsed time exceeds this
+     *   duration, datadump will stop. The unit is in seconds.
+     * @callback
+     *   Callback interface, used to transfer data to the remote controller.
+     *
+     * @return 0 on success, and a negative value on failure.
+     */
+    pub fn datadump_set_config(
+        pid: c_int,
+        comm: *const c_char,
+        proto: c_int,
+        timeout: c_int,
+        callback: extern "C" fn(data: *mut c_char, len: c_int),
+    ) -> c_int;
+
+    /*
+     * Configure and enable the debugging functionality for Continuous Profiling.
+     *
+     * @timeout
+     *   Specifying the timeout duration. If the elapsed time exceeds this
+     *   duration, cpdbg will stop. The unit is in seconds.
+     * @callback
+     *   Callback interface, used to transfer data to the remote controller.
+     *
+     * @return 0 on success, and a negative value on failure.
+     */
+    pub fn cpdbg_set_config(
+        timeout: c_int,
+        callback: extern "C" fn(data: *mut c_char, len: c_int),
+    ) -> c_int;
+}
+
+#[no_mangle]
+extern "C" fn rust_info_wrapper(msg: *const libc::c_char) {
+    let msg_str: &str = unsafe { std::ffi::CStr::from_ptr(msg).to_str().unwrap() };
+    info!("{}", msg_str);
 }

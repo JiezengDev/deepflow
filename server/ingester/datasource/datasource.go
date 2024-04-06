@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,7 +34,8 @@ import (
 var log = logging.MustGetLogger("datasource")
 
 const (
-	DATASOURCE_PORT = 20106
+	DATASOURCE_PORT      = 20106
+	MAX_DATASOURCE_COUNT = 64
 )
 
 type DatasourceManager struct {
@@ -61,7 +62,7 @@ func NewDatasourceManager(cfg *config.Config, readTimeout int) *DatasourceManage
 		ckdbCluster:       cfg.CKDB.ClusterName,
 		ckdbStoragePolicy: cfg.CKDB.StoragePolicy,
 		ckdbColdStorages:  cfg.GetCKDBColdStorages(),
-		isModifyingFlags:  make([]bool, 16),
+		isModifyingFlags:  make([]bool, MAX_DATASOURCE_COUNT),
 		server: &http.Server{
 			Addr:    ":" + strconv.Itoa(DATASOURCE_PORT),
 			Handler: mux.NewRouter(),
@@ -101,6 +102,7 @@ func respPending(w http.ResponseWriter, desc string) {
 }
 
 type AddBody struct {
+	OrgID        int    `json:"org-id"`
 	BaseRP       string `json:"base-rp"`
 	DB           string `json:"db"`
 	Interval     int    `json:"interval"`
@@ -111,14 +113,16 @@ type AddBody struct {
 }
 
 type ModBody struct {
+	OrgID    int    `json:"org-id"`
 	DB       string `json:"db"`
 	Name     string `json:"name"`
 	Duration int    `json:"retention-time"`
 }
 
 type DelBody struct {
-	DB   string `json:"db"`
-	Name string `json:"name"`
+	OrgID int    `json:"org-id"`
+	DB    string `json:"db"`
+	Name  string `json:"name"`
 }
 
 func (m *DatasourceManager) rpAdd(w http.ResponseWriter, r *http.Request) {
@@ -136,7 +140,7 @@ func (m *DatasourceManager) rpAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Infof("receive rpadd request: %+v", b)
 
-	err = m.Handle(b.DB, "add", b.BaseRP, b.Name, b.SummableOP, b.UnsummableOP, b.Interval, b.Duration)
+	err = m.Handle(b.OrgID, ADD, b.DB, b.BaseRP, b.Name, b.SummableOP, b.UnsummableOP, b.Interval, b.Duration)
 	if err != nil {
 		respFailed(w, err.Error())
 		return
@@ -159,7 +163,7 @@ func (m *DatasourceManager) rpMod(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Infof("receive rpmod request: %+v", b)
 
-	err = m.Handle(b.DB, "mod", "", b.Name, "", "", 0, b.Duration)
+	err = m.Handle(b.OrgID, MOD, b.DB, "", b.Name, "", "", 0, b.Duration)
 	if err != nil {
 		if strings.Contains(err.Error(), "try again") {
 			respPending(w, err.Error())
@@ -187,7 +191,7 @@ func (m *DatasourceManager) rpDel(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Infof("receive rpdel request: %+v", b)
 
-	err = m.Handle(b.DB, "del", "", b.Name, "", "", 0, 0)
+	err = m.Handle(b.OrgID, DEL, b.DB, "", b.Name, "", "", 0, 0)
 	if err != nil {
 		respFailed(w, err.Error())
 		return
@@ -219,12 +223,13 @@ func (m *DatasourceManager) Close() error {
 	}
 	ctx, cancel := context.WithTimeout(context.TODO(), 5*time.Second)
 
-	if err := m.server.Shutdown(ctx); err != nil {
-		log.Errorf("Shutdown() failed: %v", err)
-		return err
+	err := m.server.Shutdown(ctx)
+	if err != nil {
+		log.Warningf("shutdown failed: %v", err)
+	} else {
+		log.Info("datasource manager stopped")
 	}
 	cancel()
 
-	log.Info("datasource manager stopped")
-	return nil
+	return err
 }

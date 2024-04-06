@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023 Yunshan Networks
+* Copyright (c) 2024 Yunshan Networks
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -21,17 +21,17 @@ import (
 )
 
 type ChPrometheusLabelName struct {
-	UpdaterBase[mysql.ChPrometheusLabelName, IDKey]
+	UpdaterComponent[mysql.ChPrometheusLabelName, IDKey]
 }
 
 func NewChPrometheusLabelName() *ChPrometheusLabelName {
 	updater := &ChPrometheusLabelName{
-		UpdaterBase[mysql.ChPrometheusLabelName, IDKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_LABEL_NAME,
-		},
+		newUpdaterComponent[mysql.ChPrometheusLabelName, IDKey](
+			RESOURCE_TYPE_CH_LABEL_NAME,
+		),
 	}
 
-	updater.dataGenerator = updater
+	updater.updaterDG = updater
 	return updater
 }
 

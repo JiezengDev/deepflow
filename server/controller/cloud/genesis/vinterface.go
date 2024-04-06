@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@
 package genesis
 
 import (
+	"time"
+
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
 
@@ -28,8 +30,7 @@ func (g *Genesis) getVinterfaces() ([]model.VInterface, error) {
 	vinterfaces := []model.VInterface{}
 	vinterfacesData := g.genesisData.Ports
 
-	g.cloudStatsd.APICost["vinterfaces"] = []int{0}
-	g.cloudStatsd.APICount["vinterfaces"] = []int{len(vinterfacesData)}
+	g.cloudStatsd.RefreshAPIMoniter("vinterfaces", len(vinterfacesData), time.Time{})
 
 	for _, v := range vinterfacesData {
 		if v.DeviceLcuuid == "" || v.NetworkLcuuid == "" {

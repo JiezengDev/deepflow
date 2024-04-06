@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -61,6 +61,18 @@ func Int2Bool(i int) bool {
 	return true
 }
 
+func (e *VTapEvent) getPlugins(vConfig *vtap.VTapConfig) *api.PluginConfig {
+	if vConfig == nil || vConfig.PluginNewUpdateTime == 0 {
+		return &api.PluginConfig{}
+	}
+
+	return &api.PluginConfig{
+		UpdateTime:  proto.Uint32(vConfig.PluginNewUpdateTime),
+		WasmPlugins: vConfig.ConvertedWasmPlugins,
+		SoPlugins:   vConfig.ConvertedSoPlugins,
+	}
+}
+
 func (e *VTapEvent) generateConfigInfo(c *vtap.VTapCache, clusterID string) *api.Config {
 	gVTapInfo := trisolaris.GetGVTapInfo()
 	vtapConfig := c.GetVTapConfig()
@@ -84,10 +96,18 @@ func (e *VTapEvent) generateConfigInfo(c *vtap.VTapCache, clusterID string) *api
 	ifMacSource := api.IfMacSource(vtapConfig.IfMacSource)
 	captureSocketType := api.CaptureSocketType(vtapConfig.CaptureSocketType)
 	vtapID := uint32(c.GetVTapID())
-	tridentType := common.TridentType(c.GetVTapType())
+
+	tridentType := common.TridentType(0)
+	if clusterID != "" { // if agent report cluster_id, force set tridentType = VTAP_TYPE_POD_VM
+		tridentType = common.TridentType(VTAP_TYPE_POD_VM)
+	} else {
+		tridentType = common.TridentType(c.GetVTapType())
+	}
 	podClusterId := uint32(c.GetPodClusterID())
 	vpcID := uint32(c.GetVPCID())
 	tapMode := api.TapMode(vtapConfig.TapMode)
+	breakerMetricStr := convertBreakerMetric(vtapConfig.SystemLoadCircuitBreakerMetric)
+	loadMetric := api.SystemLoadMetric(api.SystemLoadMetric_value[breakerMetricStr])
 	configure := &api.Config{
 		CollectorEnabled:              proto.Bool(Int2Bool(vtapConfig.CollectorEnabled)),
 		CollectorSocketType:           &collectorSocketType,
@@ -96,6 +116,7 @@ func (e *VTapEvent) generateConfigInfo(c *vtap.VTapCache, clusterID string) *api
 		MaxMemory:                     proto.Uint32(uint32(vtapConfig.MaxMemory)),
 		StatsInterval:                 proto.Uint32(uint32(vtapConfig.StatsInterval)),
 		SyncInterval:                  proto.Uint32(uint32(vtapConfig.SyncInterval)),
+		PlatformSyncInterval:          proto.Uint32(uint32(vtapConfig.PlatformSyncInterval)),
 		NpbBpsThreshold:               proto.Uint64(uint64(vtapConfig.MaxNpbBps)),
 		GlobalPpsThreshold:            proto.Uint64(uint64(vtapConfig.MaxCollectPps)),
 		Mtu:                           proto.Uint32(uint32(vtapConfig.Mtu)),
@@ -157,6 +178,12 @@ func (e *VTapEvent) generateConfigInfo(c *vtap.VTapCache, clusterID string) *api
 		RegionId:          proto.Uint32(uint32(c.GetRegionID())),
 		// 容器采集器所在容器集群ID
 		PodClusterId: &podClusterId,
+
+		Plugins: e.getPlugins(vtapConfig),
+
+		SystemLoadCircuitBreakerThreshold: proto.Float32((vtapConfig.SystemLoadCircuitBreakerThreshold)),
+		SystemLoadCircuitBreakerRecover:   proto.Float32((vtapConfig.SystemLoadCircuitBreakerRecover)),
+		SystemLoadCircuitBreakerMetric:    &loadMetric,
 	}
 
 	cacheTSBIP := c.GetTSDBIP()
@@ -196,6 +223,7 @@ func (e *VTapEvent) generateConfigInfo(c *vtap.VTapCache, clusterID string) *api
 
 		configure.ProxyControllerIp = proto.String(trisolaris.GetGNodeInfo().GetControllerPodIP(c.GetControllerIP()))
 		configure.ProxyControllerPort = proto.Uint32(uint32(trisolaris.GetGrpcPort()))
+
 	}
 
 	if configure.GetProxyControllerIp() == "" {
@@ -221,6 +249,15 @@ func (e *VTapEvent) generateConfigInfo(c *vtap.VTapCache, clusterID string) *api
 	}
 
 	return configure
+}
+
+// convertBreakerMetric make the first letter of a string uppercase, such as load1 to Load1.
+func convertBreakerMetric(breakerMetric string) string {
+	var breakerMetricStr string
+	if len(breakerMetric) >= 2 {
+		breakerMetricStr = strings.ToUpper(string(breakerMetric[0])) + breakerMetric[1:]
+	}
+	return breakerMetricStr
 }
 
 func isOpenK8sSyn(vtapType int) bool {
@@ -256,10 +293,10 @@ func getRealRevision(revision string) string {
 
 func (e *VTapEvent) Sync(ctx context.Context, in *api.SyncRequest) (*api.SyncResponse, error) {
 	if trisolaris.GetConfig().DomainAutoRegister && in.GetKubernetesClusterId() != "" {
-		gKubernetesInfo := trisolaris.GetGKubernetesInfo()
-		exists := gKubernetesInfo.CreateDomainIfClusterIDNotExists(in.GetKubernetesClusterId(), in.GetKubernetesClusterName())
+		gKubernetesInfo := trisolaris.GetGKubernetesInfo(in.GetTeamId())
+		exists := gKubernetesInfo.CreateDomainIfClusterIDNotExists(in.GetTeamId(), in.GetKubernetesClusterId(), in.GetKubernetesClusterName())
 		if !exists {
-			log.Infof("call me from ip: %s with cluster_id: %s, cluster_name: %s", getRemote(ctx), in.GetKubernetesClusterId(), in.GetKubernetesClusterName())
+			log.Infof("call me from ip: %s with team_id: %s, cluster_id: %s, cluster_name: %s", getRemote(ctx), in.GetTeamId(), in.GetKubernetesClusterId(), in.GetKubernetesClusterName())
 		}
 	}
 
@@ -292,7 +329,8 @@ func (e *VTapEvent) Sync(ctx context.Context, in *api.SyncRequest) (*api.SyncRes
 				in.GetCtrlMac(),
 				in.GetHostIps(),
 				in.GetHost(),
-				in.GetVtapGroupIdRequest())
+				in.GetVtapGroupIdRequest(),
+				int(in.GetAgentUniqueIdentifier()))
 		}
 		return e.noVTapResponse(in), nil
 	}
@@ -341,6 +379,7 @@ func (e *VTapEvent) Sync(ctx context.Context, in *api.SyncRequest) (*api.SyncRes
 	if tridentException != int64(in.GetException()) {
 		vtapCache.UpdateExceptions(int64(in.GetException()))
 	}
+	vtapCache.UpdateVTapRawHostname(in.GetHost())
 	vtapCache.UpdateSyncedControllerAt(time.Now())
 	vtapCache.UpdateSystemInfoFromGrpc(
 		int(in.GetCpuNum()),
@@ -402,6 +441,7 @@ func (e *VTapEvent) Sync(ctx context.Context, in *api.SyncRequest) (*api.SyncRes
 	remoteSegments := vtapCache.GetVTapRemoteSegments()
 	upgradeRevision := vtapCache.GetExpectedRevision()
 	skipInterface := gVTapInfo.GetSkipInterface(vtapCache)
+	Containers := gVTapInfo.GetContainers(int(vtapCache.GetVTapID()))
 	return &api.SyncResponse{
 		Status:              &STATUS_SUCCESS,
 		LocalSegments:       localSegments,
@@ -414,6 +454,7 @@ func (e *VTapEvent) Sync(ctx context.Context, in *api.SyncRequest) (*api.SyncRes
 		VersionGroups:       proto.Uint64(versionGroups),
 		VersionAcls:         proto.Uint64(versionPolicy),
 		TapTypes:            tapTypes,
+		Containers:          Containers,
 		SkipInterface:       skipInterface,
 		SelfUpdateUrl:       proto.String(gVTapInfo.GetSelfUpdateUrl()),
 		Revision:            proto.String(upgradeRevision),
@@ -441,6 +482,8 @@ func (e *VTapEvent) generateNoVTapCacheConfig(groupID string) *api.Config {
 	ifMacSource := api.IfMacSource(vtapConfig.IfMacSource)
 	captureSocketType := api.CaptureSocketType(vtapConfig.CaptureSocketType)
 	tapMode := api.TapMode(vtapConfig.TapMode)
+	breakerMetricStr := convertBreakerMetric(vtapConfig.SystemLoadCircuitBreakerMetric)
+	loadMetric := api.SystemLoadMetric(api.SystemLoadMetric_value[breakerMetricStr])
 	configure := &api.Config{
 		CollectorEnabled:              proto.Bool(Int2Bool(vtapConfig.CollectorEnabled)),
 		CollectorSocketType:           &collectorSocketType,
@@ -449,6 +492,7 @@ func (e *VTapEvent) generateNoVTapCacheConfig(groupID string) *api.Config {
 		MaxMemory:                     proto.Uint32(uint32(vtapConfig.MaxMemory)),
 		StatsInterval:                 proto.Uint32(uint32(vtapConfig.StatsInterval)),
 		SyncInterval:                  proto.Uint32(uint32(vtapConfig.SyncInterval)),
+		PlatformSyncInterval:          proto.Uint32(uint32(vtapConfig.PlatformSyncInterval)),
 		NpbBpsThreshold:               proto.Uint64(uint64(vtapConfig.MaxNpbBps)),
 		GlobalPpsThreshold:            proto.Uint64(uint64(vtapConfig.MaxCollectPps)),
 		Mtu:                           proto.Uint32(uint32(vtapConfig.Mtu)),
@@ -499,6 +543,11 @@ func (e *VTapEvent) generateNoVTapCacheConfig(groupID string) *api.Config {
 		L4LogTapTypes:       vtapConfig.ConvertedL4LogTapTypes,
 		L4LogIgnoreTapSides: vtapConfig.ConvertedL4LogIgnoreTapSides,
 		L7LogIgnoreTapSides: vtapConfig.ConvertedL7LogIgnoreTapSides,
+		Plugins:             e.getPlugins(vtapConfig),
+
+		SystemLoadCircuitBreakerThreshold: proto.Float32((vtapConfig.SystemLoadCircuitBreakerThreshold)),
+		SystemLoadCircuitBreakerRecover:   proto.Float32((vtapConfig.SystemLoadCircuitBreakerRecover)),
+		SystemLoadCircuitBreakerMetric:    &loadMetric,
 	}
 	if vtapConfig.TapInterfaceRegex != "" {
 		configure.TapInterfaceRegex = proto.String(vtapConfig.TapInterfaceRegex)
@@ -554,11 +603,11 @@ func (e *VTapEvent) noVTapResponse(in *api.SyncRequest) *api.SyncResponse {
 			configInfo = &api.Config{
 				MaxEscapeSeconds: proto.Uint32(uint32(gVTapInfo.GetDefaultMaxEscapeSeconds())),
 				MaxMemory:        proto.Uint32(uint32(gVTapInfo.GetDefaultMaxMemory())),
+				PlatformEnabled:  proto.Bool(true),
 			}
 		}
 		configInfo.Enabled = proto.Bool(false)
 		configInfo.TridentType = &tridentType
-		configInfo.PlatformEnabled = proto.Bool(true)
 
 		return &api.SyncResponse{
 			Status: &STATUS_SUCCESS,
@@ -628,25 +677,26 @@ func (e *VTapEvent) pushResponse(in *api.SyncRequest) (*api.SyncResponse, error)
 	pushVersionGroups := vtapCache.GetPushVersionGroups()
 	versionPolicy := gVTapInfo.GetVTapPolicyVersion(vtapID, functions)
 	pushVersionPolicy := vtapCache.GetPushVersionPolicy()
+	newAcls := gVTapInfo.GetVTapPolicyData(vtapID, functions)
 	if versionPlatformData != pushVersionPlatformData ||
 		versionGroups != pushVersionGroups || versionPolicy != pushVersionPolicy {
-		log.Infof("push data ctrl_ip is %s, ctrl_mac is %s, host_ips is %s, "+
+		log.Infof("push data ctrl_ip is %s, ctrl_mac is %s, "+
 			"(platform data version  %d -> %d), "+
-			"(acls version %d -> %d), "+
+			"(acls version %d -> %d datalen: %d), "+
 			"(groups version %d -> %d), "+
 			"NAME:%s  REVISION:%s  BOOT_TIME:%d",
-			ctrlIP, ctrlMac, in.GetHostIps(),
+			ctrlIP, ctrlMac,
 			versionPlatformData, pushVersionPlatformData,
-			versionPolicy, pushVersionPolicy,
+			versionPolicy, pushVersionPolicy, len(newAcls),
 			versionGroups, pushVersionGroups,
 			in.GetProcessName(), in.GetRevision(), in.GetBootTime())
 	} else {
-		log.Debugf("push data ctrl_ip is %s, ctrl_mac is %s, host_ips is %s,"+
+		log.Debugf("push data ctrl_ip is %s, ctrl_mac is %s, "+
 			"(platform data version  %d -> %d), "+
 			"(acls version %d -> %d), "+
 			"(groups version %d -> %d), "+
 			"NAME:%s  REVISION:%s  BOOT_TIME:%d",
-			ctrlIP, ctrlMac, in.GetHostIps(),
+			ctrlIP, ctrlMac,
 			versionPlatformData, pushVersionPlatformData,
 			versionPolicy, pushVersionPolicy,
 			versionGroups, pushVersionGroups,
@@ -662,7 +712,7 @@ func (e *VTapEvent) pushResponse(in *api.SyncRequest) (*api.SyncResponse, error)
 		groups = gVTapInfo.GetGroupData()
 	}
 	acls := []byte{}
-	if versionPolicy != in.GetVersionAcls() {
+	if versionPolicy != pushVersionPolicy {
 		acls = gVTapInfo.GetVTapPolicyData(vtapID, functions)
 	}
 
@@ -686,6 +736,7 @@ func (e *VTapEvent) pushResponse(in *api.SyncRequest) (*api.SyncResponse, error)
 	localSegments := vtapCache.GetVTapLocalSegments()
 	remoteSegments := vtapCache.GetVTapRemoteSegments()
 	skipInterface := gVTapInfo.GetSkipInterface(vtapCache)
+	Containers := gVTapInfo.GetContainers(int(vtapCache.GetVTapID()))
 	return &api.SyncResponse{
 		Status:              &STATUS_SUCCESS,
 		LocalSegments:       localSegments,
@@ -699,6 +750,7 @@ func (e *VTapEvent) pushResponse(in *api.SyncRequest) (*api.SyncResponse, error)
 		FlowAcls:            acls,
 		VersionAcls:         proto.Uint64(versionPolicy),
 		TapTypes:            tapTypes,
+		Containers:          Containers,
 	}, nil
 }
 

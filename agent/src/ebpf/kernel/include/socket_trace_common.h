@@ -64,13 +64,15 @@ struct __socket_data {
 
 	/* 追踪数据信息 */
 	__u64 timestamp;     // 数据捕获时间戳
-	__u8  direction: 1;  // bits[0]: 方向，值为T_EGRESS(0), T_INGRESS(1)
-	__u8  msg_type:  7;  // bits[1-7]: 信息类型，值为MSG_UNKNOWN(0), MSG_REQUEST(1), MSG_RESPONSE(2)
+	__u8 direction: 1;  // bits[0]: 方向，值为T_EGRESS(0), T_INGRESS(1)
+	__u8 msg_type:  6;  // bits[1-7]: 信息类型，值为MSG_UNKNOWN(0), MSG_REQUEST(1), MSG_RESPONSE(2)
+	__u8 is_tls: 1;
 
 	__u64 syscall_len;   // 本次系统调用读、写数据的总长度
 	__u64 data_seq;      // cap_data在Socket中的相对顺序号
 	__u16 data_type;     // HTTP, DNS, MySQL
 	__u16 data_len;      // 数据长度
+	__u8  socket_role;   // this message is created by: 0:unkonwn 1:client(connect) 2:server(accept)
 	char data[BURST_DATA_BUF_SIZE];
 } __attribute__((packed));
 
@@ -105,32 +107,39 @@ struct socket_info_t {
 	 * The serial number of the socket read and write data, used to
 	 * correct out-of-sequence.
 	 *
-	 * socket读写数据的序列号，用于纠正数据乱序。
+	 * Sequence number for reading and writing data in the socket, used
+	 * to correct data disorder.
 	 */
 	volatile __u64 seq;
 
 	/*
-	 * mysql, kafka这种类型在读取数据时，先读取4字节
-	 * 然后再读取剩下的数据，这里用于对预先读取的数据存储
-	 * 用于后续的协议分析。
+	 * When reading data of types like MySQL or Kafka, the first step
+	 * involves reading 4 bytes followed by reading the remaining data.
+	 * Here, the pre-read data is stored for subsequent protocol analysis.
 	 */
 	__u8 prev_data[EBPF_CACHE_SIZE];
 	__u8 direction: 1;
-	__u8 msg_type: 2;	// 保存数据类型，值为MSG_UNKNOWN(0), MSG_REQUEST(1), MSG_RESPONSE(2)
-	__u8 role: 5;           // 标识socket角色：ROLE_CLIENT, ROLE_SERVER, ROLE_UNKNOWN
-	bool need_reconfirm;    // l7协议推断是否需要再次确认。
-	__s32 correlation_id;   // 目前用于kafka协议推断。
+	__u8 pre_direction: 1;
+	__u8 msg_type: 2;	// Store data type, values are MSG_UNKNOWN(0), MSG_REQUEST(1), MSG_RESPONSE(2)
+	__u8 role: 3;           // Socket role identifier: ROLE_CLIENT, ROLE_SERVER, ROLE_UNKNOWN
+	__u8 tls_end: 1;	// Use the Identity TLS protocol to infer whether it has been completed
+	bool need_reconfirm;    // L7 protocol inference requiring confirmation.
+	union {
+		__u8  encoding_type;    // Currently used for OpenWire encoding inference.
+		__s32 correlation_id;   // Currently used for Kafka protocol inference.
+	};
 
-	__u32 peer_fd;		// 用于记录socket间数据转移的对端fd。
+	__u32 peer_fd;		// Used to record the peer fd for data transfer between sockets.
 
 	/*
-	 * 一旦有数据读/写就会更新这个时间，这个时间是从系统开机开始
-	 * 到更新时的间隔时间单位是秒。
+	 * This time is updated whenever there is data read/write. It
+	 * represents the elapsed time in seconds from the system boot
+	 * to the time of update.
 	 */
 	__u32 update_time;
 	__u32 prev_data_len;
 	__u64 trace_id;
-	__u64 uid; // socket唯一标识ID
+	__u64 uid; // Unique identifier ID for the socket.
 } __attribute__((packed));
 
 struct trace_key_t {
@@ -155,6 +164,8 @@ struct kprobe_port_bitmap {
 	__u8 bitmap[65536 / 8];
 } __attribute__((packed));
 
+typedef struct kprobe_port_bitmap ports_bitmap_t;
+
 struct __io_event_buffer {
 	__u32 bytes_count;
 
@@ -168,8 +179,6 @@ struct __io_event_buffer {
 	// strings terminated with \0
 	char filename[64];
 } __attribute__((packed));
-
-#define is_set_bitmap(bitmap, idx) (bitmap[(idx) / 8] & (1 << ((idx) % 8)))
 
 // struct ebpf_proc_info -> offsets[]  arrays index.
 enum offsets_index {
@@ -234,6 +243,16 @@ struct process_event_t {
 	struct event_meta meta;
 	__u32 pid; // process ID
 	__u8 name[TASK_COMM_LEN]; // process name
+};
+
+struct debug_data {
+	__u16 magic;
+	__u8 fun;
+	__u8 num;
+	union {
+		__u32 len;
+		__u8 buf[4];
+	};
 };
 
 #define GO_VERSION(a, b, c) (((a) << 16) + ((b) << 8) + ((c) > 255 ? 255 : (c)))

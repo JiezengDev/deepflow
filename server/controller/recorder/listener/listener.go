@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/recorder/constraint"
 )
 
-type Listener[CT constraint.CloudModel, MT constraint.MySQLModel, BT constraint.DiffBase[MT]] interface {
+type Listener[CT constraint.CloudModel, MT constraint.MySQLModel, BT constraint.DiffBase] interface {
 	OnUpdaterAdded(addedDBItems []*MT)
 	OnUpdaterUpdated(cloudItem *CT, diffBaseItem BT)
 	OnUpdaterDeleted(lcuuids []string)

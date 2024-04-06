@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,16 +26,16 @@ import (
 )
 
 type ChIntEnum struct {
-	UpdaterBase[mysql.ChIntEnum, IntEnumTagKey]
+	UpdaterComponent[mysql.ChIntEnum, IntEnumTagKey]
 }
 
 func NewChIntEnum() *ChIntEnum {
 	updater := &ChIntEnum{
-		UpdaterBase[mysql.ChIntEnum, IntEnumTagKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_INT_ENUM,
-		},
+		newUpdaterComponent[mysql.ChIntEnum, IntEnumTagKey](
+			RESOURCE_TYPE_CH_INT_ENUM,
+		),
 	}
-	updater.dataGenerator = updater
+	updater.updaterDG = updater
 	return updater
 }
 

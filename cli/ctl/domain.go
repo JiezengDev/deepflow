@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/deepflowio/deepflow/cli/ctl/common"
+	"github.com/deepflowio/deepflow/cli/ctl/common/table"
 	"github.com/deepflowio/deepflow/cli/ctl/example"
 )
 
@@ -114,7 +115,7 @@ func listDomain(cmd *cobra.Command, args []string, output string) {
 		url += fmt.Sprintf("?name=%s", name)
 	}
 
-	response, err := common.CURLPerform("GET", url, nil, "")
+	response, err := common.CURLPerform("GET", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -125,21 +126,10 @@ func listDomain(cmd *cobra.Command, args []string, output string) {
 		yData, _ := yaml.JSONToYAML(jData)
 		fmt.Printf(string(yData))
 	} else {
-		nameMaxSize := len("NAME")
+		t := table.New()
+		t.SetHeader([]string{"NAME", "ID", "LCUUID", "TYPE", "CONTROLLER_IP", "CREATED_AT", "SYNCED_AT", "ENABLED", "STATE", "AGENT_WATCH_K8S"})
+		tableItems := [][]string{}
 
-		for i := range response.Get("DATA").MustArray() {
-			d := response.Get("DATA").GetIndex(i)
-			nameSize := len(d.Get("NAME").MustString())
-			if nameSize > nameMaxSize {
-				nameMaxSize = nameSize
-			}
-		}
-		format := "%-*s %-14s %-37s %-17s %-15s %-22s %-22s %-8s %-10s %s\n"
-		header := fmt.Sprintf(
-			format, nameMaxSize, "NAME", "ID", "LCUUID", "TYPE", "CONTROLLER_IP",
-			"CREATED_AT", "SYNCED_AT", "ENABLED", "STATE", "AGENT_WATCH_K8S", // TODO translate state to readable word
-		)
-		fmt.Fprint(os.Stderr, header)
 		for i := range response.Get("DATA").MustArray() {
 			d := response.Get("DATA").GetIndex(i)
 			name := d.Get("NAME").MustString()
@@ -149,14 +139,20 @@ func listDomain(cmd *cobra.Command, args []string, output string) {
 					nameChineseCount += 1
 				}
 			}
-			fmt.Printf(
-				format, nameMaxSize-nameChineseCount, name, d.Get("CLUSTER_ID").MustString(), d.Get("LCUUID").MustString(),
-				common.DomainType(d.Get("TYPE").MustInt()), d.Get("CONTROLLER_IP").MustString(),
+			tableItems = append(tableItems, []string{
+				name,
+				d.Get("CLUSTER_ID").MustString(),
+				d.Get("LCUUID").MustString(),
+				fmt.Sprintf("%v", common.DomainType(d.Get("TYPE").MustInt())),
+				d.Get("CONTROLLER_IP").MustString(),
 				d.Get("CREATED_AT").MustString(), d.Get("SYNCED_AT").MustString(),
-				common.DomainEnabled(d.Get("ENABLED").MustInt()), common.DomainState(d.Get("STATE").MustInt()),
+				fmt.Sprintf("%v", common.DomainEnabled(d.Get("ENABLED").MustInt())),
+				fmt.Sprintf("%v", common.DomainState(d.Get("STATE").MustInt())),
 				d.Get("VTAP_NAME").MustString(),
-			)
+			})
 		}
+		t.AppendBulk(tableItems)
+		t.Render()
 	}
 }
 
@@ -185,7 +181,7 @@ func createDomain(cmd *cobra.Command, args []string, filename string) {
 		return
 	}
 
-	resp, err := common.CURLPerform("POST", url, body, "")
+	resp, err := common.CURLPerform("POST", url, body, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -212,7 +208,7 @@ func updateDomain(cmd *cobra.Command, args []string, filename string) {
 	server := common.GetServerInfo(cmd)
 	url := fmt.Sprintf("http://%s:%d/v2/domains/?name=%s", server.IP, server.Port, args[0])
 	// curl domain API，list lcuuid
-	response, err := common.CURLPerform("GET", url, nil, "")
+	response, err := common.CURLPerform("GET", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -233,7 +229,7 @@ func updateDomain(cmd *cobra.Command, args []string, filename string) {
 		}
 
 		body["TYPE"] = domainTypeInt
-		resp, err := common.CURLPerform("PATCH", url, body, "")
+		resp, err := common.CURLPerform("PATCH", url, body, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return
@@ -261,7 +257,7 @@ func deleteDomain(cmd *cobra.Command, args []string) {
 	server := common.GetServerInfo(cmd)
 	url := fmt.Sprintf("http://%s:%d/v2/domains/?name=%s", server.IP, server.Port, args[0])
 	// curl domain API，list lcuuid
-	response, err := common.CURLPerform("GET", url, nil, "")
+	response, err := common.CURLPerform("GET", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -271,7 +267,7 @@ func deleteDomain(cmd *cobra.Command, args []string) {
 		lcuuid := response.Get("DATA").GetIndex(0).Get("LCUUID").MustString()
 		url := fmt.Sprintf("http://%s:%d/v1/domains/%s/", server.IP, server.Port, lcuuid)
 		// 调用domain API，删除对应的云平台
-		resp, err := common.CURLPerform("DELETE", url, nil, "")
+		resp, err := common.CURLPerform("DELETE", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return

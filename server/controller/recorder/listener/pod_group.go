@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan PodGroups
+ * Copyright (c) 2024 Yunshan PodGroups
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 )
 
 type PodGroup struct {
@@ -37,7 +38,7 @@ func (p *PodGroup) OnUpdaterAdded(addedDBItems []*mysql.PodGroup) {
 	p.cache.AddPodGroups(addedDBItems)
 }
 
-func (p *PodGroup) OnUpdaterUpdated(cloudItem *cloudmodel.PodGroup, diffBase *cache.PodGroup) {
+func (p *PodGroup) OnUpdaterUpdated(cloudItem *cloudmodel.PodGroup, diffBase *diffbase.PodGroup) {
 	diffBase.Update(cloudItem)
 }
 

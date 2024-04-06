@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -58,6 +58,8 @@ func NewServer(logFile string, cfg *config.ControllerConfig) *Server {
 	g := gin.New()
 	g.Use(gin.Recovery())
 	g.Use(gin.LoggerWithFormatter(logger.GinLogFormat))
+	// set custom middleware
+	g.Use(HandleOrgIDMiddleware())
 	s.engine = g
 	return s
 }
@@ -103,13 +105,16 @@ func (s *Server) appendRegistrant() []registrant.Registrant {
 		router.NewDebug(s.manager, s.genesis),
 		router.NewController(s.controllerConfig, s.controllerChecker),
 		router.NewAnalyzer(s.controllerConfig, s.analyzerChecker),
-		router.NewVtap(),
+		router.NewVtap(s.controllerConfig),
 		router.NewVtapGroup(s.controllerConfig),
 		router.NewDataSource(s.controllerConfig),
 		router.NewVTapGroupConfig(),
 		router.NewVTapInterface(),
 		router.NewVtapRepo(),
 		router.NewPlugin(),
+		router.NewMail(),
+		router.NewPrometheus(),
+		router.NewDatabase(s.controllerConfig),
 
 		// resource
 		resource.NewDomain(s.controllerConfig),

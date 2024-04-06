@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/vishvananda/netlink"
 )
 
@@ -127,4 +128,11 @@ func Lookup(host net.IP) (net.IP, error) {
 		src = route.Src.To4()
 	}
 	return src, nil
+}
+
+func IsVMofBMHtype(htype int) bool {
+	if Find[int]([]int{common.VM_HTYPE_BM_C, common.VM_HTYPE_BM_N, common.VM_HTYPE_BM_S}, htype) == true {
+		return true
+	}
+	return false
 }

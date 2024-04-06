@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,12 +27,13 @@ import (
 	"github.com/deepflowio/deepflow/server/libs/ckdb"
 	"github.com/deepflowio/deepflow/server/libs/grpc"
 	"github.com/deepflowio/deepflow/server/libs/pool"
+	"github.com/deepflowio/deepflow/server/libs/utils"
 	"github.com/google/gopacket/layers"
 	"github.com/pyroscope-io/pyroscope/pkg/storage"
 )
 
 const (
-	DefaultPartition  = ckdb.TimeFuncTwelveHour
+	DefaultPartition  = ckdb.TimeFuncHour
 	LabelTraceID      = "trace_id"
 	LabelSpanName     = "span_name"
 	LabelAppService   = "app_service"
@@ -67,6 +68,7 @@ type InProcessProfile struct {
 	// Ebpf Profile Infos
 	ProcessID        uint32 `json:"process_id"`
 	ProcessStartTime int64  `json:"process_start_time"`
+	GPID             uint32
 
 	// Universal Tag
 	VtapID       uint16
@@ -80,13 +82,19 @@ type InProcessProfile struct {
 	PodNSID      uint16
 	PodClusterID uint16
 	PodGroupID   uint32
-	IP4          uint32 `json:"ip4"`
-	IP6          net.IP `json:"ip6"`
-	IsIPv4       bool   `json:"is_ipv4"`
+
+	IP4    uint32 `json:"ip4"`
+	IP6    net.IP `json:"ip6"`
+	IsIPv4 bool   `json:"is_ipv4"`
 
 	L3DeviceType uint8
 	L3DeviceID   uint32
 	ServiceID    uint32
+
+	// Not stored, only determines which database to store in.
+	// When Orgid is 0 or 1, it is stored in database 'profile', otherwise stored in '<OrgId>_profile'.
+	OrgId  uint16
+	TeamID uint16
 }
 
 // profile_event_type <-> profile_value_unit relation
@@ -135,14 +143,15 @@ func ProfileColumns() []*ckdb.Column {
 		ckdb.NewColumn("trace_id", ckdb.String).SetComment("含义等同 l7_flow_log 的 trace_id"),
 		ckdb.NewColumn("span_name", ckdb.String).SetComment("含义等同 l7_flow_log 的 endpoint"),
 		ckdb.NewColumn("app_instance", ckdb.String).SetComment("应用实例名称, 用户上报"),
-		ckdb.NewColumn("tag_names", ckdb.ArrayString).SetComment("profile 上报的 tagnames"),
+		ckdb.NewColumn("tag_names", ckdb.ArrayLowCardinalityString).SetComment("profile 上报的 tagnames"),
 		ckdb.NewColumn("tag_values", ckdb.ArrayString).SetComment("profile 上报的 tagvalues"),
 		ckdb.NewColumn("compression_algo", ckdb.LowCardinalityString).SetComment("压缩算法"),
 		ckdb.NewColumn("process_id", ckdb.UInt32).SetComment("进程 id"),
 		ckdb.NewColumn("process_start_time", ckdb.DateTime64ms).SetComment("进程启动时间"),
+		ckdb.NewColumn("gprocess_id", ckdb.UInt32).SetComment("Process"),
 
 		// universal tag
-		ckdb.NewColumn("vtap_id", ckdb.UInt16).SetIndex(ckdb.IndexSet),
+		ckdb.NewColumn("agent_id", ckdb.UInt16).SetIndex(ckdb.IndexSet),
 		ckdb.NewColumn("region_id", ckdb.UInt16).SetComment("云平台区域ID"),
 		ckdb.NewColumn("az_id", ckdb.UInt16).SetComment("可用区ID"),
 		ckdb.NewColumn("subnet_id", ckdb.UInt16).SetComment("ip对应的子网ID"),
@@ -157,13 +166,14 @@ func ProfileColumns() []*ckdb.Column {
 		ckdb.NewColumn("l3_device_type", ckdb.UInt8).SetComment("资源类型"),
 		ckdb.NewColumn("l3_device_id", ckdb.UInt32).SetComment("资源ID"),
 		ckdb.NewColumn("service_id", ckdb.UInt32).SetComment("服务ID"),
+		ckdb.NewColumn("team_id", ckdb.UInt16).SetComment("团队ID"),
 	}
 }
 
 func GenProfileCKTable(cluster, dbName, tableName, storagePolicy string, ttl int, coldStorage *ckdb.ColdStorage) *ckdb.Table {
 	timeKey := "time"
 	engine := ckdb.MergeTree
-	orderKeys := []string{timeKey, "app_service", "ip4", "ip6"}
+	orderKeys := []string{"app_service", timeKey, "ip4", "ip6"}
 
 	return &ckdb.Table{
 		Version:         basecommon.CK_VERSION,
@@ -208,6 +218,7 @@ func (p *InProcessProfile) WriteBlock(block *ckdb.Block) {
 		p.CompressionAlgo,
 		p.ProcessID,
 		p.ProcessStartTime,
+		p.GPID,
 
 		p.VtapID,
 		p.RegionID,
@@ -223,7 +234,12 @@ func (p *InProcessProfile) WriteBlock(block *ckdb.Block) {
 		p.L3DeviceType,
 		p.L3DeviceID,
 		p.ServiceID,
+		p.TeamID,
 	)
+}
+
+func (p *InProcessProfile) OrgID() uint16 {
+	return p.OrgId
 }
 
 var poolInProcess = pool.NewLockFreePool(func() interface{} {
@@ -258,6 +274,7 @@ func ReleaseInProcess(p *InProcessProfile) {
 func (p *InProcessProfile) FillProfile(input *storage.PutInput,
 	platformData *grpc.PlatformInfoTable,
 	vtapID uint16,
+	podID uint32,
 	profileName string,
 	eventType string,
 	location string,
@@ -270,9 +287,10 @@ func (p *InProcessProfile) FillProfile(input *storage.PutInput,
 	tagNames []string,
 	tagValues []string) {
 
-	p.Time = uint32(inTimeStamp.Unix())
+	p.Time = uint32(input.StartTime.Unix())
 	p._id = genID(uint32(input.StartTime.UnixNano()/int64(time.Second)), &InProcessCounter, vtapID)
 	p.VtapID = vtapID
+	p.PodID = podID
 	p.AppService = profileName
 	p.ProfileLocationStr = location
 	p.CompressionAlgo = compressionAlgo
@@ -288,12 +306,14 @@ func (p *InProcessProfile) FillProfile(input *storage.PutInput,
 	}
 	p.ProcessID = pid
 	p.ProcessStartTime = stime
+	p.GPID = platformData.QueryProcessInfo(vtapID, pid)
 	tagNames = append(tagNames, LabelAppService, LabelLanguageType, LabelTraceID, LabelSpanName, LabelAppInstance)
 	tagValues = append(tagValues, p.AppService, p.ProfileLanguageType, p.TraceID, p.SpanName, p.AppInstance)
 	p.TagNames = tagNames
 	p.TagValues = tagValues
 
-	p.fillResource(uint32(vtapID), platformData)
+	p.fillResource(vtapID, podID, platformData)
+	p.OrgId, p.TeamID = platformData.QueryVtapOrgAndTeamID(vtapID)
 }
 
 func genID(time uint32, counter *uint32, vtapID uint16) uint64 {
@@ -301,17 +321,53 @@ func genID(time uint32, counter *uint32, vtapID uint16) uint64 {
 	return uint64(time)<<32 | ((uint64(vtapID) & 0x3fff) << 18) | (uint64(count) & 0x03ffff)
 }
 
-func (p *InProcessProfile) fillResource(vtapID uint32, platformData *grpc.PlatformInfoTable) {
+func (p *InProcessProfile) fillResource(vtapID uint16, podID uint32, platformData *grpc.PlatformInfoTable) {
 	vtapInfo := platformData.QueryVtapInfo(vtapID)
+	var vtapPlatformInfo *grpc.Info
 	if vtapInfo != nil {
 		p.L3EpcID = vtapInfo.EpcId
+		p.PodClusterID = uint16(vtapInfo.PodClusterId)
+		vtapIP := net.ParseIP(vtapInfo.Ip)
+		// get vtap platformInfo, incase can not find Pod by container (maybe containerID is empty)
+		if vtapIP != nil {
+			if ip4 := vtapIP.To4(); ip4 != nil {
+				// fill ip from Vtap first, can be overwritten by podInfo later
+				IP4 := utils.IpToUint32(ip4)
+				vtapPlatformInfo = platformData.QueryIPV4Infos(vtapInfo.EpcId, IP4)
+				if p.IP4 == 0 && (len(p.IP6) == 0 || p.IP6.Equal(net.IPv6zero)) {
+					p.IP4 = IP4
+					p.IsIPv4 = true
+				}
+			} else {
+				IP6 := vtapIP
+				vtapPlatformInfo = platformData.QueryIPV6Infos(vtapInfo.EpcId, IP6)
+				if p.IP4 == 0 && (len(p.IP6) == 0 || p.IP6.Equal(net.IPv6zero)) {
+					p.IP6 = IP6
+					p.IsIPv4 = false
+				}
+			}
+		}
 	}
 
 	var info *grpc.Info
-	if p.IsIPv4 {
-		info = platformData.QueryIPV4Infos(p.L3EpcID, p.IP4)
-	} else {
-		info = platformData.QueryIPV6Infos(p.L3EpcID, p.IP6)
+	// 1. try to find platform info by podID first
+	if podID != 0 {
+		info = platformData.QueryPodIdInfo(podID)
+		if info != nil {
+			// rewirte ip from podInfo
+			p.IsIPv4, p.IP4, p.IP6 = info.IsIPv4, info.IP4, info.IP6
+		}
+	}
+
+	// 2. try to fix platform info by IP
+	if info == nil {
+		// app profile: submit IP from agent
+		// ebpf profile with hostnetwork: when PodID get nil infos, try to get info from PodNodeID
+		if p.IsIPv4 {
+			info = platformData.QueryIPV4Infos(p.L3EpcID, p.IP4)
+		} else {
+			info = platformData.QueryIPV6Infos(p.L3EpcID, p.IP6)
+		}
 	}
 
 	if info != nil {
@@ -319,14 +375,70 @@ func (p *InProcessProfile) fillResource(vtapID uint32, platformData *grpc.Platfo
 		p.AZID = uint16(info.AZID)
 		p.SubnetID = uint16(info.SubnetID)
 		p.HostID = uint16(info.HostID)
-		p.PodID = info.PodID
+		if p.PodID == 0 {
+			p.PodID = info.PodID
+		}
 		p.PodNodeID = info.PodNodeID
 		p.PodNSID = uint16(info.PodNSID)
-		p.PodClusterID = uint16(info.PodClusterID)
+		if p.PodClusterID == 0 {
+			p.PodClusterID = uint16(info.PodClusterID)
+		}
 		p.PodGroupID = info.PodGroupID
 		p.L3DeviceType = uint8(info.DeviceType)
 		p.L3DeviceID = info.DeviceID
 		p.ServiceID = platformData.QueryService(p.PodID, p.PodNodeID, uint32(p.PodClusterID), p.PodGroupID, p.L3EpcID, !p.IsIPv4, p.IP4, p.IP6, layers.IPProtocolTCP, 0)
+	}
+
+	// fix up when all resource match failed
+	if vtapPlatformInfo != nil {
+		p.fillInfraInfo(vtapPlatformInfo)
+	}
+}
+
+func (p *InProcessProfile) fillPodInfo(vtapID uint16, containerID string, platformData *grpc.PlatformInfoTable) {
+	if containerID == "" {
+		log.Debugf("%s-%s uploaded empty containerID by vtapID: %d", p.AppService, p.ProfileEventType, vtapID)
+		return
+	}
+	podInfo := platformData.QueryPodContainerInfo(vtapID, containerID)
+	if podInfo != nil {
+		p.PodID = podInfo.PodId
+		ip := net.ParseIP(podInfo.Ip)
+		// ip is nil means pod maybe `hostNetwork` and PodIP equals NodeIP
+		if ip == nil {
+			ip = net.ParseIP(podInfo.PodNodeIp)
+		}
+		if ip != nil {
+			if ip4 := ip.To4(); ip4 != nil {
+				p.IsIPv4 = true
+				p.IP4 = utils.IpToUint32(ip4)
+			} else {
+				p.IP6 = ip
+			}
+		}
+	}
+}
+
+func (p *InProcessProfile) fillInfraInfo(vtapPlatformInfo *grpc.Info) {
+	// when all resource match failed, still confirm pod is run on vtap node
+	if p.RegionID == 0 {
+		p.RegionID = uint16(vtapPlatformInfo.RegionID)
+	}
+	if p.AZID == 0 {
+		p.AZID = uint16(vtapPlatformInfo.AZID)
+	}
+	if p.SubnetID == 0 {
+		p.SubnetID = uint16(vtapPlatformInfo.SubnetID)
+	}
+	if p.HostID == 0 {
+		p.HostID = uint16(vtapPlatformInfo.HostID)
+	}
+	if p.PodNodeID == 0 {
+		p.PodNodeID = vtapPlatformInfo.PodNodeID
+	}
+	if p.L3DeviceID == 0 {
+		p.L3DeviceID = uint32(vtapPlatformInfo.DeviceID)
+		p.L3DeviceType = uint8(vtapPlatformInfo.DeviceType)
 	}
 }
 
@@ -336,6 +448,8 @@ func (p *InProcessProfile) GenerateFlowTags(cache *flow_tag.FlowTagCache) {
 		Table:   fmt.Sprintf("%s.%s", p.ProfileLanguageType, p.ProfileEventType),
 		VpcId:   p.L3EpcID,
 		PodNsId: p.PodNSID,
+		OrgId:   p.OrgId,
+		TeamID:  p.TeamID,
 	}
 	cache.Fields = cache.Fields[:0]
 	cache.FieldValues = cache.FieldValues[:0]
@@ -343,6 +457,9 @@ func (p *InProcessProfile) GenerateFlowTags(cache *flow_tag.FlowTagCache) {
 	// tags
 	flowTagInfo.FieldType = flow_tag.FieldTag
 	for i, name := range p.TagNames {
+		if p.TagValues[i] == "" {
+			continue
+		}
 		flowTagInfo.FieldName = name
 
 		// tag + value
@@ -354,7 +471,7 @@ func (p *InProcessProfile) GenerateFlowTags(cache *flow_tag.FlowTagCache) {
 				cache.FieldValueCache.Add(*flowTagInfo, p.Time)
 			}
 		}
-		tagFieldValue := flow_tag.AcquireFlowTag()
+		tagFieldValue := flow_tag.AcquireFlowTag(flow_tag.TagFieldValue)
 		tagFieldValue.Timestamp = p.Time
 		tagFieldValue.FlowTagInfo = *flowTagInfo
 		cache.FieldValues = append(cache.FieldValues, tagFieldValue)
@@ -368,7 +485,7 @@ func (p *InProcessProfile) GenerateFlowTags(cache *flow_tag.FlowTagCache) {
 				cache.FieldCache.Add(*flowTagInfo, p.Time)
 			}
 		}
-		tagField := flow_tag.AcquireFlowTag()
+		tagField := flow_tag.AcquireFlowTag(flow_tag.TagField)
 		tagField.Timestamp = p.Time
 		tagField.FlowTagInfo = *flowTagInfo
 		cache.Fields = append(cache.Fields, tagField)

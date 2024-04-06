@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ package encoder
 import (
 	"sync"
 
+	"github.com/cornelk/hashmap"
 	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/golang/protobuf/proto"
 
@@ -30,29 +31,29 @@ import (
 type labelName struct {
 	lock         sync.Mutex
 	resourceType string
-	strToID      map[string]int
-	idAllocator
+	strToID      *hashmap.Map[string, int]
+	ascIDAllocator
 }
 
 func newLabelName(max int) *labelName {
 	ln := &labelName{
 		resourceType: "label_name",
-		strToID:      make(map[string]int),
-		idAllocator: idAllocator{
-			resourceType: "label_name",
-			max:          max,
-			usableIDs:    make([]int, 0, max),
-		},
+		strToID:      hashmap.New[string, int](),
 	}
+	ln.ascIDAllocator = newAscIDAllocator(ln.resourceType, 1, max)
 	ln.rawDataProvider = ln
 	return ln
+}
+
+func (mn *labelName) getID(str string) (int, bool) {
+	return mn.strToID.Get(str)
 }
 
 func (ln *labelName) refresh(args ...interface{}) error {
 	ln.lock.Lock()
 	defer ln.lock.Unlock()
 
-	return ln.idAllocator.refresh()
+	return ln.ascIDAllocator.refresh()
 }
 
 func (ln *labelName) encode(strs []string) ([]*controller.PrometheusLabelName, error) {
@@ -63,7 +64,7 @@ func (ln *labelName) encode(strs []string) ([]*controller.PrometheusLabelName, e
 	var dbToAdd []*mysql.PrometheusLabelName
 	for i := range strs {
 		str := strs[i]
-		if id, ok := ln.strToID[str]; ok {
+		if id, ok := ln.strToID.Get(str); ok {
 			resp = append(resp, &controller.PrometheusLabelName{Name: &str, Id: proto.Uint32(uint32(id))})
 			continue
 		}
@@ -87,7 +88,7 @@ func (ln *labelName) encode(strs []string) ([]*controller.PrometheusLabelName, e
 	for i := range dbToAdd {
 		id := dbToAdd[i].ID
 		str := dbToAdd[i].Name
-		ln.strToID[str] = id
+		ln.strToID.Set(str, id)
 		resp = append(resp, &controller.PrometheusLabelName{Name: &str, Id: proto.Uint32(uint32(id))})
 	}
 	return resp, nil
@@ -103,7 +104,7 @@ func (ln *labelName) load() (ids mapset.Set[int], err error) {
 	inUseIDsSet := mapset.NewSet[int]()
 	for _, item := range items {
 		inUseIDsSet.Add(item.ID)
-		ln.strToID[item.Name] = item.ID
+		ln.strToID.Set(item.Name, item.ID)
 	}
 	return inUseIDsSet, nil
 }

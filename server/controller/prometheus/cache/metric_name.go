@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ import (
 
 type metricName struct {
 	nameToID sync.Map
+	idToName sync.Map
 }
 
 func (mn *metricName) Get() *sync.Map {
@@ -38,9 +39,17 @@ func (mn *metricName) GetIDByName(n string) (int, bool) {
 	return 0, false
 }
 
+func (mn *metricName) GetNameByID(id int) (string, bool) {
+	if name, ok := mn.idToName.Load(id); ok {
+		return name.(string), true
+	}
+	return "", false
+}
+
 func (mn *metricName) Add(batch []*controller.PrometheusMetricName) {
 	for _, item := range batch {
 		mn.nameToID.Store(item.GetName(), int(item.GetId()))
+		mn.idToName.Store(int(item.GetId()), item.GetName())
 	}
 }
 
@@ -51,6 +60,7 @@ func (mn *metricName) refresh(args ...interface{}) error {
 	}
 	for _, item := range metricNames {
 		mn.nameToID.Store(item.Name, item.ID)
+		mn.idToName.Store(item.ID, item.Name)
 	}
 	return nil
 }

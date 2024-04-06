@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@
 package genesis
 
 import (
+	"time"
+
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
 
@@ -27,8 +29,7 @@ func (g *Genesis) getSubnets() ([]model.Subnet, error) {
 	log.Debug("get subnets starting")
 	subnets := []model.Subnet{}
 
-	g.cloudStatsd.APICost["subnets"] = []int{0}
-	g.cloudStatsd.APICount["subnets"] = []int{len(g.subnets)}
+	g.cloudStatsd.RefreshAPIMoniter("subnets", len(g.subnets), time.Time{})
 
 	for _, s := range g.subnets {
 		if s.NetworkLcuuid == "" {

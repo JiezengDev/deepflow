@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ package datatype
 // in the IDC.
 //
 // Note: For historical reasons, we use the confusing term VTAP to refer
-// to deepflow-agent, and vtap_id to represent the id of a deepflow-agent.
+// to deepflow-agent, and agent_id to represent the id of a deepflow-agent.
 type TapType uint16
 
 const (

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::mem;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::process;
 use std::sync::{
     atomic::{AtomicBool, AtomicI64, Ordering},
     Arc, Mutex,
@@ -38,8 +37,6 @@ use super::{
 use special_recv_engine::Libpcap;
 
 use crate::config::handler::{CollectorAccess, LogParserAccess};
-#[cfg(target_os = "linux")]
-use crate::platform::GenericPoller;
 use crate::{
     common::{
         decapsulate::{TunnelInfo, TunnelType, TunnelTypeBitmap},
@@ -51,7 +48,7 @@ use crate::{
     },
     config::{handler::FlowAccess, DispatcherConfig},
     exception::ExceptionHandler,
-    flow_generator::MetaAppProto,
+    flow_generator::AppProto,
     handler::PacketHandlerBuilder,
     policy::PolicyGetter,
     rpc::get_timestamp,
@@ -61,7 +58,6 @@ use crate::{
 use public::{
     buffer::BatchedBox,
     debug::QueueDebugger,
-    netns::NsFile,
     packet::Packet,
     proto::trident::{Exception, IfMacSource, TapMode},
     queue::DebugSender,
@@ -76,6 +72,7 @@ pub(super) struct BaseDispatcher {
     pub(super) src_interface_index: u32,
     pub(super) src_interface: String,
     pub(super) ctrl_mac: MacAddr,
+    pub(super) local_dispatcher_count: usize,
 
     pub(super) options: Arc<Mutex<Options>>,
     pub(super) bpf_options: Arc<Mutex<BpfOptions>>,
@@ -102,13 +99,13 @@ pub(super) struct BaseDispatcher {
 
     pub(super) flow_output_queue: DebugSender<Arc<BatchedBox<TaggedFlow>>>,
     pub(super) l7_stats_output_queue: DebugSender<BatchedBox<L7Stats>>,
-    pub(super) log_output_queue: DebugSender<Box<MetaAppProto>>,
+    pub(super) log_output_queue: DebugSender<Box<AppProto>>,
 
     pub(super) counter: Arc<PacketCounter>,
     pub(super) terminated: Arc<AtomicBool>,
     pub(super) stats: Arc<Collector>,
     #[cfg(target_os = "linux")]
-    pub(super) platform_poller: Arc<GenericPoller>,
+    pub(super) platform_poller: Arc<crate::platform::GenericPoller>,
 
     pub(super) policy_getter: PolicyGetter,
     pub(super) exception_handler: ExceptionHandler,
@@ -122,7 +119,8 @@ pub(super) struct BaseDispatcher {
     pub(super) packet_sequence_output_queue:
         DebugSender<Box<packet_sequence_block::PacketSequenceBlock>>,
 
-    pub(super) netns: NsFile,
+    #[cfg(target_os = "linux")]
+    pub(super) netns: public::netns::NsFile,
 
     // dispatcher id for easy debugging
     pub log_id: String,
@@ -169,11 +167,13 @@ impl BaseDispatcher {
             analyzer_port: DEFAULT_INGESTER_PORT,
             tunnel_type_bitmap: self.tunnel_type_bitmap.clone(),
             handler_builders: self.handler_builder.clone(),
+            #[cfg(target_os = "linux")]
             netns: self.netns.clone(),
             npb_dedup_enabled: self.npb_dedup_enabled.clone(),
             log_id: self.log_id.clone(),
             reset_whitelist: self.reset_whitelist.clone(),
             pause: self.pause.clone(),
+            local_dispatcher_count: self.local_dispatcher_count,
         }
     }
 
@@ -181,44 +181,26 @@ impl BaseDispatcher {
         self.pipelines.lock().unwrap().clear();
     }
 
-    pub(super) fn check_and_update_bpf(&mut self) {
-        if !self.need_update_bpf.swap(false, Ordering::Relaxed) {
-            return;
-        }
-
+    pub(super) fn switch_recv_engine(&mut self, config: &DispatcherConfig) -> Result<()> {
         #[cfg(target_os = "linux")]
-        let tap_interfaces = self.tap_interfaces.lock().unwrap();
-        #[cfg(target_os = "linux")]
-        if tap_interfaces.len() == 0 {
-            return;
-        }
-
-        let bpf_options = self.bpf_options.lock().unwrap();
-        #[cfg(target_os = "linux")]
-        if let Err(e) = self.engine.set_bpf(
-            bpf_options.get_bpf_instructions(
-                &tap_interfaces,
-                &self.tap_interface_whitelist,
-                self.options.lock().unwrap().snap_len,
-            ),
-            &CString::new(bpf_options.get_bpf_syntax()).unwrap(),
+        let pcap_interfaces = match public::netns::links_by_name_regex_in_netns(
+            &config.tap_interface_regex,
+            &self.netns,
         ) {
-            warn!(
-                "set_bpf failed with tap_interfaces count {}: {}",
-                tap_interfaces.len(),
-                e
-            );
-        }
-        #[cfg(target_os = "windows")]
-        if let Err(e) = self
-            .engine
-            .set_bpf(vec![], &CString::new(bpf_options.get_bpf_syntax()).unwrap())
-        {
-            warn!("set_bpf failed: {}", e);
-        }
-    }
-
-    pub(super) fn switch_recv_engine(&mut self, pcap_interfaces: Vec<Link>) -> Result<()> {
+            Err(e) => {
+                warn!("get interfaces by name regex failed: {}", e);
+                vec![]
+            }
+            Ok(links) => links,
+        };
+        #[cfg(any(target_os = "windows", target_os = "android"))]
+        let pcap_interfaces = match net::links_by_name_regex(&config.tap_interface_regex) {
+            Err(e) => {
+                warn!("get interfaces by name regex failed: {}", e);
+                vec![]
+            }
+            Ok(links) => links,
+        };
         let options = self.options.lock().unwrap();
         self.engine = if options.tap_mode == TapMode::Local && options.libpcap_enabled {
             if pcap_interfaces.is_empty() {
@@ -231,12 +213,11 @@ impl BaseDispatcher {
                 .iter()
                 .map(|src_iface| (src_iface.device_name.as_str(), src_iface.if_index as isize))
                 .collect();
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             let src_ifaces: Vec<_> = pcap_interfaces
                 .iter()
                 .map(|src_iface| (src_iface.name.as_str(), src_iface.if_index as isize))
                 .collect();
-            #[cfg(target_os = "linux")]
             let libpcap = Libpcap::new(
                 src_ifaces.clone(),
                 options.packet_blocks,
@@ -244,9 +225,6 @@ impl BaseDispatcher {
                 &self.queue_debugger,
             )
             .map_err(|e| Error::Libpcap(e.to_string()))?;
-            #[cfg(target_os = "windows")]
-            let libpcap = Libpcap::new(src_ifaces.clone(), options.packet_blocks, options.snap_len)
-                .map_err(|e| Error::Libpcap(e.to_string()))?;
             info!(
                 "libpcap init with {:?} block {} snap {}",
                 src_ifaces, options.packet_blocks, options.snap_len
@@ -259,96 +237,7 @@ impl BaseDispatcher {
 
         Ok(())
     }
-}
 
-#[cfg(target_os = "windows")]
-impl BaseDispatcher {
-    pub(super) fn init(&mut self) {
-        if let Err(e) = self.engine.init() {
-            error!(
-                "dispatcher recv_engine init error: {}, deepflow-agent restart...",
-                e
-            );
-            thread::sleep(Duration::from_secs(1));
-            process::exit(1);
-        }
-    }
-
-    pub(super) fn decapsulate(
-        packet: &mut [u8],
-        tap_type_handler: &TapTypeHandler,
-        tunnel_info: &mut TunnelInfo,
-        bitmap: &TunnelTypeBitmap,
-    ) -> Result<(usize, TapType)> {
-        if packet.len() < ETH_HEADER_SIZE {
-            return Err(Error::PacketInvalid(
-                "packet.len() < ETH_HEADER_SIZE".to_string(),
-            ));
-        }
-
-        let (tap_type, eth_type, l2_len) = tap_type_handler.get_l2_info(packet)?;
-        let offset = match eth_type {
-            // 最外层隧道封装，可能是ERSPAN或VXLAN
-            EthernetType::Ipv4 => tunnel_info.decapsulate(packet, l2_len, bitmap),
-            EthernetType::Ipv6 => tunnel_info.decapsulate_v6(packet, l2_len, bitmap),
-            _ => 0,
-        };
-        if offset == 0 {
-            Ok((0, tap_type))
-        } else {
-            Ok((l2_len + offset, tap_type))
-        }
-    }
-
-    pub(super) fn decap_tunnel_with_erspan(
-        packet: &mut [u8],
-        tap_type_handler: &TapTypeHandler,
-        tunnel_info: &mut TunnelInfo,
-        bitmap: &TunnelTypeBitmap,
-    ) -> Result<(usize, TapType)> {
-        let mut decap_len = 0;
-        let mut tap_type = TapType::Any;
-        // 仅解析两层隧道
-        for i in 0..2 {
-            let (offset, t) = Self::decapsulate(
-                &mut packet[decap_len..],
-                tap_type_handler,
-                tunnel_info,
-                bitmap,
-            )?;
-            if i == 0 {
-                tap_type = t;
-            }
-            if tunnel_info.tunnel_type == TunnelType::None {
-                break;
-            }
-            if tunnel_info.tunnel_type == TunnelType::ErspanOrTeb {
-                // 包括ERSPAN或TEB隧道前的所有隧道信息不保留，例如：
-                // vxlan-erspan：隧道信息为空
-                // erspan-vxlan；隧道信息为vxlan，隧道层数为1
-                // erspan-vxlan-erspan；隧道信息为空
-                *tunnel_info = Default::default();
-            }
-            if decap_len + offset > packet.len() {
-                break;
-            }
-            decap_len += offset;
-        }
-        Ok((decap_len, tap_type))
-    }
-
-    pub(super) fn decap_tunnel(
-        packet: &mut [u8],
-        tap_type_handler: &TapTypeHandler,
-        tunnel_info: &mut TunnelInfo,
-        bitmap: TunnelTypeBitmap,
-    ) -> Result<(usize, TapType)> {
-        *tunnel_info = Default::default();
-        Self::decap_tunnel_with_erspan(packet, tap_type_handler, tunnel_info, &bitmap)
-    }
-}
-
-impl BaseDispatcher {
     pub(super) unsafe fn recv<'a>(
         engine: &'a mut RecvEngine,
         leaky_bucket: &LeakyBucket,
@@ -407,7 +296,108 @@ impl BaseDispatcher {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "windows")]
+impl BaseDispatcher {
+    pub(super) fn init(&mut self) -> Result<()> {
+        if let Err(e) = self.engine.init() {
+            error!(
+                "dispatcher recv_engine init error: {}, deepflow-agent restart...",
+                e
+            );
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn decapsulate(
+        packet: &mut [u8],
+        tap_type_handler: &TapTypeHandler,
+        tunnel_info: &mut TunnelInfo,
+        bitmap: &TunnelTypeBitmap,
+    ) -> Result<(usize, TapType)> {
+        if packet.len() < ETH_HEADER_SIZE {
+            return Err(Error::PacketInvalid(
+                "packet.len() < ETH_HEADER_SIZE".to_string(),
+            ));
+        }
+
+        let (tap_type, eth_type, l2_len) = tap_type_handler.get_l2_info(packet)?;
+        let offset = match eth_type {
+            // 最外层隧道封装，可能是ERSPAN或VXLAN
+            EthernetType::IPV4 => tunnel_info.decapsulate(packet, l2_len, bitmap),
+            EthernetType::IPV6 => tunnel_info.decapsulate_v6(packet, l2_len, bitmap),
+            _ => 0,
+        };
+        if offset == 0 {
+            Ok((0, tap_type))
+        } else {
+            Ok((l2_len + offset, tap_type))
+        }
+    }
+
+    pub(super) fn decap_tunnel_with_erspan(
+        packet: &mut [u8],
+        tap_type_handler: &TapTypeHandler,
+        tunnel_info: &mut TunnelInfo,
+        bitmap: &TunnelTypeBitmap,
+    ) -> Result<(usize, TapType)> {
+        let mut decap_len = 0;
+        let mut tap_type = TapType::Any;
+        // 仅解析两层隧道
+        for i in 0..2 {
+            let (offset, t) = Self::decapsulate(
+                &mut packet[decap_len..],
+                tap_type_handler,
+                tunnel_info,
+                bitmap,
+            )?;
+            if i == 0 {
+                tap_type = t;
+            }
+            if tunnel_info.tunnel_type == TunnelType::None {
+                break;
+            }
+            if tunnel_info.tunnel_type == TunnelType::ErspanOrTeb {
+                // 包括ERSPAN或TEB隧道前的所有隧道信息不保留，例如：
+                // vxlan-erspan：隧道信息为空
+                // erspan-vxlan；隧道信息为vxlan，隧道层数为1
+                // erspan-vxlan-erspan；隧道信息为空
+                *tunnel_info = Default::default();
+            }
+            if decap_len + offset > packet.len() {
+                break;
+            }
+            decap_len += offset;
+        }
+        Ok((decap_len, tap_type))
+    }
+
+    pub(super) fn decap_tunnel(
+        packet: &mut [u8],
+        tap_type_handler: &TapTypeHandler,
+        tunnel_info: &mut TunnelInfo,
+        bitmap: TunnelTypeBitmap,
+    ) -> Result<(usize, TapType)> {
+        *tunnel_info = Default::default();
+        Self::decap_tunnel_with_erspan(packet, tap_type_handler, tunnel_info, &bitmap)
+    }
+
+    pub(super) fn check_and_update_bpf(&mut self) {
+        if !self.need_update_bpf.swap(false, Ordering::Relaxed) {
+            return;
+        }
+
+        let bpf_options = self.bpf_options.lock().unwrap();
+        if let Err(e) = self
+            .engine
+            .set_bpf(vec![], &CString::new(bpf_options.get_bpf_syntax()).unwrap())
+        {
+            warn!("set_bpf failed: {}", e);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl BaseDispatcher {
     #[cfg(not(target_arch = "s390x"))]
     fn is_engine_dpdk(&self) -> bool {
@@ -422,7 +412,7 @@ impl BaseDispatcher {
         false
     }
 
-    pub(super) fn init(&mut self) {
+    pub(super) fn init(&mut self) -> Result<()> {
         match self.engine.init() {
             Ok(_) => {
                 if &self.src_interface != "" {
@@ -430,14 +420,14 @@ impl BaseDispatcher {
                         self.src_interface_index = link.if_index;
                     }
                 }
+                Ok(())
             }
             Err(e) => {
                 error!(
                     "dispatcher recv_engine init error: {}, deepflow-agent restart...",
                     e
                 );
-                thread::sleep(Duration::from_secs(1));
-                process::exit(1);
+                Err(e.into())
             }
         }
     }
@@ -457,8 +447,8 @@ impl BaseDispatcher {
         let (tap_type, eth_type, l2_len) = tap_type_handler.get_l2_info(packet)?;
         let offset = match eth_type {
             // 最外层隧道封装，可能是ERSPAN或VXLAN
-            EthernetType::Ipv4 => tunnel_info.decapsulate(packet, l2_len, bitmap),
-            EthernetType::Ipv6 => tunnel_info.decapsulate_v6(packet, l2_len, bitmap),
+            EthernetType::IPV4 => tunnel_info.decapsulate(packet, l2_len, bitmap),
+            EthernetType::IPV6 => tunnel_info.decapsulate_v6(packet, l2_len, bitmap),
             _ => 0,
         };
         if offset == 0 {
@@ -511,6 +501,33 @@ impl BaseDispatcher {
         *tunnel_info = Default::default();
         Self::decap_tunnel_with_erspan(packet, tap_type_handler, tunnel_info, &bitmap)
     }
+
+    pub(super) fn check_and_update_bpf(&mut self) {
+        if !self.need_update_bpf.swap(false, Ordering::Relaxed) {
+            return;
+        }
+
+        let tap_interfaces = self.tap_interfaces.lock().unwrap();
+        if tap_interfaces.len() == 0 {
+            return;
+        }
+
+        let bpf_options = self.bpf_options.lock().unwrap();
+        if let Err(e) = self.engine.set_bpf(
+            bpf_options.get_bpf_instructions(
+                &tap_interfaces,
+                &self.tap_interface_whitelist,
+                self.options.lock().unwrap().snap_len,
+            ),
+            &CString::new(bpf_options.get_bpf_syntax()).unwrap(),
+        ) {
+            warn!(
+                "set_bpf failed with tap_interfaces count {}: {}",
+                tap_interfaces.len(),
+                e
+            );
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -527,7 +544,7 @@ impl TapTypeHandler {
         let mut eth_type = read_u16_be(&packet[FIELD_OFFSET_ETH_TYPE..]);
         let mut tap_type = self.default_tap_type;
         let mut l2_len = ETH_HEADER_SIZE;
-        if eth_type == EthernetType::Dot1Q && packet.len() >= ETH_HEADER_SIZE + VLAN_HEADER_SIZE {
+        if eth_type == EthernetType::DOT1Q && packet.len() >= ETH_HEADER_SIZE + VLAN_HEADER_SIZE {
             let vlan_tag = read_u16_be(&packet[ETH_HEADER_SIZE..]);
             eth_type = read_u16_be(&packet[FIELD_OFFSET_ETH_TYPE + VLAN_HEADER_SIZE..]);
             // tap_type从qinq外层的vlan获取
@@ -541,7 +558,7 @@ impl TapTypeHandler {
                 }
             }
             l2_len += VLAN_HEADER_SIZE;
-            if eth_type == EthernetType::Dot1Q
+            if eth_type == EthernetType::DOT1Q
                 && packet.len() >= ETH_HEADER_SIZE + 2 * VLAN_HEADER_SIZE
             {
                 eth_type = read_u16_be(&packet[FIELD_OFFSET_ETH_TYPE + 2 * VLAN_HEADER_SIZE..]);
@@ -591,7 +608,7 @@ impl TapInterfaceWhitelist {
         if now.is_zero() {
             now = get_timestamp(self.ntp_diff.load(Ordering::Relaxed));
         }
-        if now > self.last_sync && now - self.last_sync > Self::SYNC_INTERVAL {
+        if now > Self::SYNC_INTERVAL + self.last_sync {
             self.updated = false;
             self.last_sync = now;
             true
@@ -613,7 +630,7 @@ pub struct BaseDispatcherListener {
     pub tap_interfaces: Arc<Mutex<Vec<Link>>>,
     pub need_update_bpf: Arc<AtomicBool>,
     #[cfg(target_os = "linux")]
-    pub platform_poller: Arc<GenericPoller>,
+    pub platform_poller: Arc<crate::platform::GenericPoller>,
     pub tunnel_type_bitmap: Arc<Mutex<TunnelTypeBitmap>>,
     pub npb_dedup_enabled: Arc<AtomicBool>,
     pub reset_whitelist: Arc<AtomicBool>,
@@ -623,10 +640,12 @@ pub struct BaseDispatcherListener {
     analyzer_ip: String,
     proxy_controller_port: u16,
     analyzer_port: u16,
-    pub netns: NsFile,
+    #[cfg(target_os = "linux")]
+    pub netns: public::netns::NsFile,
 
     // dispatcher id for easy debugging
     pub log_id: String,
+    pub local_dispatcher_count: usize,
 }
 
 impl BaseDispatcherListener {
@@ -686,7 +705,7 @@ impl BaseDispatcherListener {
 
         let mut bpf_options = self.bpf_options.lock().unwrap();
         bpf_options.capture_bpf = config.capture_bpf.clone();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             bpf_options.bpf_syntax = bpf_builder.build_pcap_syntax();
         }
@@ -708,7 +727,7 @@ impl BaseDispatcherListener {
     }
 
     pub(super) fn on_config_change(&mut self, config: &DispatcherConfig) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         self.on_afpacket_change(config);
         self.on_decap_type_change(config);
         self.on_bpf_change(config);
@@ -772,6 +791,12 @@ impl BaseDispatcherListener {
 
     pub(super) fn on_tap_interface_change(&self, mut interfaces: Vec<Link>, _: IfMacSource) {
         if &self.src_interface != "" {
+            #[cfg(target_os = "linux")]
+            match public::netns::link_by_name_in_netns(&self.src_interface, &self.netns) {
+                Ok(link) => interfaces = vec![link],
+                Err(e) => warn!("link_by_name failed: {:?}", e),
+            }
+            #[cfg(any(target_os = "windows", target_os = "android"))]
             match net::link_by_name(&self.src_interface) {
                 Ok(link) => interfaces = vec![link],
                 Err(e) => warn!("link_by_name failed: {:?}", e),
@@ -789,14 +814,14 @@ impl BaseDispatcherListener {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl BaseDispatcherListener {
     fn on_afpacket_change(&mut self, config: &DispatcherConfig) {
         if self.options.lock().unwrap().af_packet_version != config.capture_socket_type.into() {
             // TODO：目前通过进程退出的方式修改AfPacket版本，后面需要支持动态修改
             info!("Afpacket version update, deepflow-agent restart...");
+            crate::utils::notify_exit(1);
             thread::sleep(Duration::from_secs(1));
-            process::exit(1);
         }
     }
 }

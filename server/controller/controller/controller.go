@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,6 +34,8 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/election"
 	"github.com/deepflowio/deepflow/server/controller/genesis"
 	"github.com/deepflowio/deepflow/server/controller/grpc"
+	_ "github.com/deepflowio/deepflow/server/controller/grpc/controller"
+	_ "github.com/deepflowio/deepflow/server/controller/grpc/synchronizer"
 	"github.com/deepflowio/deepflow/server/controller/http"
 	"github.com/deepflowio/deepflow/server/controller/http/router"
 	"github.com/deepflowio/deepflow/server/controller/manager"
@@ -44,9 +46,6 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/statsd"
 	"github.com/deepflowio/deepflow/server/controller/tagrecorder"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris"
-
-	_ "github.com/deepflowio/deepflow/server/controller/grpc/controller"
-	_ "github.com/deepflowio/deepflow/server/controller/grpc/synchronizer"
 	_ "github.com/deepflowio/deepflow/server/controller/trisolaris/services/grpc/debug"
 	_ "github.com/deepflowio/deepflow/server/controller/trisolaris/services/grpc/healthcheck"
 	_ "github.com/deepflowio/deepflow/server/controller/trisolaris/services/http/cache"
@@ -58,6 +57,7 @@ var log = logging.MustGetLogger("controller")
 type Controller struct{}
 
 func Start(ctx context.Context, configPath, serverLogFile string, shared *servercommon.ControllerIngesterShared) {
+	common.InitEnvData()
 	flag.Parse()
 
 	serverCfg := config.DefaultConfig()
@@ -75,7 +75,10 @@ func Start(ctx context.Context, configPath, serverLogFile string, shared *server
 
 	router.SetInitStageForHealthChecker("Election init")
 	// start election
-	go election.Start(ctx, cfg)
+	if common.IsStandaloneRunningMode() == false {
+		// in standalone mode, We have no way to elect because there is no k8s module
+		go election.Start(ctx, cfg)
+	}
 
 	isMasterController := IsMasterController(cfg)
 	if isMasterController {
@@ -85,8 +88,13 @@ func Start(ctx context.Context, configPath, serverLogFile string, shared *server
 
 	router.SetInitStageForHealthChecker("MySQL init")
 	// 初始化MySQL
-	err := mysql.InitMySQL(cfg.MySqlCfg)
+	err := mysql.InitMySQL(cfg.MySqlCfg) // TODO remove
 	if err != nil {
+		log.Errorf("init mysql failed: %s", err.Error())
+		time.Sleep(time.Second)
+		os.Exit(0)
+	}
+	if err := mysql.GetDBs().Init(cfg.MySqlCfg); err != nil {
 		log.Errorf("init mysql failed: %s", err.Error())
 		time.Sleep(time.Second)
 		os.Exit(0)
@@ -94,9 +102,9 @@ func Start(ctx context.Context, configPath, serverLogFile string, shared *server
 
 	// 启动资源ID管理器
 	router.SetInitStageForHealthChecker("Resource ID manager init")
-	recorderResource := recorder.GetSingletonResource().Init(&cfg.ManagerCfg.TaskCfg.RecorderCfg)
+	recorderResource := recorder.GetResource().Init(ctx, cfg.ManagerCfg.TaskCfg.RecorderCfg)
 	if isMasterController {
-		err := recorderResource.IDManager.Start()
+		err := recorderResource.IDManagers.Start()
 		if err != nil {
 			log.Errorf("resource id manager start failed: %s", err.Error())
 			time.Sleep(time.Second)
@@ -140,18 +148,27 @@ func Start(ctx context.Context, configPath, serverLogFile string, shared *server
 	prometheus := prometheus.GetSingleton()
 	prometheus.SynchronizerCache.Start(ctx, &cfg.PrometheusCfg)
 	prometheus.Encoder.Init(ctx, &cfg.PrometheusCfg)
+	prometheus.Clear.Init(ctx, &cfg.PrometheusCfg)
+	prometheus.APPLabelLayoutUpdater.Init(ctx, &cfg.PrometheusCfg)
 	if isMasterController {
 		prometheus.Encoder.Start()
 	}
 
 	router.SetInitStageForHealthChecker("TagRecorder init")
-	tr := tagrecorder.NewTagRecorder(*cfg, ctx)
-	go checkAndStartAllRegionMasterFunctions(tr)
+	tr := tagrecorder.GetSingleton()
+	tr.Init(ctx, *cfg)
+	err = tr.SubscriberManager.Start()
+	if err != nil {
+		log.Errorf("get icon failed: %s", err.Error())
+		time.Sleep(time.Second)
+		os.Exit(0)
+	}
+	go checkAndStartAllRegionMasterFunctions()
 
 	router.SetInitStageForHealthChecker("Master function init")
 	controllerCheck := monitor.NewControllerCheck(cfg, ctx)
 	analyzerCheck := monitor.NewAnalyzerCheck(cfg, ctx)
-	go checkAndStartMasterFunctions(cfg, ctx, tr, controllerCheck, analyzerCheck)
+	go checkAndStartMasterFunctions(cfg, ctx, controllerCheck, analyzerCheck)
 
 	router.SetInitStageForHealthChecker("Register routers init")
 	httpServer.SetControllerChecker(controllerCheck)
@@ -169,6 +186,11 @@ func Start(ctx context.Context, configPath, serverLogFile string, shared *server
 
 func grpcStart(ctx context.Context, cfg *config.ControllerConfig) {
 	go grpc.Run(ctx, cfg)
+	_, err1 := os.Stat(cfg.AgentSSLKeyFile)
+	_, err2 := os.Stat(cfg.AgentSSLCertFile)
+	if err1 == nil && err2 == nil {
+		go grpc.RunTLS(ctx, cfg)
+	}
 }
 
 func setGlobalConfig(cfg *config.ControllerConfig) {

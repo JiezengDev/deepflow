@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,11 +16,10 @@
 
 use std::mem::{self, MaybeUninit};
 use std::rc::Rc;
-use std::time::Duration;
 
 use super::FlowTimeout;
 
-use crate::common::enums::TcpFlags;
+use crate::common::{enums::TcpFlags, Timestamp};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FlowState {
@@ -50,13 +49,13 @@ pub enum FlowState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StateValue {
-    pub timeout: Duration,
+    pub timeout: Timestamp,
     pub state: FlowState,
     pub closed: bool,
 }
 
 impl StateValue {
-    pub fn new(timeout: Duration, state: FlowState, closed: bool) -> Self {
+    pub fn new(timeout: Timestamp, state: FlowState, closed: bool) -> Self {
         Self {
             timeout,
             state,
@@ -68,7 +67,7 @@ impl StateValue {
 impl Default for StateValue {
     fn default() -> Self {
         Self {
-            timeout: Duration::default(),
+            timeout: Timestamp::default(),
             state: FlowState::Raw,
             closed: false,
         }
@@ -726,7 +725,7 @@ mod tests {
     use super::*;
 
     use crate::common::endpoint::{
-        EndpointData, EndpointDataPov, EndpointInfo, EPC_FROM_DEEPFLOW, EPC_FROM_INTERNET,
+        EndpointData, EndpointDataPov, EndpointInfo, EPC_DEEPFLOW, EPC_INTERNET,
     };
     use crate::common::flow::{CloseType, PacketDirection};
     use crate::config::RuntimeConfig;
@@ -784,9 +783,9 @@ mod tests {
             timestamp_key: get_timestamp(0).as_nanos() as u64,
 
             tagged_flow: Default::default(),
-            min_arrived_time: Duration::ZERO,
-            recent_time: Duration::ZERO,
-            timeout: Duration::ZERO,
+            min_arrived_time: Timestamp::ZERO,
+            recent_time: Timestamp::ZERO,
+            timeout: Timestamp::ZERO,
             flow_state: FlowState::Raw,
             meta_flow_log: None,
             policy_data_cache: Default::default(),
@@ -822,6 +821,7 @@ mod tests {
             residual_request: 0,
             next_tcp_seq0: 0,
             next_tcp_seq1: 0,
+            last_cap_seq: 0,
             packet_in_tick: false,
             policy_in_tick: [false; 2],
             packet_sequence_block: Some(Box::new(PacketSequenceBlock::default())), // Enterprise Edition Feature: packet-sequence
@@ -852,9 +852,9 @@ mod tests {
             timestamp_key: get_timestamp(0).as_nanos() as u64,
 
             tagged_flow: Default::default(),
-            min_arrived_time: Duration::ZERO,
-            recent_time: Duration::ZERO,
-            timeout: Duration::ZERO,
+            min_arrived_time: Timestamp::ZERO,
+            recent_time: Timestamp::ZERO,
+            timeout: Timestamp::ZERO,
             flow_state: FlowState::Raw,
             meta_flow_log: None,
             policy_data_cache: Default::default(),
@@ -890,6 +890,7 @@ mod tests {
             residual_request: 0,
             next_tcp_seq0: 0,
             next_tcp_seq1: 0,
+            last_cap_seq: 0,
             packet_in_tick: false,
             policy_in_tick: [false; 2],
             packet_sequence_block: Some(Box::new(PacketSequenceBlock::default())), // Enterprise Edition Feature: packet-sequence
@@ -928,11 +929,11 @@ mod tests {
         let capture = Capture::load_pcap(pcap_file, None);
         let packets = capture.as_meta_packets();
         let delta = packets.first().unwrap().lookup_key.timestamp;
-        let mut last_timestamp = Duration::ZERO;
+        let mut last_timestamp = Timestamp::ZERO;
         let ep = EndpointDataPov::new(Arc::new(EndpointData {
             src_info: EndpointInfo {
                 real_ip: Ipv4Addr::UNSPECIFIED.into(),
-                l2_epc_id: EPC_FROM_DEEPFLOW,
+                l2_epc_id: EPC_DEEPFLOW,
                 l3_epc_id: 1,
                 l2_end: false,
                 l3_end: false,
@@ -944,8 +945,8 @@ mod tests {
             },
             dst_info: EndpointInfo {
                 real_ip: Ipv4Addr::UNSPECIFIED.into(),
-                l2_epc_id: EPC_FROM_DEEPFLOW,
-                l3_epc_id: EPC_FROM_INTERNET,
+                l2_epc_id: EPC_DEEPFLOW,
+                l3_epc_id: EPC_INTERNET,
                 l2_end: false,
                 l3_end: false,
                 is_device: false,
@@ -959,19 +960,19 @@ mod tests {
             flow: &module_config.flow,
             log_parser: &module_config.log_parser,
             collector: &module_config.collector,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             ebpf: None,
         };
         for mut pkt in packets {
             pkt.endpoint_data.replace(ep.clone());
 
-            pkt.lookup_key.timestamp = get_timestamp(0) + (pkt.lookup_key.timestamp - delta);
+            pkt.lookup_key.timestamp = (pkt.lookup_key.timestamp - delta) + get_timestamp(0);
             last_timestamp = pkt.lookup_key.timestamp;
             flow_map.inject_meta_packet(&config, &mut pkt);
         }
 
-        flow_map.inject_flush_ticker(&config, last_timestamp);
-        flow_map.inject_flush_ticker(&config, last_timestamp + Duration::from_secs(600));
+        flow_map.inject_flush_ticker(&config, last_timestamp.into());
+        flow_map.inject_flush_ticker(&config, (last_timestamp + Timestamp::from_secs(600)).into());
 
         let mut tagged_flows = vec![];
         // 如果不设置超时，队列就会永远等待
@@ -1035,7 +1036,7 @@ mod tests {
     fn opening_reset() {
         state_machine_helper(
             Path::new(FILE_DIR).join("client-syn-try-lack.pcap"),
-            CloseType::TcpClientRst,
+            CloseType::TcpFinClientRst,
         );
     }
 
@@ -1063,7 +1064,7 @@ mod tests {
 
         // expected output
         pub next_state: FlowState,
-        pub timeout: Duration,
+        pub timeout: Timestamp,
         pub closed: bool,
     }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,8 +14,18 @@
  * limitations under the License.
  */
 
+mod amqp;
 mod kafka;
 pub mod mqtt;
+mod nats;
+mod openwire;
+mod pulsar;
+mod zmtp;
 
+pub use amqp::{AmqpInfo, AmqpLog};
 pub use kafka::{KafkaInfo, KafkaLog};
 pub use mqtt::{MqttInfo, MqttLog};
+pub use nats::{NatsInfo, NatsLog};
+pub use openwire::{OpenWireInfo, OpenWireLog};
+pub use pulsar::{PulsarInfo, PulsarLog};
+pub use zmtp::{ZmtpInfo, ZmtpLog};

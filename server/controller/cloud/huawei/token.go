@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -83,11 +83,10 @@ func (h *HuaWei) createToken(projectName, projectID string) (*Token, error) {
 			},
 		},
 	}
-	resp, err := cloudcommon.RequestPost(
+	resp, err := RequestPost(
 		fmt.Sprintf("https://%s.%s.%s/v3/auth/tokens", h.config.IAMHostPrefix, projectName, h.config.Domain), time.Duration(h.httpTimeout), authBody,
 	)
 	if err != nil {
-		log.Errorf("request failed: %+v", err)
 		return nil, err
 	}
 	return &Token{resp.Get("X-Subject-Token").MustString(), resp.Get("token").Get("expires_at").MustString()}, nil
@@ -103,9 +102,8 @@ func (h *HuaWei) refreshTokenMap() (err error) {
 	h.toolDataSet.configProjectToken = token.token
 
 	projectIDs := []string{}
-	jProjects, err := h.getRawData(fmt.Sprintf("https://%s/v3/auth/projects", h.config.IAMHost), token.token, "projects")
+	jProjects, err := h.getRawData(newRawDataGetContext(fmt.Sprintf("https://%s/v3/auth/projects", h.config.IAMHost), token.token, "projects", pageQueryMethodNotPage))
 	if err != nil {
-		log.Errorf("request failed: %v", err)
 		return
 	}
 	for i := range jProjects {
@@ -139,11 +137,10 @@ func (h *HuaWei) refreshTokenMap() (err error) {
 			delete(h.projectTokenMap, p)
 			continue
 		}
-		jvpcs, err := h.getRawData(
-			fmt.Sprintf("https://vpc.%s.%s/v1/%s/vpcs", p.name, h.config.Domain, p.id), t.token, "vpcs",
-		)
+		jvpcs, err := h.getRawData(newRawDataGetContext(
+			fmt.Sprintf("https://vpc.%s.%s/v1/%s/vpcs", p.name, h.config.Domain, p.id), t.token, "vpcs", pageQueryMethodMarker,
+		))
 		if err != nil {
-			log.Errorf("request failed: %v", err)
 			delete(h.projectTokenMap, p)
 			continue
 		} else if len(jvpcs) == 0 {

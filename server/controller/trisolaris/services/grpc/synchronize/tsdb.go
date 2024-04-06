@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/op/go-logging"
+	logging "github.com/op/go-logging"
 	context "golang.org/x/net/context"
 
 	api "github.com/deepflowio/deepflow/message/trident"
@@ -70,7 +70,7 @@ func (e *TSDBEvent) AnalyzerSync(ctx context.Context, in *api.SyncRequest) (*api
 	}
 
 	vTapInfo := trisolaris.GetGVTapInfo()
-	// 只有roze进入数据节点注册流程，其他节点直接返回数据
+	// 只有ingester进入数据节点注册流程，其他节点直接返回数据
 	if processName == TSDB_PROCESS_NAME {
 		log.Infof(
 			"ctrl_ip:%s, cpu_num:%d, memory_size:%d, arch:%s, os:%s, "+

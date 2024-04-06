@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,17 +20,20 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/bitly/go-simplejson"
 	cloudcommon "github.com/deepflowio/deepflow/server/controller/cloud/common"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-
-	"github.com/bitly/go-simplejson"
 	uuid "github.com/satori/go.uuid"
 )
 
 func (k *KubernetesGather) getPodNodes() (podNodes []model.PodNode, nodeNetwork, podNetwork model.Network, err error) {
 	log.Debug("get nodes starting")
 	podNetworkCIDRs := []string{}
+	nodeLcuuidToHostName, err := cloudcommon.GetNodeHostNameByDomain(k.Lcuuid, k.isSubDomain)
+	if err != nil {
+		log.Warningf("get pod node hostname error : (%s)", err.Error())
+	}
 	for _, n := range k.k8sInfo["*v1.Node"] {
 		nData, nErr := simplejson.NewJson([]byte(n))
 		if nErr != nil {
@@ -70,7 +73,11 @@ func (k *KubernetesGather) getPodNodes() (podNodes []model.PodNode, nodeNetwork,
 		nodeIP := nodeIPs[0]
 		labels := metaData.Get("labels").MustMap()
 		nodeType := common.POD_NODE_TYPE_NODE
-		if _, ok := labels["node-role.kubernetes.io/master"]; ok {
+		// support k8s version less than 1.20
+		_, masterOK := labels["node-role.kubernetes.io/master"]
+		// support k8s version equal or great than 1.20
+		_, controlPlaneOK := labels["node-role.kubernetes.io/control-plane"]
+		if masterOK || controlPlaneOK {
 			nodeType = common.POD_NODE_TYPE_MASTER
 		}
 		statusConditions := nData.Get("status").Get("conditions")
@@ -105,12 +112,13 @@ func (k *KubernetesGather) getPodNodes() (podNodes []model.PodNode, nodeNetwork,
 			ServerType:       common.POD_NODE_SERVER_TYPE_HOST,
 			State:            state,
 			IP:               nodeIP,
+			Hostname:         nodeLcuuidToHostName[uID],
 			VCPUNum:          cpuNum,
 			MemTotal:         memory,
-			VPCLcuuid:        k.VPCUuid,
+			VPCLcuuid:        k.VPCUUID,
 			AZLcuuid:         k.azLcuuid,
-			RegionLcuuid:     k.RegionUuid,
-			PodClusterLcuuid: common.GetUUID(k.UuidGenerate, uuid.Nil),
+			RegionLcuuid:     k.RegionUUID,
+			PodClusterLcuuid: k.podClusterLcuuid,
 		}
 		podNodes = append(podNodes, podNode)
 		k.nodeIPToLcuuid[nodeIP] = uID
@@ -148,12 +156,12 @@ func (k *KubernetesGather) getPodNodes() (podNodes []model.PodNode, nodeNetwork,
 		Lcuuid:         nodeNetworkLcuuid,
 		Name:           nodeNetworkName,
 		SegmentationID: 1,
-		VPCLcuuid:      k.VPCUuid,
+		VPCLcuuid:      k.VPCUUID,
 		Shared:         false,
 		External:       false,
 		NetType:        common.NETWORK_TYPE_WAN,
 		AZLcuuid:       k.azLcuuid,
-		RegionLcuuid:   k.RegionUuid,
+		RegionLcuuid:   k.RegionUUID,
 	}
 
 	k.nodeNetworkLcuuidCIDRs = networkLcuuidCIDRs{
@@ -186,12 +194,12 @@ func (k *KubernetesGather) getPodNodes() (podNodes []model.PodNode, nodeNetwork,
 		Lcuuid:         podNetworkLcuuid,
 		Name:           podNetworkName,
 		SegmentationID: 1,
-		VPCLcuuid:      k.VPCUuid,
+		VPCLcuuid:      k.VPCUUID,
 		Shared:         false,
 		External:       false,
 		NetType:        common.NETWORK_TYPE_LAN,
 		AZLcuuid:       k.azLcuuid,
-		RegionLcuuid:   k.RegionUuid,
+		RegionLcuuid:   k.RegionUUID,
 	}
 
 	k.podNetworkLcuuidCIDRs = networkLcuuidCIDRs{

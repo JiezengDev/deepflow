@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,30 +18,55 @@ package updater
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
-	"github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type LBTargetServer struct {
-	UpdaterBase[cloudmodel.LBTargetServer, mysql.LBTargetServer, *cache.LBTargetServer]
+	UpdaterBase[
+		cloudmodel.LBTargetServer,
+		mysql.LBTargetServer,
+		*diffbase.LBTargetServer,
+		*message.LBTargetServerAdd,
+		message.LBTargetServerAdd,
+		*message.LBTargetServerUpdate,
+		message.LBTargetServerUpdate,
+		*message.LBTargetServerFieldsUpdate,
+		message.LBTargetServerFieldsUpdate,
+		*message.LBTargetServerDelete,
+		message.LBTargetServerDelete]
 }
 
 func NewLBTargetServer(wholeCache *cache.Cache, cloudData []cloudmodel.LBTargetServer) *LBTargetServer {
 	updater := &LBTargetServer{
-		UpdaterBase[cloudmodel.LBTargetServer, mysql.LBTargetServer, *cache.LBTargetServer]{
-			cache:        wholeCache,
-			dbOperator:   db.NewLBTargetServer(),
-			diffBaseData: wholeCache.LBTargetServers,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.LBTargetServer,
+			mysql.LBTargetServer,
+			*diffbase.LBTargetServer,
+			*message.LBTargetServerAdd,
+			message.LBTargetServerAdd,
+			*message.LBTargetServerUpdate,
+			message.LBTargetServerUpdate,
+			*message.LBTargetServerFieldsUpdate,
+			message.LBTargetServerFieldsUpdate,
+			*message.LBTargetServerDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_LB_TARGET_SERVER_EN,
+			wholeCache,
+			db.NewLBTargetServer().SetORG(wholeCache.GetORG()),
+			wholeCache.DiffBaseDataSet.LBTargetServers,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
 }
 
-func (s *LBTargetServer) getDiffBaseByCloudItem(cloudItem *cloudmodel.LBTargetServer) (diffBase *cache.LBTargetServer, exists bool) {
+func (s *LBTargetServer) getDiffBaseByCloudItem(cloudItem *cloudmodel.LBTargetServer) (diffBase *diffbase.LBTargetServer, exists bool) {
 	diffBase, exists = s.diffBaseData[cloudItem.Lcuuid]
 	return
 }
@@ -49,37 +74,37 @@ func (s *LBTargetServer) getDiffBaseByCloudItem(cloudItem *cloudmodel.LBTargetSe
 func (s *LBTargetServer) generateDBItemToAdd(cloudItem *cloudmodel.LBTargetServer) (*mysql.LBTargetServer, bool) {
 	lbID, exists := s.cache.ToolDataSet.GetLBIDByLcuuid(cloudItem.LBLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
-			common.RESOURCE_TYPE_LB_EN, cloudItem.LBLcuuid,
-			common.RESOURCE_TYPE_LB_TARGET_SERVER_EN, cloudItem.Lcuuid,
-		))
+		log.Error(s.org.LogPre(resourceAForResourceBNotFound(
+			ctrlrcommon.RESOURCE_TYPE_LB_EN, cloudItem.LBLcuuid,
+			ctrlrcommon.RESOURCE_TYPE_LB_TARGET_SERVER_EN, cloudItem.Lcuuid,
+		)))
 		return nil, false
 	}
 	lbListenerID, exists := s.cache.ToolDataSet.GetLBListenerIDByLcuuid(cloudItem.LBListenerLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
-			common.RESOURCE_TYPE_LB_LISTENER_EN, cloudItem.LBListenerLcuuid,
-			common.RESOURCE_TYPE_LB_TARGET_SERVER_EN, cloudItem.Lcuuid,
-		))
+		log.Error(s.org.LogPre(resourceAForResourceBNotFound(
+			ctrlrcommon.RESOURCE_TYPE_LB_LISTENER_EN, cloudItem.LBListenerLcuuid,
+			ctrlrcommon.RESOURCE_TYPE_LB_TARGET_SERVER_EN, cloudItem.Lcuuid,
+		)))
 		return nil, false
 	}
 	var vmID int
 	if cloudItem.VMLcuuid != "" {
 		vmID, exists = s.cache.ToolDataSet.GetVMIDByLcuuid(cloudItem.VMLcuuid)
 		if !exists {
-			log.Errorf(resourceAForResourceBNotFound(
-				common.RESOURCE_TYPE_VM_EN, cloudItem.VMLcuuid,
-				common.RESOURCE_TYPE_LB_TARGET_SERVER_EN, cloudItem.Lcuuid,
-			))
+			log.Error(s.org.LogPre(resourceAForResourceBNotFound(
+				ctrlrcommon.RESOURCE_TYPE_VM_EN, cloudItem.VMLcuuid,
+				ctrlrcommon.RESOURCE_TYPE_LB_TARGET_SERVER_EN, cloudItem.Lcuuid,
+			)))
 			return nil, false
 		}
 	}
 	vpcID, exists := s.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
-			common.RESOURCE_TYPE_VPC_EN, cloudItem.VPCLcuuid,
-			common.RESOURCE_TYPE_LB_TARGET_SERVER_EN, cloudItem.Lcuuid,
-		))
+		log.Error(s.org.LogPre(resourceAForResourceBNotFound(
+			ctrlrcommon.RESOURCE_TYPE_VPC_EN, cloudItem.VPCLcuuid,
+			ctrlrcommon.RESOURCE_TYPE_LB_TARGET_SERVER_EN, cloudItem.Lcuuid,
+		)))
 	}
 
 	dbItem := &mysql.LBTargetServer{
@@ -97,20 +122,21 @@ func (s *LBTargetServer) generateDBItemToAdd(cloudItem *cloudmodel.LBTargetServe
 	return dbItem, true
 }
 
-func (s *LBTargetServer) generateUpdateInfo(diffBase *cache.LBTargetServer, cloudItem *cloudmodel.LBTargetServer) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (s *LBTargetServer) generateUpdateInfo(diffBase *diffbase.LBTargetServer, cloudItem *cloudmodel.LBTargetServer) (*message.LBTargetServerFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.LBTargetServerFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.IP != cloudItem.IP {
-		updateInfo["ip"] = cloudItem.IP
+		mapInfo["ip"] = cloudItem.IP
+		structInfo.IP.Set(diffBase.IP, cloudItem.IP)
 	}
 	if diffBase.Port != cloudItem.Port {
-		updateInfo["port"] = cloudItem.Port
+		mapInfo["port"] = cloudItem.Port
+		structInfo.Port.Set(diffBase.Port, cloudItem.Port)
 	}
 	if diffBase.Protocol != cloudItem.Protocol {
-		updateInfo["protocol"] = cloudItem.Protocol
+		mapInfo["protocol"] = cloudItem.Protocol
+		structInfo.Protocol.Set(diffBase.Protocol, cloudItem.Protocol)
 	}
 
-	if len(updateInfo) > 0 {
-		return updateInfo, true
-	}
-	return nil, false
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

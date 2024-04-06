@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ type Engine interface {
 	TransSelect(sqlparser.SelectExprs) error
 	TransFrom(sqlparser.TableExprs) error
 	TransGroupBy(sqlparser.GroupBy) error
+	TransDerivativeGroupBy(sqlparser.GroupBy) error
 	TransWhere(*sqlparser.Where) error
 	TransHaving(*sqlparser.Where) error
 	TransOrderBy(sqlparser.OrderBy) error

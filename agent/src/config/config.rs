@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32,6 +32,8 @@ use serde::{
 use thiserror::Error;
 use tokio::runtime::Runtime;
 
+use crate::common::l7_protocol_log::L7ProtocolParser;
+use crate::flow_generator::{DnsLog, TlsLog};
 use crate::{
     common::{
         decapsulate::TunnelType,
@@ -54,7 +56,7 @@ use public::{
     utils::bitmap::parse_u16_range_list_to_bitmap,
 };
 
-const K8S_CA_CRT_PATH: &str = "/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+pub const K8S_CA_CRT_PATH: &str = "/run/secrets/kubernetes.io/serviceaccount/ca.crt";
 const MINUTE: Duration = Duration::from_secs(60);
 const DEFAULT_STANDALONE_CONFIG: &str = "/etc/deepflow-agent-standalone.yaml";
 
@@ -68,6 +70,38 @@ pub enum ConfigError {
     RuntimeConfigInvalid(String),
     #[error("yaml config invalid: {0}")]
     YamlConfigInvalid(String),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum AgentIdType {
+    #[default]
+    IpMac,
+    Ip,
+}
+
+impl<'de> Deserialize<'de> for AgentIdType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match String::deserialize(deserializer)?.as_str() {
+            "ip-and-mac" | "ip_and_mac" => Ok(Self::IpMac),
+            "ip" => Ok(Self::Ip),
+            other => Err(de::Error::invalid_value(
+                Unexpected::Str(other),
+                &"ip|ip-and-mac|ip_and_mac",
+            )),
+        }
+    }
+}
+
+impl From<AgentIdType> for trident::AgentIdentifier {
+    fn from(t: AgentIdType) -> Self {
+        match t {
+            AgentIdType::IpMac => trident::AgentIdentifier::IpAndMac,
+            AgentIdType::Ip => trident::AgentIdentifier::Ip,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -86,6 +120,10 @@ pub struct Config {
     pub agent_mode: RunningMode,
     pub override_os_hostname: Option<String>,
     pub async_worker_thread_number: u16,
+    pub agent_unique_identifier: AgentIdType,
+    #[cfg(target_os = "linux")]
+    pub pid_file: String,
+    pub team_id: String,
 }
 
 impl Config {
@@ -138,33 +176,27 @@ impl Config {
         }
     }
 
-    pub async fn async_get_k8s_cluster_id(
-        session: &Session,
-        kubernetes_cluster_name: Option<&String>,
-    ) -> String {
-        let ca_md5 = loop {
-            match fs::read_to_string(K8S_CA_CRT_PATH) {
-                Ok(c) => {
-                    break Some(
-                        Md5::digest(c.as_bytes())
-                            .into_iter()
-                            .fold(String::new(), |s, c| s + &format!("{:02x}", c)),
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        "get kubernetes_cluster_id error: failed to read {} error: {}",
-                        K8S_CA_CRT_PATH, e
-                    );
-                    tokio::time::sleep(MINUTE).await;
-                }
+    pub async fn async_get_k8s_cluster_id(session: &Session, config: &Config) -> Option<String> {
+        let ca_md5 = match fs::read_to_string(K8S_CA_CRT_PATH) {
+            Ok(c) => Some(
+                Md5::digest(c.as_bytes())
+                    .into_iter()
+                    .fold(String::new(), |s, c| s + &format!("{:02x}", c)),
+            ),
+            Err(e) => {
+                info!(
+                    "get kubernetes_cluster_id error: failed to read {} error: {}, this shows that agent is not running in K8s.",
+                    K8S_CA_CRT_PATH, e
+                );
+                return None;
             }
         };
 
         loop {
             let request = KubernetesClusterIdRequest {
                 ca_md5: ca_md5.clone(),
-                kubernetes_cluster_name: kubernetes_cluster_name.map(Clone::clone),
+                kubernetes_cluster_name: config.kubernetes_cluster_name.clone(),
+                team_id: Some(config.team_id.clone()),
             };
 
             match session
@@ -193,7 +225,7 @@ impl Config {
                             // ==============================================================================================
                             // FIXME: 这里获取成功后 Session 中的 Channel 会失效，所以在这里重置 Session
                             session.reset();
-                            return id;
+                            return Some(id);
                         }
                         None => {
                             error!("call get_kubernetes_cluster_id return response is none")
@@ -217,12 +249,9 @@ impl Config {
     pub fn get_k8s_cluster_id(
         runtime: &Runtime,
         session: &Session,
-        kubernetes_cluster_name: Option<&String>,
-    ) -> String {
-        runtime.block_on(Self::async_get_k8s_cluster_id(
-            session,
-            kubernetes_cluster_name,
-        ))
+        config: &Config,
+    ) -> Option<String> {
+        runtime.block_on(Self::async_get_k8s_cluster_id(session, config))
     }
 }
 
@@ -241,6 +270,10 @@ impl Default for Config {
             agent_mode: Default::default(),
             override_os_hostname: None,
             async_worker_thread_number: 16,
+            agent_unique_identifier: Default::default(),
+            #[cfg(target_os = "linux")]
+            pid_file: Default::default(),
+            team_id: "".into(),
         }
     }
 }
@@ -293,6 +326,9 @@ pub struct OnCpuProfile {
     pub frequency: u16,
     pub cpu: u16,
     pub regex: String,
+    pub java_symbol_file_max_space_limit: u8,
+    #[serde(with = "humantime_serde")]
+    pub java_symbol_file_refresh_defer_interval: Duration,
 }
 
 impl Default for OnCpuProfile {
@@ -302,6 +338,8 @@ impl Default for OnCpuProfile {
             frequency: 99,
             cpu: 0,
             regex: "^deepflow-.*".to_string(),
+            java_symbol_file_max_space_limit: 10,
+            java_symbol_file_refresh_defer_interval: Duration::from_secs(600),
         }
     }
 }
@@ -379,6 +417,64 @@ pub struct KubernetesResourceConfig {
     pub disabled: bool,
 }
 
+#[derive(Clone, Default, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct MatchRule {
+    pub prefix: String,
+    pub keep_segments: usize,
+}
+
+#[derive(Clone, Default, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct HttpEndpointExtraction {
+    pub disabled: bool,
+    pub match_rules: Vec<MatchRule>,
+}
+
+#[derive(Clone, Default, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct ExtraLogFieldsInfo {
+    pub field_name: String,
+}
+
+#[derive(Clone, Default, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct ExtraLogFields {
+    pub http: Vec<ExtraLogFieldsInfo>,
+    pub http2: Vec<ExtraLogFieldsInfo>,
+}
+
+impl ExtraLogFields {
+    pub fn deduplicate(&mut self) {
+        fn deduplicate_fields(fields: &mut Vec<ExtraLogFieldsInfo>) {
+            fields
+                .iter_mut()
+                .for_each(|f| f.field_name.make_ascii_lowercase());
+            fields.sort_by(|a, b| a.field_name.cmp(&b.field_name));
+            fields.dedup_by(|a, b| a.field_name == b.field_name);
+        }
+
+        deduplicate_fields(&mut self.http);
+        deduplicate_fields(&mut self.http2);
+    }
+}
+
+#[derive(Clone, Default, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct L7ProtocolAdvancedFeatures {
+    pub http_endpoint_extraction: HttpEndpointExtraction,
+    pub obfuscate_enabled_protocols: Vec<String>,
+    pub extra_log_fields: ExtraLogFields,
+}
+
+#[derive(Clone, Copy, Default, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct OracleParseConfig {
+    pub is_be: bool,
+    pub int_compress: bool,
+    pub resp_0x04_extra_byte: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct YamlConfig {
@@ -396,6 +492,7 @@ pub struct YamlConfig {
     pub enable_qos_bypass: bool,
     pub fast_path_map_size: usize,
     pub first_path_level: u32,
+    pub local_dispatcher_count: usize,
     pub src_interfaces: Vec<String>,
     pub mirror_traffic_pcp: u16,
     pub vtap_group_id_request: String,
@@ -406,10 +503,8 @@ pub struct YamlConfig {
     pub analyzer_queue_size: usize,
     pub analyzer_raw_packet_block_size: usize,
     pub batched_buffer_size_limit: usize,
-    #[serde(rename = "ovs-dpdk-enable")]
-    pub ovs_dpdk_enabled: bool,
-    pub dpdk_pmd_core_id: u32,
-    pub dpdk_ring_port: String,
+    pub dpdk_enabled: bool,
+    pub dispatcher_queue: bool,
     pub libpcap_enabled: bool,
     pub xflow_collector: XflowGeneratorConfig,
     pub vxlan_flags: u8,
@@ -430,6 +525,7 @@ pub struct YamlConfig {
     pub grpc_buffer_size: usize,
     #[serde(with = "humantime_serde")]
     pub l7_log_session_aggr_timeout: Duration,
+    pub l7_log_session_slot_capacity: usize,
     pub tap_mac_script: String,
     pub cloud_gateway_traffic: bool,
     pub kubernetes_namespace: String,
@@ -470,8 +566,6 @@ pub struct YamlConfig {
     #[serde(with = "humantime_serde")]
     pub guard_interval: Duration,
     pub check_core_file_disabled: bool,
-    pub wasm_plugins: Vec<String>,
-    pub so_plugins: Vec<String>,
     pub memory_trim_disabled: bool,
     pub forward_capacity: usize,
     pub fast_path_disabled: bool,
@@ -486,9 +580,18 @@ pub struct YamlConfig {
     pub external_profile_integration_disabled: bool,
     pub external_trace_integration_disabled: bool,
     pub external_metric_integration_disabled: bool,
+    #[serde(with = "humantime_serde")]
+    pub ntp_max_interval: Duration,
+    #[serde(with = "humantime_serde")]
+    pub ntp_min_interval: Duration,
+    pub l7_protocol_advanced_features: L7ProtocolAdvancedFeatures,
+    pub oracle_parse_config: OracleParseConfig,
 }
 
 impl YamlConfig {
+    const DEFAULT_DNS_PORTS: &'static str = "53,5353";
+    const DEFAULT_TLS_PORTS: &'static str = "443,6443";
+
     pub fn load_from_file<T: AsRef<Path>>(path: T, tap_mode: TapMode) -> Result<Self, io::Error> {
         let contents = fs::read_to_string(path)?;
         Self::load(&contents, tap_mode)
@@ -563,6 +666,10 @@ impl YamlConfig {
             c.l7_log_session_aggr_timeout = Duration::from_secs(10);
         }
 
+        if c.l7_log_session_slot_capacity < 1024 {
+            c.l7_log_session_slot_capacity = 1024;
+        }
+
         if c.external_metrics_sender_queue_size == 0 {
             c.external_metrics_sender_queue_size = 1 << 12;
         }
@@ -632,6 +739,25 @@ impl YamlConfig {
         if c.ebpf.max_trace_entries < 100000 || c.ebpf.max_trace_entries > 2000000 {
             c.ebpf.max_trace_entries = 524288;
         }
+        if c.ebpf.on_cpu_profile.java_symbol_file_max_space_limit < 2
+            || c.ebpf.on_cpu_profile.java_symbol_file_max_space_limit > 100
+        {
+            c.ebpf.on_cpu_profile.java_symbol_file_max_space_limit = 10
+        }
+        if c.ebpf
+            .on_cpu_profile
+            .java_symbol_file_refresh_defer_interval
+            < Duration::from_secs(5)
+            || c.ebpf
+                .on_cpu_profile
+                .java_symbol_file_refresh_defer_interval
+                > Duration::from_secs(3600)
+        {
+            c.ebpf
+                .on_cpu_profile
+                .java_symbol_file_refresh_defer_interval = Duration::from_secs(600)
+        }
+
         if c.guard_interval < Duration::from_secs(1) || c.guard_interval > Duration::from_secs(3600)
         {
             c.guard_interval = Duration::from_secs(10);
@@ -688,12 +814,32 @@ impl YamlConfig {
         if c.process_scheduling_priority < -20 || c.process_scheduling_priority > 19 {
             c.process_scheduling_priority = 0;
         }
+        if c.local_dispatcher_count == 0 {
+            c.local_dispatcher_count = 1;
+        }
 
         Ok(c)
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
         Ok(())
+    }
+
+    pub fn get_protocol_port(&self) -> HashMap<String, String> {
+        let mut new = self.l7_protocol_ports.clone();
+
+        let dns_str = L7ProtocolParser::DNS(DnsLog::default()).as_str();
+        // dns default only parse 53,5353 port. when l7_protocol_ports config without DNS, need to reserve the dns default config.
+        if !self.l7_protocol_ports.contains_key(dns_str) {
+            new.insert(dns_str.to_string(), Self::DEFAULT_DNS_PORTS.to_string());
+        }
+        let tls_str = L7ProtocolParser::TLS(TlsLog::default()).as_str();
+        // tls default only parse 443,6443 port. when l7_protocol_ports config without TLS, need to reserve the tls default config.
+        if !self.l7_protocol_ports.contains_key(tls_str) {
+            new.insert(tls_str.to_string(), Self::DEFAULT_TLS_PORTS.to_string());
+        }
+
+        new
     }
 
     pub fn get_protocol_port_parse_bitmap(&self) -> Vec<(String, Bitmap)> {
@@ -705,8 +851,9 @@ impl YamlConfig {
                     "HTTP": "80,8080,1000-2000"
                 ...
         */
+        let l7_protocol_ports = self.get_protocol_port();
         let mut port_bitmap = Vec::new();
-        for (protocol_name, port_range) in self.l7_protocol_ports.iter() {
+        for (protocol_name, port_range) in l7_protocol_ports.iter() {
             port_bitmap.push((
                 protocol_name.clone(),
                 parse_u16_range_list_to_bitmap(port_range, false).unwrap(),
@@ -741,10 +888,9 @@ impl Default for YamlConfig {
             analyzer_queue_size: 131072,
             analyzer_raw_packet_block_size: 65536,
             batched_buffer_size_limit: 131072,
-            ovs_dpdk_enabled: false,
-            dpdk_pmd_core_id: 0,
-            dpdk_ring_port: "dpdkr0".into(),
-            #[cfg(target_os = "linux")]
+            dpdk_enabled: false,
+            dispatcher_queue: false,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             libpcap_enabled: false,
             #[cfg(target_os = "windows")]
             libpcap_enabled: true,
@@ -766,6 +912,7 @@ impl Default for YamlConfig {
             analyzer_ip: "".into(),
             grpc_buffer_size: 5,
             l7_log_session_aggr_timeout: Duration::from_secs(120),
+            l7_log_session_slot_capacity: 1024,
             tap_mac_script: "".into(),
             cloud_gateway_traffic: false,
             kubernetes_namespace: "".into(),
@@ -799,7 +946,10 @@ impl Default for YamlConfig {
                 .to_string(),
 
             log_file: DEFAULT_LOG_FILE.into(),
-            l7_protocol_ports: HashMap::from([(String::from("DNS"), String::from("53"))]),
+            l7_protocol_ports: HashMap::from([
+                (String::from("DNS"), String::from(Self::DEFAULT_DNS_PORTS)),
+                (String::from("TLS"), String::from(Self::DEFAULT_TLS_PORTS)),
+            ]),
             ebpf: EbpfYamlConfig::default(),
             npb_port: NPB_DEFAULT_PORT,
             os_proc_root: "/proc".into(),
@@ -817,8 +967,6 @@ impl Default for YamlConfig {
             os_proc_sync_tagged_only: false,
             guard_interval: Duration::from_secs(10),
             check_core_file_disabled: false,
-            wasm_plugins: vec![],
-            so_plugins: vec![],
             memory_trim_disabled: false,
             fast_path_disabled: false,
             forward_capacity: 1 << 14,
@@ -830,6 +978,15 @@ impl Default for YamlConfig {
             external_profile_integration_disabled: false,
             external_trace_integration_disabled: false,
             external_metric_integration_disabled: false,
+            ntp_max_interval: Duration::from_secs(300),
+            ntp_min_interval: Duration::from_secs(10),
+            l7_protocol_advanced_features: L7ProtocolAdvancedFeatures::default(),
+            local_dispatcher_count: 1,
+            oracle_parse_config: OracleParseConfig {
+                is_be: true,
+                int_compress: true,
+                resp_0x04_extra_byte: false,
+            },
         }
     }
 }
@@ -994,8 +1151,9 @@ pub struct RuntimeConfig {
     pub enabled: bool,
     pub max_cpus: u32,
     pub max_memory: u64,
-    pub sync_interval: u64,  // unit(second)
-    pub stats_interval: u64, // unit(second)
+    pub sync_interval: u64,          // unit(second)
+    pub platform_sync_interval: u64, // unit(second)
+    pub stats_interval: u64,         // unit(second)
     #[serde(rename = "max_collect_pps")]
     pub global_pps_threshold: u64,
     #[cfg(target_os = "linux")]
@@ -1024,6 +1182,12 @@ pub struct RuntimeConfig {
     #[serde(deserialize_with = "bool_from_int")]
     pub platform_enabled: bool,
     #[serde(skip)]
+    pub system_load_circuit_breaker_threshold: f32,
+    #[serde(skip)]
+    pub system_load_circuit_breaker_recover: f32,
+    #[serde(skip)]
+    pub system_load_circuit_breaker_metric: trident::SystemLoadMetric,
+    #[serde(skip)]
     pub server_tx_bandwidth_threshold: u64,
     #[serde(skip)]
     pub bandwidth_probe_interval: Duration,
@@ -1040,7 +1204,6 @@ pub struct RuntimeConfig {
     pub log_threshold: u32,
     #[serde(deserialize_with = "to_log_level")]
     pub log_level: log::Level,
-    #[serde(skip)]
     pub analyzer_ip: String,
     pub analyzer_port: u16,
     #[serde(rename = "max_escape_seconds")]
@@ -1097,9 +1260,11 @@ pub struct RuntimeConfig {
     #[serde(deserialize_with = "bool_from_int")]
     pub external_agent_http_proxy_enabled: bool,
     pub external_agent_http_proxy_port: u16,
-    #[serde(skip)]
+    #[serde(deserialize_with = "to_tap_mode")]
     pub tap_mode: TapMode,
     pub prometheus_http_api_addresses: Vec<String>,
+    #[serde(skip)]
+    pub plugins: Option<trident::PluginConfig>,
     // TODO: expand and remove
     #[serde(rename = "static_config")]
     pub yaml_config: YamlConfig,
@@ -1119,7 +1284,7 @@ impl RuntimeConfig {
         // reset below switch in standalone mode
         c.app_proto_log_enabled = !c.l7_log_store_tap_types.is_empty();
         c.ntp_enabled = false;
-        c.collector_socket_type = trident::SocketType::File;
+        // c.collector_socket_type = trident::SocketType::File;
         c.max_memory <<= 20;
         c.server_tx_bandwidth_threshold <<= 20;
 
@@ -1135,8 +1300,9 @@ impl RuntimeConfig {
             max_cpus: 1,
             max_memory: 768,
             sync_interval: 60,
+            platform_sync_interval: 10,
             stats_interval: 10,
-            global_pps_threshold: 200,
+            global_pps_threshold: 2000000,
             #[cfg(target_os = "linux")]
             extra_netns_regex: Default::default(),
             tap_interface_regex: "^(tap.*|cali.*|veth.*|eth.*|en[ospx].*|lxc.*|lo|[0-9a-f]+_h)$"
@@ -1149,6 +1315,9 @@ impl RuntimeConfig {
             collector_enabled: true,
             l4_log_store_tap_types: vec![0],
             platform_enabled: false,
+            system_load_circuit_breaker_threshold: 1.0,
+            system_load_circuit_breaker_recover: 0.9,
+            system_load_circuit_breaker_metric: trident::SystemLoadMetric::Load15,
             server_tx_bandwidth_threshold: 1,
             bandwidth_probe_interval: Duration::from_secs(60),
             npb_vlan_mode: trident::VlanMode::None,
@@ -1202,6 +1371,7 @@ impl RuntimeConfig {
             tap_mode: TapMode::Local,
             yaml_config: YamlConfig::load("", TapMode::Local).unwrap(), // Default configuration that needs to be corrected to be available
             prometheus_http_api_addresses: vec![],
+            plugins: Default::default(),
         }
     }
 
@@ -1210,6 +1380,12 @@ impl RuntimeConfig {
             return Err(ConfigError::RuntimeConfigInvalid(format!(
                 "sync-interval {:?} not in [1s, 1h]",
                 Duration::from_secs(self.sync_interval)
+            )));
+        }
+        if self.platform_sync_interval < 10 || self.platform_sync_interval > 60 * 60 {
+            return Err(ConfigError::RuntimeConfigInvalid(format!(
+                "platform-sync-interval {:?} not in [10s, 1h]",
+                Duration::from_secs(self.platform_sync_interval)
             )));
         }
         if self.stats_interval < 1 || self.stats_interval > 60 * 60 {
@@ -1304,6 +1480,7 @@ impl TryFrom<trident::Config> for RuntimeConfig {
             max_cpus: conf.max_cpus(),
             max_memory: (conf.max_memory() as u64) << 20,
             sync_interval: conf.sync_interval() as u64,
+            platform_sync_interval: conf.platform_sync_interval() as u64,
             stats_interval: conf.stats_interval() as u64,
             global_pps_threshold: conf.global_pps_threshold(),
             #[cfg(target_os = "linux")]
@@ -1328,6 +1505,9 @@ impl TryFrom<trident::Config> for RuntimeConfig {
                 })
                 .collect(),
             platform_enabled: conf.platform_enabled(),
+            system_load_circuit_breaker_threshold: conf.system_load_circuit_breaker_threshold(),
+            system_load_circuit_breaker_recover: conf.system_load_circuit_breaker_recover(),
+            system_load_circuit_breaker_metric: conf.system_load_circuit_breaker_metric(),
             server_tx_bandwidth_threshold: conf.server_tx_bandwidth_threshold(),
             bandwidth_probe_interval: Duration::from_secs(conf.bandwidth_probe_interval()),
             npb_vlan_mode: conf.npb_vlan_mode(),
@@ -1429,6 +1609,7 @@ impl TryFrom<trident::Config> for RuntimeConfig {
             tap_mode: conf.tap_mode(),
             prometheus_http_api_addresses: conf.prometheus_http_api_addresses.to_owned(),
             yaml_config: YamlConfig::load(conf.local_config(), conf.tap_mode())?,
+            plugins: conf.plugins,
         };
         rc.validate()
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
@@ -1462,7 +1643,7 @@ where
             TunnelType::try_from(t).map_err(|_| {
                 de::Error::invalid_value(
                     Unexpected::Unsigned(t as u64),
-                    &"None|Vxlan|Ipip|TencentGre|ErspanOrTeb",
+                    &"None|Vxlan|Ipip|TencentGre|Geneve|ErspanOrTeb",
                 )
             })
         })
@@ -1527,6 +1708,21 @@ where
         0 => Ok(trident::VlanMode::None),
         1 => Ok(trident::VlanMode::Qinq),
         2 => Ok(trident::VlanMode::Vlan),
+        other => Err(de::Error::invalid_value(
+            Unexpected::Unsigned(other as u64),
+            &"0|1|2",
+        )),
+    }
+}
+
+fn to_tap_mode<'de, D>(deserializer: D) -> Result<TapMode, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match u8::deserialize(deserializer)? {
+        0 => Ok(TapMode::Local),
+        1 => Ok(TapMode::Mirror),
+        2 => Ok(TapMode::Analyzer),
         other => Err(de::Error::invalid_value(
             Unexpected::Unsigned(other as u64),
             &"0|1|2",

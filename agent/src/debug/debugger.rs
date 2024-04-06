@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,7 +34,10 @@ use parking_lot::RwLock;
 use tokio::runtime::Runtime;
 
 #[cfg(target_os = "linux")]
-use super::platform::{PlatformDebugger, PlatformMessage};
+use super::{
+    ebpf::{EbpfDebugger, EbpfMessage},
+    platform::{PlatformDebugger, PlatformMessage},
+};
 use super::{
     policy::{PolicyDebugger, PolicyMessage},
     rpc::{RpcDebugger, RpcMessage},
@@ -46,10 +49,13 @@ use crate::{
     config::handler::DebugAccess,
     policy::PolicySetter,
     rpc::{Session, StaticConfig, Status},
-    trident::{AgentId, RunningMode},
+    trident::AgentId,
     utils::command::get_hostname,
 };
-use public::debug::{send_to, Error, QueueDebugger, QueueMessage, Result, MAX_BUF_SIZE};
+use public::{
+    consts::DEFAULT_CONTROLLER_PORT,
+    debug::{send_to, Error, QueueDebugger, QueueMessage, Result, MAX_BUF_SIZE},
+};
 
 struct ModuleDebuggers {
     #[cfg(target_os = "linux")]
@@ -57,6 +63,8 @@ struct ModuleDebuggers {
     pub rpc: RpcDebugger,
     pub queue: Arc<QueueDebugger>,
     pub policy: PolicyDebugger,
+    #[cfg(target_os = "linux")]
+    pub ebpf: EbpfDebugger,
 }
 
 pub struct Debugger {
@@ -92,7 +100,7 @@ impl Debugger {
         let conf = self.config.clone();
         let override_os_hostname = self.override_os_hostname.clone();
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let thread = thread::Builder::new()
             .name("debugger".to_owned())
             .spawn(move || {
@@ -120,6 +128,7 @@ impl Debugger {
                 let sock_clone = sock.clone();
                 let running_clone = running.clone();
                 let serialize_conf = config::standard();
+                #[cfg(target_os = "linux")]
                 let agent_mode = conf.load().agent_mode;
                 let beacon_port = conf.load().controller_port;
                 thread::Builder::new()
@@ -127,15 +136,15 @@ impl Debugger {
                     .spawn(move || {
                         while running_clone.load(Ordering::Relaxed) {
                             thread::sleep(BEACON_INTERVAL);
-                            let Some(hostname) = override_os_hostname.as_ref().clone().or_else(|| {
-                                match get_hostname() {
+                            let Some(hostname) = override_os_hostname.as_ref().clone().or_else(
+                                || match get_hostname() {
                                     Ok(hostname) => Some(hostname),
                                     Err(e) => {
                                         warn!("get hostname failed: {}", e);
                                         None
                                     }
-                                }
-                            }) else {
+                                },
+                            ) else {
                                 continue;
                             };
 
@@ -181,6 +190,7 @@ impl Debugger {
                                 &buf,
                                 &debuggers,
                                 serialize_conf,
+                                #[cfg(target_os = "linux")]
                                 agent_mode,
                             )
                             .unwrap_or_else(|e| warn!("handle client request error: {}", e));
@@ -249,22 +259,21 @@ impl Debugger {
                 let sock_v6_clone = sock_v6.clone();
                 let running_clone = running.clone();
                 let serialize_conf = config::standard();
-                let agent_mode = conf.load().agent_mode;
                 let beacon_port = conf.load().controller_port;
                 thread::Builder::new()
                     .name("debugger-beacon".to_owned())
                     .spawn(move || {
                         while running_clone.load(Ordering::Relaxed) {
                             thread::sleep(BEACON_INTERVAL);
-                            let Some(hostname) = override_os_hostname.as_ref().clone().or_else(|| {
-                                match get_hostname() {
+                            let Some(hostname) = override_os_hostname.as_ref().clone().or_else(
+                                || match get_hostname() {
                                     Ok(hostname) => Some(hostname),
                                     Err(e) => {
                                         warn!("get hostname failed: {}", e);
                                         None
                                     }
-                                }
-                            }) else {
+                                },
+                            ) else {
                                 continue;
                             };
 
@@ -325,7 +334,6 @@ impl Debugger {
                                     &buf_v4,
                                     &debuggers,
                                     serialize_conf,
-                                    agent_mode,
                                 )
                                 .unwrap_or_else(|e| warn!("handle client request error: {}", e));
                             }
@@ -360,7 +368,6 @@ impl Debugger {
                                     &buf_v6,
                                     &debuggers,
                                     serialize_conf,
-                                    agent_mode,
                                 )
                                 .unwrap_or_else(|e| warn!("handle client request error: {}", e));
                             }
@@ -391,8 +398,7 @@ impl Debugger {
         mut payload: &[u8],
         debuggers: &ModuleDebuggers,
         serialize_conf: Configuration,
-        #[cfg(target_os = "linux")] agent_mode: RunningMode,
-        #[cfg(target_os = "windows")] _: RunningMode,
+        #[cfg(target_os = "linux")] agent_mode: crate::trident::RunningMode,
     ) -> Result<()> {
         let m = *payload.first().unwrap();
         let module = Module::try_from(m).unwrap_or_default();
@@ -400,7 +406,7 @@ impl Debugger {
         match module {
             #[cfg(target_os = "linux")]
             Module::Platform => {
-                if matches!(agent_mode, RunningMode::Standalone) {
+                if matches!(agent_mode, crate::trident::RunningMode::Standalone) {
                     let msg = PlatformMessage::Fin;
                     send_to(conn.0, conn.1, msg, serialize_conf)?;
                 }
@@ -480,6 +486,21 @@ impl Debugger {
                     _ => unreachable!(),
                 }
             }
+            #[cfg(target_os = "linux")]
+            Module::Ebpf => {
+                let ebpf = &debuggers.ebpf;
+                let req: Message<EbpfMessage> = decode_from_std_read(&mut payload, serialize_conf)?;
+                let req = req.into_inner();
+                match req {
+                    EbpfMessage::DataDump(_) => {
+                        ebpf.datadump(conn.0, conn.1, serialize_conf, &req);
+                    }
+                    EbpfMessage::Cpdbg(_) => {
+                        ebpf.cpdbg(conn.0, conn.1, serialize_conf, &req);
+                    }
+                    _ => unreachable!(),
+                }
+            }
             _ => warn!("invalid module or invalid request, skip it"),
         }
 
@@ -503,6 +524,8 @@ impl Debugger {
             ),
             queue: Arc::new(QueueDebugger::new()),
             policy: PolicyDebugger::new(context.policy_setter),
+            #[cfg(target_os = "linux")]
+            ebpf: EbpfDebugger::new(),
         };
 
         Self {
@@ -545,7 +568,11 @@ pub struct Client {
 
 impl Client {
     pub fn new(addr: SocketAddr) -> Result<Self> {
-        let sock = UdpSocket::bind((IpAddr::from(Ipv6Addr::UNSPECIFIED), 0))?;
+        let sock = if addr.is_ipv4() {
+            UdpSocket::bind((IpAddr::from(Ipv4Addr::UNSPECIFIED), DEFAULT_CONTROLLER_PORT))?
+        } else {
+            UdpSocket::bind((IpAddr::from(Ipv6Addr::UNSPECIFIED), DEFAULT_CONTROLLER_PORT))?
+        };
         Ok(Self {
             sock,
             conf: config::standard(),

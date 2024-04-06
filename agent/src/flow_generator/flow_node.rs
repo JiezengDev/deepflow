@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,18 +14,18 @@
  * limitations under the License.
  */
 
-use std::{net::IpAddr, sync::Arc, time::Duration};
+use std::{net::IpAddr, sync::Arc};
 
 use super::{perf::FlowLog, FlowState, FLOW_METRICS_PEER_DST, FLOW_METRICS_PEER_SRC};
 use crate::common::{
     decapsulate::TunnelType,
     endpoint::EndpointDataPov,
     enums::{EthernetType, TapType, TcpFlags},
-    flow::{FlowMetricsPeer, PacketDirection, SignalSource},
+    flow::{FlowMetricsPeer, L7PerfStats, PacketDirection, SignalSource, TcpPerfStats},
     lookup_key::LookupKey,
     meta_packet::MetaPacket,
     tagged_flow::TaggedFlow,
-    TapPort,
+    TapPort, Timestamp,
 };
 use public::{proto::common::TridentType, utils::net::MacAddr};
 
@@ -88,7 +88,7 @@ impl FlowMapKey {
 
     pub(super) fn new(lookup_key: &LookupKey, tap_port: TapPort) -> Self {
         match lookup_key.eth_type {
-            EthernetType::Ipv4 | EthernetType::Ipv6 => {
+            EthernetType::IPV4 | EthernetType::IPV6 => {
                 let lhs = Self::l3_hash(lookup_key);
                 let rhs = ((u16::from(lookup_key.tap_type) as u64) << 24
                     | tap_port.ignore_nat_source())
@@ -96,7 +96,7 @@ impl FlowMapKey {
                     | Self::l4_hash(lookup_key);
                 Self { lhs, rhs }
             }
-            EthernetType::Arp => {
+            EthernetType::ARP => {
                 let lhs = Self::l3_hash(lookup_key);
                 let rhs = ((u16::from(lookup_key.tap_type) as u64) << 24
                     | tap_port.ignore_nat_source())
@@ -117,11 +117,11 @@ impl FlowMapKey {
 #[derive(Default)]
 pub struct FlowNode {
     pub tagged_flow: TaggedFlow,
-    pub min_arrived_time: Duration,
+    pub min_arrived_time: Timestamp,
     // 最近一个Packet的时间戳
-    pub recent_time: Duration,
+    pub recent_time: Timestamp,
     // 相对超时时间
-    pub timeout: Duration,
+    pub timeout: Timestamp,
     // 用作time_set比对的标识，等于FlowTimeKey的timestamp_key, 只有创建FlowNode和刷新更新流节点的超时才会更新
     pub timestamp_key: u64,
 
@@ -133,6 +133,8 @@ pub struct FlowNode {
     pub residual_request: i32,
     pub next_tcp_seq0: u32,
     pub next_tcp_seq1: u32,
+    pub last_cap_seq: u32,
+
     // 当前统计周期（目前是自然秒）是否更新策略
     pub policy_in_tick: [bool; 2],
     pub packet_in_tick: bool, // 当前统计周期（目前是自然秒）是否有包
@@ -162,6 +164,21 @@ impl FlowNode {
         flow_metrics_peer_dst.l3_byte_count = 0;
         flow_metrics_peer_dst.l4_byte_count = 0;
         flow_metrics_peer_dst.tcp_flags = TcpFlags::empty();
+
+        if let Some(ref mut flow_perf_stats) = &mut flow.flow_perf_stats {
+            flow_perf_stats.tcp = TcpPerfStats::default();
+            flow_perf_stats.l7 = L7PerfStats::default();
+        }
+    }
+
+    // reset l7 parser and l7 perf stats on plugin reload to avoid inconsistency
+    pub fn reset_on_plugin_reload(&mut self) {
+        if let Some(stats) = self.tagged_flow.flow.flow_perf_stats.as_mut() {
+            stats.reset_on_plugin_reload();
+        }
+        if let Some(flow_log) = self.meta_flow_log.as_mut() {
+            flow_log.reset_on_plugin_reload();
+        }
     }
 
     pub fn match_node(
@@ -173,7 +190,7 @@ impl FlowNode {
         trident_type: TridentType,
     ) -> bool {
         if meta_packet.signal_source == SignalSource::EBPF {
-            if self.tagged_flow.flow.flow_id != meta_packet.socket_id {
+            if self.tagged_flow.flow.flow_id != meta_packet.generate_ebpf_flow_id() {
                 return false;
             }
 
@@ -210,7 +227,7 @@ impl FlowNode {
         }
 
         // other ethernet type
-        if flow.eth_type != EthernetType::Ipv4 && meta_lookup_key.eth_type != EthernetType::Ipv6 {
+        if flow.eth_type != EthernetType::IPV4 && meta_lookup_key.eth_type != EthernetType::IPV6 {
             // direction = ClientToServer
             if flow_key.mac_src == meta_lookup_key.src_mac
                 && flow_key.mac_dst == meta_lookup_key.dst_mac
@@ -254,38 +271,29 @@ impl FlowNode {
             && flow_key.port_src == meta_lookup_key.src_port
             && flow_key.port_dst == meta_lookup_key.dst_port
         {
-            meta_packet.lookup_key.direction = PacketDirection::ClientToServer;
-            Self::endpoint_match_with_direction(
-                &flow.flow_metrics_peers,
-                meta_packet,
-                PacketDirection::ClientToServer,
-            ) && Self::mac_match_with_direction(
-                meta_packet,
-                flow_key.mac_src,
-                flow_key.mac_dst,
-                mac_match,
-                PacketDirection::ClientToServer,
-            )
+            // l3 protocols, such as icmp, can determine the direction of packets according
+            // to icmp type, so there is no need to correct the direction of packets
+            if meta_lookup_key.is_tcp() || meta_lookup_key.is_udp() {
+                meta_packet.lookup_key.direction = PacketDirection::ClientToServer;
+            }
         } else if flow_key.ip_src == meta_lookup_key.dst_ip
             && flow_key.ip_dst == meta_lookup_key.src_ip
             && flow_key.port_src == meta_lookup_key.dst_port
             && flow_key.port_dst == meta_lookup_key.src_port
         {
-            meta_packet.lookup_key.direction = PacketDirection::ServerToClient;
-            Self::endpoint_match_with_direction(
-                &flow.flow_metrics_peers,
-                meta_packet,
-                PacketDirection::ServerToClient,
-            ) && Self::mac_match_with_direction(
+            if meta_lookup_key.is_tcp() || meta_lookup_key.is_udp() {
+                meta_packet.lookup_key.direction = PacketDirection::ServerToClient;
+            }
+        } else {
+            return false;
+        }
+        Self::endpoint_match_with_direction(&flow.flow_metrics_peers, meta_packet)
+            && Self::mac_match_with_direction(
                 meta_packet,
                 flow_key.mac_src,
                 flow_key.mac_dst,
                 mac_match,
-                PacketDirection::ServerToClient,
             )
-        } else {
-            false
-        }
     }
 
     fn is_hyper_v(trident_type: TridentType) -> bool {
@@ -339,9 +347,8 @@ impl FlowNode {
         flow_mac_src: MacAddr,
         flow_mac_dst: MacAddr,
         match_mac: MatchMac,
-        direction: PacketDirection,
     ) -> bool {
-        let (src_mac, dst_mac) = match direction {
+        let (src_mac, dst_mac) = match meta_packet.lookup_key.direction {
             PacketDirection::ClientToServer => (flow_mac_src, flow_mac_dst),
             PacketDirection::ServerToClient => (flow_mac_dst, flow_mac_src),
         };
@@ -360,7 +367,6 @@ impl FlowNode {
     fn endpoint_match_with_direction(
         peers: &[FlowMetricsPeer; 2],
         meta_packet: &MetaPacket,
-        direction: PacketDirection,
     ) -> bool {
         if meta_packet.tunnel.is_none() {
             return true;
@@ -369,7 +375,7 @@ impl FlowNode {
         // 同一个TapPort上的流量，如果有隧道的话，当Port做发卡弯转发时，进出的内层流量完全一样
         // 此时需要额外比较L2End确定哪股是进入的哪股是出去的
         let lookup_key = &meta_packet.lookup_key;
-        match direction {
+        match meta_packet.lookup_key.direction {
             PacketDirection::ClientToServer => {
                 lookup_key.l2_end_0 == peers[0].is_l2_end
                     && lookup_key.l2_end_1 == peers[1].is_l2_end

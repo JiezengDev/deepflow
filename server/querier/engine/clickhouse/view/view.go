@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,6 @@ package view
 import (
 	"bytes"
 	"strings"
-	"time"
 
 	"github.com/deepflowio/deepflow/server/querier/common"
 )
@@ -51,8 +50,10 @@ type Model struct {
 	Limit     *Limit
 	Callbacks map[string]func(*common.Result) error
 	//Havings Havings
-	MetricsLevelFlag int //Metrics是否需要拆层的标识
-	HasAggFunc       bool
+	MetricsLevelFlag  int //Metrics是否需要拆层的标识
+	HasAggFunc        bool
+	IsDerivative      bool
+	DerivativeGroupBy []string
 }
 
 func NewModel() *Model {
@@ -103,8 +104,11 @@ type Time struct {
 	Interval           int
 	DatasourceInterval int
 	WindowSize         int
+	Offset             int
 	Fill               string
 	Alias              string
+	TimeStartOperator  string
+	TimeEndOperator    string
 }
 
 func (t *Time) AddTimeStart(timeStart int64) {
@@ -114,7 +118,7 @@ func (t *Time) AddTimeStart(timeStart int64) {
 }
 
 func (t *Time) AddTimeEnd(timeEnd int64) {
-	if timeEnd < t.TimeEnd {
+	if t.TimeEnd == 0 || timeEnd < t.TimeEnd {
 		t.TimeEnd = timeEnd
 	}
 }
@@ -131,15 +135,21 @@ func (t *Time) AddFill(fill string) {
 	t.Fill = fill
 }
 
+func (t *Time) AddOffset(offset int) {
+	t.Offset = offset
+}
+
 func (t *Time) AddAlias(alias string) {
 	t.Alias = alias
 }
 
 func NewTime() *Time {
 	return &Time{
-		TimeEnd:            time.Now().Unix(),
+		TimeEnd:            0,
 		DatasourceInterval: 1,
 		WindowSize:         1,
+		TimeStartOperator:  ">=",
+		TimeEndOperator:    "<=",
 	}
 }
 
@@ -376,7 +386,7 @@ func (sv *SubView) WriteTo(buf *bytes.Buffer) {
 	}
 	if !sv.Filters.IsNull() {
 		from := sv.From.ToString()
-		if strings.HasPrefix(from, "flow_tag") {
+		if strings.Contains(from, "flow_tag") || strings.Contains(from, "deepflow_system") {
 			buf.WriteString(" WHERE ")
 		} else if strings.HasPrefix(from, "flow_metrics") && !strings.HasSuffix(from, ".1m`") && !strings.HasSuffix(from, ".1s`") {
 			buf.WriteString(" WHERE ")

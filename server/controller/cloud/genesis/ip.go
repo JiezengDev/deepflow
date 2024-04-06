@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@
 package genesis
 
 import (
+	"time"
+
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
 
@@ -27,8 +29,7 @@ func (g *Genesis) getIPs() ([]model.IP, error) {
 	log.Debug("get ips starting")
 	ips := []model.IP{}
 
-	g.cloudStatsd.APICost["ips"] = []int{0}
-	g.cloudStatsd.APICount["ips"] = []int{len(g.ips)}
+	g.cloudStatsd.RefreshAPIMoniter("ips", len(g.ips), time.Time{})
 
 	for _, i := range g.ips {
 		if i.VInterfaceLcuuid == "" || i.SubnetLcuuid == "" {

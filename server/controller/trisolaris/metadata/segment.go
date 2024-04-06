@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,14 +26,16 @@ import (
 )
 
 type MacID struct {
-	Mac string
-	ID  int
+	Mac  string
+	VMac string
+	ID   int
 }
 
 func newMacID(vif *models.VInterface) *MacID {
 	return &MacID{
-		Mac: vif.Mac,
-		ID:  vif.ID,
+		Mac:  vif.Mac,
+		ID:   vif.ID,
+		VMac: vif.VMac,
 	}
 }
 
@@ -92,15 +94,18 @@ func (t IDToNetworkMacs) getSegmentsByID(id int, s *Segment) []*trident.Segment 
 	segments := make([]*trident.Segment, 0, len(networkMacs))
 	for networkID, macIDs := range networkMacs {
 		macs := make([]string, 0, len(macIDs))
+		vmacs := make([]string, 0, len(macIDs))
 		vifIDs := make([]uint32, 0, len(macIDs))
 		for _, macID := range macIDs {
 			macs = append(macs, macID.Mac)
+			vmacs = append(vmacs, macID.Mac)
 			vifIDs = append(vifIDs, uint32(macID.ID))
 			s.vtapUsedVInterfaceIDs.Add(macID.ID)
 		}
 		segment := &trident.Segment{
 			Id:          proto.Uint32(uint32(networkID)),
 			Mac:         macs,
+			Vmac:        vmacs,
 			InterfaceId: vifIDs,
 		}
 		segments = append(segments, segment)
@@ -121,15 +126,18 @@ func (t ServerToNetworkMacs) getSegmentsByServer(server string, s *Segment) []*t
 	segments := make([]*trident.Segment, 0, len(networkMacs))
 	for networkID, macIDs := range networkMacs {
 		macs := make([]string, 0, len(macIDs))
+		vmacs := make([]string, 0, len(macIDs))
 		vifIDs := make([]uint32, 0, len(macIDs))
 		for _, macID := range macIDs {
 			macs = append(macs, macID.Mac)
+			vmacs = append(vmacs, macID.Mac)
 			vifIDs = append(vifIDs, uint32(macID.ID))
 			s.vtapUsedVInterfaceIDs.Add(macID.ID)
 		}
 		segment := &trident.Segment{
 			Id:          proto.Uint32(uint32(networkID)),
 			Mac:         macs,
+			Vmac:        vmacs,
 			InterfaceId: vifIDs,
 		}
 		segments = append(segments, segment)
@@ -344,16 +352,23 @@ func (s *Segment) generateGatewayHostSegments() {
 	for _, hostSegments := range s.gatewayHostIDToSegments {
 		for _, macIDs := range hostSegments {
 			macs := make([]string, 0, len(macIDs))
+			vmacs := make([]string, 0, len(macIDs))
 			vifIDs := make([]uint32, 0, len(macIDs))
 			for _, macID := range macIDs {
 				if !isMacNullOrDefault(macID.Mac) {
 					macs = append(macs, macID.Mac)
 					vifIDs = append(vifIDs, uint32(macID.ID))
+					if macID.VMac == "" {
+						vmacs = append(vmacs, macID.Mac)
+					} else {
+						vmacs = append(vmacs, macID.VMac)
+					}
 				}
 			}
 			segment := &trident.Segment{
 				Id:          proto.Uint32(uint32(1)),
 				Mac:         macs,
+				Vmac:        vmacs,
 				InterfaceId: vifIDs,
 			}
 			segments = append(segments, segment)
@@ -364,12 +379,14 @@ func (s *Segment) generateGatewayHostSegments() {
 
 func (s *Segment) GenerateNoVTapUsedSegments(rawData *PlatformRawData) {
 	macs := []string{}
+	vmacs := []string{}
 	vifIDs := []uint32{}
 	segments := make([]*trident.Segment, 0, 1)
 	for _, vif := range rawData.deviceVifs {
 		if !s.vtapUsedVInterfaceIDs.Contains(vif.ID) {
 			if !isMacNullOrDefault(vif.Mac) {
 				macs = append(macs, vif.Mac)
+				vmacs = append(vmacs, vif.Mac)
 				vifIDs = append(vifIDs, uint32(vif.ID))
 			}
 		}
@@ -379,6 +396,7 @@ func (s *Segment) GenerateNoVTapUsedSegments(rawData *PlatformRawData) {
 		segment := &trident.Segment{
 			Id:          proto.Uint32(uint32(1)),
 			Mac:         macs,
+			Vmac:        vmacs,
 			InterfaceId: vifIDs,
 		}
 		segments = append(segments, segment)
@@ -413,11 +431,13 @@ func (s *Segment) GetPodNodeSegments(podNodeID int) []*trident.Segment {
 
 func (s *Segment) GetTypeVMSegments(launchServer string, hostID int) []*trident.Segment {
 	macs := []string{}
+	vmacs := []string{}
 	vifIDs := []uint32{}
 	if networkMacs, ok := s.launchServerToSegments[launchServer]; ok {
 		for _, macIDs := range networkMacs {
 			for _, macID := range macIDs {
 				macs = append(macs, macID.Mac)
+				vmacs = append(vmacs, macID.Mac)
 				vifIDs = append(vifIDs, uint32(macID.ID))
 				s.vtapUsedVInterfaceIDs.Add(macID.ID)
 			}
@@ -427,6 +447,7 @@ func (s *Segment) GetTypeVMSegments(launchServer string, hostID int) []*trident.
 		for _, macIDs := range networkMacs {
 			for _, macID := range macIDs {
 				macs = append(macs, macID.Mac)
+				vmacs = append(vmacs, macID.Mac)
 				vifIDs = append(vifIDs, uint32(macID.ID))
 				s.vtapUsedVInterfaceIDs.Add(macID.ID)
 			}
@@ -436,6 +457,7 @@ func (s *Segment) GetTypeVMSegments(launchServer string, hostID int) []*trident.
 		for _, macIDs := range networkMacs {
 			for _, macID := range macIDs {
 				macs = append(macs, macID.Mac)
+				vmacs = append(vmacs, macID.Mac)
 				vifIDs = append(vifIDs, uint32(macID.ID))
 				s.vtapUsedVInterfaceIDs.Add(macID.ID)
 			}
@@ -445,6 +467,7 @@ func (s *Segment) GetTypeVMSegments(launchServer string, hostID int) []*trident.
 	segment := &trident.Segment{
 		Id:          proto.Uint32(uint32(1)),
 		Mac:         macs,
+		Vmac:        vmacs,
 		InterfaceId: vifIDs,
 	}
 	return []*trident.Segment{segment}

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -60,6 +60,10 @@ func (a *Aws) getPeerConnections(region awsRegion) ([]model.PeerConnection, erro
 		}
 		if pData.AccepterVpcInfo == nil || pData.RequesterVpcInfo == nil {
 			log.Debug("accepter or requester vpc info is nil")
+			continue
+		}
+		if pData.Status.Code != types.VpcPeeringConnectionStateReasonCodeActive {
+			log.Infof("peer connections (%s) status (%s) invalid", peerConnectionName, pData.Status.Code)
 			continue
 		}
 		peerConnections = append(peerConnections, model.PeerConnection{

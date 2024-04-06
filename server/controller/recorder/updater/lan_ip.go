@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,25 +18,53 @@ package updater
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
-	"github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
+	rcommon "github.com/deepflowio/deepflow/server/controller/recorder/common"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type LANIP struct {
-	UpdaterBase[cloudmodel.IP, mysql.LANIP, *cache.LANIP]
+	UpdaterBase[
+		cloudmodel.IP,
+		mysql.LANIP,
+		*diffbase.LANIP,
+		*message.LANIPAdd,
+		message.LANIPAdd,
+		*message.LANIPUpdate,
+		message.LANIPUpdate,
+		*message.LANIPFieldsUpdate,
+		message.LANIPFieldsUpdate,
+		*message.LANIPDelete,
+		message.LANIPDelete]
 }
 
-func NewLANIP(wholeCache *cache.Cache, domainToolDataSet *cache.ToolDataSet) *LANIP {
+func NewLANIP(wholeCache *cache.Cache, domainToolDataSet *tool.DataSet) *LANIP {
 	updater := &LANIP{
-		UpdaterBase[cloudmodel.IP, mysql.LANIP, *cache.LANIP]{
-			cache:             wholeCache,
-			domainToolDataSet: domainToolDataSet,
-			dbOperator:        db.NewLANIP(),
-			diffBaseData:      wholeCache.LANIPs,
-		},
+		newUpdaterBase[
+			cloudmodel.IP,
+			mysql.LANIP,
+			*diffbase.LANIP,
+			*message.LANIPAdd,
+			message.LANIPAdd,
+			*message.LANIPUpdate,
+			message.LANIPUpdate,
+			*message.LANIPFieldsUpdate,
+			message.LANIPFieldsUpdate,
+			*message.LANIPDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_LAN_IP_EN,
+			wholeCache,
+			db.NewLANIP().SetORG(wholeCache.GetORG()),
+			wholeCache.DiffBaseDataSet.LANIPs,
+			nil,
+		),
 	}
+	updater.setDomainToolDataSet(domainToolDataSet)
 	updater.dataGenerator = updater
 	return updater
 }
@@ -45,50 +73,50 @@ func (i *LANIP) SetCloudData(cloudData []cloudmodel.IP) {
 	i.cloudData = cloudData
 }
 
-func (i *LANIP) getDiffBaseByCloudItem(cloudItem *cloudmodel.IP) (diffBase *cache.LANIP, exists bool) {
+func (i *LANIP) getDiffBaseByCloudItem(cloudItem *cloudmodel.IP) (diffBase *diffbase.LANIP, exists bool) {
 	diffBase, exists = i.diffBaseData[cloudItem.Lcuuid]
 	return
 }
 
 func (i *LANIP) generateDBItemToAdd(cloudItem *cloudmodel.IP) (*mysql.LANIP, bool) {
-	vinterfaceID, exists := i.cache.GetVInterfaceIDByLcuuid(cloudItem.VInterfaceLcuuid)
+	vinterfaceID, exists := i.cache.ToolDataSet.GetVInterfaceIDByLcuuid(cloudItem.VInterfaceLcuuid)
 	if !exists {
 		log.Error(resourceAForResourceBNotFound(
-			common.RESOURCE_TYPE_VINTERFACE_EN, cloudItem.VInterfaceLcuuid,
-			common.RESOURCE_TYPE_LAN_IP_EN, cloudItem.Lcuuid,
+			ctrlrcommon.RESOURCE_TYPE_VINTERFACE_EN, cloudItem.VInterfaceLcuuid,
+			ctrlrcommon.RESOURCE_TYPE_LAN_IP_EN, cloudItem.Lcuuid,
 		))
 		return nil, false
 	}
-	networkID, exists := i.cache.GetNetworkIDByVInterfaceLcuuid(cloudItem.VInterfaceLcuuid)
+	networkID, exists := i.cache.ToolDataSet.GetNetworkIDByVInterfaceLcuuid(cloudItem.VInterfaceLcuuid)
 	if !exists {
 		if i.domainToolDataSet != nil {
 			networkID, exists = i.domainToolDataSet.GetNetworkIDByVInterfaceLcuuid(cloudItem.VInterfaceLcuuid)
 		}
 		if !exists {
 			log.Error(resourceAForResourceBNotFound(
-				common.RESOURCE_TYPE_VINTERFACE_EN, cloudItem.VInterfaceLcuuid,
-				common.RESOURCE_TYPE_LAN_IP_EN, cloudItem.Lcuuid,
+				ctrlrcommon.RESOURCE_TYPE_VINTERFACE_EN, cloudItem.VInterfaceLcuuid,
+				ctrlrcommon.RESOURCE_TYPE_LAN_IP_EN, cloudItem.Lcuuid,
 			))
 			return nil, false
 		}
 	}
-	subnetID, exists := i.cache.GetSubnetIDByLcuuid(cloudItem.SubnetLcuuid)
+	subnetID, exists := i.cache.ToolDataSet.GetSubnetIDByLcuuid(cloudItem.SubnetLcuuid)
 	if !exists {
 		if i.domainToolDataSet != nil {
 			subnetID, exists = i.domainToolDataSet.GetSubnetIDByLcuuid(cloudItem.SubnetLcuuid)
 		}
 		if !exists {
 			log.Error(resourceAForResourceBNotFound(
-				common.RESOURCE_TYPE_SUBNET_EN, cloudItem.SubnetLcuuid,
-				common.RESOURCE_TYPE_LAN_IP_EN, cloudItem.Lcuuid,
+				ctrlrcommon.RESOURCE_TYPE_SUBNET_EN, cloudItem.SubnetLcuuid,
+				ctrlrcommon.RESOURCE_TYPE_LAN_IP_EN, cloudItem.Lcuuid,
 			))
 			return nil, false
 		}
 	}
-	ip := common.FormatIP(cloudItem.IP)
+	ip := rcommon.FormatIP(cloudItem.IP)
 	if ip == "" {
 		log.Error(ipIsInvalid(
-			common.RESOURCE_TYPE_LAN_IP_EN, cloudItem.Lcuuid, cloudItem.IP,
+			ctrlrcommon.RESOURCE_TYPE_LAN_IP_EN, cloudItem.Lcuuid, cloudItem.IP,
 		))
 		return nil, false
 	}
@@ -104,24 +132,27 @@ func (i *LANIP) generateDBItemToAdd(cloudItem *cloudmodel.IP) (*mysql.LANIP, boo
 	return dbItem, true
 }
 
-func (i *LANIP) generateUpdateInfo(diffBase *cache.LANIP, cloudItem *cloudmodel.IP) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (i *LANIP) generateUpdateInfo(diffBase *diffbase.LANIP, cloudItem *cloudmodel.IP) (*message.LANIPFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.LANIPFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.SubnetLcuuid != cloudItem.SubnetLcuuid {
-		subnetID, exists := i.cache.GetSubnetIDByLcuuid(cloudItem.SubnetLcuuid)
+		subnetID, exists := i.cache.ToolDataSet.GetSubnetIDByLcuuid(cloudItem.SubnetLcuuid)
 		if !exists {
 			if i.domainToolDataSet != nil {
 				subnetID, exists = i.domainToolDataSet.GetSubnetIDByLcuuid(cloudItem.SubnetLcuuid)
 			}
 			if !exists {
 				log.Error(resourceAForResourceBNotFound(
-					common.RESOURCE_TYPE_SUBNET_EN, cloudItem.SubnetLcuuid,
-					common.RESOURCE_TYPE_LAN_IP_EN, cloudItem.Lcuuid,
+					ctrlrcommon.RESOURCE_TYPE_SUBNET_EN, cloudItem.SubnetLcuuid,
+					ctrlrcommon.RESOURCE_TYPE_LAN_IP_EN, cloudItem.Lcuuid,
 				))
-				return nil, false
+				return nil, nil, false
 			}
 		}
-		updateInfo["vl2_net_id"] = subnetID
+		mapInfo["vl2_net_id"] = subnetID
+		structInfo.SubnetID.SetNew(mapInfo["vl2_net_id"].(int))
+		structInfo.SubnetLcuuid.Set(diffBase.SubnetLcuuid, cloudItem.SubnetLcuuid)
 	}
 
-	return updateInfo, len(updateInfo) > 0
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

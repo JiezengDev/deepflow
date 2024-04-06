@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@ use sysinfo::{NetworkExt, System, SystemExt};
 
 use crate::common::platform_data::PlatformData;
 use crate::common::policy::{Acl, Cidr, IpGroupData, PeerConnection};
-use crate::common::FlowAclListener;
+use crate::common::{FlowAclListener, FlowAclListenerId};
 use crate::exception::ExceptionHandler;
 use crate::utils::stats::{Counter, CounterType, CounterValue, RefCountable};
 use npb_pcap_policy::{NpbTunnelType, NOT_SUPPORT};
@@ -141,7 +141,7 @@ impl Watcher {
 
     fn npb_start(&self, tx_bps: u64) -> bool {
         self.npb_leaky_bucket
-            .set_rate(Some(self.npb_bps_threshold.load(Relaxed) / 8));
+            .set_rate(Some(self.npb_bps_threshold.load(Relaxed)));
         self.exception_handler.clear(Exception::NpbFuse);
         info!("Npb reopen, tx bandwidth is {} bps.", tx_bps);
 
@@ -205,6 +205,7 @@ impl Watcher {
 pub struct NpbBandwidthWatcher {
     watcher: Arc<Watcher>,
     thread_handler: Mutex<Option<JoinHandle<()>>>,
+    exception_handler: ExceptionHandler,
 }
 
 impl NpbBandwidthWatcher {
@@ -234,9 +235,10 @@ impl NpbBandwidthWatcher {
                     nic_name: RwLock::new("".to_string()),
                     is_running: AtomicBool::new(false),
                     traffic_count: traffic_count.clone(),
-                    exception_handler,
+                    exception_handler: exception_handler.clone(),
                 }),
                 thread_handler: Mutex::new(None),
+                exception_handler,
             })),
             traffic_count,
         )
@@ -244,6 +246,11 @@ impl NpbBandwidthWatcher {
 
     pub fn set_npb_rate(&self, threshold: u64) {
         self.watcher.npb_bps_threshold.store(threshold, Relaxed);
+        // When there is Exception::NpbFuse, npb_leaky_bucket cannot be
+        // set in order to not distribute traffic packet.
+        if !self.exception_handler.has(Exception::NpbFuse) {
+            self.watcher.npb_leaky_bucket.set_rate(Some(threshold));
+        }
     }
 
     pub fn set_nic_rate(&self, mut threshold: u64) {
@@ -349,6 +356,6 @@ impl FlowAclListener for Arc<NpbBandwidthWatcher> {
     }
 
     fn id(&self) -> usize {
-        1
+        u16::from(FlowAclListenerId::NpbBandWatcher) as usize
     }
 }

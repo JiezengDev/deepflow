@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,5 +17,6 @@
 package config
 
 type Config struct {
-	RedisRefreshInterval int `default:"3600" yaml:"redis_refresh_interval"`
+	RedisRefreshInterval int      `default:"3600" yaml:"redis_refresh_interval"`
+	AdditionalDomains    []string `yaml:"additional_domains"`
 }

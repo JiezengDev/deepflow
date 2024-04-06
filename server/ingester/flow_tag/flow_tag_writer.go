@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -113,16 +113,13 @@ func NewFlowTagWriter(
 	var err error
 	for _, tagType := range []TagType{TagField, TagFieldValue} {
 		tableName := fmt.Sprintf("%s_%s", srcDB, tagType.String())
-		t.FieldValue = ""
-		if tagType == TagFieldValue {
-			t.FieldValue = "x" // Assign a value to the FieldValue field to correctly identify the type of FlowTag.
-		}
+		t.TagType = tagType
 		w.ckwriters[tagType], err = ckwriter.NewCKWriter(
 			w.ckdbAddrs, w.ckdbUsername, w.ckdbPassword,
 			fmt.Sprintf("%s-%s-%d", name, tableName, decoderIndex),
 			config.CKDB.TimeZone,
 			t.GenCKTable(config.CKDB.ClusterName, config.CKDB.StoragePolicy, tableName, ttl, partition),
-			w.writerConfig.QueueCount, w.writerConfig.QueueSize, w.writerConfig.BatchSize, w.writerConfig.FlushTimeout)
+			w.writerConfig.QueueCount, w.writerConfig.QueueSize, w.writerConfig.BatchSize, w.writerConfig.FlushTimeout, config.CKDB.Watcher)
 		if err != nil {
 			return nil, err
 		}

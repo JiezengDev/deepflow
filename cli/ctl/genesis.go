@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,9 +25,10 @@ import (
 	"strings"
 
 	"github.com/bitly/go-simplejson"
-	"github.com/deepflowio/deepflow/cli/ctl/common"
 	"github.com/olekukonko/tablewriter"
 	"github.com/spf13/cobra"
+
+	"github.com/deepflowio/deepflow/cli/ctl/common"
 )
 
 func RegisterGenesisCommand() *cobra.Command {
@@ -73,7 +74,7 @@ func RegisterGenesisCommand() *cobra.Command {
 	agentInfo := &cobra.Command{
 		Use:     "agent",
 		Short:   "genesis agent info",
-		Example: "deepflow-ctl genesis agent -i node_ip [host_ip or vtap_id]",
+		Example: "deepflow-ctl genesis agent -i node_ip [host_ip or agent_id]",
 		Run: func(cmd *cobra.Command, args []string) {
 			agentInfo(cmd, args)
 		},
@@ -82,7 +83,7 @@ func RegisterGenesisCommand() *cobra.Command {
 	storageInfo := &cobra.Command{
 		Use:     "storage",
 		Short:   "genesis storage info",
-		Example: "deepflow-ctl genesis storage vtap_id",
+		Example: "deepflow-ctl genesis storage agent_id",
 		Run: func(cmd *cobra.Command, args []string) {
 			storageInfo(cmd, args)
 		},
@@ -100,7 +101,7 @@ func syncInfo(cmd *cobra.Command, resType string) {
 	server := common.GetServerInfo(cmd)
 	url := fmt.Sprintf("http://%s:%d/v1/sync/%s/", server.IP, server.Port, resType)
 
-	response, err := common.CURLPerform("GET", url, nil, "")
+	response, err := common.CURLPerform("GET", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -152,7 +153,7 @@ func k8sInfo(cmd *cobra.Command, args []string, resType string) {
 	server := common.GetServerInfo(cmd)
 	url := fmt.Sprintf("http://%s:%d/v1/kubernetes-info/%s/", server.IP, server.Port, args[0])
 
-	response, err := common.CURLPerform("GET", url, nil, "")
+	response, err := common.CURLPerform("GET", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -308,7 +309,7 @@ func tableIp(response *simplejson.Json, table *tablewriter.Table) {
 }
 
 func tableVip(response *simplejson.Json, table *tablewriter.Table) {
-	table.SetHeader([]string{"IP", "VTAP_ID"})
+	table.SetHeader([]string{"IP", "AGENT_ID"})
 
 	tableItems := [][]string{}
 	for i := range response.Get("DATA").MustArray() {
@@ -324,7 +325,7 @@ func tableVip(response *simplejson.Json, table *tablewriter.Table) {
 }
 
 func tableVinterface(response *simplejson.Json, table *tablewriter.Table) {
-	table.SetHeader([]string{"MAC", "NAME", "TAP_MAC", "TAP_NAME", "DEVICE_TYPE", "DEVICE_NAME", "HOST_IP", "VTAP_ID", "CLUSTER_ID", "NETNS_ID", "IP"})
+	table.SetHeader([]string{"MAC", "NAME", "TAP_MAC", "TAP_NAME", "IF_TYPE", "DEVICE_TYPE", "DEVICE_NAME", "HOST_IP", "AGENT_ID", "CLUSTER_ID", "NETNS_ID", "IP"})
 
 	tableItems := [][]string{}
 	for i := range response.Get("DATA").MustArray() {
@@ -339,6 +340,7 @@ func tableVinterface(response *simplejson.Json, table *tablewriter.Table) {
 			tableItem = append(tableItem, data.Get("NAME").MustString())
 			tableItem = append(tableItem, data.Get("TAP_MAC").MustString())
 			tableItem = append(tableItem, data.Get("TAP_NAME").MustString())
+			tableItem = append(tableItem, data.Get("IF_TYPE").MustString())
 			tableItem = append(tableItem, data.Get("DEVICE_TYPE").MustString())
 			tableItem = append(tableItem, data.Get("DEVICE_NAME").MustString())
 			tableItem = append(tableItem, data.Get("HOST_IP").MustString())
@@ -355,7 +357,7 @@ func tableVinterface(response *simplejson.Json, table *tablewriter.Table) {
 }
 
 func tableProcess(response *simplejson.Json, table *tablewriter.Table) {
-	table.SetHeader([]string{"PID", "VTAP_ID", "NETNS_ID", "NAME", "PROCESS_NAME", "USER", "START_TIME"})
+	table.SetHeader([]string{"PID", "AGENT_ID", "NETNS_ID", "NAME", "PROCESS_NAME", "USER", "START_TIME"})
 
 	tableItems := [][]string{}
 	for i := range response.Get("DATA").MustArray() {
@@ -388,7 +390,7 @@ func agentInfo(cmd *cobra.Command, args []string) {
 	}
 
 	url := fmt.Sprintf("http://%s:%d/v1/agent-stats/%s/", podIP, server.SvcPort, args[0])
-	response, err := common.CURLPerform("GET", url, nil, "")
+	response, err := common.CURLPerform("GET", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -417,15 +419,15 @@ func prometheusInfo(cmd *cobra.Command, args []string) {
 	}
 
 	path := fmt.Sprintf("/v1/prometheus-info/%s/", args[0])
-	common.GetURLInfo(cmd, path)
+	common.GetURLInfo(cmd, path, []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 }
 
 func storageInfo(cmd *cobra.Command, args []string) {
 	if len(args) == 0 {
-		fmt.Fprintf(os.Stderr, "must specify vtap id.\nExample: %s\n", cmd.Example)
+		fmt.Fprintf(os.Stderr, "must specify agent id.\nExample: %s\n", cmd.Example)
 		return
 	}
 
 	path := fmt.Sprintf("/v1/genesis-storage/%s/", args[0])
-	common.GetURLInfo(cmd, path)
+	common.GetURLInfo(cmd, path, []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 }

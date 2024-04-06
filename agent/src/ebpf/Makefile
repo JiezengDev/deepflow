@@ -33,21 +33,23 @@ ARCH := $(shell uname -m)
 
 CLANG ?= /usr/bin/clang
 CC ?= gcc
+GNU_CC ?= gcc
+MUSL_CC ?= musl-gcc
 OBJDIR ?= .
 STATIC_OBJDIR := $(OBJDIR)/staticobjs
 
 define compile_socket_trace_elf
 	@echo "  COMPILE ELF kernel version $(1)"
-	@cd kernel && make clean --no-print-directory && make socket_trace.elf $(2) --no-print-directory && cd ../
+	@cd kernel && make clean --no-print-directory && make socket_trace.bpf.elf $(2) --no-print-directory && cd ../
 	@echo "  Generate file user/socket_trace_bpf_$(strip $1).c"
-	@./tools/ebpftobuffer kernel/socket_trace.elf user/socket_trace_bpf_$(strip $1).c socket_trace_$(strip $1)_ebpf_data
+	@./tools/bintobuffer kernel/socket_trace.bpf.elf user/socket_trace_bpf_$(strip $1).c socket_trace_$(strip $1)_ebpf_data
 endef
 
 define compile_perf_profiler_elf
 	@echo "  COMPILE ELF kernel version $(1)"
-	@cd kernel && make clean --no-print-directory && make perf_profiler.elf $(2) --no-print-directory && cd ../
+	@cd kernel && make clean --no-print-directory && make perf_profiler.bpf.elf $(2) --no-print-directory && cd ../
 	@echo "  Generate file user/perf_profiler_bpf_$(strip $1).c"
-	@./tools/ebpftobuffer kernel/perf_profiler.elf user/perf_profiler_bpf_$(strip $1).c perf_profiler_$(strip $1)_ebpf_data
+	@./tools/bintobuffer kernel/perf_profiler.bpf.elf user/perf_profiler_bpf_$(strip $1).c perf_profiler_$(strip $1)_ebpf_data
 endef
 
 define check_gcc_version
@@ -86,8 +88,18 @@ OBJS := user/elf.o \
 	user/mem.o \
 	user/vec.o \
 	user/bihash.o \
-	user/perf_profiler.o \
-	user/stringifier.o
+	user/profile/perf_profiler.o \
+	user/profile/stringifier.o \
+	user/profile/java/df_jattach.o \
+	user/profile/java/gen_syms_file.o
+
+JAVA_TOOL := deepflow-jattach
+JAVA_AGENT_VERSION := 1
+JAVA_AGENT_GNU_SO := df_java_agent_v$(JAVA_AGENT_VERSION).so
+JAVA_AGENT_MUSL_SO := df_java_agent_musl_v$(JAVA_AGENT_VERSION).so
+JAVA_AGENT_SO := $(JAVA_AGENT_GNU_SO) $(JAVA_AGENT_MUSL_SO)
+JAVA_AGENT_SRC := user/profile/java/agent.c
+JAVA_AGENT_MACROS := -DAGENT_LIB_NAME="\"$(JAVA_AGENT_GNU_SO)\"" -DAGENT_MUSL_LIB_NAME="\"$(JAVA_AGENT_MUSL_SO)\""
 
 STATIC_OBJS := $(addprefix $(STATIC_OBJDIR)/,$(OBJS))
 CFLAGS ?= -std=gnu99 -g -O2 -ffunction-sections -fdata-sections -fPIC -Wall -Wno-strict-aliasing -Wno-sign-compare -Wno-unused-parameter -Wno-missing-field-initializers
@@ -96,6 +108,7 @@ GCC_VER_GTE71 := $(shell echo `gcc --version | grep ^gcc | cut -f3 -d' '|cut -f1
 ifeq ($(GCC_VER_GTE71),1)
   CFLAGS += -Wformat-truncation=0
 endif
+CFLAGS += $(JAVA_AGENT_MACROS)
 
 # -DBPF_DEBUG for parse and load ebpf probes.
 # -fsanitize=address: Enable the Address Sanitizer tool, which
@@ -106,7 +119,7 @@ endif
 #  where the error occurred.
 # -DDF_MEM_DEBUG Used for memory leak detection, to check for memory
 #  leak issues during the debugging phase.
-CFLAGS += $(MACHINE_CFLAGS) -fno-omit-frame-pointer -I.
+CFLAGS += $(MACHINE_CFLAGS) -fno-omit-frame-pointer -I/usr/lib/jvm/java/include -I/usr/lib/jvm/java/include/linux -I.
 ifeq ($(findstring musl,$(CC)),musl)
     IS_MUSL := 1
     ifeq ($(findstring aarch64,$(ARCH)),aarch64)
@@ -119,15 +132,19 @@ endif
 all: build
 
 ELFFILES = ./.data_done
-$(ELFFILES):
+
+tools/bintobuffer:
+	$(call msg,TOOLS,tools/bintobuffer)
+	@$(CC) tools/bintobuffer.c -o tools/bintobuffer
+
+$(ELFFILES): tools/bintobuffer
 	$(call msg,Clang/LLVM,,$(CLANG_VER))
 	@if [ $(CLANG_VER_MAIN) -lt 10 ]; then \
                 echo "  check llvm-clang fail. expect Clang/LLVM 10+" && exit 1; \
         fi
 	@rm -rf data
-	$(call msg,Tools,,tools/ebpftobuffer)
-	@$(CC) tools/ebpftobuffer.c -o tools/ebpftobuffer
 	$(call compile_socket_trace_elf, common)
+	$(call compile_socket_trace_elf, 3_10_0, LINUX_VER_3_10_0=1)
 	$(call compile_socket_trace_elf, 5_2_plus, LINUX_VER_5_2_PLUS=1)
 	$(call compile_socket_trace_elf, kylin, LINUX_VER_KYLIN=1)
 	$(call compile_perf_profiler_elf, common)
@@ -135,7 +152,7 @@ $(ELFFILES):
 
 $(STATIC_OBJDIR) $(SHARED_OBJDIR):
 	$(call msg,MKDIR,$@)
-	$(Q)mkdir -p $@/user
+	$(Q)mkdir -p $@/user/profile/java
 
 $(STATIC_OBJDIR)/%.o: %.c | $(STATIC_OBJDIR)
 	$(call msg,CC,$@)
@@ -145,16 +162,39 @@ $(LIBTRACE): $(STATIC_OBJS)
 	$(call msg,AR,$@)
 	$(Q)$(AR) rcs $@ $^
 
-build: $(ELFFILES) $(LIBTRACE)
+$(JAVA_AGENT_GNU_SO): tools/bintobuffer $(JAVA_AGENT_SRC)
+	$(call msg,SO,$@)
+	$(Q)$(GNU_CC) $(CFLAGS) -shared -o $@ $(JAVA_AGENT_SRC)
+	@rm -rf user/profile/java_agent_so_gnu.c
+	@./tools/bintobuffer ./$@ user/profile/java_agent_so_gnu.c java_agent_so_gnu
+
+$(JAVA_AGENT_MUSL_SO): tools/bintobuffer $(JAVA_AGENT_SRC)
+	$(call msg,SO,$@)
+	$(Q)$(MUSL_CC) $(CFLAGS) -shared -o $@ $(JAVA_AGENT_SRC)
+	@rm -rf user/profile/java_agent_so_musl.c
+	@./tools/bintobuffer ./$@ user/profile/java_agent_so_musl.c java_agent_so_musl
+
+build: $(ELFFILES) $(JAVA_TOOL) $(LIBTRACE)
 
 tools: $(LIBTRACE)
 	$(call msg,TOOLS,deepflow-ebpfctl)
 	$(Q)$(CC) $(CFLAGS) --static -g -O2 user/ctrl_tracer.c user/ctrl.c $(LIBTRACE) -o deepflow-ebpfctl -lelf -lz -lpthread
 
+$(JAVA_TOOL): $(JAVA_AGENT_SO) user/profile/java/df_jattach.c user/log.c user/common.c libs/jattach/build/libjattach.a
+	$(call msg,TOOLS,$@)
+	@$(GNU_CC) $(CFLAGS) -DJAVA_AGENT_ATTACH_TOOL user/profile/java/df_jattach.c user/log.c user/common.c libs/jattach/build/libjattach.a -o $@ -ldl -lpthread
+	@rm -rf user/profile/deepflow_jattach_bin.c
+	@./tools/bintobuffer ./$@ user/profile/deepflow_jattach_bin.c deepflow_jattach_bin
+
+libs/jattach/build/libjattach.a:
+	$(call msg,MAKE,$@)
+	$(Q)patch -p1 -d libs/jattach -Ns --no-backup-if-mismatch <libs/0001-Add-compilation-for-static-lib.patch || true
+	$(Q)$(MAKE) -sC libs/jattach dll --no-print-directory
+
 rust-sample: .socket-tracer .profiler
 socket-tracer: .socket-tracer
 profiler: .profiler
-.socket-tracer: $(ELFFILES) $(LIBTRACE)
+.socket-tracer: $(ELFFILES) $(JAVA_TOOL) $(LIBTRACE)
 	$(call msg,Current-DIR,,$(CURR))
 	$(Q)rm -rf samples/rust/socket-tracer/src/ebpf.rs
 	$(Q)cp mod.rs samples/rust/socket-tracer/src/ebpf.rs
@@ -183,7 +223,7 @@ profiler: .profiler
         fi
 	$(Q)touch .socket-tracer
 
-.profiler: $(ELFFILES) $(LIBTRACE)
+.profiler: $(ELFFILES) $(JAVA_TOOL) $(LIBTRACE)
 	$(call msg,Current-DIR,,$(CURR))
 	$(Q)rm -rf samples/rust/profiler/src/ebpf.rs
 	$(Q)cp mod.rs samples/rust/profiler/src/ebpf.rs
@@ -220,10 +260,12 @@ clean-sample:
 clean:
 	$(Q)$(MAKE) -C kernel clean --no-print-directory
 	$(Q)$(MAKE) -C test clean --no-print-directory
+	$(Q)$(MAKE) -C libs/jattach clean --no-print-directory
 	$(Q)rm -rf $(ELFFILES) data deepflow-ebpfctl $(STATIC_OBJDIR) $(LIBTRACE) *.a
 	$(Q)rm -rf .profiler .socket-tracer
 	$(Q)rm -rf samples/rust/socket-tracer/target
 	$(Q)rm -rf samples/rust/profiler/target
+	$(Q)rm -rf $(JAVA_AGENT_SO) $(JAVA_TOOL) tools/bintobuffer
 
 test: $(ELFFILES) $(LIBTRACE)
 	$(Q)$(MAKE) -C test --no-print-directory

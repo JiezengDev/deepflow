@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ package dbmgr
 import (
 	"context"
 	"fmt"
+
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -219,6 +220,11 @@ func (obj *_DBMgr[M]) UpdateBulk(data []*M) (err error) {
 	for _, d := range data {
 		err = obj.DB.WithContext(obj.ctx).Save(&d).Error
 	}
+	return
+}
+
+func (obj *_DBMgr[M]) Updates(data *M, values map[string]interface{}) (err error) {
+	err = obj.DB.WithContext(obj.ctx).Model(&data).Updates(values).Error
 	return
 }
 

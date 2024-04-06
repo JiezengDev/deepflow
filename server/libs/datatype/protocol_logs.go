@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -138,7 +138,7 @@ func (i *AppProtoLogsBaseInfo) String() string {
 	formatted += fmt.Sprintf("VtapId: %v ", i.VtapId)
 	formatted += fmt.Sprintf("TapType: %v ", i.TapType)
 	formatted += fmt.Sprintf("TapPort: %s ", i.TapPort)
-	formatted += fmt.Sprintf("Proto: %s ", i.Proto.String())
+	formatted += fmt.Sprintf("Proto: %s ", i.Proto.String(false))
 	formatted += fmt.Sprintf("MsgType: %s ", i.MsgType.String())
 	formatted += fmt.Sprintf("Code: %v ", i.Code)
 	formatted += fmt.Sprintf("Status: %v ", i.Status)

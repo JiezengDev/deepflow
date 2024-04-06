@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ use std::{
 };
 
 use arc_swap::access::Access;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use log::debug;
 use log::{info, warn};
 
@@ -57,8 +57,10 @@ use crate::{
 use packet_dedup::PacketDedupMap;
 #[cfg(windows)]
 use public::packet::Packet;
-use public::proto::{common::TridentType, trident::IfMacSource};
-use public::utils::net::{Link, MacAddr};
+use public::{
+    proto::{common::TridentType, trident::IfMacSource},
+    utils::net::{Link, MacAddr},
+};
 
 const IF_INDEX_MAX_SIZE: usize = 1000;
 
@@ -73,12 +75,12 @@ pub struct MirrorModeDispatcherListener {
 }
 
 impl MirrorModeDispatcherListener {
-    pub fn on_tap_interface_change(
-        &self,
-        _: &Vec<Link>,
-        _: IfMacSource,
-        trident_type: TridentType,
-    ) {
+    #[cfg(target_os = "linux")]
+    pub fn netns(&self) -> &public::netns::NsFile {
+        &self.base.netns
+    }
+
+    pub fn on_tap_interface_change(&self, _: &[Link], _: IfMacSource, trident_type: TridentType) {
         let mut old_trident_type = self.trident_type.lock().unwrap();
         *old_trident_type = trident_type;
         self.base
@@ -131,10 +133,11 @@ impl MirrorModeDispatcherListener {
 
     pub fn on_vm_change(&self, vm_mac_addrs: &[MacAddr]) {
         #[cfg(target_os = "linux")]
-        let tap_bridge_macs = self.tap_bridge_inner_macs(self.base.src_interface_index);
-        #[cfg(target_os = "linux")]
-        self.on_vm_change_with_bridge_macs(vm_mac_addrs, &tap_bridge_macs);
-        #[cfg(target_os = "windows")]
+        self.on_vm_change_with_bridge_macs(
+            vm_mac_addrs,
+            &self.tap_bridge_inner_macs(self.base.src_interface_index),
+        );
+        #[cfg(any(target_os = "windows", target_os = "android"))]
         self.on_vm_change_with_bridge_macs(vm_mac_addrs, &vec![]);
     }
 
@@ -214,12 +217,12 @@ pub(super) struct MirrorModeDispatcher {
 }
 
 impl MirrorModeDispatcher {
-    pub(super) fn init(&mut self) {
+    pub(super) fn init(&mut self) -> Result<()> {
         info!(
             "Mirror mode dispatcher {} init with 0x{:x}.",
             self.base.id, self.mac
         );
-        self.base.init();
+        self.base.init()
     }
 
     pub(super) fn listener(&self) -> MirrorModeDispatcherListener {
@@ -362,7 +365,7 @@ impl MirrorModeDispatcher {
         );
         // flowProcesser
         flow_map.inject_meta_packet(&config, &mut meta_packet);
-        let mini_packet = MiniPacket::new(overlay_packet, &meta_packet);
+        let mini_packet = MiniPacket::new(overlay_packet, &meta_packet, 0);
         for i in pipeline.handlers.iter_mut() {
             i.handle(&mini_packet);
         }
@@ -384,7 +387,7 @@ impl MirrorModeDispatcher {
             self.base.ntp_diff.clone(),
             &self.base.flow_map_config.load(),
             Some(self.base.packet_sequence_output_queue.clone()), // Enterprise Edition Feature: packet-sequence
-            &self.base.stats,
+            self.base.stats.clone(),
             false, // !from_ebpf
         );
 
@@ -393,7 +396,7 @@ impl MirrorModeDispatcher {
                 flow: &self.base.flow_map_config.load(),
                 log_parser: &self.base.log_parse_config.load(),
                 collector: &self.base.collector_config.load(),
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 ebpf: None,
             };
             if self.base.reset_whitelist.swap(false, Ordering::Relaxed) {
@@ -422,7 +425,7 @@ impl MirrorModeDispatcher {
             if self.base.pause.load(Ordering::Relaxed) {
                 continue;
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             let (packet, mut timestamp) = recved.unwrap();
             #[cfg(target_os = "windows")]
             let (mut packet, mut timestamp) = recved.unwrap();
@@ -443,7 +446,7 @@ impl MirrorModeDispatcher {
                 .rx_bytes
                 .fetch_add(packet.capture_length as u64, Ordering::Relaxed);
 
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             let decap_length = 0;
             #[cfg(target_os = "windows")]
             let decap_length = {
@@ -467,7 +470,7 @@ impl MirrorModeDispatcher {
             let overlay_packet = &mut packet.data[decap_length..decap_length + original_length];
 
             // Only virtual network traffic goes to remove duplicates
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             if self.dedup.duplicate(overlay_packet, timestamp) {
                 debug!("Packet is duplicate");
                 continue;
@@ -506,8 +509,8 @@ impl MirrorModeDispatcher {
                 let _ = Self::handler(
                     self.base.id,
                     sa_key,
-                    src_local,
-                    dst_local,
+                    true,
+                    false,
                     overlay_packet,
                     timestamp,
                     original_length,
@@ -527,8 +530,8 @@ impl MirrorModeDispatcher {
                 let _ = Self::handler(
                     self.base.id,
                     da_key,
-                    src_local,
-                    dst_local,
+                    false,
+                    true,
                     overlay_packet,
                     timestamp,
                     original_length,

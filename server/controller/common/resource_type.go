@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -61,8 +61,10 @@ const (
 	RESOURCE_TYPE_POD_EN                      = "pod"
 	RESOURCE_TYPE_PROCESS_EN                  = "process"
 	RESOURCE_TYPE_PROMETHEUS_TARGET_EN        = "prometheus_target"
+	RESOURCE_TYPE_VIP_EN                      = "vip"
 
 	// http api resource type
 	RESOURCE_TYPE_IP_EN      = "ip"
+	RESOURCE_TYPE_ALL_IP_EN  = "all_ip"
 	RESOURCE_TYPE_LB_RULE_EN = "lb_rule"
 )

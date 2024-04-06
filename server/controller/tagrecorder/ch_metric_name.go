@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023 Yunshan Networks
+* Copyright (c) 2024 Yunshan Networks
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -21,17 +21,17 @@ import (
 )
 
 type ChPrometheusMetricName struct {
-	UpdaterBase[mysql.ChPrometheusMetricName, IDKey]
+	UpdaterComponent[mysql.ChPrometheusMetricName, IDKey]
 }
 
 func NewChPrometheusMetricNames() *ChPrometheusMetricName {
 	updater := &ChPrometheusMetricName{
-		UpdaterBase[mysql.ChPrometheusMetricName, IDKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_METRIC_NAME,
-		},
+		newUpdaterComponent[mysql.ChPrometheusMetricName, IDKey](
+			RESOURCE_TYPE_CH_METRIC_NAME,
+		),
 	}
 
-	updater.dataGenerator = updater
+	updater.updaterDG = updater
 	return updater
 }
 

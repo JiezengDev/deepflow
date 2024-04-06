@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -47,6 +47,14 @@ pub struct KeyVal {
     pub val: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricKeyVal {
+    pub key: String,
+    pub val: f32,
+}
+
+impl Eq for MetricKeyVal {}
+
 #[derive(Default, Debug)]
 pub struct ExtendedInfo {
     pub service_name: Option<String>,
@@ -59,15 +67,16 @@ pub struct ExtendedInfo {
     pub referer: Option<String>,
     pub protocol_str: Option<String>,
     pub attributes: Option<Vec<KeyVal>>,
+    pub metrics: Option<Vec<MetricKeyVal>>,
 }
 
 /*
-server的协议适配结构,用于把所有协议转换成统一的结构发送到server.
-目前暂时所有协议都需要实现 From<xxx> for L7ProtocolSendLog, 将协议转为L7ProtocolSendLog这个通用结构,后面考虑将协议抽象成trait.
-这个结构最终用于填充 AppProtoLogsData 这个pb结构提,然后pb编码后发送到server.
-
-在server中, req_len,resp_len = -1 时会认为没有值. resp.code = -32768 会认为没有值.
-*/
+ * server 的协议适配结构，用于把所有协议转换成统一的结构发送到 server
+ * 目前暂时所有协议都需要实现 From<xxx> for L7ProtocolSendLog, 将协议转为 L7ProtocolSendLog 这个通用结构，后面考虑将协议抽象成 trait
+ * 这个结构最终用于填充 AppProtoLogsData 这个 pb 结构体，然后 pb 编码后发送到 server
+ *
+ * 在 server 中，req_len、resp_len = -1 时会认为没有值； resp.code = -32768 会认为没有值
+ */
 #[derive(Default, Debug)]
 pub struct L7ProtocolSendLog {
     pub req_len: Option<u32>,
@@ -78,9 +87,12 @@ pub struct L7ProtocolSendLog {
     pub version: Option<String>,
     pub trace_info: Option<TraceInfo>,
     pub ext_info: Option<ExtendedInfo>,
+    pub flags: u32,
 }
 
 impl L7ProtocolSendLog {
+    pub const SECONDS_PER_DAY: f32 = 60.0 * 60.0 * 24.0;
+
     pub fn fill_app_proto_log(self, log: &mut flow_log::AppProtoLogsData) {
         let req_len = if let Some(len) = self.req_len {
             len as i32
@@ -166,7 +178,14 @@ impl L7ProtocolSendLog {
                     ext_info.attribute_values.push(kv.val);
                 }
             }
+            if let Some(metrics) = ext.metrics {
+                for kv in metrics.into_iter() {
+                    ext_info.metrics_names.push(kv.key);
+                    ext_info.metrics_values.push(kv.val as f64);
+                }
+            }
             log.ext_info = Some(ext_info);
         }
+        log.flags = self.flags;
     }
 }

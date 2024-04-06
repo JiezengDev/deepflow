@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -82,6 +82,7 @@ func (a *Aws) getVMs(region awsRegion) ([]model.VM, []model.VMSecurityGroup, err
 				VPCLcuuid:    common.GetUUID(a.getStringPointerValue(ins.VpcId), uuid.Nil),
 				State:        vmState,
 				HType:        common.VM_HTYPE_VM_C,
+				IP:           a.instanceIDToPrimaryIP[instanceID],
 				CreatedAt:    a.getTimePointerValue(ins.LaunchTime),
 				AZLcuuid:     azLcuuid,
 				RegionLcuuid: a.getRegionLcuuid(region.lcuuid),

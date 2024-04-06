@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,16 +25,10 @@ import (
 	"os"
 	"path"
 
+	"github.com/spf13/cobra"
+
 	"github.com/deepflowio/deepflow/cli/ctl/common"
 	"github.com/deepflowio/deepflow/cli/ctl/common/jsonparser"
-	"github.com/spf13/cobra"
-)
-
-var (
-	// TODO(weiqiang): delete(reference server library)
-	PluginTypeIntToName = map[int]string{
-		1: "wasm",
-	}
 )
 
 func RegisterPluginCommand() *cobra.Command {
@@ -120,14 +114,14 @@ func createPlugin(cmd *cobra.Command, t, image, name string) error {
 
 	server := common.GetServerInfo(cmd)
 	url := fmt.Sprintf("http://%s:%d/v1/plugin/", server.IP, server.Port)
-	_, err = common.CURLPostFormData(url, contentType, bodyBuf)
+	_, err = common.CURLPostFormData(url, contentType, bodyBuf, []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	return err
 }
 
 func listPlugin(cmd *cobra.Command) {
 	server := common.GetServerInfo(cmd)
 	url := fmt.Sprintf("http://%s:%d/v1/plugin/", server.IP, server.Port)
-	response, err := common.CURLPerform("GET", url, nil, "")
+	response, err := common.CURLPerform("GET", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -143,7 +137,7 @@ func listPlugin(cmd *cobra.Command) {
 		d := data.GetIndex(i)
 
 		fmt.Printf(cmdFormat,
-			typeMaxSize, PluginTypeIntToName[d.Get("TYPE").MustInt()],
+			typeMaxSize, common.PluginType(d.Get("TYPE").MustInt()),
 			nameMaxSize, d.Get("NAME").MustString(),
 			d.Get("UPDATED_AT").MustString(),
 		)
@@ -159,6 +153,6 @@ func deletePlugin(cmd *cobra.Command, args []string) error {
 
 	server := common.GetServerInfo(cmd)
 	url := fmt.Sprintf("http://%s:%d/v1/plugin/%s/", server.IP, server.Port, args[0])
-	_, err := common.CURLPerform("DELETE", url, nil, "")
+	_, err := common.CURLPerform("DELETE", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	return err
 }

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ package encoder
 import (
 	"sync"
 
+	"github.com/cornelk/hashmap"
 	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/golang/protobuf/proto"
 
@@ -30,29 +31,29 @@ import (
 type metricName struct {
 	lock         sync.Mutex
 	resourceType string
-	strToID      map[string]int
-	idAllocator
+	strToID      *hashmap.Map[string, int]
+	ascIDAllocator
 }
 
 func newMetricName(max int) *metricName {
 	mn := &metricName{
 		resourceType: "metric_name",
-		strToID:      make(map[string]int),
-		idAllocator: idAllocator{
-			resourceType: "metric_name",
-			max:          max,
-			usableIDs:    make([]int, 0, max),
-		},
+		strToID:      hashmap.New[string, int](),
 	}
+	mn.ascIDAllocator = newAscIDAllocator(mn.resourceType, 1, max)
 	mn.rawDataProvider = mn
 	return mn
+}
+
+func (mn *metricName) getID(str string) (int, bool) {
+	return mn.strToID.Get(str)
 }
 
 func (mn *metricName) refresh(args ...interface{}) error {
 	mn.lock.Lock()
 	defer mn.lock.Unlock()
 
-	return mn.idAllocator.refresh()
+	return mn.ascIDAllocator.refresh()
 }
 
 func (mn *metricName) encode(strs []string) ([]*controller.PrometheusMetricName, error) {
@@ -63,7 +64,7 @@ func (mn *metricName) encode(strs []string) ([]*controller.PrometheusMetricName,
 	dbToAdd := make([]*mysql.PrometheusMetricName, 0)
 	for i := range strs {
 		str := strs[i]
-		if id, ok := mn.strToID[str]; ok {
+		if id, ok := mn.strToID.Get(str); ok {
 			resp = append(resp, &controller.PrometheusMetricName{Name: &str, Id: proto.Uint32(uint32(id))})
 			continue
 		}
@@ -87,7 +88,7 @@ func (mn *metricName) encode(strs []string) ([]*controller.PrometheusMetricName,
 	for i := range dbToAdd {
 		id := dbToAdd[i].ID
 		str := dbToAdd[i].Name
-		mn.strToID[str] = id
+		mn.strToID.Set(str, id)
 		resp = append(resp, &controller.PrometheusMetricName{Name: &str, Id: proto.Uint32(uint32(id))})
 	}
 	return resp, nil
@@ -103,7 +104,7 @@ func (mn *metricName) load() (ids mapset.Set[int], err error) {
 	inUseIDsSet := mapset.NewSet[int]()
 	for _, item := range items {
 		inUseIDsSet.Add(item.ID)
-		mn.strToID[item.Name] = item.ID
+		mn.strToID.Set(item.Name, item.ID)
 	}
 	return inUseIDsSet, nil
 }

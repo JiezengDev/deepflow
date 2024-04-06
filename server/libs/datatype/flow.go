@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/google/gopacket/layers"
@@ -40,11 +41,11 @@ const (
 	//		_CLOSE_TYPE_METERS[flowType].ServerRstFlow = 1
 	//	...
 	// 流统计指标量和数据库字段名之间的对应关系，见
-	// droplet-libs/zerodoc/basic_meter.go: Anomaly结构体定义
+	// droplet-libs/flow-metrics/basic_meter.go: Anomaly结构体定义
 	//	ClientRstFlow       uint64 `db:"client_rst_flow"`
 	//	...
 	// 数据库字段名和页面文案之间的对应关系，见
-	// droplet-libs/zerodoc/basic_meter.go: AnomalyColumns函数
+	// droplet-libs/flow-metrics/basic_meter.go: AnomalyColumns函数
 	//	ANOMALY_CLIENT_RST_FLOW: {"client_rst_flow", "传输-客户端重置"},
 	//	...
 
@@ -54,10 +55,10 @@ const (
 	_                              //  4: 【废弃】CloseTypeFlood
 	CloseTypeForcedReport          //  5: 周期性上报
 	_                              //  6: 【废弃】CloseTypeFoecedClose
-	CloseTypeClientSYNRepeat       //  7: 建连-客户端SYN结束
+	CloseTypeServerSynMiss         //  7: 建连-服务端 SYN 缺失
 	CloseTypeServerHalfClose       //  8: 断连-服务端半关
 	CloseTypeTCPClientRst          //  9: 传输-客户端重置
-	CloseTypeServerSYNACKRepeat    // 10: 建连-服务端SYN结束
+	CloseTypeClientAckMiss         // 10: 建连-客户端 ACK 缺失
 	CloseTypeClientHalfClose       // 11: 断连-客户端半关
 	_                              // 12: 【废弃】CloseTypeClientNoResponse
 	CloseTypeClientSourcePortReuse // 13: 建连-客户端端口复用
@@ -72,14 +73,14 @@ const (
 )
 
 func (t CloseType) IsClientError() bool {
-	return t == CloseTypeClientSYNRepeat || t == CloseTypeTCPClientRst ||
-		t == CloseTypeClientHalfClose || t == CloseTypeClientSourcePortReuse ||
+	return t == CloseTypeClientAckMiss || t == CloseTypeTCPClientRst ||
+		t == CloseTypeClientSourcePortReuse ||
 		t == CloseTypeClientEstablishReset
 }
 
 func (t CloseType) IsServerError() bool {
 	return t == CloseTypeTCPServerRst || t == CloseTypeTimeout ||
-		t == CloseTypeServerHalfClose || t == CloseTypeServerSYNACKRepeat ||
+		t == CloseTypeServerSynMiss ||
 		t == CloseTypeServerReset || t == CloseTypeServerQueueLack || t == CloseTypeServerEstablishReset
 }
 
@@ -147,23 +148,29 @@ const (
 type L7Protocol uint8
 
 const (
-	L7_PROTOCOL_UNKNOWN      L7Protocol = 0
-	L7_PROTOCOL_OTHER        L7Protocol = 1
-	L7_PROTOCOL_HTTP_1       L7Protocol = 20
-	L7_PROTOCOL_HTTP_2       L7Protocol = 21
-	L7_PROTOCOL_HTTP_1_TLS   L7Protocol = 22
-	L7_PROTOCOL_HTTP_2_TLS   L7Protocol = 23
-	L7_PROTOCOL_DUBBO        L7Protocol = 40
-	L7_PROTOCOL_GRPC         L7Protocol = 41
-	L7_PROTOCOL_PROTOBUF_RPC L7Protocol = 42
-	L7_PROTOCOL_SOFARPC      L7Protocol = 43
-	L7_PROTOCOL_MYSQL        L7Protocol = 60
-	L7_PROTOCOL_POSTGRE      L7Protocol = 61
-	L7_PROTOCOL_REDIS        L7Protocol = 80
-	L7_PROTOCOL_KAFKA        L7Protocol = 100
-	L7_PROTOCOL_MQTT         L7Protocol = 101
-	L7_PROTOCOL_DNS          L7Protocol = 120
-	L7_PROTOCOL_CUSTOM       L7Protocol = 127
+	L7_PROTOCOL_UNKNOWN  L7Protocol = 0
+	L7_PROTOCOL_HTTP_1   L7Protocol = 20
+	L7_PROTOCOL_HTTP_2   L7Protocol = 21
+	L7_PROTOCOL_DUBBO    L7Protocol = 40
+	L7_PROTOCOL_GRPC     L7Protocol = 41
+	L7_PROTOCOL_SOFARPC  L7Protocol = 43
+	L7_PROTOCOL_FASTCGI  L7Protocol = 44
+	L7_PROTOCOL_BRPC     L7Protocol = 45
+	L7_PROTOCOL_MYSQL    L7Protocol = 60
+	L7_PROTOCOL_POSTGRE  L7Protocol = 61
+	L7_PROTOCOL_ORACLE   L7Protocol = 62
+	L7_PROTOCOL_REDIS    L7Protocol = 80
+	L7_PROTOCOL_MONGODB  L7Protocol = 81
+	L7_PROTOCOL_KAFKA    L7Protocol = 100
+	L7_PROTOCOL_MQTT     L7Protocol = 101
+	L7_PROTOCOL_AMQP     L7Protocol = 102
+	L7_PROTOCOL_OPENWIRE L7Protocol = 103
+	L7_PROTOCOL_NATS     L7Protocol = 104
+	L7_PROTOCOL_PULSAR   L7Protocol = 105
+	L7_PROTOCOL_ZMTP     L7Protocol = 106
+	L7_PROTOCOL_DNS      L7Protocol = 120
+	L7_PROTOCOL_TLS      L7Protocol = 121
+	L7_PROTOCOL_CUSTOM   L7Protocol = 127
 )
 
 // size = 9 * 4B = 36B
@@ -404,13 +411,9 @@ func (f *TCPPerfStats) WriteToPB(p *pb.TCPPerfStats, l4Protocol L4Protocol) {
 		p.ArtMax = f.ARTMax
 
 		p.Rtt = f.RTT
-		p.RttClientSum = f.RTTClientSum
-		p.RttServerSum = f.RTTServerSum
 		p.SrtSum = f.SRTSum
 		p.ArtSum = f.ARTSum
 
-		p.RttClientCount = f.RTTClientCount
-		p.RttServerCount = f.RTTServerCount
 		p.SrtCount = f.SRTCount
 		p.ArtCount = f.ARTCount
 
@@ -608,61 +611,165 @@ func formatStruct(s interface{}) string {
 	return formatted
 }
 
-func (p L7Protocol) String() string {
-	formatted := ""
+func (p L7Protocol) String(isTLS bool) string {
 	switch p {
 	case L7_PROTOCOL_HTTP_1:
-		formatted = "HTTP"
+		if isTLS {
+			return "HTTP_TLS"
+		} else {
+			return "HTTP"
+		}
 	case L7_PROTOCOL_HTTP_2:
-		formatted = "HTTP2"
-	case L7_PROTOCOL_HTTP_1_TLS:
-		formatted = "HTTP1_TLS"
-	case L7_PROTOCOL_HTTP_2_TLS:
-		formatted = "HTTP2_TLS"
-	case L7_PROTOCOL_DNS:
-		formatted = "DNS"
-	case L7_PROTOCOL_MYSQL:
-		formatted = "MySQL"
-	case L7_PROTOCOL_POSTGRE:
-		formatted = "PostgreSQL"
-	case L7_PROTOCOL_REDIS:
-		formatted = "Redis"
+		if isTLS {
+			return "HTTP2_TLS"
+		} else {
+			return "HTTP2"
+		}
 	case L7_PROTOCOL_DUBBO:
-		formatted = "Dubbo"
+		if isTLS {
+			return "Dubbo_TLS"
+		} else {
+			return "Dubbo"
+		}
 	case L7_PROTOCOL_GRPC:
-		formatted = "gRPC"
-	case L7_PROTOCOL_PROTOBUF_RPC:
-		formatted = "ProtobufRPC"
+		if isTLS {
+			return "gRPC_TLS"
+		} else {
+			return "gRPC"
+		}
 	case L7_PROTOCOL_SOFARPC:
-		formatted = "SofaRPC"
+		if isTLS {
+			return "SofaRPC_TLS"
+		} else {
+			return "SofaRPC"
+		}
+	case L7_PROTOCOL_FASTCGI:
+		if isTLS {
+			return "FastCGI_TLS"
+		} else {
+			return "FastCGI"
+		}
+	case L7_PROTOCOL_BRPC:
+		if isTLS {
+			return "bRPC_TLS"
+		} else {
+			return "bRPC"
+		}
+	case L7_PROTOCOL_MYSQL:
+		if isTLS {
+			return "MySQL_TLS"
+		} else {
+			return "MySQL"
+		}
+	case L7_PROTOCOL_POSTGRE:
+		if isTLS {
+			return "PostgreSQL_TLS"
+		} else {
+			return "PostgreSQL"
+		}
+	case L7_PROTOCOL_ORACLE:
+		if isTLS {
+			return "Oracle_TLS"
+		} else {
+			return "Oracle"
+		}
+	case L7_PROTOCOL_REDIS:
+		if isTLS {
+			return "Redis_TLS"
+		} else {
+			return "Redis"
+		}
+	case L7_PROTOCOL_MONGODB:
+		if isTLS {
+			return "MongoDB_TLS"
+		} else {
+			return "MongoDB"
+		}
 	case L7_PROTOCOL_KAFKA:
-		formatted = "Kafka"
+		if isTLS {
+			return "Kafka_TLS"
+		} else {
+			return "Kafka"
+		}
 	case L7_PROTOCOL_MQTT:
-		formatted = "MQTT"
+		if isTLS {
+			return "MQTT_TLS"
+		} else {
+			return "MQTT"
+		}
+	case L7_PROTOCOL_AMQP:
+		if isTLS {
+			return "AMQP_TLS"
+		} else {
+			return "AMQP"
+		}
+	case L7_PROTOCOL_OPENWIRE:
+		if isTLS {
+			return "OpenWire_TLS"
+		} else {
+			return "OpenWire"
+		}
+	case L7_PROTOCOL_NATS:
+		if isTLS {
+			return "NATS_TLS"
+		} else {
+			return "NATS"
+		}
+	case L7_PROTOCOL_PULSAR:
+		if isTLS {
+			return "Pulsar_TLS"
+		} else {
+			return "Pulsar"
+		}
+	case L7_PROTOCOL_ZMTP:
+		if isTLS {
+			return "ZMTP_TLS"
+		} else {
+			return "ZMTP"
+		}
+	case L7_PROTOCOL_DNS:
+		if isTLS {
+			return "DNS_TLS"
+		} else {
+			return "DNS"
+		}
+	case L7_PROTOCOL_TLS:
+		return "TLS"
 	case L7_PROTOCOL_CUSTOM:
-		formatted = "Custom"
-	case L7_PROTOCOL_OTHER:
-		formatted = "Others"
+		if isTLS {
+			return "Custom_TLS"
+		} else {
+			return "Custom"
+		}
 	default:
-		formatted = "N/A"
+		return "N/A"
 	}
-	return formatted
 }
 
 var L7ProtocolStringMap = map[string]L7Protocol{
-	L7_PROTOCOL_HTTP_1.String():     L7_PROTOCOL_HTTP_1,
-	L7_PROTOCOL_HTTP_2.String():     L7_PROTOCOL_HTTP_2,
-	L7_PROTOCOL_HTTP_1_TLS.String(): L7_PROTOCOL_HTTP_1_TLS,
-	L7_PROTOCOL_HTTP_2_TLS.String(): L7_PROTOCOL_HTTP_2_TLS,
-	L7_PROTOCOL_DNS.String():        L7_PROTOCOL_DNS,
-	L7_PROTOCOL_MYSQL.String():      L7_PROTOCOL_MYSQL,
-	L7_PROTOCOL_REDIS.String():      L7_PROTOCOL_REDIS,
-	L7_PROTOCOL_DUBBO.String():      L7_PROTOCOL_DUBBO,
-	L7_PROTOCOL_GRPC.String():       L7_PROTOCOL_GRPC,
-	L7_PROTOCOL_KAFKA.String():      L7_PROTOCOL_KAFKA,
-	L7_PROTOCOL_MQTT.String():       L7_PROTOCOL_MQTT,
-	L7_PROTOCOL_OTHER.String():      L7_PROTOCOL_OTHER,
-	L7_PROTOCOL_UNKNOWN.String():    L7_PROTOCOL_UNKNOWN,
+	strings.ToLower(L7_PROTOCOL_HTTP_1.String(false)):   L7_PROTOCOL_HTTP_1,
+	strings.ToLower(L7_PROTOCOL_HTTP_2.String(false)):   L7_PROTOCOL_HTTP_2,
+	strings.ToLower(L7_PROTOCOL_DUBBO.String(false)):    L7_PROTOCOL_DUBBO,
+	strings.ToLower(L7_PROTOCOL_GRPC.String(false)):     L7_PROTOCOL_GRPC,
+	strings.ToLower(L7_PROTOCOL_SOFARPC.String(false)):  L7_PROTOCOL_SOFARPC,
+	strings.ToLower(L7_PROTOCOL_FASTCGI.String(false)):  L7_PROTOCOL_FASTCGI,
+	strings.ToLower(L7_PROTOCOL_BRPC.String(false)):     L7_PROTOCOL_BRPC,
+	strings.ToLower(L7_PROTOCOL_MYSQL.String(false)):    L7_PROTOCOL_MYSQL,
+	strings.ToLower(L7_PROTOCOL_POSTGRE.String(false)):  L7_PROTOCOL_POSTGRE,
+	strings.ToLower(L7_PROTOCOL_ORACLE.String(false)):   L7_PROTOCOL_ORACLE,
+	strings.ToLower(L7_PROTOCOL_REDIS.String(false)):    L7_PROTOCOL_REDIS,
+	strings.ToLower(L7_PROTOCOL_MONGODB.String(false)):  L7_PROTOCOL_MONGODB,
+	strings.ToLower(L7_PROTOCOL_KAFKA.String(false)):    L7_PROTOCOL_KAFKA,
+	strings.ToLower(L7_PROTOCOL_MQTT.String(false)):     L7_PROTOCOL_MQTT,
+	strings.ToLower(L7_PROTOCOL_AMQP.String(false)):     L7_PROTOCOL_AMQP,
+	strings.ToLower(L7_PROTOCOL_OPENWIRE.String(false)): L7_PROTOCOL_OPENWIRE,
+	strings.ToLower(L7_PROTOCOL_NATS.String(false)):     L7_PROTOCOL_NATS,
+	strings.ToLower(L7_PROTOCOL_PULSAR.String(false)):   L7_PROTOCOL_PULSAR,
+	strings.ToLower(L7_PROTOCOL_ZMTP.String(false)):     L7_PROTOCOL_ZMTP,
+	strings.ToLower(L7_PROTOCOL_DNS.String(false)):      L7_PROTOCOL_DNS,
+	strings.ToLower(L7_PROTOCOL_TLS.String(false)):      L7_PROTOCOL_TLS,
+	strings.ToLower(L7_PROTOCOL_CUSTOM.String(false)):   L7_PROTOCOL_CUSTOM,
+	strings.ToLower(L7_PROTOCOL_UNKNOWN.String(false)):  L7_PROTOCOL_UNKNOWN,
 }
 
 func (p *L4Protocol) String() string {
@@ -721,7 +828,7 @@ func (p *FlowPerfStats) String() string {
 	formatted := ""
 	formatted += fmt.Sprintf("L4Protocol:%s ", p.L4Protocol.String())
 	formatted += fmt.Sprintf("TCPPerfStats:{%s} ", p.TCPPerfStats.String())
-	formatted += fmt.Sprintf("\n\tL7Protocol:%s ", p.L7Protocol.String())
+	formatted += fmt.Sprintf("\n\tL7Protocol:%s ", p.L7Protocol.String(false))
 	formatted += fmt.Sprintf("L7PerfStats:{%s}", p.L7PerfStats.String())
 	return formatted
 }
@@ -853,8 +960,7 @@ func (f *FlowPerfStats) SequentialMerge(rhs *FlowPerfStats) {
 	if f.L4Protocol == L4_PROTOCOL_UNKOWN {
 		f.L4Protocol = rhs.L4Protocol
 	}
-	if f.L7Protocol == L7_PROTOCOL_UNKNOWN || (f.L7Protocol == L7_PROTOCOL_OTHER &&
-		rhs.L7Protocol != L7_PROTOCOL_UNKNOWN) {
+	if f.L7Protocol == L7_PROTOCOL_UNKNOWN {
 		f.L7Protocol = rhs.L7Protocol
 	}
 	f.TCPPerfStats.SequentialMerge(&rhs.TCPPerfStats)

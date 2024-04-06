@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,7 +37,7 @@ func FindUnscopedWhere[T any](query interface{}, args ...interface{}) ([]*T, err
 func FindInBatches[T any](query *gorm.DB) ([]*T, error) {
 	data := make([]*T, 0)
 	pageIndex := 0
-	pageCount := mysql.GetResultSetMax()
+	pageCount := int(mysql.GetConfig().ResultSetMax)
 	pageData := make([]*T, 0)
 	for pageIndex == 0 || len(pageData) == pageCount {
 		err := query.Find(&pageData).Limit(pageCount).Offset(pageIndex * pageCount).Error
@@ -54,7 +54,7 @@ func FindInBatches[T any](query *gorm.DB) ([]*T, error) {
 func FindInBatchesObj[T any](query *gorm.DB) ([]T, error) { // TODO unify return pointer or struct
 	data := make([]T, 0)
 	pageIndex := 0
-	pageCount := mysql.GetResultSetMax()
+	pageCount := int(mysql.GetConfig().ResultSetMax)
 	pageData := make([]T, 0)
 	for pageIndex == 0 || len(pageData) == pageCount {
 		err := query.Find(&pageData).Limit(pageCount).Offset(pageIndex * pageCount).Error

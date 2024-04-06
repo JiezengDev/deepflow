@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,66 +18,124 @@ package updater
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type PrometheusTarget struct {
-	UpdaterBase[cloudmodel.PrometheusTarget, mysql.PrometheusTarget, *cache.PrometheusTarget]
+	UpdaterBase[
+		cloudmodel.PrometheusTarget,
+		mysql.PrometheusTarget,
+		*diffbase.PrometheusTarget,
+		*message.PrometheusTargetAdd,
+		message.PrometheusTargetAdd,
+		*message.PrometheusTargetUpdate,
+		message.PrometheusTargetUpdate,
+		*message.PrometheusTargetFieldsUpdate,
+		message.PrometheusTargetFieldsUpdate,
+		*message.PrometheusTargetDelete,
+		message.PrometheusTargetDelete]
 }
 
 func NewPrometheusTarget(wholeCache *cache.Cache, cloudData []cloudmodel.PrometheusTarget) *PrometheusTarget {
 	updater := &PrometheusTarget{
-		UpdaterBase[cloudmodel.PrometheusTarget, mysql.PrometheusTarget, *cache.PrometheusTarget]{
-			cache:        wholeCache,
-			dbOperator:   db.NewPrometheusTarget(),
-			diffBaseData: wholeCache.PrometheusTarget,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.PrometheusTarget,
+			mysql.PrometheusTarget,
+			*diffbase.PrometheusTarget,
+			*message.PrometheusTargetAdd,
+			message.PrometheusTargetAdd,
+			*message.PrometheusTargetUpdate,
+			message.PrometheusTargetUpdate,
+			*message.PrometheusTargetFieldsUpdate,
+			message.PrometheusTargetFieldsUpdate,
+			*message.PrometheusTargetDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_PROMETHEUS_TARGET_EN,
+			wholeCache,
+			db.NewPrometheusTarget().SetORG(wholeCache.GetORG()),
+			wholeCache.DiffBaseDataSet.PrometheusTarget,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
 }
 
-func (p *PrometheusTarget) getDiffBaseByCloudItem(cloudItem *cloudmodel.PrometheusTarget) (diffBase *cache.PrometheusTarget, exits bool) {
+func (p *PrometheusTarget) getDiffBaseByCloudItem(cloudItem *cloudmodel.PrometheusTarget) (diffBase *diffbase.PrometheusTarget, exits bool) {
 	diffBase, exits = p.diffBaseData[cloudItem.Lcuuid]
 	return
 }
 
 func (p *PrometheusTarget) generateDBItemToAdd(cloudItem *cloudmodel.PrometheusTarget) (*mysql.PrometheusTarget, bool) {
+	podClusterID, exists := p.cache.ToolDataSet.GetPodClusterIDByLcuuid(cloudItem.PodClusterLcuuid)
+	if !exists {
+		log.Error(p.org.LogPre(resourceAForResourceBNotFound(
+			ctrlrcommon.RESOURCE_TYPE_POD_CLUSTER_EN, cloudItem.PodClusterLcuuid,
+			ctrlrcommon.RESOURCE_TYPE_PROMETHEUS_TARGET_EN, cloudItem.Lcuuid,
+		)))
+		return nil, false
+	}
+	vpcID, exists := p.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)
+	if !exists {
+		log.Error(p.org.LogPre(resourceAForResourceBNotFound(
+			ctrlrcommon.RESOURCE_TYPE_VPC_EN, cloudItem.VPCLcuuid,
+			ctrlrcommon.RESOURCE_TYPE_PROMETHEUS_TARGET_EN, cloudItem.Lcuuid,
+		)))
+		return nil, false
+	}
 	dbItem := &mysql.PrometheusTarget{
-		Instance:    cloudItem.Instance,
-		Job:         cloudItem.Job,
-		ScrapeURL:   cloudItem.ScrapeURL,
-		OtherLabels: cloudItem.OtherLabels,
-		Domain:      p.cache.DomainLcuuid,
-		SubDomain:   cloudItem.SubDomainLcuuid,
+		Instance:     cloudItem.Instance,
+		Job:          cloudItem.Job,
+		ScrapeURL:    cloudItem.ScrapeURL,
+		OtherLabels:  cloudItem.OtherLabels,
+		VPCID:        vpcID,
+		Domain:       p.cache.DomainLcuuid,
+		SubDomain:    cloudItem.SubDomainLcuuid,
+		PodClusterID: podClusterID,
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 
 	return dbItem, true
 }
 
-func (p *PrometheusTarget) generateUpdateInfo(diffBase *cache.PrometheusTarget, cloudItem *cloudmodel.PrometheusTarget) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (p *PrometheusTarget) generateUpdateInfo(diffBase *diffbase.PrometheusTarget, cloudItem *cloudmodel.PrometheusTarget) (*message.PrometheusTargetFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.PrometheusTargetFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.Instance != cloudItem.Instance {
-		updateInfo["name"] = cloudItem.Instance
+		mapInfo["name"] = cloudItem.Instance
+		structInfo.Name.Set(diffBase.Instance, cloudItem.Instance)
 	}
 	if diffBase.Job != cloudItem.Job {
-		updateInfo["job"] = cloudItem.Job
+		mapInfo["job"] = cloudItem.Job
+		structInfo.Job.Set(diffBase.Job, cloudItem.Job)
 	}
 
 	if diffBase.ScrapeURL != cloudItem.ScrapeURL {
-		updateInfo["scrape_url"] = cloudItem.ScrapeURL
+		mapInfo["scrape_url"] = cloudItem.ScrapeURL
+		structInfo.ScrapeURL.Set(diffBase.ScrapeURL, cloudItem.ScrapeURL)
 	}
 
 	if diffBase.OtherLabels != cloudItem.OtherLabels {
-		updateInfo["other_labels"] = cloudItem.OtherLabels
+		mapInfo["other_labels"] = cloudItem.OtherLabels
+		structInfo.OtherLabels.Set(diffBase.OtherLabels, cloudItem.OtherLabels)
 	}
-
-	if len(updateInfo) > 0 {
-		return updateInfo, true
+	if diffBase.VPCLcuuid != cloudItem.VPCLcuuid {
+		vpcID, exists := p.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)
+		if !exists {
+			log.Error(p.org.LogPre(resourceAForResourceBNotFound(
+				ctrlrcommon.RESOURCE_TYPE_VPC_EN, cloudItem.VPCLcuuid,
+				ctrlrcommon.RESOURCE_TYPE_PROMETHEUS_TARGET_EN, cloudItem.Lcuuid,
+			)))
+			return nil, nil, false
+		}
+		mapInfo["epc_id"] = vpcID
+		structInfo.VPCID.SetNew(vpcID)
+		structInfo.VPCLcuuid.Set(diffBase.VPCLcuuid, cloudItem.VPCLcuuid)
 	}
-	return nil, false
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

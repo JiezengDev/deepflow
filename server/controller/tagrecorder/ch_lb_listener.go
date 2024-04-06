@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,19 +21,19 @@ import (
 )
 
 type ChLbListener struct {
-	UpdaterBase[mysql.ChLBListener, IDKey]
+	UpdaterComponent[mysql.ChLBListener, IDKey]
 	resourceTypeToIconID map[IconKey]int
 }
 
 func NewChLbListener(resourceTypeToIconID map[IconKey]int) *ChLbListener {
 	updater := &ChLbListener{
-		UpdaterBase[mysql.ChLBListener, IDKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_LB_LISTENER,
-		},
+		newUpdaterComponent[mysql.ChLBListener, IDKey](
+			RESOURCE_TYPE_CH_LB_LISTENER,
+		),
 		resourceTypeToIconID,
 	}
 
-	updater.dataGenerator = updater
+	updater.updaterDG = updater
 	return updater
 }
 

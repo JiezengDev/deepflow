@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan PodReplicaSets
+ * Copyright (c) 2024 Yunshan PodReplicaSets
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 )
 
 type PodReplicaSet struct {
@@ -37,7 +38,7 @@ func (prs *PodReplicaSet) OnUpdaterAdded(addedDBItems []*mysql.PodReplicaSet) {
 	prs.cache.AddPodReplicaSets(addedDBItems)
 }
 
-func (prs *PodReplicaSet) OnUpdaterUpdated(cloudItem *cloudmodel.PodReplicaSet, diffBase *cache.PodReplicaSet) {
+func (prs *PodReplicaSet) OnUpdaterUpdated(cloudItem *cloudmodel.PodReplicaSet, diffBase *diffbase.PodReplicaSet) {
 	diffBase.Update(cloudItem)
 }
 

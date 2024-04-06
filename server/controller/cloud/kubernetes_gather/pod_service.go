@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -72,8 +72,7 @@ func (k *KubernetesGather) getPodServices() (services []model.PodService, servic
 				log.Infof("service (%s) selector not found", name)
 				continue
 			}
-			selectorSlice := cloudcommon.StringInterfaceMapKVs(selector, ":", 0)
-			selectorStrings := strings.Join(selectorSlice, ", ")
+			selectorSlice := cloudcommon.GenerateCustomTag(selector, nil, 0, ":")
 			specTypeString := sData.Get("spec").Get("type").MustString()
 			specType, ok := serviceTypes[specTypeString]
 			if !ok {
@@ -92,25 +91,23 @@ func (k *KubernetesGather) getPodServices() (services []model.PodService, servic
 					labels[cloudcommon.SVC_RULE_RESOURCE_NAME+"_servicerule"] = v
 				}
 			}
-			labelSlice := cloudcommon.StringInterfaceMapKVs(labels, ":", 0)
-			labelString := strings.Join(labelSlice, ", ")
 
 			annotations := metaData.Get("annotations")
-			annotationString := expand.GetAnnotation(annotations, k.customTagLenMax)
+			annotationString := expand.GetAnnotation(annotations, k.annotationRegex, k.customTagLenMax)
 
 			service := model.PodService{
 				Lcuuid:             uID,
 				Name:               name,
-				Label:              labelString,
+				Label:              k.GetLabel(labels),
 				Annotation:         annotationString,
 				Type:               specType,
-				Selector:           selectorStrings,
+				Selector:           strings.Join(selectorSlice, ", "),
 				ServiceClusterIP:   clusterIP,
 				PodNamespaceLcuuid: namespaceLcuuid,
-				VPCLcuuid:          k.VPCUuid,
+				VPCLcuuid:          k.VPCUUID,
 				AZLcuuid:           k.azLcuuid,
-				RegionLcuuid:       k.RegionUuid,
-				PodClusterLcuuid:   common.GetUUID(k.UuidGenerate, uuid.Nil),
+				RegionLcuuid:       k.RegionUUID,
+				PodClusterLcuuid:   k.podClusterLcuuid,
 			}
 			specPorts := sData.Get("spec").Get("ports")
 			var hasPodGroup bool
@@ -215,16 +212,22 @@ func (k *KubernetesGather) getPodServices() (services []model.PodService, servic
 				// 在service确定有pod group的时候添加pod service port
 				servicePorts = append(servicePorts, servicePort)
 				for _, Lcuuid := range podGroupLcuuids.ToSlice() {
+					pgLcuuid, ok := Lcuuid.(string)
+					if !ok {
+						log.Warningf("pod group lcuuid (%v) assert failed", Lcuuid)
+						continue
+					}
 					key := ports.Get("protocol").MustString() + strconv.Itoa(targetPort)
 					podGroupPort := model.PodGroupPort{
-						Lcuuid:           common.GetUUID(uID+Lcuuid.(string)+key, uuid.Nil),
+						Lcuuid:           common.GetUUID(uID+pgLcuuid+key, uuid.Nil),
 						Name:             ports.Get("name").MustString(),
 						Port:             targetPort,
 						Protocol:         strings.ToUpper(ports.Get("protocol").MustString()),
-						PodGroupLcuuid:   Lcuuid.(string),
+						PodGroupLcuuid:   pgLcuuid,
 						PodServiceLcuuid: uID,
 					}
 					podGroupPorts = append(podGroupPorts, podGroupPort)
+					k.pgLcuuidToPSLcuuids[pgLcuuid] = append(k.pgLcuuidToPSLcuuids[pgLcuuid], uID)
 				}
 			}
 			if !hasPodGroup {
@@ -270,7 +273,7 @@ func (k *KubernetesGather) getPodServices() (services []model.PodService, servic
 			Name:          serviceNetworkName,
 			CIDR:          sCIDR,
 			NetworkLcuuid: serviceNetworkLcuuid,
-			VPCLcuuid:     k.VPCUuid,
+			VPCLcuuid:     k.VPCUUID,
 		}
 		subnets = append(subnets, nodeSubnet)
 	}
@@ -283,8 +286,8 @@ func (k *KubernetesGather) getPodServices() (services []model.PodService, servic
 		External:       false,
 		NetType:        common.NETWORK_TYPE_LAN,
 		AZLcuuid:       k.azLcuuid,
-		VPCLcuuid:      k.VPCUuid,
-		RegionLcuuid:   k.RegionUuid,
+		VPCLcuuid:      k.VPCUUID,
+		RegionLcuuid:   k.RegionUUID,
 	}
 	for Lcuuid, IP := range serviceLcuuidToClusterIP {
 		vinterfaceID := common.GetUUID(Lcuuid+common.VIF_DEFAULT_MAC+IP, uuid.Nil)
@@ -295,15 +298,15 @@ func (k *KubernetesGather) getPodServices() (services []model.PodService, servic
 			DeviceLcuuid:  Lcuuid,
 			DeviceType:    common.VIF_DEVICE_TYPE_POD_SERVICE,
 			NetworkLcuuid: serviceNetworkLcuuid,
-			VPCLcuuid:     k.VPCUuid,
-			RegionLcuuid:  k.RegionUuid,
+			VPCLcuuid:     k.VPCUUID,
+			RegionLcuuid:  k.RegionUUID,
 		}
 		vinterfaces = append(vinterfaces, vinterface)
 		ip := model.IP{
 			Lcuuid:           common.GetUUID(Lcuuid+IP, uuid.Nil),
 			VInterfaceLcuuid: vinterfaceID,
 			IP:               IP,
-			RegionLcuuid:     k.RegionUuid,
+			RegionLcuuid:     k.RegionUUID,
 			SubnetLcuuid:     common.GetUUID(serviceNetworkLcuuid, uuid.Nil),
 		}
 		ips = append(ips, ip)

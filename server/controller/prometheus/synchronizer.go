@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@
 package prometheus
 
 import (
+	"sort"
+
 	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/golang/protobuf/proto"
 	"github.com/op/go-logging"
@@ -48,39 +50,30 @@ func NewSynchronizer() *Synchronizer {
 
 func (s *Synchronizer) assembleMetricLabelFully() ([]*trident.MetricLabelResponse, error) {
 	var err error
-	nonLabelNames := mapset.NewSet[string]()
-	nonLabelValues := mapset.NewSet[string]()
+	nonLabelNameIDs := mapset.NewSet[int]()
 	mLabels := make([]*trident.MetricLabelResponse, 0)
 	s.cache.MetricName.Get().Range(func(k, v interface{}) bool {
 		var labels []*trident.LabelResponse
 		metricName := k.(string)
 		metricID := v.(int)
-		labelKeys := s.cache.MetricLabel.GetLabelsByMetricName(metricName)
-		for i := range labelKeys {
-			lk := labelKeys[i]
-			if slices.Contains([]string{TargetLabelInstance, TargetLabelJob}, lk.Name) {
-				continue
-			}
-			labelNameID, ok := s.cache.LabelName.GetIDByName(lk.Name)
+		labelNameIDs := s.cache.MetricLabelName.GetLabelNameIDsByMetricName(metricName)
+		for i := range labelNameIDs {
+			li := labelNameIDs[i]
+			ln, ok := s.cache.LabelName.GetNameByID(li)
 			if !ok {
-				nonLabelNames.Add(lk.Name)
+				nonLabelNameIDs.Add(li)
 				continue
 			}
-			labelValueID, ok := s.cache.LabelValue.GetIDByValue(lk.Value)
-			if !ok {
-				nonLabelValues.Add(lk.Value)
+			if slices.Contains([]string{TargetLabelInstance, TargetLabelJob}, ln) {
 				continue
 			}
-			idx, _ := s.cache.MetricAndAPPLabelLayout.GetIndexByKey(cache.NewLayoutKey(metricName, lk.Name))
+			idx, _ := s.cache.MetricAndAPPLabelLayout.GetIndexByKey(cache.NewLayoutKey(metricName, ln))
 			label := &trident.LabelResponse{
-				Name:                &lk.Name,
-				Value:               &lk.Value,
-				NameId:              proto.Uint32(uint32(labelNameID)),
-				ValueId:             proto.Uint32(uint32(labelValueID)),
+				Name:                &ln,
+				NameId:              proto.Uint32(uint32(li)),
 				AppLabelColumnIndex: proto.Uint32(uint32(idx)),
 			}
 			labels = append(labels, label)
-			s.counter.SendLabelCount++
 		}
 		mLabels = append(mLabels, &trident.MetricLabelResponse{
 			MetricName: &metricName,
@@ -90,13 +83,43 @@ func (s *Synchronizer) assembleMetricLabelFully() ([]*trident.MetricLabelRespons
 		s.counter.SendMetricCount++
 		return true
 	})
+	if nonLabelNameIDs.Cardinality() > 0 {
+		log.Warningf("label name not found, ids: %v", nonLabelNameIDs.ToSlice())
+	}
+	return mLabels, err
+}
+
+func (s *Synchronizer) assembleLabelFully() ([]*trident.LabelResponse, error) {
+	ls := make([]*trident.LabelResponse, 0)
+	nonLabelNames := mapset.NewSet[string]()
+	nonLabelValues := mapset.NewSet[string]()
+	for iter := range s.cache.Label.GetKeyToID().Iter() {
+		k := iter.Key
+		ni, ok := s.cache.LabelName.GetIDByName(k.Name)
+		if !ok {
+			nonLabelNames.Add(k.Name)
+			continue
+		}
+		vi, ok := s.cache.LabelValue.GetIDByValue(k.Value)
+		if !ok {
+			nonLabelValues.Add(k.Value)
+			continue
+		}
+		ls = append(ls, &trident.LabelResponse{
+			Name:    &k.Name,
+			Value:   &k.Value,
+			NameId:  proto.Uint32(uint32(ni)),
+			ValueId: proto.Uint32(uint32(vi)),
+		})
+		s.counter.SendLabelCount++
+	}
 	if nonLabelNames.Cardinality() > 0 {
 		log.Warningf("label name id not found, names: %v", nonLabelNames.ToSlice())
 	}
 	if nonLabelValues.Cardinality() > 0 {
 		log.Warningf("label value id not found, values: %v", nonLabelValues.ToSlice())
 	}
-	return mLabels, err
+	return ls, nil
 }
 
 func (s *Synchronizer) assembleTargetFully() ([]*trident.TargetResponse, error) {
@@ -105,26 +128,51 @@ func (s *Synchronizer) assembleTargetFully() ([]*trident.TargetResponse, error) 
 	nonJobs := mapset.NewSet[string]()
 	targets := make([]*trident.TargetResponse, 0)
 	for tk, targetID := range s.cache.Target.Get() {
-		tInstanceID, ok := s.cache.LabelValue.GetIDByValue(tk.Instance)
+		targetKey := tk
+		tInstanceID, ok := s.cache.LabelValue.GetIDByValue(targetKey.Instance)
 		if !ok {
-			nonInstances.Add(tk.Instance)
+			nonInstances.Add(targetKey.Instance)
 			continue
 		}
-		tJobID, ok := s.cache.LabelValue.GetIDByValue(tk.Job)
+		tJobID, ok := s.cache.LabelValue.GetIDByValue(targetKey.Job)
 		if !ok {
-			nonJobs.Add(tk.Job)
+			nonJobs.Add(targetKey.Job)
 			continue
 		}
+
+		var labelNIDs []uint32
+		for _, n := range s.cache.Target.GetLabelNamesByID(targetID) {
+			if id, ok := s.cache.LabelName.GetIDByName(n); ok {
+				labelNIDs = append(labelNIDs, uint32(id))
+			}
+		}
+		sort.Slice(labelNIDs, func(i, j int) bool {
+			return labelNIDs[i] < labelNIDs[j]
+		})
+
+		metricIDs := s.cache.MetricTarget.GetMetricIDsByTargetID(targetID)
+		sort.Slice(metricIDs, func(i, j int) bool {
+			return metricIDs[i] < metricIDs[j]
+		})
+
 		targets = append(targets, &trident.TargetResponse{
-			Instance:   &tk.Instance,
-			Job:        &tk.Job,
-			InstanceId: proto.Uint32(uint32(tInstanceID)),
-			JobId:      proto.Uint32(uint32(tJobID)),
-			TargetId:   proto.Uint32(uint32(targetID)),
-			MetricIds:  s.cache.MetricTarget.GetMetricIDsByTargetID(targetID),
+			Instance:           &targetKey.Instance,
+			Job:                &targetKey.Job,
+			InstanceId:         proto.Uint32(uint32(tInstanceID)),
+			JobId:              proto.Uint32(uint32(tJobID)),
+			TargetId:           proto.Uint32(uint32(targetID)),
+			MetricIds:          metricIDs,
+			TargetLabelNameIds: labelNIDs,
+			PodClusterId:       proto.Uint32(uint32(targetKey.PodClusterID)),
+			EpcId:              proto.Uint32(uint32(targetKey.VPCID)),
 		})
 		s.counter.SendTargetCount++
 	}
+
+	sort.Slice(targets, func(i, j int) bool {
+		return targets[i].GetTargetId() < targets[j].GetTargetId()
+	})
+
 	if nonInstances.Cardinality() > 0 {
 		log.Warningf("target instance id not found, instances: %v", nonInstances.ToSlice())
 	}

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,10 +19,10 @@ package event
 import (
 	"fmt"
 
-	"github.com/deepflowio/deepflow/server/controller/common"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
-	. "github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
+	rcommon "github.com/deepflowio/deepflow/server/controller/recorder/common"
 	"github.com/deepflowio/deepflow/server/controller/recorder/constraint"
 	"github.com/deepflowio/deepflow/server/libs/eventapi"
 )
@@ -35,37 +35,50 @@ var (
 	DESCRemoveIPFormat    = "%s remove ip %s(mac: %s) in subnet %s."
 )
 
-func GetDeviceOptionsByDeviceID(t *cache.ToolDataSet, deviceType, deviceID int) ([]eventapi.TagFieldOption, error) {
-	switch deviceType {
-	case common.VIF_DEVICE_TYPE_HOST:
-		return getHostOptionsByID(t, deviceID)
-	case common.VIF_DEVICE_TYPE_VM:
-		return getVMOptionsByID(t, deviceID)
-	case common.VIF_DEVICE_TYPE_VROUTER:
-		return getVRouterOptionsByID(t, deviceID)
-	case common.VIF_DEVICE_TYPE_DHCP_PORT:
-		return getDHCPPortOptionsByID(t, deviceID)
-	case common.VIF_DEVICE_TYPE_NAT_GATEWAY:
-		return getNatGateWayOptionsByID(t, deviceID)
-	case common.VIF_DEVICE_TYPE_LB:
-		return getLBOptionsByID(t, deviceID)
-	case common.VIF_DEVICE_TYPE_RDS_INSTANCE:
-		return getRDSInstanceOptionsByID(t, deviceID)
-	case common.VIF_DEVICE_TYPE_REDIS_INSTANCE:
-		return getRedisInstanceOptionsByID(t, deviceID)
-	case common.VIF_DEVICE_TYPE_POD_NODE:
-		return getPodNodeOptionsByID(t, deviceID)
-	case common.VIF_DEVICE_TYPE_POD_SERVICE:
-		return getPodServiceOptionsByID(t, deviceID)
-	case common.VIF_DEVICE_TYPE_POD:
-		return getPodOptionsByID(t, deviceID)
-	default:
-		return nil, fmt.Errorf("device type %d not supported", deviceType)
+type IPTool struct {
+	org *rcommon.ORG
+
+	t *tool.DataSet
+}
+
+func newTool(t *tool.DataSet) *IPTool {
+	return &IPTool{
+		org: t.GetORG(),
+		t:   t,
 	}
 }
 
-func getHostOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagFieldOption, error) {
-	info, err := t.GetHostInfoByID(id)
+func (i *IPTool) GetDeviceOptionsByDeviceID(deviceType, deviceID int) ([]eventapi.TagFieldOption, error) {
+	switch deviceType {
+	case ctrlrcommon.VIF_DEVICE_TYPE_HOST:
+		return i.getHostOptionsByID(deviceID)
+	case ctrlrcommon.VIF_DEVICE_TYPE_VM:
+		return i.getVMOptionsByID(deviceID)
+	case ctrlrcommon.VIF_DEVICE_TYPE_VROUTER:
+		return i.getVRouterOptionsByID(deviceID)
+	case ctrlrcommon.VIF_DEVICE_TYPE_DHCP_PORT:
+		return i.getDHCPPortOptionsByID(deviceID)
+	case ctrlrcommon.VIF_DEVICE_TYPE_NAT_GATEWAY:
+		return i.getNatGateWayOptionsByID(deviceID)
+	case ctrlrcommon.VIF_DEVICE_TYPE_LB:
+		return i.getLBOptionsByID(deviceID)
+	case ctrlrcommon.VIF_DEVICE_TYPE_RDS_INSTANCE:
+		return i.getRDSInstanceOptionsByID(deviceID)
+	case ctrlrcommon.VIF_DEVICE_TYPE_REDIS_INSTANCE:
+		return i.getRedisInstanceOptionsByID(deviceID)
+	case ctrlrcommon.VIF_DEVICE_TYPE_POD_NODE:
+		return i.getPodNodeOptionsByID(deviceID)
+	case ctrlrcommon.VIF_DEVICE_TYPE_POD_SERVICE:
+		return i.getPodServiceOptionsByID(deviceID)
+	case ctrlrcommon.VIF_DEVICE_TYPE_POD:
+		return i.getPodOptionsByID(deviceID)
+	default:
+		return nil, fmt.Errorf(i.org.LogPre("device type %d not supported", deviceType))
+	}
+}
+
+func (i *IPTool) getHostOptionsByID(id int) ([]eventapi.TagFieldOption, error) {
+	info, err := i.t.GetHostInfoByID(id)
 	if err != nil {
 		return nil, err
 	}
@@ -78,8 +91,8 @@ func getHostOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagFieldOption
 	return opts, nil
 }
 
-func getVMOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagFieldOption, error) {
-	info, err := t.GetVMInfoByID(id)
+func (i *IPTool) getVMOptionsByID(id int) ([]eventapi.TagFieldOption, error) {
+	info, err := i.t.GetVMInfoByID(id)
 	if err != nil {
 		return nil, err
 	}
@@ -90,14 +103,14 @@ func getVMOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagFieldOption, 
 		eventapi.TagAZID(info.AZID),
 		eventapi.TagVPCID(info.VPCID),
 		eventapi.TagHostID(info.HostID),
-		eventapi.TagL3DeviceType(common.VIF_DEVICE_TYPE_VM),
+		eventapi.TagL3DeviceType(ctrlrcommon.VIF_DEVICE_TYPE_VM),
 		eventapi.TagL3DeviceID(id),
 	}...)
 	return opts, nil
 }
 
-func getVRouterOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagFieldOption, error) {
-	info, err := t.GetVRouterInfoByID(id)
+func (i *IPTool) getVRouterOptionsByID(id int) ([]eventapi.TagFieldOption, error) {
+	info, err := i.t.GetVRouterInfoByID(id)
 	if err != nil {
 		return nil, err
 	}
@@ -106,13 +119,13 @@ func getVRouterOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagFieldOpt
 	opts = append(opts, []eventapi.TagFieldOption{
 		eventapi.TagRegionID(info.RegionID),
 		eventapi.TagVPCID(info.VPCID),
-		eventapi.TagL3DeviceType(common.VIF_DEVICE_TYPE_VROUTER),
+		eventapi.TagL3DeviceType(ctrlrcommon.VIF_DEVICE_TYPE_VROUTER),
 		eventapi.TagL3DeviceID(id),
 	}...)
 
-	hostID, ok := t.GetHostIDByIP(info.GWLaunchServer)
+	hostID, ok := i.t.GetHostIDByIP(info.GWLaunchServer)
 	if !ok {
-		log.Error(idByIPNotFound(RESOURCE_TYPE_HOST_EN, info.GWLaunchServer))
+		log.Error(idByIPNotFound(ctrlrcommon.RESOURCE_TYPE_HOST_EN, info.GWLaunchServer))
 	} else {
 		opts = append(opts, []eventapi.TagFieldOption{
 			eventapi.TagHostID(hostID),
@@ -122,8 +135,8 @@ func getVRouterOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagFieldOpt
 	return opts, nil
 }
 
-func getDHCPPortOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagFieldOption, error) {
-	info, err := t.GetDHCPPortInfoByID(id)
+func (i *IPTool) getDHCPPortOptionsByID(id int) ([]eventapi.TagFieldOption, error) {
+	info, err := i.t.GetDHCPPortInfoByID(id)
 	if err != nil {
 		return nil, err
 	}
@@ -133,14 +146,14 @@ func getDHCPPortOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagFieldOp
 		eventapi.TagRegionID(info.RegionID),
 		eventapi.TagAZID(info.AZID),
 		eventapi.TagVPCID(info.VPCID),
-		eventapi.TagL3DeviceType(common.VIF_DEVICE_TYPE_DHCP_PORT),
+		eventapi.TagL3DeviceType(ctrlrcommon.VIF_DEVICE_TYPE_DHCP_PORT),
 		eventapi.TagL3DeviceID(id),
 	}...)
 	return opts, nil
 }
 
-func getNatGateWayOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagFieldOption, error) {
-	info, err := t.GetNATGatewayInfoByID(id)
+func (i *IPTool) getNatGateWayOptionsByID(id int) ([]eventapi.TagFieldOption, error) {
+	info, err := i.t.GetNATGatewayInfoByID(id)
 	if err != nil {
 		return nil, err
 	}
@@ -150,14 +163,14 @@ func getNatGateWayOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagField
 		eventapi.TagRegionID(info.RegionID),
 		eventapi.TagAZID(info.AZID),
 		eventapi.TagVPCID(info.VPCID),
-		eventapi.TagL3DeviceType(common.VIF_DEVICE_TYPE_NAT_GATEWAY),
+		eventapi.TagL3DeviceType(ctrlrcommon.VIF_DEVICE_TYPE_NAT_GATEWAY),
 		eventapi.TagL3DeviceID(id),
 	}...)
 	return opts, nil
 }
 
-func getLBOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagFieldOption, error) {
-	info, err := t.GetLBInfoByID(id)
+func (i *IPTool) getLBOptionsByID(id int) ([]eventapi.TagFieldOption, error) {
+	info, err := i.t.GetLBInfoByID(id)
 	if err != nil {
 		return nil, err
 	}
@@ -166,31 +179,14 @@ func getLBOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagFieldOption, 
 	opts = append(opts, []eventapi.TagFieldOption{
 		eventapi.TagRegionID(info.RegionID),
 		eventapi.TagVPCID(info.VPCID),
-		eventapi.TagL3DeviceType(common.VIF_DEVICE_TYPE_LB),
+		eventapi.TagL3DeviceType(ctrlrcommon.VIF_DEVICE_TYPE_LB),
 		eventapi.TagL3DeviceID(id),
 	}...)
 	return opts, nil
 }
 
-func getRDSInstanceOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagFieldOption, error) {
-	info, err := t.GetRDSInstanceInfoByID(id)
-	if err != nil {
-		return nil, err
-	}
-
-	var opts []eventapi.TagFieldOption
-	opts = append(opts, []eventapi.TagFieldOption{
-		eventapi.TagRegionID(info.RegionID),
-		eventapi.TagAZID(info.AZID),
-		eventapi.TagVPCID(info.VPCID),
-		eventapi.TagL3DeviceType(common.VIF_DEVICE_TYPE_RDS_INSTANCE),
-		eventapi.TagL3DeviceID(id),
-	}...)
-	return opts, nil
-}
-
-func getRedisInstanceOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagFieldOption, error) {
-	info, err := t.GetRedisInstanceInfoByID(id)
+func (i *IPTool) getRDSInstanceOptionsByID(id int) ([]eventapi.TagFieldOption, error) {
+	info, err := i.t.GetRDSInstanceInfoByID(id)
 	if err != nil {
 		return nil, err
 	}
@@ -200,14 +196,31 @@ func getRedisInstanceOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagFi
 		eventapi.TagRegionID(info.RegionID),
 		eventapi.TagAZID(info.AZID),
 		eventapi.TagVPCID(info.VPCID),
-		eventapi.TagL3DeviceType(common.VIF_DEVICE_TYPE_REDIS_INSTANCE),
+		eventapi.TagL3DeviceType(ctrlrcommon.VIF_DEVICE_TYPE_RDS_INSTANCE),
 		eventapi.TagL3DeviceID(id),
 	}...)
 	return opts, nil
 }
 
-func getPodNodeOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagFieldOption, error) {
-	info, err := t.GetPodNodeInfoByID(id)
+func (i *IPTool) getRedisInstanceOptionsByID(id int) ([]eventapi.TagFieldOption, error) {
+	info, err := i.t.GetRedisInstanceInfoByID(id)
+	if err != nil {
+		return nil, err
+	}
+
+	var opts []eventapi.TagFieldOption
+	opts = append(opts, []eventapi.TagFieldOption{
+		eventapi.TagRegionID(info.RegionID),
+		eventapi.TagAZID(info.AZID),
+		eventapi.TagVPCID(info.VPCID),
+		eventapi.TagL3DeviceType(ctrlrcommon.VIF_DEVICE_TYPE_REDIS_INSTANCE),
+		eventapi.TagL3DeviceID(id),
+	}...)
+	return opts, nil
+}
+
+func (i *IPTool) getPodNodeOptionsByID(id int) ([]eventapi.TagFieldOption, error) {
+	info, err := i.t.GetPodNodeInfoByID(id)
 	if err != nil {
 		return nil, err
 	}
@@ -223,8 +236,8 @@ func getPodNodeOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagFieldOpt
 	return opts, nil
 }
 
-func getPodServiceOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagFieldOption, error) {
-	info, err := t.GetPodServiceInfoByID(id)
+func (i *IPTool) getPodServiceOptionsByID(id int) ([]eventapi.TagFieldOption, error) {
+	info, err := i.t.GetPodServiceInfoByID(id)
 	if err != nil {
 		return nil, err
 	}
@@ -234,7 +247,7 @@ func getPodServiceOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagField
 		eventapi.TagRegionID(info.RegionID),
 		eventapi.TagAZID(info.AZID),
 		eventapi.TagVPCID(info.VPCID),
-		eventapi.TagL3DeviceType(common.VIF_DEVICE_TYPE_POD_SERVICE),
+		eventapi.TagL3DeviceType(ctrlrcommon.VIF_DEVICE_TYPE_POD_SERVICE),
 		eventapi.TagL3DeviceID(id),
 		eventapi.TagPodClusterID(info.PodClusterID),
 		eventapi.TagPodNSID(info.PodNamespaceID),
@@ -243,8 +256,8 @@ func getPodServiceOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagField
 	return opts, nil
 }
 
-func getPodOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagFieldOption, error) {
-	info, err := t.GetPodInfoByID(id)
+func (i *IPTool) getPodOptionsByID(id int) ([]eventapi.TagFieldOption, error) {
+	info, err := i.t.GetPodInfoByID(id)
 	if err != nil {
 		return nil, err
 	}
@@ -263,11 +276,11 @@ func getPodOptionsByID(t *cache.ToolDataSet, id int) ([]eventapi.TagFieldOption,
 	return opts, nil
 }
 
-func getL3DeviceOptionsByPodNodeID(t *cache.ToolDataSet, id int) (opts []eventapi.TagFieldOption, ok bool) {
-	vmID, ok := t.GetVMIDByPodNodeID(id)
+func (i *IPTool) getL3DeviceOptionsByPodNodeID(id int) (opts []eventapi.TagFieldOption, ok bool) {
+	vmID, ok := i.t.GetVMIDByPodNodeID(id)
 	if ok {
-		opts = append(opts, []eventapi.TagFieldOption{eventapi.TagL3DeviceType(common.VIF_DEVICE_TYPE_VM), eventapi.TagL3DeviceID(vmID)}...)
-		vmInfo, err := t.GetVMInfoByID(vmID)
+		opts = append(opts, []eventapi.TagFieldOption{eventapi.TagL3DeviceType(ctrlrcommon.VIF_DEVICE_TYPE_VM), eventapi.TagL3DeviceID(vmID)}...)
+		vmInfo, err := i.t.GetVMInfoByID(vmID)
 		if err != nil {
 			log.Error(err)
 		} else {
@@ -277,9 +290,95 @@ func getL3DeviceOptionsByPodNodeID(t *cache.ToolDataSet, id int) (opts []eventap
 	return
 }
 
-func findFromAllByID[MT constraint.MySQLSoftDeleteModel](id int) *MT {
+func (i *IPTool) getDeviceNameFromAllByID(deviceType, deviceID int) string {
+	switch deviceType {
+	case ctrlrcommon.VIF_DEVICE_TYPE_HOST:
+		device := findFromAllByID[mysql.Host](i.org.DB, deviceID)
+		if device == nil {
+			log.Error(i.org.LogPre(dbSoftDeletedResourceByIDNotFound(ctrlrcommon.RESOURCE_TYPE_HOST_EN, deviceID)))
+		} else {
+			return device.Name
+		}
+	case ctrlrcommon.VIF_DEVICE_TYPE_VM:
+		device := findFromAllByID[mysql.VM](i.org.DB, deviceID)
+		if device == nil {
+			log.Error(i.org.LogPre(dbSoftDeletedResourceByIDNotFound(ctrlrcommon.RESOURCE_TYPE_VM_EN, deviceID)))
+		} else {
+			return device.Name
+		}
+	case ctrlrcommon.VIF_DEVICE_TYPE_VROUTER:
+		device := findFromAllByID[mysql.VRouter](i.org.DB, deviceID)
+		if device == nil {
+			log.Error(i.org.LogPre(dbSoftDeletedResourceByIDNotFound(ctrlrcommon.RESOURCE_TYPE_VROUTER_EN, deviceID)))
+		} else {
+			return device.Name
+		}
+	case ctrlrcommon.VIF_DEVICE_TYPE_DHCP_PORT:
+		device := findFromAllByID[mysql.DHCPPort](i.org.DB, deviceID)
+		if device == nil {
+			log.Error(i.org.LogPre(dbSoftDeletedResourceByIDNotFound(ctrlrcommon.RESOURCE_TYPE_DHCP_PORT_EN, deviceID)))
+		} else {
+			return device.Name
+		}
+	case ctrlrcommon.VIF_DEVICE_TYPE_NAT_GATEWAY:
+		device := findFromAllByID[mysql.NATGateway](i.org.DB, deviceID)
+		if device == nil {
+			log.Error(i.org.LogPre(dbSoftDeletedResourceByIDNotFound(ctrlrcommon.RESOURCE_TYPE_NAT_GATEWAY_EN, deviceID)))
+		} else {
+			return device.Name
+		}
+	case ctrlrcommon.VIF_DEVICE_TYPE_LB:
+		device := findFromAllByID[mysql.LB](i.org.DB, deviceID)
+		if device == nil {
+			log.Error(i.org.LogPre(dbSoftDeletedResourceByIDNotFound(ctrlrcommon.RESOURCE_TYPE_LB_EN, deviceID)))
+		} else {
+			return device.Name
+		}
+	case ctrlrcommon.VIF_DEVICE_TYPE_RDS_INSTANCE:
+		device := findFromAllByID[mysql.RDSInstance](i.org.DB, deviceID)
+		if device == nil {
+			log.Error(i.org.LogPre(dbSoftDeletedResourceByIDNotFound(ctrlrcommon.RESOURCE_TYPE_RDS_INSTANCE_EN, deviceID)))
+		} else {
+			return device.Name
+		}
+	case ctrlrcommon.VIF_DEVICE_TYPE_REDIS_INSTANCE:
+		device := findFromAllByID[mysql.RedisInstance](i.org.DB, deviceID)
+		if device == nil {
+			log.Error(i.org.LogPre(dbSoftDeletedResourceByIDNotFound(ctrlrcommon.RESOURCE_TYPE_REDIS_INSTANCE_EN, deviceID)))
+		} else {
+			return device.Name
+		}
+	case ctrlrcommon.VIF_DEVICE_TYPE_POD_NODE:
+		device := findFromAllByID[mysql.PodNode](i.org.DB, deviceID)
+		if device == nil {
+			log.Error(i.org.LogPre(dbSoftDeletedResourceByIDNotFound(ctrlrcommon.RESOURCE_TYPE_POD_NODE_EN, deviceID)))
+		} else {
+			return device.Name
+		}
+	case ctrlrcommon.VIF_DEVICE_TYPE_POD_SERVICE:
+		device := findFromAllByID[mysql.PodService](i.org.DB, deviceID)
+		if device == nil {
+			log.Error(i.org.LogPre(dbSoftDeletedResourceByIDNotFound(ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN, deviceID)))
+		} else {
+			return device.Name
+		}
+	case ctrlrcommon.VIF_DEVICE_TYPE_POD:
+		device := findFromAllByID[mysql.Pod](i.org.DB, deviceID)
+		if device == nil {
+			log.Error(i.org.LogPre(dbSoftDeletedResourceByIDNotFound(ctrlrcommon.RESOURCE_TYPE_POD_EN, deviceID)))
+		} else {
+			return device.Name
+		}
+	default:
+		log.Error(i.org.LogPre("device type: %d is not supported", deviceType))
+		return ""
+	}
+	return ""
+}
+
+func findFromAllByID[MT constraint.MySQLSoftDeleteModel](db *mysql.DB, id int) *MT {
 	var item *MT
-	res := mysql.Db.Unscoped().Where("id = ?", id).Find(&item)
+	res := db.Unscoped().Where("id = ?", id).Find(&item)
 	if res.Error != nil {
 		log.Error(dbQueryFailed(res.Error))
 		return nil
@@ -288,90 +387,4 @@ func findFromAllByID[MT constraint.MySQLSoftDeleteModel](id int) *MT {
 		return nil
 	}
 	return item
-}
-
-func getDeviceNameFromAllByID(deviceType, deviceID int) string {
-	switch deviceType {
-	case common.VIF_DEVICE_TYPE_HOST:
-		device := findFromAllByID[mysql.Host](deviceID)
-		if device == nil {
-			log.Errorf(dbSoftDeletedResourceByIDNotFound(RESOURCE_TYPE_HOST_EN, deviceID))
-		} else {
-			return device.Name
-		}
-	case common.VIF_DEVICE_TYPE_VM:
-		device := findFromAllByID[mysql.VM](deviceID)
-		if device == nil {
-			log.Errorf(dbSoftDeletedResourceByIDNotFound(RESOURCE_TYPE_VM_EN, deviceID))
-		} else {
-			return device.Name
-		}
-	case common.VIF_DEVICE_TYPE_VROUTER:
-		device := findFromAllByID[mysql.VRouter](deviceID)
-		if device == nil {
-			log.Errorf(dbSoftDeletedResourceByIDNotFound(RESOURCE_TYPE_VROUTER_EN, deviceID))
-		} else {
-			return device.Name
-		}
-	case common.VIF_DEVICE_TYPE_DHCP_PORT:
-		device := findFromAllByID[mysql.DHCPPort](deviceID)
-		if device == nil {
-			log.Errorf(dbSoftDeletedResourceByIDNotFound(RESOURCE_TYPE_DHCP_PORT_EN, deviceID))
-		} else {
-			return device.Name
-		}
-	case common.VIF_DEVICE_TYPE_NAT_GATEWAY:
-		device := findFromAllByID[mysql.NATGateway](deviceID)
-		if device == nil {
-			log.Errorf(dbSoftDeletedResourceByIDNotFound(RESOURCE_TYPE_NAT_GATEWAY_EN, deviceID))
-		} else {
-			return device.Name
-		}
-	case common.VIF_DEVICE_TYPE_LB:
-		device := findFromAllByID[mysql.LB](deviceID)
-		if device == nil {
-			log.Errorf(dbSoftDeletedResourceByIDNotFound(RESOURCE_TYPE_LB_EN, deviceID))
-		} else {
-			return device.Name
-		}
-	case common.VIF_DEVICE_TYPE_RDS_INSTANCE:
-		device := findFromAllByID[mysql.RDSInstance](deviceID)
-		if device == nil {
-			log.Errorf(dbSoftDeletedResourceByIDNotFound(RESOURCE_TYPE_RDS_INSTANCE_EN, deviceID))
-		} else {
-			return device.Name
-		}
-	case common.VIF_DEVICE_TYPE_REDIS_INSTANCE:
-		device := findFromAllByID[mysql.RedisInstance](deviceID)
-		if device == nil {
-			log.Errorf(dbSoftDeletedResourceByIDNotFound(RESOURCE_TYPE_REDIS_INSTANCE_EN, deviceID))
-		} else {
-			return device.Name
-		}
-	case common.VIF_DEVICE_TYPE_POD_NODE:
-		device := findFromAllByID[mysql.PodNode](deviceID)
-		if device == nil {
-			log.Errorf(dbSoftDeletedResourceByIDNotFound(RESOURCE_TYPE_POD_NODE_EN, deviceID))
-		} else {
-			return device.Name
-		}
-	case common.VIF_DEVICE_TYPE_POD_SERVICE:
-		device := findFromAllByID[mysql.PodService](deviceID)
-		if device == nil {
-			log.Errorf(dbSoftDeletedResourceByIDNotFound(RESOURCE_TYPE_POD_SERVICE_EN, deviceID))
-		} else {
-			return device.Name
-		}
-	case common.VIF_DEVICE_TYPE_POD:
-		device := findFromAllByID[mysql.Pod](deviceID)
-		if device == nil {
-			log.Errorf(dbSoftDeletedResourceByIDNotFound(RESOURCE_TYPE_POD_EN, deviceID))
-		} else {
-			return device.Name
-		}
-	default:
-		log.Errorf("device type: %d is not supported", deviceType)
-		return ""
-	}
-	return ""
 }

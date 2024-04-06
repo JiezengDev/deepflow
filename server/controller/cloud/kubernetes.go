@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,22 +17,21 @@
 package cloud
 
 import (
-	"fmt"
+	"time"
+
+	uuid "github.com/satori/go.uuid"
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/satori/go.uuid"
 )
 
 // Kubernetes平台直接使用对应kubernetesgather的resource作为cloud的resource
 func (c *Cloud) getKubernetesData() model.Resource {
 	k8sGatherTask, ok := c.kubernetesGatherTaskMap[c.basicInfo.Lcuuid]
 	if !ok {
-		errMSG := fmt.Sprintf("domain (%s) no related kubernetes_gather_task", c.basicInfo.Name)
-		log.Warning(errMSG)
+		log.Warningf("domain (%s) no related kubernetes_gather_task", c.basicInfo.Name)
 		return model.Resource{
-			ErrorMessage: errMSG,
-			ErrorState:   common.RESOURCE_STATE_CODE_EXCEPTION,
+			ErrorState: common.RESOURCE_STATE_CODE_SUCCESS,
 		}
 	}
 	kubernetesGatherResource := k8sGatherTask.GetResource()
@@ -95,6 +94,8 @@ func (c *Cloud) getKubernetesData() model.Resource {
 			Label:        node.Lcuuid,
 			HType:        common.VM_HTYPE_VM_C,
 			State:        state,
+			IP:           node.IP,
+			Hostname:     node.Hostname,
 			VPCLcuuid:    node.VPCLcuuid,
 			AZLcuuid:     node.AZLcuuid,
 			RegionLcuuid: node.RegionLcuuid,
@@ -106,8 +107,20 @@ func (c *Cloud) getKubernetesData() model.Resource {
 		})
 	}
 
+	if len(vms) == 0 {
+		return model.Resource{
+			ErrorState:   kubernetesGatherResource.ErrorState,
+			ErrorMessage: "invalid vm count (0). " + kubernetesGatherResource.ErrorMessage,
+		}
+	}
+
+	if kubernetesGatherResource.ErrorState == common.RESOURCE_STATE_CODE_SUCCESS {
+		c.sendStatsd(k8sGatherTask.GetGatherCost())
+	}
+
 	return model.Resource{
 		Verified:               true,
+		SyncAt:                 time.Now(),
 		AZs:                    []model.AZ{kubernetesGatherResource.AZ},
 		VPCs:                   []model.VPC{kubernetesGatherResource.VPC},
 		PodClusters:            []model.PodCluster{kubernetesGatherResource.PodCluster},

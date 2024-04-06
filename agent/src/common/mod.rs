@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -53,10 +53,12 @@ use std::{
     sync::Arc,
 };
 
+use num_enum::IntoPrimitive;
+
 use crate::common::policy::Acl;
 use public::proto::common::TridentType;
 
-use policy::{Cidr, IpGroupData, PeerConnection};
+use policy::{Cidr, Container, IpGroupData, PeerConnection};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct XflowKey {
@@ -77,6 +79,17 @@ impl fmt::Display for XflowKey {
     }
 }
 
+#[derive(Debug, PartialEq, Clone, Copy, IntoPrimitive)]
+#[repr(u16)]
+pub enum FlowAclListenerId {
+    Policy = 0,
+    NpbBandWatcher = 1,
+    EbpfDispatcher = 2,
+    // There are multiple Dispatcher in Agent, and Dispatcher ID increases from FlowAclListenerId::Dispatcher.
+    // FlowAclListenerId::Dispatcher must be the last one.
+    Dispatcher = 3,
+}
+
 pub trait FlowAclListener: Send + Sync {
     fn flow_acl_change(
         &mut self,
@@ -88,5 +101,6 @@ pub trait FlowAclListener: Send + Sync {
         cidrs: &Vec<Arc<Cidr>>,
         acls: &Vec<Arc<Acl>>,
     ) -> Result<(), String>;
+    fn containers_change(&mut self, _: &Vec<Arc<Container>>) {}
     fn id(&self) -> usize;
 }

@@ -22,12 +22,14 @@
 #include <time.h>
 #include <string.h>
 #include <stdlib.h>
+#include <pthread.h>
 #include "types.h"
 #include "clib.h"
 #include "log.h"
 
 #define __unused __attribute__((__unused__))
 
+#define PORT_NUM_MAX	65536
 #define NS_IN_SEC       1000000000ULL
 #define NS_IN_MSEC      1000000ULL
 #define TIME_TYPE_NAN   1
@@ -40,6 +42,9 @@
 #ifndef NELEMS
 #define NELEMS(a) (sizeof(a) / sizeof((a)[0]))
 #endif
+
+#define MAX_PATH_LENGTH 1024
+#define CONTAINER_ID_SIZE 65
 
 struct sysinfo {
 	long uptime;
@@ -247,7 +252,7 @@ uint32_t get_sys_uptime(void);
 u64 get_sys_btime_msecs(void);
 u64 get_process_starttime(pid_t pid);
 int max_rlim_open_files_set(int num);
-int fetch_kernel_version(int *major, int *minor, int *patch);
+int fetch_kernel_version(int *major, int *minor, int *rev, int *num);
 unsigned int fetch_kernel_version_code(void);
 int get_num_possible_cpus(void);
 
@@ -264,4 +269,23 @@ u64 get_process_starttime_and_comm(pid_t pid,
 				   char *name_base,
 				   int len);
 u32 legacy_fetch_log2_page_size(void);
+u64 get_netns_id_from_pid(pid_t pid);
+int get_nspid(int pid);
+int get_target_uid_and_gid(int target_pid, int *uid, int *gid);
+int copy_file(const char *src_file, const char *dest_file);
+int df_enter_ns(int pid, const char *type, int *self_fd);
+void df_exit_ns(int fd);
+int gen_file_from_mem(const char *mem_ptr, int write_bytes, const char *path);
+int exec_command(const char *cmd, const char *args);
+u64 current_sys_time_secs(void);
+int fetch_container_id_from_str(char *buff, char *id, int copy_bytes);
+int fetch_container_id(pid_t pid, char *id, int copy_bytes);
+int parse_num_range(const char *config_str, int bytes_count,
+		    bool **mask, int *count);
+int parse_num_range_disorder(const char *config_str,
+			     int bytes_count, bool ** mask);
+int generate_random_integer(int max_value);
+#if !defined(AARCH64_MUSL) && !defined(JAVA_AGENT_ATTACH_TOOL)
+int create_work_thread(const char *name, pthread_t *t, void *fn, void *arg);
+#endif /* !defined(AARCH64_MUSL) && !defined(JAVA_AGENT_ATTACH_TOOL) */
 #endif /* DF_COMMON_H */

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -56,9 +56,6 @@ func (e *SynchronizerEvent) GetPrometheusTargets(ctx context.Context, in *triden
 	if err != nil {
 		log.Errorf("target error: %+v", err)
 		return &trident.PrometheusTargetResponse{}, nil
-	}
-	if in.GetVersion() != resp.GetVersion() {
-		log.Infof("target version update from %d to %d", in.GetVersion(), resp.GetVersion())
 	}
 	return resp, err
 }

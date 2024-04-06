@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,29 +18,55 @@ package updater
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type VIP struct {
-	UpdaterBase[cloudmodel.VIP, mysql.VIP, *cache.VIP]
+	UpdaterBase[
+		cloudmodel.VIP,
+		mysql.VIP,
+		*diffbase.VIP,
+		*message.VIPAdd,
+		message.VIPAdd,
+		*message.VIPUpdate,
+		message.VIPUpdate,
+		*message.VIPFieldsUpdate,
+		message.VIPFieldsUpdate,
+		*message.VIPDelete,
+		message.VIPDelete]
 }
 
 func NewVIP(wholeCache *cache.Cache, cloudData []cloudmodel.VIP) *VIP {
 	updater := &VIP{
-		UpdaterBase[cloudmodel.VIP, mysql.VIP, *cache.VIP]{
-			cache:        wholeCache,
-			dbOperator:   db.NewVIP(),
-			diffBaseData: wholeCache.VIP,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.VIP,
+			mysql.VIP,
+			*diffbase.VIP,
+			*message.VIPAdd,
+			message.VIPAdd,
+			*message.VIPUpdate,
+			message.VIPUpdate,
+			*message.VIPFieldsUpdate,
+			message.VIPFieldsUpdate,
+			*message.VIPDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_VIP_EN,
+			wholeCache,
+			db.NewVIP().SetORG(wholeCache.GetORG()),
+			wholeCache.DiffBaseDataSet.VIP,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
 }
 
-func (p *VIP) getDiffBaseByCloudItem(cloudItem *cloudmodel.VIP) (diffBase *cache.VIP, exits bool) {
+func (p *VIP) getDiffBaseByCloudItem(cloudItem *cloudmodel.VIP) (diffBase *diffbase.VIP, exits bool) {
 	diffBase, exits = p.diffBaseData[cloudItem.Lcuuid]
 	return
 }
@@ -56,17 +82,17 @@ func (p *VIP) generateDBItemToAdd(cloudItem *cloudmodel.VIP) (*mysql.VIP, bool) 
 	return dbItem, true
 }
 
-func (p *VIP) generateUpdateInfo(diffBase *cache.VIP, cloudItem *cloudmodel.VIP) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (p *VIP) generateUpdateInfo(diffBase *diffbase.VIP, cloudItem *cloudmodel.VIP) (*message.VIPFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.VIPFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.IP != cloudItem.IP {
-		updateInfo["ip"] = cloudItem.IP
+		mapInfo["ip"] = cloudItem.IP
+		structInfo.IP.Set(diffBase.IP, cloudItem.IP)
 	}
 	if diffBase.VTapID != cloudItem.VTapID {
-		updateInfo["vtap_id"] = cloudItem.VTapID
+		mapInfo["vtap_id"] = cloudItem.VTapID
+		structInfo.VTapID.Set(diffBase.VTapID, cloudItem.VTapID)
 	}
 
-	if len(updateInfo) > 0 {
-		return updateInfo, true
-	}
-	return nil, false
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

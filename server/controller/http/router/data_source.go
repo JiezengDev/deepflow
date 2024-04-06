@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/binding"
 
+	"github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/config"
 	httpcommon "github.com/deepflowio/deepflow/server/controller/http/common"
 	. "github.com/deepflowio/deepflow/server/controller/http/router/common"
@@ -37,7 +38,7 @@ func NewDataSource(cfg *config.ControllerConfig) *DataSource {
 
 func (ds *DataSource) RegisterTo(e *gin.Engine) {
 	e.GET("/v1/data-sources/:lcuuid/", getDataSource)
-	e.GET("/v1/data-sources/", getDataSources)
+	e.GET("/v1/data-sources/", getDataSources(ds.cfg))
 	e.POST("/v1/data-sources/", createDataSource(ds.cfg))
 	e.PATCH("/v1/data-sources/:lcuuid/", updateDataSource(ds.cfg))
 	e.DELETE("/v1/data-sources/:lcuuid/", deleteDataSource(ds.cfg))
@@ -46,20 +47,24 @@ func (ds *DataSource) RegisterTo(e *gin.Engine) {
 func getDataSource(c *gin.Context) {
 	args := make(map[string]interface{})
 	args["lcuuid"] = c.Param("lcuuid")
-	data, err := service.GetDataSources(args)
+	orgID, _ := c.Get(common.HEADER_KEY_X_ORG_ID)
+	data, err := service.GetDataSources(orgID.(int), args, nil)
 	JsonResponse(c, data, err)
 }
 
-func getDataSources(c *gin.Context) {
-	args := make(map[string]interface{})
-	if value, ok := c.GetQuery("type"); ok {
-		args["type"] = value
-	}
-	if value, ok := c.GetQuery("name"); ok {
-		args["name"] = value
-	}
-	data, err := service.GetDataSources(args)
-	JsonResponse(c, data, err)
+func getDataSources(cfg *config.ControllerConfig) gin.HandlerFunc {
+	return gin.HandlerFunc(func(c *gin.Context) {
+		args := make(map[string]interface{})
+		if value, ok := c.GetQuery("type"); ok {
+			args["type"] = value
+		}
+		if value, ok := c.GetQuery("name"); ok {
+			args["name"] = value
+		}
+		orgID, _ := c.Get(common.HEADER_KEY_X_ORG_ID)
+		data, err := service.GetDataSources(orgID.(int), args, &cfg.Spec)
+		JsonResponse(c, data, err)
+	})
 }
 
 func createDataSource(cfg *config.ControllerConfig) gin.HandlerFunc {
@@ -70,8 +75,8 @@ func createDataSource(cfg *config.ControllerConfig) gin.HandlerFunc {
 		// 参数校验
 		err = c.ShouldBindBodyWith(&dataSourceCreate, binding.JSON)
 		if dataSourceCreate != nil &&
-			!(dataSourceCreate.DataTableCollection == "flow_metrics.vtap_app*" || dataSourceCreate.DataTableCollection == "flow_metrics.vtap_flow*") {
-			BadRequestResponse(c, httpcommon.PARAMETER_ILLEGAL, "tsdb type only supports flow_metrics.vtap_app* and flow_metrics.vtap_flow*")
+			!(dataSourceCreate.DataTableCollection == "flow_metrics.application*" || dataSourceCreate.DataTableCollection == "flow_metrics.network*") {
+			BadRequestResponse(c, httpcommon.PARAMETER_ILLEGAL, "tsdb type only supports flow_metrics.application* and flow_metrics.network*")
 			return
 		}
 		if err != nil {
@@ -79,7 +84,8 @@ func createDataSource(cfg *config.ControllerConfig) gin.HandlerFunc {
 			return
 		}
 
-		data, err := service.CreateDataSource(dataSourceCreate, cfg)
+		orgID, _ := c.Get(common.HEADER_KEY_X_ORG_ID)
+		data, err := service.CreateDataSource(orgID.(int), dataSourceCreate, cfg)
 		JsonResponse(c, data, err)
 	})
 }
@@ -97,7 +103,8 @@ func updateDataSource(cfg *config.ControllerConfig) gin.HandlerFunc {
 		}
 
 		lcuuid := c.Param("lcuuid")
-		data, err := service.UpdateDataSource(lcuuid, dataSourceUpdate, cfg)
+		orgID, _ := c.Get(common.HEADER_KEY_X_ORG_ID)
+		data, err := service.UpdateDataSource(orgID.(int), lcuuid, dataSourceUpdate, cfg)
 		JsonResponse(c, data, err)
 	})
 }
@@ -107,7 +114,8 @@ func deleteDataSource(cfg *config.ControllerConfig) gin.HandlerFunc {
 		var err error
 
 		lcuuid := c.Param("lcuuid")
-		data, err := service.DeleteDataSource(lcuuid, cfg)
+		orgID, _ := c.Get(common.HEADER_KEY_X_ORG_ID)
+		data, err := service.DeleteDataSource(orgID.(int), lcuuid, cfg)
 		JsonResponse(c, data, err)
 	})
 }

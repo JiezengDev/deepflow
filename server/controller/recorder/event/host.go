@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,10 +18,10 @@ package event
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/common"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
-	. "github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 	"github.com/deepflowio/deepflow/server/libs/eventapi"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 )
@@ -31,14 +31,14 @@ type Host struct {
 	deviceType int
 }
 
-func NewHost(toolDS *cache.ToolDataSet, eq *queue.OverwriteQueue) *Host {
+func NewHost(toolDS *tool.DataSet, eq *queue.OverwriteQueue) *Host {
 	mng := &Host{
-		EventManagerBase{
-			resourceType: RESOURCE_TYPE_HOST_EN,
-			ToolDataSet:  toolDS,
-			Queue:        eq,
-		},
-		common.VIF_DEVICE_TYPE_HOST,
+		newEventManagerBase(
+			ctrlrcommon.RESOURCE_TYPE_HOST_EN,
+			toolDS,
+			eq,
+		),
+		ctrlrcommon.VIF_DEVICE_TYPE_HOST,
 	}
 	return mng
 }
@@ -72,7 +72,7 @@ func (h *Host) ProduceByAdd(items []*mysql.Host) {
 	}
 }
 
-func (h *Host) ProduceByUpdate(cloudItem *cloudmodel.Host, diffBase *cache.Host) {
+func (h *Host) ProduceByUpdate(cloudItem *cloudmodel.Host, diffBase *diffbase.Host) {
 }
 
 func (h *Host) ProduceByDelete(lcuuids []string) {
@@ -85,7 +85,7 @@ func (h *Host) ProduceByDelete(lcuuids []string) {
 			var err error
 			name, err = h.ToolDataSet.GetHostNameByID(id)
 			if err != nil {
-				log.Errorf("%v, %v", idByLcuuidNotFound(h.resourceType, lcuuid), err)
+				log.Error(h.org.LogPre("%v, %v", idByLcuuidNotFound(h.resourceType, lcuuid), err))
 			}
 		}
 

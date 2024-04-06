@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,11 +14,9 @@
  * limitations under the License.
  */
 
-use std::{mem::swap, sync::Arc};
+use std::mem::swap;
 
-use public::{buffer::BatchedBox, l7_protocol::L7Protocol, proto::metric};
-
-use crate::common::TaggedFlow;
+use public::proto::metric;
 
 const FLOW_ID: u32 = 1;
 const USAGE_ID: u32 = 4;
@@ -207,6 +205,7 @@ pub struct Latency {
     pub art_max: u32,
     pub rrt_max: u32,
     pub cit_max: u32, // us, the max time between the client request and the last server response (Payload > 1)
+    pub tls_rtt_max: u32,
 
     pub rtt_sum: u64,
     pub rtt_client_sum: u64,
@@ -215,6 +214,7 @@ pub struct Latency {
     pub art_sum: u64,
     pub rrt_sum: u64,
     pub cit_sum: u64,
+    pub tls_rtt_sum: u64,
 
     pub rtt_count: u32,
     pub rtt_client_count: u32,
@@ -223,6 +223,7 @@ pub struct Latency {
     pub art_count: u32,
     pub rrt_count: u32,
     pub cit_count: u32,
+    pub tls_rtt_count: u32,
 }
 
 impl Latency {
@@ -248,6 +249,9 @@ impl Latency {
         if self.cit_max < other.cit_max {
             self.cit_max = other.cit_max;
         }
+        if self.tls_rtt_max < other.tls_rtt_max {
+            self.tls_rtt_max = other.tls_rtt_max;
+        }
 
         self.rtt_sum += other.rtt_sum;
         self.rtt_client_sum += other.rtt_client_sum;
@@ -256,6 +260,7 @@ impl Latency {
         self.art_sum += other.art_sum;
         self.rrt_sum += other.rrt_sum;
         self.cit_sum += other.cit_sum;
+        self.tls_rtt_sum += other.tls_rtt_sum;
 
         self.rtt_count += other.rtt_count;
         self.rtt_client_count += other.rtt_client_count;
@@ -264,6 +269,7 @@ impl Latency {
         self.art_count += other.art_count;
         self.rrt_count += other.rrt_count;
         self.cit_count += other.cit_count;
+        self.tls_rtt_count += other.tls_rtt_count;
     }
 }
 
@@ -335,8 +341,8 @@ impl From<Performance> for metric::Performance {
 pub struct Anomaly {
     pub client_rst_flow: u64,
     pub server_rst_flow: u64,
-    pub client_syn_repeat: u64,
-    pub server_synack_repeat: u64,
+    pub client_ack_miss: u64,
+    pub server_syn_miss: u64,
     pub client_half_close_flow: u64,
     pub server_half_close_flow: u64,
 
@@ -356,8 +362,8 @@ impl Anomaly {
     pub fn sequential_merge(&mut self, other: &Anomaly) {
         self.client_rst_flow += other.client_rst_flow;
         self.server_rst_flow += other.server_rst_flow;
-        self.client_syn_repeat += other.client_syn_repeat;
-        self.server_synack_repeat += other.server_synack_repeat;
+        self.client_ack_miss += other.client_ack_miss;
+        self.server_syn_miss += other.server_syn_miss;
         self.client_half_close_flow += other.client_half_close_flow;
         self.server_half_close_flow += other.server_half_close_flow;
 
@@ -379,8 +385,8 @@ impl From<Anomaly> for metric::Anomaly {
         metric::Anomaly {
             client_rst_flow: m.client_rst_flow,
             server_rst_flow: m.server_rst_flow,
-            client_syn_repeat: m.client_syn_repeat,
-            server_synack_repeat: m.server_synack_repeat,
+            client_ack_miss: m.client_ack_miss,
+            server_syn_miss: m.server_syn_miss,
             client_half_close_flow: m.client_half_close_flow,
             server_half_close_flow: m.server_half_close_flow,
 
@@ -447,17 +453,6 @@ impl From<AppMeter> for metric::AppMeter {
             anomaly: Some(m.anomaly.into()),
         }
     }
-}
-
-#[derive(Debug)]
-pub struct AppMeterWithFlow {
-    pub app_meter: AppMeter,
-    pub flow: Arc<BatchedBox<TaggedFlow>>,
-    pub l7_protocol: L7Protocol,
-    pub endpoint_hash: u32,
-    pub endpoint: Option<String>,
-    pub is_active_host0: bool,
-    pub is_active_host1: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -558,6 +553,7 @@ impl UsageMeter {
         self.packet_tx += other.packet_tx;
         self.packet_rx += other.packet_rx;
         self.byte_tx += other.byte_tx;
+        self.byte_rx += other.byte_rx;
         self.l3_byte_rx += other.l3_byte_rx;
         self.l3_byte_tx += other.l3_byte_tx;
         self.l4_byte_rx += other.l4_byte_rx;

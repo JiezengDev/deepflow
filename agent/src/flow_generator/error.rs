@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ use std::str::Utf8Error;
 
 use thiserror::Error;
 
-use super::AppProtoLogsData;
+use super::MetaAppProto;
 
 use crate::common::l7_protocol_info::L7ProtocolInfo;
 
@@ -47,18 +47,39 @@ pub enum Error {
     MqttLogParseFailed,
     #[error("mqtt perf parse failed")]
     MqttPerfParseFailed,
+    #[error("openwire log parse failed")]
+    OpenWireLogParseFailed,
+    // openwire log parse unimplemented is acceptable
+    #[error("openwire log parse unimplemented")]
+    OpenWireLogParseUnimplemented,
+    #[error("openwire log parse EOF")]
+    OpenWireLogParseEOF,
+    #[error("zmtp log parse failed")]
+    ZmtpLogParseFailed,
+    #[error("zmtp log parse EOF")]
+    ZmtpLogParseEOF,
+    #[error("zmtp perf parse failed")]
+    ZmtpPerfParseFailed,
     #[error("redis log parse failed")]
     RedisLogParseFailed,
     #[error("redis perf parse failed")]
+    RedisLogParsePartial,
+    #[error("redis perf parse partial result")]
     RedisPerfParseFailed,
     #[error("mysql log parse failed")]
     MysqlLogParseFailed,
     #[error("mysql perf parse failed")]
     MysqlPerfParseFailed,
+    #[error("mongodb log parse failed")]
+    MongoDBLogParseFailed,
     #[error("{0}")]
     DNSLogParseFailed(String),
     #[error("{0}")]
     DNSPerfParseFailed(&'static str),
+    #[error("{0}")]
+    TlsLogParseFailed(String),
+    #[error("{0}")]
+    TlsPerfParseFailed(&'static str),
     #[error("l7 protocol unknown")]
     L7ProtocolUnknown,
     #[error("l7 protocol check limit")]
@@ -68,7 +89,7 @@ pub enum Error {
     #[error("l7 protocol can not merge")]
     L7ProtocolCanNotMerge(L7ProtocolInfo),
     #[error("l7 log can not merge")]
-    L7LogCanNotMerge(AppProtoLogsData),
+    L7LogCanNotMerge(MetaAppProto),
     #[error("parse config not provided")]
     NoParseConfig,
     #[error("wasm parse fail")]

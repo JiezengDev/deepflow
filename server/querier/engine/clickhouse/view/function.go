@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,6 +30,9 @@ const (
 	FUNCTION_MAX         = "Max"
 	FUNCTION_MIN         = "Min"
 	FUNCTION_AVG         = "Avg"
+	FUNCTION_COUNTER_AVG = "Counter_Avg"
+	FUNCTION_DELAY_AVG   = "Delay_Avg"
+	FUNCTION_AAVG        = "AAvg"
 	FUNCTION_PCTL        = "Percentile"
 	FUNCTION_PCTL_EXACT  = "PercentileExact"
 	FUNCTION_STDDEV      = "Stddev"
@@ -48,6 +51,9 @@ const (
 	FUNCTION_PERCENTAG   = "Percentage"
 	FUNCTION_HISTOGRAM   = "Histogram"
 	FUNCTION_LAST        = "Last"
+	FUNCTION_TOPK        = "TopK"
+	FUNCTION_ANY         = "Any"
+	FUNCTION_DERIVATIVE  = "nonNegativeDerivative"
 )
 
 // 对外提供的算子与数据库实际算子转换
@@ -55,7 +61,7 @@ var FUNC_NAME_MAP map[string]string = map[string]string{
 	FUNCTION_SUM:         "SUM",
 	FUNCTION_MAX:         "MAX",
 	FUNCTION_MIN:         "MIN",
-	FUNCTION_AVG:         "AVG",
+	FUNCTION_AAVG:        "AVG",
 	FUNCTION_PCTL:        "quantile",
 	FUNCTION_PCTL_EXACT:  "quantileExact",
 	FUNCTION_STDDEV:      "stddevPopStable",
@@ -68,6 +74,9 @@ var FUNC_NAME_MAP map[string]string = map[string]string{
 	FUNCTION_UNIQ:        "uniq",
 	FUNCTION_UNIQ_EXACT:  "uniqExact",
 	FUNCTION_LAST:        "last_value",
+	FUNCTION_TOPK:        "topK",
+	FUNCTION_ANY:         "any", // because need to set any to topK(1), and '(1)' may be appended after 'If' in func (f *DefaultFunction) WriteTo(buf *bytes.Buffer)
+	FUNCTION_DERIVATIVE:  "nonNegativeDerivative",
 }
 
 var MATH_FUNCTIONS = []string{
@@ -93,6 +102,12 @@ func GetFunc(name string) Function {
 		return &PerSecondFunction{DefaultFunction: DefaultFunction{Name: name}}
 	case FUNCTION_HISTOGRAM:
 		return &HistogramFunction{DefaultFunction: DefaultFunction{Name: name}}
+	case FUNCTION_COUNTER_AVG:
+		return &CounterAvgFunction{DefaultFunction: DefaultFunction{Name: FUNC_NAME_MAP[FUNCTION_AAVG]}}
+	case FUNCTION_DELAY_AVG:
+		return &DelayAvgFunction{DefaultFunction: DefaultFunction{Name: FUNC_NAME_MAP[FUNCTION_AAVG]}}
+	case FUNCTION_DERIVATIVE:
+		return &NonNegativeDerivativeFunction{DefaultFunction: DefaultFunction{Name: name}}
 	default:
 		return &DefaultFunction{Name: name}
 	}
@@ -143,6 +158,7 @@ type DefaultFunction struct {
 	Name           string   // 算子名称
 	Fields         []Node   // 指标量名称
 	Args           []string // 其他参数
+	DerivativeArgs []string // Derivative其他参数
 	Alias          string   // as
 	Condition      string   // 算子过滤 例：Condition："code in [1,2]" SUMIf(byte, code in [1,2])
 	Withs          []Node
@@ -196,6 +212,35 @@ func (f *DefaultFunction) WriteTo(buf *bytes.Buffer) {
 	if !ok {
 		dbFuncName = f.Name
 	}
+	// derivative
+	if f.Name == FUNCTION_DERIVATIVE {
+		partitionBy := ""
+		argsNoSuffixStr := ""
+		argsNoSuffix := []string{}
+		if len(f.DerivativeArgs) > 0 {
+			for _, arg := range f.DerivativeArgs {
+				arg = strings.Trim(arg, "`")
+				argsNoSuffix = append(argsNoSuffix, arg)
+			}
+			argsNoSuffixStr = strings.Join(argsNoSuffix, "_")
+			if len(f.DerivativeArgs) > 1 {
+				partitionBy = fmt.Sprintf("PARTITION BY %s ", strings.Join(f.DerivativeArgs[1:], ","))
+			}
+		}
+		buf.WriteString(fmt.Sprintf("nonNegativeDerivative(last_value(%s),_time) OVER (%sORDER BY _time)", f.DerivativeArgs[0], partitionBy))
+		if f.Alias != "" {
+			buf.WriteString(" AS ")
+			buf.WriteString("`")
+			buf.WriteString(fmt.Sprintf("_nonnegativederivative_%s", argsNoSuffixStr))
+			buf.WriteString("`")
+		}
+		return
+	}
+
+	isSingleTagTok := f.Name == FUNCTION_TOPK && len(f.Args) == 1
+	if isSingleTagTok {
+		buf.WriteString("arrayStringConcat(")
+	}
 	buf.WriteString(dbFuncName)
 
 	if f.IsGroupArray {
@@ -207,11 +252,17 @@ func (f *DefaultFunction) WriteTo(buf *bytes.Buffer) {
 		buf.WriteString("If")
 	}
 
-	if len(f.Args) > 0 {
+	args := f.Args
+	if f.Name == FUNCTION_TOPK {
+		args = f.Args[len(f.Args)-1:]
+	} else if f.Name == FUNCTION_ANY {
+		args = nil
+	}
+	if len(args) > 0 {
 		buf.WriteString("(")
-		for i, arg := range f.Args {
+		for i, arg := range args {
 			buf.WriteString(arg)
-			if i < len(f.Args)-1 {
+			if i < len(args)-1 {
 				buf.WriteString(", ")
 			}
 		}
@@ -236,7 +287,7 @@ func (f *DefaultFunction) WriteTo(buf *bytes.Buffer) {
 			}
 			for i, field := range f.Fields {
 				field.WriteTo(buf)
-				buf.WriteString(" != 0")
+				buf.WriteString(" > 0")
 				if i < len(f.Fields)-1 {
 					buf.WriteString(" AND ")
 				}
@@ -248,7 +299,7 @@ func (f *DefaultFunction) WriteTo(buf *bytes.Buffer) {
 			if !f.IgnoreZero {
 				field.WriteTo(buf)
 			} else {
-				buf.WriteString("arrayFilter(x -> x!=0, ")
+				buf.WriteString("arrayFilter(x -> x>0, ")
 				field.WriteTo(buf)
 				buf.WriteString(")")
 			}
@@ -260,6 +311,9 @@ func (f *DefaultFunction) WriteTo(buf *bytes.Buffer) {
 	}
 
 	buf.WriteString(")")
+	if isSingleTagTok {
+		buf.WriteString(", ',')")
+	}
 	buf.WriteString(f.Math)
 	if !f.Nest && f.Alias != "" {
 		buf.WriteString(" AS ")
@@ -267,6 +321,7 @@ func (f *DefaultFunction) WriteTo(buf *bytes.Buffer) {
 		buf.WriteString(strings.Trim(f.Alias, "`"))
 		buf.WriteString("`")
 	}
+
 }
 
 func (f *DefaultFunction) GetDefaultAlias(inner bool) string {
@@ -300,6 +355,10 @@ func (f *DefaultFunction) GetDefaultAlias(inner bool) string {
 	for _, arg := range f.Args {
 		buf.WriteString("_")
 		buf.WriteString(FormatField(arg))
+	}
+	if f.Condition != "" {
+		buf.WriteString("_")
+		buf.WriteString(FormatField(f.Condition))
 	}
 	return buf.String()
 }
@@ -811,5 +870,108 @@ func (f *MinFunction) GetWiths() []Node {
 		))
 		f.Withs = append(f.Withs, &With{Value: with, Alias: alias})
 		return f.Withs
+	}
+}
+
+type CounterAvgFunction struct {
+	DefaultFunction
+}
+
+func (f *CounterAvgFunction) WriteTo(buf *bytes.Buffer) {
+	var interval int
+	if f.Time.Interval > 0 {
+		interval = f.Time.Interval
+	} else {
+		interval = int(f.Time.TimeEnd-f.Time.TimeStart) + f.Time.DatasourceInterval
+	}
+	buf.WriteString(fmt.Sprintf("sum(%s)/(%d/%d)", f.Fields[0].ToString(), interval, f.Time.DatasourceInterval))
+	buf.WriteString(f.Math)
+	if f.Alias != "" {
+		buf.WriteString(" AS ")
+		buf.WriteString("`")
+		buf.WriteString(strings.Trim(f.Alias, "`"))
+		buf.WriteString("`")
+	}
+}
+
+type DelayAvgFunction struct {
+	DefaultFunction
+	divFunction *DivFunction
+}
+
+func (f *DelayAvgFunction) Init() {
+	// Sum(Numerator)/Sum(Denominator)
+	if strings.Contains(f.Fields[0].ToString(), "/") {
+		fieldsSlice := strings.Split(f.Fields[0].ToString(), "/")
+		if len(fieldsSlice) > 1 {
+			dividendSumFunc := DefaultFunction{
+				Name:   FUNCTION_SUM,
+				Fields: []Node{&Field{Value: fieldsSlice[0]}},
+				Nest:   true,
+			}
+			divisorSumFunc := DefaultFunction{
+				Name:      FUNCTION_SUM,
+				Fields:    []Node{&Field{Value: fieldsSlice[1]}},
+				Nest:      true,
+				Condition: fmt.Sprintf("%s>0", fieldsSlice[1]),
+			}
+			f.divFunction = &DivFunction{
+				DivType: FUNCTION_DIV_TYPE_0DIVIDER_AS_NULL,
+				DefaultFunction: DefaultFunction{
+					Name:   FUNCTION_DIV,
+					Fields: []Node{&dividendSumFunc, &divisorSumFunc},
+					Math:   f.Math,
+				},
+			}
+		}
+	}
+}
+
+func (f *DelayAvgFunction) WriteTo(buf *bytes.Buffer) {
+	if !strings.Contains(f.Fields[0].ToString(), "/") {
+		f.DefaultFunction.WriteTo(buf)
+	} else {
+		f.divFunction.WriteTo(buf)
+		if f.Alias != "" {
+			buf.WriteString(" AS ")
+			buf.WriteString("`")
+			buf.WriteString(strings.Trim(f.Alias, "`"))
+			buf.WriteString("`")
+		}
+	}
+}
+
+func (f *DelayAvgFunction) GetWiths() []Node {
+	if !strings.Contains(f.Fields[0].ToString(), "/") {
+		return f.DefaultFunction.GetWiths()
+	} else {
+		return f.divFunction.GetWiths()
+	}
+}
+
+type NonNegativeDerivativeFunction struct {
+	DefaultFunction
+}
+
+func (f *NonNegativeDerivativeFunction) WriteTo(buf *bytes.Buffer) {
+	partitionBy := ""
+	argsNoSuffixStr := ""
+	argsNoSuffix := []string{}
+	if len(f.DerivativeArgs) > 0 {
+		for _, arg := range f.DerivativeArgs {
+			arg = strings.Trim(arg, "`")
+			argsNoSuffix = append(argsNoSuffix, arg)
+		}
+		argsNoSuffixStr = strings.Join(argsNoSuffix, "_")
+		if len(f.DerivativeArgs) > 1 {
+			partitionBy = fmt.Sprintf("PARTITION BY %s ", strings.Join(f.DerivativeArgs[1:], ","))
+		}
+	}
+	buf.WriteString(fmt.Sprintf("nonNegativeDerivative(last_value(%s),_time) OVER (%sORDER BY _time)", f.DerivativeArgs[0], partitionBy))
+	if f.Alias != "" {
+		buf.WriteString(" AS ")
+		buf.WriteString("`")
+		buf.WriteString(fmt.Sprintf("_nonnegativederivative_%s", argsNoSuffixStr))
+		buf.WriteString("`")
 	}
 }

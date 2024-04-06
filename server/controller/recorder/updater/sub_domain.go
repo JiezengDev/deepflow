@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,29 +18,55 @@ package updater
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type SubDomain struct {
-	UpdaterBase[cloudmodel.SubDomain, mysql.SubDomain, *cache.SubDomain]
+	UpdaterBase[
+		cloudmodel.SubDomain,
+		mysql.SubDomain,
+		*diffbase.SubDomain,
+		*message.SubDomainAdd,
+		message.SubDomainAdd,
+		*message.SubDomainUpdate,
+		message.SubDomainUpdate,
+		*message.SubDomainFieldsUpdate,
+		message.SubDomainFieldsUpdate,
+		*message.SubDomainDelete,
+		message.SubDomainDelete]
 }
 
 func NewSubDomain(wholeCache *cache.Cache, cloudData []cloudmodel.SubDomain) *SubDomain {
 	updater := &SubDomain{
-		UpdaterBase[cloudmodel.SubDomain, mysql.SubDomain, *cache.SubDomain]{
-			cache:        wholeCache,
-			dbOperator:   db.NewSubDomain(),
-			diffBaseData: wholeCache.SubDomains,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.SubDomain,
+			mysql.SubDomain,
+			*diffbase.SubDomain,
+			*message.SubDomainAdd,
+			message.SubDomainAdd,
+			*message.SubDomainUpdate,
+			message.SubDomainUpdate,
+			*message.SubDomainFieldsUpdate,
+			message.SubDomainFieldsUpdate,
+			*message.SubDomainDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_SUB_DOMAIN_EN,
+			wholeCache,
+			db.NewSubDomain().SetORG(wholeCache.GetORG()),
+			wholeCache.DiffBaseDataSet.SubDomains,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
 }
 
-func (d *SubDomain) getDiffBaseByCloudItem(cloudItem *cloudmodel.SubDomain) (diffBase *cache.SubDomain, exists bool) {
+func (d *SubDomain) getDiffBaseByCloudItem(cloudItem *cloudmodel.SubDomain) (diffBase *diffbase.SubDomain, exists bool) {
 	diffBase, exists = d.diffBaseData[cloudItem.Lcuuid]
 	return
 }
@@ -57,10 +83,12 @@ func (d *SubDomain) generateDBItemToAdd(cloudItem *cloudmodel.SubDomain) (*mysql
 	return dbItem, true
 }
 
-func (d *SubDomain) generateUpdateInfo(diffBase *cache.SubDomain, cloudItem *cloudmodel.SubDomain) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (d *SubDomain) generateUpdateInfo(diffBase *diffbase.SubDomain, cloudItem *cloudmodel.SubDomain) (*message.SubDomainFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.SubDomainFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
-		updateInfo["name"] = cloudItem.Name
+		mapInfo["name"] = cloudItem.Name
+		structInfo.Name.Set(diffBase.Name, cloudItem.Name)
 	}
-	return updateInfo, len(updateInfo) > 0
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

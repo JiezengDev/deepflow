@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,12 +16,15 @@
 
 use std::cmp::max;
 use std::net::IpAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, RwLock,
+};
 use std::thread;
 use std::time::Duration;
 
 use ipnet::{IpNet, Ipv4Net};
-use log::{info, warn};
+use log::warn;
 use lru::LruCache;
 
 use crate::common::endpoint::{EndpointData, EndpointStore};
@@ -34,6 +37,9 @@ use npb_pcap_policy::PolicyData;
 const MAX_ACL_PROTOCOL: usize = 255;
 const MAX_TAP_TYPE: usize = 256;
 const MAX_FAST_PATH: usize = MAX_TAP_TYPE * (super::MAX_QUEUE_COUNT + 1);
+const NET_IP_MAX: u32 = 32;
+const NET_IP_LEN: u32 = 16;
+const NET_IP_MASK: u32 = u32::MAX << NET_IP_LEN;
 
 type TableLruCache = LruCache<u128, PolicyTableItem>;
 
@@ -47,26 +53,29 @@ pub struct FastPath {
     interest_table: RwLock<Vec<PortRange>>,
     policy_table: Vec<Option<TableLruCache>>,
 
+    // Use the first 16 bits of the IPv4 address to query the table and obtain the corresponding netmask.
     netmask_table: RwLock<Vec<u32>>,
 
-    policy_table_flush_flags: [bool; super::MAX_QUEUE_COUNT + 1],
+    policy_table_flush_flags: [AtomicBool; super::MAX_QUEUE_COUNT + 1],
 
     mask_from_interface: RwLock<Vec<u32>>,
     mask_from_ipgroup: RwLock<Vec<u32>>,
     mask_from_cidr: RwLock<Vec<u32>>,
 
     map_size: usize,
-    queue_count: usize,
 
     // 统计计数
     policy_count: usize,
 }
 
+const FLUSH_FLAGS: AtomicBool = AtomicBool::new(false);
 impl FastPath {
     // 策略相关等内容更新后必须执行该函数以清空策略表
     pub fn flush(&mut self) {
         self.generate_mask_table();
-        self.policy_table_flush_flags = [true; super::MAX_QUEUE_COUNT + 1];
+        self.policy_table_flush_flags.iter_mut().for_each(|f| {
+            f.store(true, Ordering::Relaxed);
+        });
         self.policy_count = 0;
     }
 
@@ -78,13 +87,13 @@ impl FastPath {
                 match ip.raw_ip {
                     IpAddr::V4(ipv4) => {
                         let ip_int = u32::from_be_bytes(ipv4.octets());
-                        let mask = u32::MAX << (32 - ip.netmask);
+                        let mask = u32::MAX << (NET_IP_MAX - ip.netmask);
                         let net_addr = ip_int & mask;
 
-                        let mut start = net_addr >> 16;
+                        let mut start = net_addr >> NET_IP_LEN;
                         let mut end = start;
-                        if ip.netmask < 16 {
-                            end += (1 << (16 - ip.netmask)) - 1;
+                        if ip.netmask < NET_IP_LEN {
+                            end += (1 << (NET_IP_LEN - ip.netmask)) - 1;
                         }
 
                         while start <= end {
@@ -110,11 +119,11 @@ impl FastPath {
             // internet资源因为匹配所有IP, 不需要加在这里
             return;
         }
-        let mut start = ipv4 >> 16;
+        let mut start = ipv4 >> NET_IP_LEN;
         let mut end = start;
         let mask = u32::from(addr.netmask());
-        if mask_len < 16 {
-            end += (1 << (16 - mask_len)) - 1;
+        if mask_len < NET_IP_LEN as u8 {
+            end += (1 << (NET_IP_LEN as u8 - mask_len)) - 1;
         }
 
         while start <= end {
@@ -175,14 +184,23 @@ impl FastPath {
 
     fn generate_mask_ip(&self, key: &LookupKey) -> (u32, u32) {
         match (key.src_ip, key.dst_ip) {
-            (IpAddr::V4(src), IpAddr::V4(dst)) => {
-                let src = u32::from_be_bytes(src.octets());
-                let dst = u32::from_be_bytes(dst.octets());
+            (IpAddr::V4(src_addr), IpAddr::V4(dst_addr)) => {
+                let src = u32::from_be_bytes(src_addr.octets());
+                let dst = u32::from_be_bytes(dst_addr.octets());
                 let netmask_table = self.netmask_table.read().unwrap();
-                return (
-                    src & netmask_table[(src >> 16) as usize],
-                    dst & netmask_table[(dst >> 16) as usize],
-                );
+                let mut src_mask = netmask_table[(src >> NET_IP_LEN) as usize];
+                let mut dst_mask = netmask_table[(dst >> NET_IP_LEN) as usize];
+                // The EPC of the local link IP and private IP is 0, which needs to be
+                // distinguished from other internet IP to avoid querying incorrect EPC.
+                // The longest netmask between local link IP and private IP is used to
+                // ensure accurate queries.
+                if src_addr.is_link_local() || src_addr.is_private() {
+                    src_mask = src_mask.max(NET_IP_MASK);
+                }
+                if dst_addr.is_link_local() || dst_addr.is_private() {
+                    dst_mask = dst_mask.max(NET_IP_MASK);
+                }
+                return (src & src_mask, dst & dst_mask);
             }
             (IpAddr::V6(src), IpAddr::V6(dst)) => {
                 let src = u128::from_be_bytes(src.octets());
@@ -248,30 +266,15 @@ impl FastPath {
         key.dst_port = table[key.dst_port as usize].min();
     }
 
-    pub fn update_map_size(&mut self, map_size: usize) {
-        if self.map_size == map_size {
-            return;
-        }
-        info!(
-            "fastpath map size change from {} to {}",
-            self.map_size, map_size
-        );
-        self.map_size = map_size;
-
-        for i in 0..self.queue_count {
-            self.policy_table_flush_flags[i] = true
-        }
-    }
-
     fn table_flush_check(&mut self, key: &LookupKey) -> bool {
         let start_index = key.fast_index * MAX_TAP_TYPE;
-        if self.policy_table_flush_flags[key.fast_index] {
+        if self.policy_table_flush_flags[key.fast_index].load(Ordering::Relaxed) {
             for i in 0..MAX_TAP_TYPE {
                 if let Some(t) = &mut self.policy_table[start_index + i] {
                     t.clear();
                 }
             }
-            self.policy_table_flush_flags[key.fast_index] = false
+            self.policy_table_flush_flags[key.fast_index].store(false, Ordering::Relaxed);
         }
 
         if self.policy_table[start_index + u16::from(key.tap_type) as usize].is_none() {
@@ -287,7 +290,7 @@ impl FastPath {
         packet: &mut LookupKey,
         policy: &PolicyData,
         endpoints: EndpointData,
-    ) {
+    ) -> (Arc<PolicyData>, Arc<EndpointData>) {
         self.table_flush_check(packet);
         self.interest_table_map(packet);
 
@@ -302,30 +305,47 @@ impl FastPath {
 
         let mut forward = PolicyData::default();
         if acl_id > 0 {
-            forward.merge_npb_action(&policy.npb_actions, acl_id, None);
+            forward.merge_and_dedup_npb_actions(&policy.npb_actions, acl_id, false);
             forward.format_npb_action();
         }
 
-        if let Some(item) = table.get_mut(&key) {
-            item.protocol_table[proto] = Some(Arc::new(forward.clone()));
+        let (forward_policy, forward_endpoints) = if let Some(item) = table.get_mut(&key) {
+            let forward_policy = Arc::new(forward.clone());
+            item.protocol_table[proto] = Some(forward_policy.clone());
+            let forward_endpoints = item.store.get(
+                packet.l2_end_0,
+                packet.l2_end_1,
+                packet.l3_end_0,
+                packet.l3_end_1,
+            );
+            (forward_policy, forward_endpoints)
         } else {
             let mut item = PolicyTableItem {
                 store: EndpointStore::from(endpoints),
                 protocol_table: unsafe { std::mem::zeroed() },
             };
-            item.protocol_table[proto] = Some(Arc::new(forward.clone()));
+            let forward_policy = Arc::new(forward.clone());
+            let forward_endpoints = item.store.get(
+                packet.l2_end_0,
+                packet.l2_end_1,
+                packet.l3_end_0,
+                packet.l3_end_1,
+            );
+            item.protocol_table[proto] = Some(forward_policy.clone());
             table.put(key, item);
 
             self.policy_count += 1;
-        }
+
+            (forward_policy, forward_endpoints)
+        };
 
         if key_0 == key_1 {
-            return;
+            return (forward_policy, forward_endpoints);
         }
 
         let mut backward = PolicyData::default();
         if acl_id > 0 {
-            backward.merge_reverse_npb_action(&policy.npb_actions, acl_id);
+            backward.merge_and_dedup_npb_actions(&policy.npb_actions, acl_id, true);
             backward.format_npb_action();
         }
 
@@ -348,6 +368,7 @@ impl FastPath {
 
             self.policy_count += 1;
         }
+        return (forward_policy, forward_endpoints);
     }
 
     pub fn get_policy(
@@ -395,7 +416,6 @@ impl FastPath {
         );
         FastPath {
             map_size,
-            queue_count,
 
             mask_from_interface: RwLock::new(
                 std::iter::repeat(0).take(u16::MAX as usize + 1).collect(),
@@ -420,11 +440,21 @@ impl FastPath {
                 table
             },
 
-            policy_table_flush_flags: [false; super::MAX_QUEUE_COUNT + 1],
+            policy_table_flush_flags: [FLUSH_FLAGS; super::MAX_QUEUE_COUNT + 1],
 
             // 统计计数
             policy_count: 0,
         }
+    }
+
+    pub fn reset_queue_size(&mut self, queue_count: usize) {
+        assert!(
+            queue_count <= super::MAX_QUEUE_COUNT,
+            "Fastpath queue count over limit."
+        );
+        self.policy_table_flush_flags.iter_mut().for_each(|f| {
+            f.store(true, Ordering::Relaxed);
+        });
     }
 }
 

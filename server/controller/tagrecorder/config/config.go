@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,4 +20,5 @@ type TagRecorderConfig struct {
 	Interval                  int `default:"60" yaml:"timeout"`
 	MySQLBatchSize            int `default:"1000" yaml:"mysql_batch_size"`
 	DictionaryRefreshInterval int `default:"60" yaml:"dictionary_refresh_interval"`
+	LiveViewRefreshSecond     int `default:"60" yaml:"live_view_refresh_second"`
 }

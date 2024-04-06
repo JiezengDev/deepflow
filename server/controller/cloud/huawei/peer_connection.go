@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,11 +26,10 @@ import (
 func (h *HuaWei) getPeerConnections() ([]model.PeerConnection, error) {
 	var pns []model.PeerConnection
 	for project, token := range h.projectTokenMap {
-		jpns, err := h.getRawData(
-			fmt.Sprintf("https://vpc.%s.%s/v2.0/vpc/peerings", project.name, h.config.Domain), token.token, "peerings",
-		)
+		jpns, err := h.getRawData(newRawDataGetContext(
+			fmt.Sprintf("https://vpc.%s.%s/v2.0/vpc/peerings", project.name, h.config.Domain), token.token, "peerings", pageQueryMethodMarker,
+		))
 		if err != nil {
-			log.Errorf("request failed: %v", err)
 			return nil, err
 		}
 

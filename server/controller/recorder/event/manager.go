@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,16 +22,28 @@ import (
 	"time"
 
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 	. "github.com/deepflowio/deepflow/server/controller/recorder/common"
 	"github.com/deepflowio/deepflow/server/libs/eventapi"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 )
 
 type EventManagerBase struct {
+	org *ORG
+
 	resourceType string
-	ToolDataSet  *cache.ToolDataSet
+	ToolDataSet  *tool.DataSet
 	Queue        *queue.OverwriteQueue
+}
+
+func newEventManagerBase(rt string, toolDS *tool.DataSet, q *queue.OverwriteQueue) EventManagerBase {
+	return EventManagerBase{
+		org: toolDS.GetORG(),
+
+		resourceType: rt,
+		ToolDataSet:  toolDS,
+		Queue:        q,
+	}
 }
 
 type ResourceEventToMySQL struct {
@@ -81,7 +93,7 @@ func (e *EventManagerBase) enqueue(resourceLcuuid string, event *eventapi.Resour
 	if rt == "" {
 		rt = DEVICE_TYPE_INT_TO_STR[int(event.InstanceType)]
 	}
-	log.Infof("put %s event (lcuuid: %s): %+v into shared queue", rt, resourceLcuuid, event)
+	log.Info(e.org.LogPre("put %s event (lcuuid: %s): %+v into shared queue", rt, resourceLcuuid, event))
 	err := e.Queue.Put(event)
 	if err != nil {
 		log.Error(putEventIntoQueueFailed(rt, err))
@@ -101,17 +113,17 @@ func (e *EventManagerBase) enqueueIfInsertIntoMySQLFailed(
 	e.fillEvent(event, eventType, instanceName, instanceType, instanceID, options...)
 	content, err := json.Marshal(event)
 	if err != nil {
-		log.Errorf("json marshal event (detail: %#v) failed: %s", event, err.Error())
+		log.Error(e.org.LogPre("json marshal event (detail: %#v) failed: %s", event, err.Error()))
 	} else {
 		dbItem := mysql.ResourceEvent{
 			Domain:  domainLcuuid,
 			Content: string(content),
 		}
-		err = mysql.Db.Create(&dbItem).Error
+		err = e.org.DB.Create(&dbItem).Error
 		if err != nil {
-			log.Errorf("add resource_event (detail: %#v) failed: %s", dbItem, err.Error())
+			log.Error(e.org.LogPre("add resource_event (detail: %#v) failed: %s", dbItem, err.Error()))
 		} else {
-			log.Infof("create resource_event (detail: %#v) success", dbItem)
+			log.Info(e.org.LogPre("create resource_event (detail: %#v) success", dbItem))
 			return
 		}
 	}

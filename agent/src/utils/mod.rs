@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,8 +26,22 @@ pub(crate) mod possible_host;
 pub(crate) mod process;
 pub(crate) mod stats;
 
+#[cfg(target_os = "linux")]
+pub(crate) mod pid_file;
+
 pub use public::bytes;
 
 pub mod test;
 
 const WIN_ERROR_CODE_STR: &str = "please browse website(https://docs.microsoft.com/en-us/windows/win32/debug/system-error-codes) to get more detail";
+
+pub fn notify_exit(code: i32) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Err(_) =
+        nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGTERM)
+    {
+        std::process::exit(code);
+    }
+    #[cfg(target_os = "windows")]
+    std::process::exit(code);
+}

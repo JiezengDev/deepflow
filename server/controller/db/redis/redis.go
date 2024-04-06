@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -46,6 +46,10 @@ type Config struct {
 
 func GetClient() *Client {
 	return client
+}
+
+func GetConfig() *Config { // TODO use this function
+	return client.Config
 }
 
 type Client struct {

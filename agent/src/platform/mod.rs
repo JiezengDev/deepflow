@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,24 +16,26 @@
 
 #[cfg(target_os = "linux")]
 pub mod kubernetes;
+#[cfg(target_os = "linux")]
 mod libvirt_xml_extractor;
 mod platform_synchronizer;
 #[cfg(target_os = "linux")]
 pub mod prometheus;
 
 #[cfg(target_os = "linux")]
-pub use kubernetes::{ActivePoller, ApiWatcher, GenericPoller, Poller};
-pub use libvirt_xml_extractor::LibvirtXmlExtractor;
-pub use platform_synchronizer::ProcRegRewrite;
+pub use kubernetes::{ApiWatcher, GenericPoller, Poller};
 #[cfg(target_os = "linux")]
+pub use libvirt_xml_extractor::LibvirtXmlExtractor;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use platform_synchronizer::ProcRegRewrite;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use platform_synchronizer::SocketSynchronizer;
 pub use platform_synchronizer::{process_info_enabled, PlatformSynchronizer};
-use public::utils::net::MacAddr;
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceEntry {
     pub name: String,
-    pub mac: MacAddr,
+    pub mac: public::utils::net::MacAddr,
     pub domain_uuid: String,
     pub domain_name: String,
 }

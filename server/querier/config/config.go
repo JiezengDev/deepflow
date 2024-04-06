@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,37 +27,54 @@ import (
 	"gopkg.in/yaml.v2"
 
 	prometheus "github.com/deepflowio/deepflow/server/querier/app/prometheus/config"
+	tracing_adapter "github.com/deepflowio/deepflow/server/querier/app/tracing-adapter/config"
 	profile "github.com/deepflowio/deepflow/server/querier/profile/config"
 )
 
 var log = logging.MustGetLogger("clickhouse")
 var Cfg *QuerierConfig
+var TraceConfig *TraceIdWithIndex
 
 type Config struct {
-	QuerierConfig QuerierConfig `yaml:"querier"`
+	QuerierConfig    QuerierConfig    `yaml:"querier"`
+	TraceIdWithIndex TraceIdWithIndex `yaml:"trace-id-with-index"`
 }
 
 type QuerierConfig struct {
-	LogFile                         string                `default:"/var/log/querier.log" yaml:"log-file"`
-	LogLevel                        string                `default:"info" yaml:"log-level"`
-	ListenPort                      int                   `default:"20416" yaml:"listen-port"`
-	Clickhouse                      Clickhouse            `yaml:clickhouse`
-	Profile                         profile.ProfileConfig `yaml:profile`
-	DeepflowApp                     DeepflowApp           `yaml:"deepflow-app"`
-	Prometheus                      prometheus.Prometheus `yaml:"prometheus"`
-	Language                        string                `default:"en" yaml:"language"`
-	OtelEndpoint                    string                `default:"http://${K8S_NODE_IP_FOR_DEEPFLOW}:38086/api/v1/otel/trace" yaml:"otel-endpoint"`
-	Limit                           string                `default:"10000" yaml:"limit"`
-	TimeFillLimit                   int                   `default:"20" yaml:"time-fill-limit"`
-	PrometheusCacheUpdateInterval   int                   `default:"60" yaml:"prometheus-cache-update-interval"`
-	MaxCacheableEntrySize           int                   `default:"1000" yaml:"max-cacheable-entry-size"`
-	MaxPrometheusIdSubqueryLruEntry int                   `default:"8000" yaml:"max-prometheus-id-subquery-lru-entry"`
-	PrometheusIdSubqueryLruTimeout  int                   `default:"60" yaml:"prometheus-id-subquery-lru-timeout"`
+	LogFile                         string                        `default:"/var/log/querier.log" yaml:"log-file"`
+	LogLevel                        string                        `default:"info" yaml:"log-level"`
+	ListenPort                      int                           `default:"20416" yaml:"listen-port"`
+	Clickhouse                      Clickhouse                    `yaml:clickhouse`
+	Profile                         profile.ProfileConfig         `yaml:profile`
+	DeepflowApp                     DeepflowApp                   `yaml:"deepflow-app"`
+	Prometheus                      prometheus.Prometheus         `yaml:"prometheus"`
+	ExternalAPM                     []tracing_adapter.ExternalAPM `yaml:"external-apm"`
+	Language                        string                        `default:"en" yaml:"language"`
+	OtelEndpoint                    string                        `default:"http://deepflow-agent/api/v1/otel/trace" yaml:"otel-endpoint"`
+	Limit                           string                        `default:"10000" yaml:"limit"`
+	TimeFillLimit                   int                           `default:"20" yaml:"time-fill-limit"`
+	PrometheusCacheUpdateInterval   int                           `default:"60" yaml:"prometheus-cache-update-interval"`
+	MaxCacheableEntrySize           int                           `default:"1000" yaml:"max-cacheable-entry-size"`
+	MaxPrometheusIdSubqueryLruEntry int                           `default:"8000" yaml:"max-prometheus-id-subquery-lru-entry"`
+	PrometheusIdSubqueryLruTimeout  int                           `default:"60" yaml:"prometheus-id-subquery-lru-timeout"`
+	AutoCustomTags                  []AutoCustomTags              `yaml:"auto-custom-tags" binding:"omitempty,dive"`
 }
 
 type DeepflowApp struct {
 	Host string `default:"deepflow-app" yaml:"host"`
 	Port string `default:"20418" yaml:"port"`
+}
+
+type Location struct {
+	Start  int    `yaml:"start"`
+	Length int    `yaml:"length"`
+	Format string `yaml:"format"`
+}
+
+type TraceIdWithIndex struct {
+	Enabled               bool     `yaml:"enabled"`
+	Type                  string   `yaml:"type"`
+	IncrementalIdLocation Location `yaml:"incremental-id-location"`
 }
 
 type Clickhouse struct {
@@ -68,6 +85,12 @@ type Clickhouse struct {
 	Timeout        int    `default:"60" yaml:"timeout"`
 	ConnectTimeout int    `default:"2" yaml:"connect-timeout"`
 	MaxConnection  int    `default:"20" yaml:"max-connection"`
+}
+type AutoCustomTags struct {
+	TagName     string   `default:"" yaml:"tag-name"`
+	TagFields   []string `yaml:"tag-fields" binding:"omitempty,dive"`
+	DisplayName string   `default:"" yaml:"display_name"`
+	Description string   `default:"" yaml:"description"`
 }
 
 func (c *Config) expendEnv() {

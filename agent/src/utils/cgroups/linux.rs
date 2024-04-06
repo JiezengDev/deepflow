@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
-use std::{fs, process, thread};
+use std::{fs, thread};
 
 use super::Error;
 use crate::config::handler::EnvironmentAccess;
@@ -149,8 +149,8 @@ impl Cgroups {
                                 "apply cgroups resource failed, {}, deepflow-agent restart...",
                                 e
                             );
-                            thread::sleep(Duration::from_secs(1));
-                            process::exit(1);
+                            crate::utils::notify_exit(1);
+                            break;
                         }
                     }
                     last_cpu = max_cpus;

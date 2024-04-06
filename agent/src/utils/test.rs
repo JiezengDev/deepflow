@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,7 +28,7 @@ impl Capture {
         let parse_len = parse_len.unwrap_or(1500);
         let mut packets = vec![];
         let mut capture = pcap::Capture::from_file(path).unwrap();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         while let Ok(packet) = capture.next() {
             packets.push((
                 packet.header.clone(),

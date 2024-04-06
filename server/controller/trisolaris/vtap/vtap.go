@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -76,6 +76,7 @@ type VTapInfo struct {
 	kcData                         *KubernetesCluster
 	isReady                        atomicbool.Bool // 缓存是否初始化完成
 	realDefaultConfig              *VTapConfig     // 实际默认值配置
+	pluginNameToUpdateTime         map[string]uint32
 
 	// 配置改变重新生成平台数据
 	isVTapChangedForPD atomicbool.Bool
@@ -132,6 +133,7 @@ func NewVTapInfo(db *gorm.DB, metaData *metadata.MetaData, cfg *config.Config) *
 		vtapGroupLcuuidToEAHPEnabled:   make(map[string]*int),
 		noVTapTapPortsMac:              mapset.NewSet(),
 		kvmVTapCtrlIPToTapPorts:        make(map[string]mapset.Set),
+		pluginNameToUpdateTime:         make(map[string]uint32),
 		kcData:                         newKubernetesCluster(db),
 		isReady:                        atomicbool.NewBool(false),
 		isVTapChangedForPD:             atomicbool.NewBool(false),
@@ -359,6 +361,20 @@ func (v *VTapInfo) loadTapPortsData() {
 	v.kvmVTapCtrlIPToTapPorts = kvmVTapCtrlIPToTapPorts
 }
 
+func (v *VTapInfo) loadPlugins() {
+	pluginNameToUpdateTime := make(map[string]uint32)
+	plugins, err := dbmgr.DBMgr[models.Plugin](v.db).GetFields([]string{"name", "updated_at"})
+	if err != nil {
+		log.Error(err)
+		return
+	}
+	for _, plugin := range plugins {
+		pluginNameToUpdateTime[plugin.Name] = uint32(plugin.UpdatedAt.Unix())
+	}
+	v.pluginNameToUpdateTime = pluginNameToUpdateTime
+
+}
+
 func (v *VTapInfo) loadConfigData() {
 	deafaultConfiguration := &models.RVTapGroupConfiguration{}
 	b, err := json.Marshal(DefaultVTapGroupConfig)
@@ -375,6 +391,7 @@ func (v *VTapInfo) loadConfigData() {
 	dbDataCache := v.metaData.GetDBDataCache()
 	configs := dbDataCache.GetVTapGroupConfigurationsFromDB(v.db)
 	v.convertConfig(configs)
+	v.loadPlugins()
 }
 
 func (v *VTapInfo) loadKubernetesCluster() {
@@ -553,6 +570,15 @@ func (v *VTapInfo) GetSkipInterface(c *VTapCache) []*trident.SkipInterface {
 		if rawData != nil {
 			return rawData.GetSkipInterface(launchServer)
 		}
+	}
+
+	return nil
+}
+
+func (v *VTapInfo) GetContainers(vtapID int) []*trident.Container {
+	rawData := v.metaData.GetPlatformDataOP().GetRawData()
+	if rawData != nil {
+		return rawData.GetContainers(vtapID)
 	}
 
 	return nil
@@ -977,6 +1003,7 @@ func (v *VTapInfo) updateCacheToDB() {
 			dbVTap.KernelVersion = cacheVTap.GetKernelVersion()
 			dbVTap.ProcessName = cacheVTap.GetProcessName()
 			dbVTap.CtrlMac = cacheVTap.GetCtrlMac()
+			dbVTap.RawHostname = cacheVTap.GetVTapRawHostname()
 			cacheExceptions := cacheVTap.GetExceptions()
 			tridentExceptions := uint64(VTAP_TRIDENT_EXCEPTIONS_MASK) & uint64(cacheExceptions)
 			controllerException := uint64(VTAP_CONTROLLER_EXCEPTIONS_MASK) & uint64(dbVTap.Exceptions)
@@ -1080,8 +1107,9 @@ func (v *VTapInfo) getVTapAutoRegister() bool {
 	return v.config.VTapAutoRegister
 }
 
-func (v *VTapInfo) Register(tapMode int, ctrlIP string, ctrlMac string, hostIPs []string, host string, vTapGroupID string) {
-	vTapRegister := newVTapRegister(tapMode, ctrlIP, ctrlMac, hostIPs, host, vTapGroupID)
+func (v *VTapInfo) Register(tapMode int, ctrlIP string, ctrlMac string,
+	hostIPs []string, host string, vTapGroupID string, agentUniqueIdentifier int) {
+	vTapRegister := newVTapRegister(tapMode, ctrlIP, ctrlMac, hostIPs, host, vTapGroupID, agentUniqueIdentifier)
 	v.registerMU.Lock()
 	v.register[vTapRegister.getKey()] = vTapRegister
 	v.registerMU.Unlock()

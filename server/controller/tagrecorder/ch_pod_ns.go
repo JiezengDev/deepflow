@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,66 +17,69 @@
 package tagrecorder
 
 import (
+	"gorm.io/gorm/clause"
+
+	"github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type ChPodNamespace struct {
-	UpdaterBase[mysql.ChPodNamespace, IDKey]
+	SubscriberComponent[*message.PodNamespaceFieldsUpdate, message.PodNamespaceFieldsUpdate, mysql.PodNamespace, mysql.ChPodNamespace, IDKey]
 	resourceTypeToIconID map[IconKey]int
 }
 
 func NewChPodNamespace(resourceTypeToIconID map[IconKey]int) *ChPodNamespace {
-	updater := &ChPodNamespace{
-		UpdaterBase[mysql.ChPodNamespace, IDKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_POD_NAMESPACE,
-		},
+	mng := &ChPodNamespace{
+		newSubscriberComponent[*message.PodNamespaceFieldsUpdate, message.PodNamespaceFieldsUpdate, mysql.PodNamespace, mysql.ChPodNamespace, IDKey](
+			common.RESOURCE_TYPE_POD_NAMESPACE_EN, RESOURCE_TYPE_CH_POD_NAMESPACE,
+		),
 		resourceTypeToIconID,
 	}
-	updater.dataGenerator = updater
-	return updater
+	mng.subscriberDG = mng
+	return mng
 }
 
-func (p *ChPodNamespace) generateNewData() (map[IDKey]mysql.ChPodNamespace, bool) {
-	var podNamespaces []mysql.PodNamespace
-	err := mysql.Db.Unscoped().Find(&podNamespaces).Error
-	if err != nil {
-		log.Errorf(dbQueryResourceFailed(p.resourceTypeName, err))
-		return nil, false
+// sourceToTarget implements SubscriberDataGenerator
+func (c *ChPodNamespace) sourceToTarget(source *mysql.PodNamespace) (keys []IDKey, targets []mysql.ChPodNamespace) {
+	iconID := c.resourceTypeToIconID[IconKey{
+		NodeType: RESOURCE_TYPE_POD_NAMESPACE,
+	}]
+	sourceName := source.Name
+	if source.DeletedAt.Valid {
+		sourceName += " (deleted)"
 	}
 
-	keyToItem := make(map[IDKey]mysql.ChPodNamespace)
-	for _, podNamespace := range podNamespaces {
-		if podNamespace.DeletedAt.Valid {
-			keyToItem[IDKey{ID: podNamespace.ID}] = mysql.ChPodNamespace{
-				ID:     podNamespace.ID,
-				Name:   podNamespace.Name + " (deleted)",
-				IconID: p.resourceTypeToIconID[IconKey{NodeType: RESOURCE_TYPE_POD_NAMESPACE}],
-			}
-		} else {
-			keyToItem[IDKey{ID: podNamespace.ID}] = mysql.ChPodNamespace{
-				ID:     podNamespace.ID,
-				Name:   podNamespace.Name,
-				IconID: p.resourceTypeToIconID[IconKey{NodeType: RESOURCE_TYPE_POD_NAMESPACE}],
-			}
-		}
-	}
-	return keyToItem, true
+	keys = append(keys, IDKey{ID: source.ID})
+	targets = append(targets, mysql.ChPodNamespace{
+		ID:           source.ID,
+		Name:         sourceName,
+		PodClusterID: source.PodClusterID,
+		IconID:       iconID,
+	})
+	return
 }
 
-func (p *ChPodNamespace) generateKey(dbItem mysql.ChPodNamespace) IDKey {
-	return IDKey{ID: dbItem.ID}
-}
-
-func (p *ChPodNamespace) generateUpdateInfo(oldItem, newItem mysql.ChPodNamespace) (map[string]interface{}, bool) {
+// onResourceUpdated implements SubscriberDataGenerator
+func (c *ChPodNamespace) onResourceUpdated(sourceID int, fieldsUpdate *message.PodNamespaceFieldsUpdate) {
 	updateInfo := make(map[string]interface{})
-	if oldItem.Name != newItem.Name {
-		updateInfo["name"] = newItem.Name
+	if fieldsUpdate.Name.IsDifferent() {
+		updateInfo["name"] = fieldsUpdate.Name.GetNew()
 	}
-	if oldItem.IconID != newItem.IconID {
-		updateInfo["icon_id"] = newItem.IconID
+	if fieldsUpdate.PodClusterID.IsDifferent() {
+		updateInfo["pod_cluster_id"] = fieldsUpdate.PodClusterID.GetNew()
 	}
 	if len(updateInfo) > 0 {
-		return updateInfo, true
+		var chItem mysql.ChPodNamespace
+		mysql.Db.Where("id = ?", sourceID).First(&chItem)
+		c.SubscriberComponent.dbOperator.update(chItem, updateInfo, IDKey{ID: sourceID})
 	}
-	return nil, false
+}
+
+// softDeletedTargetsUpdated implements SubscriberDataGenerator
+func (c *ChPodNamespace) softDeletedTargetsUpdated(targets []mysql.ChPodNamespace) {
+	mysql.Db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"name"}),
+	}).Create(&targets)
 }

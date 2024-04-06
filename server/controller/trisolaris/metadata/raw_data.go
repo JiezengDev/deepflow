@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,6 +29,15 @@ import (
 	models "github.com/deepflowio/deepflow/server/controller/db/mysql"
 	. "github.com/deepflowio/deepflow/server/controller/trisolaris/utils"
 )
+
+var PodGroupTypeMap = map[int]uint32{
+	POD_GROUP_DEPLOYMENT:            uint32(trident.AutoServiceType_AUTO_SERVICE_TYPE_POD_GROUP_DEPLOYMENT),
+	POD_GROUP_STATEFULSET:           uint32(trident.AutoServiceType_AUTO_SERVICE_TYPE_POD_GROUP_STATEFULSET),
+	POD_GROUP_RC:                    uint32(trident.AutoServiceType_AUTO_SERVICE_TYPE_POD_GROUP_RC),
+	POD_GROUP_DAEMON_SET:            uint32(trident.AutoServiceType_AUTO_SERVICE_TYPE_POD_GROUP_DAEMON_SET),
+	POD_GROUP_REPLICASET_CONTROLLER: uint32(trident.AutoServiceType_AUTO_SERVICE_TYPE_POD_GROUP_REPLICASET_CONTROLLER),
+	POD_GROUP_CLONESET:              uint32(trident.AutoServiceType_AUTO_SERVICE_TYPE_POD_GROUP_CLONESET),
+}
 
 type TypeIDData struct {
 	LaunchServer   string
@@ -97,6 +106,7 @@ type PlatformRawData struct {
 	peerConnIDs       mapset.Set
 	cenIDs            mapset.Set
 	podServiceIDs     mapset.Set
+	podGroupIDs       mapset.Set
 	redisInstanceIDs  mapset.Set
 	rdsInstanceIDs    mapset.Set
 	podNodeIDs        mapset.Set
@@ -126,6 +136,7 @@ type PlatformRawData struct {
 	idToPodNode         map[int]*models.PodNode
 	idToPod             map[int]*models.Pod
 	idToPodService      map[int]*models.PodService
+	idToPodGroup        map[int]*models.PodGroup
 
 	vmIDToVifs            map[int]mapset.Set
 	vRouterIDToVifs       map[int]mapset.Set
@@ -145,6 +156,10 @@ type PlatformRawData struct {
 	deviceTypeAndIDToVInterfaceID map[TypeIDKey][]int
 
 	launchServerToSkipInterface map[string][]*trident.SkipInterface
+
+	vtapIDToContainer    map[int][]*trident.Container
+	launchServerIDToVTap map[int]*models.VTap
+	containerIdToPodId   map[string]int
 
 	launchServerToVRouterIDs map[string][]int
 }
@@ -169,6 +184,7 @@ func NewPlatformRawData() *PlatformRawData {
 		peerConnIDs:       mapset.NewSet(),
 		cenIDs:            mapset.NewSet(),
 		podServiceIDs:     mapset.NewSet(),
+		podGroupIDs:       mapset.NewSet(),
 		redisInstanceIDs:  mapset.NewSet(),
 		rdsInstanceIDs:    mapset.NewSet(),
 		podNodeIDs:        mapset.NewSet(),
@@ -208,6 +224,7 @@ func NewPlatformRawData() *PlatformRawData {
 		idToPodNode:            make(map[int]*models.PodNode),
 		idToPod:                make(map[int]*models.Pod),
 		idToPodService:         make(map[int]*models.PodService),
+		idToPodGroup:           make(map[int]*models.PodGroup),
 
 		vmIDToVifs:                    make(map[int]mapset.Set),
 		vRouterIDToVifs:               make(map[int]mapset.Set),
@@ -226,6 +243,10 @@ func NewPlatformRawData() *PlatformRawData {
 		deviceTypeAndIDToVInterfaceID: make(map[TypeIDKey][]int),
 		typeIDToDevice:                make(map[TypeIDKey]*TypeIDData),
 		launchServerToSkipInterface:   make(map[string][]*trident.SkipInterface),
+
+		vtapIDToContainer:    make(map[int][]*trident.Container),
+		launchServerIDToVTap: make(map[int]*models.VTap),
+		containerIdToPodId:   make(map[string]int),
 
 		launchServerToVRouterIDs: make(map[string][]int),
 	}
@@ -314,7 +335,7 @@ func (r *PlatformRawData) ConvertDBVInterface(dbDataCache *DBDataCache) {
 			} else {
 				r.hostIDToVifs[vif.DeviceID] = mapset.NewSet(vif)
 			}
-			if Find[int](r.gatewayHostIDs, vif.ID) {
+			if Find[int](r.gatewayHostIDs, vif.DeviceID) {
 				if vifs, ok := r.gatewayHostIDToVifs[vif.DeviceID]; ok {
 					vifs.Add(vif)
 				} else {
@@ -446,12 +467,34 @@ func (r *PlatformRawData) ConvertDBDHCPPort(dbDataCache *DBDataCache) {
 	}
 }
 
+func (r *PlatformRawData) GetContainers(vtapID int) []*trident.Container {
+	return r.vtapIDToContainer[vtapID]
+}
+
+func (r *PlatformRawData) addContainers(pod *models.Pod) {
+	if pod.ContainerIDs == "" {
+		return
+	}
+	vtap, ok := r.launchServerIDToVTap[pod.PodNodeID]
+	for _, cid := range strings.Split(pod.ContainerIDs, ", ") {
+		r.containerIdToPodId[cid] = pod.ID
+		if ok {
+			container := &trident.Container{
+				PodId:       proto.Uint32(uint32(pod.ID)),
+				ContainerId: proto.String(cid),
+			}
+			r.vtapIDToContainer[vtap.ID] = append(r.vtapIDToContainer[vtap.ID], container)
+		}
+	}
+}
+
 func (r *PlatformRawData) ConvertDBPod(dbDataCache *DBDataCache) {
 	pods := dbDataCache.GetPods()
 	if pods == nil {
 		return
 	}
 	for _, pod := range pods {
+		r.addContainers(pod)
 		r.idToPod[pod.ID] = pod
 		r.podIDs.Add(pod.ID)
 		podIDs, ok := r.podNodeIDtoPodIDs[pod.PodNodeID]
@@ -628,7 +671,7 @@ func (r *PlatformRawData) ConvertHost(dbDataCache *DBDataCache) {
 			AZ:             host.AZ,
 			Type:           VIF_DEVICE_TYPE_HOST,
 		}
-		if host.Type == HOST_HTYPE_GATEWAY {
+		if host.HType == HOST_HTYPE_GATEWAY {
 			r.gatewayHostIDs = append(r.gatewayHostIDs, host.ID)
 		}
 	}
@@ -712,6 +755,17 @@ func (r *PlatformRawData) ConvertDBPodService(dbDataCache *DBDataCache) {
 			PodNamespaceID: ps.PodNamespaceID,
 			Type:           VIF_DEVICE_TYPE_POD_SERVICE,
 		}
+	}
+}
+
+func (r *PlatformRawData) ConvertDBPodGroup(dbDataCache *DBDataCache) {
+	podGroups := dbDataCache.GetPodGroups()
+	if podGroups == nil {
+		return
+	}
+	for _, pg := range podGroups {
+		r.idToPodGroup[pg.ID] = pg
+		r.podGroupIDs.Add(pg.ID)
 	}
 }
 
@@ -1075,12 +1129,17 @@ func (r *PlatformRawData) ConvertDBVIPs(dbDataCache *DBDataCache) {
 
 func (r *PlatformRawData) ConvertDBVTaps(dbDataCache *DBDataCache) {
 	for _, vtap := range dbDataCache.GetVTapsIDAndName() {
+		if vtap.Type == VTAP_TYPE_POD_HOST || vtap.Type == VTAP_TYPE_POD_VM {
+			r.launchServerIDToVTap[vtap.LaunchServerID] = vtap
+		}
 		r.vtapIdToVtap[vtap.ID] = vtap
 	}
 }
 
 // 有依赖 需要按顺序convert
 func (r *PlatformRawData) ConvertDBCache(dbDataCache *DBDataCache) {
+	r.ConvertDBVTaps(dbDataCache)
+	r.ConvertDBVIPs(dbDataCache)
 	r.ConvertHost(dbDataCache)
 	r.ConvertDBVPC(dbDataCache)
 	r.ConvertDBVM(dbDataCache)
@@ -1095,6 +1154,7 @@ func (r *PlatformRawData) ConvertDBCache(dbDataCache *DBDataCache) {
 	r.ConvertDBPeerConnection(dbDataCache)
 	r.ConvertDBCEN(dbDataCache)
 	r.ConvertDBPodService(dbDataCache)
+	r.ConvertDBPodGroup(dbDataCache)
 	r.ConvertDBPodServicePort(dbDataCache)
 	r.ConvertDBRedisInstance(dbDataCache)
 	r.ConvertDBRdsInstance(dbDataCache)
@@ -1106,8 +1166,6 @@ func (r *PlatformRawData) ConvertDBCache(dbDataCache *DBDataCache) {
 	r.ConvertDBVipDomain(dbDataCache)
 	r.ConvertSkipVTapVIfIDs(dbDataCache)
 	r.ConvertDBProcesses(dbDataCache)
-	r.ConvertDBVTaps(dbDataCache)
-	r.ConvertDBVIPs(dbDataCache)
 }
 
 func (r *PlatformRawData) checkVifIsVip(vif *models.VInterface) bool {
@@ -1165,6 +1223,11 @@ func (r *PlatformRawData) vInterfaceToProto(
 	if err != nil {
 		log.Error(err, vif.Mac)
 	}
+	podGroupType := uint32(0)
+	podGroup := r.idToPodGroup[device.PodGroupID]
+	if podGroup != nil {
+		podGroupType = PodGroupTypeMap[podGroup.Type]
+	}
 	aInterface := &trident.Interface{
 		Id:             proto.Uint32(uint32(vif.ID)),
 		Mac:            proto.Uint64(macU64),
@@ -1185,6 +1248,7 @@ func (r *PlatformRawData) vInterfaceToProto(
 		IsVipInterface: proto.Bool(ipResourceData.isVipInterface),
 		NetnsId:        proto.Uint32(vif.NetnsID),
 		VtapId:         proto.Uint32(vif.VtapID),
+		PodGroupType:   proto.Uint32(podGroupType),
 	}
 	sInterface := &trident.Interface{
 		Id:             proto.Uint32(uint32(vif.ID)),
@@ -1306,6 +1370,10 @@ func (r *PlatformRawData) GetVMIDToPodNodeID() map[int]int {
 
 func (r *PlatformRawData) GetPodNode(podNodeID int) *models.PodNode {
 	return r.idToPodNode[podNodeID]
+}
+
+func (r *PlatformRawData) GetPodGroup(podGroupID int) *models.PodGroup {
+	return r.idToPodGroup[podGroupID]
 }
 
 func (r *PlatformRawData) GetPod(podID int) *models.Pod {
@@ -1465,6 +1533,11 @@ func (r *PlatformRawData) equal(o *PlatformRawData) bool {
 		return false
 	}
 
+	if !r.podGroupIDs.Equal(o.podGroupIDs) {
+		log.Info("platform pod group changed")
+		return false
+	}
+
 	if !r.redisInstanceIDs.Equal(o.redisInstanceIDs) {
 		log.Info("platform redis instance changed")
 		return false
@@ -1559,6 +1632,23 @@ func (r *PlatformRawData) equal(o *PlatformRawData) bool {
 	if !r.vipDomainLcuuids.Equal(o.vipDomainLcuuids) {
 		log.Info("platform vip domains changed")
 		return false
+	}
+
+	if len(r.gatewayHostIDToVifs) != len(o.gatewayHostIDToVifs) {
+		log.Info("platform gateway host vinterface changed")
+		return false
+	} else {
+		for id, vif := range r.gatewayHostIDToVifs {
+			if ovif, ok := o.gatewayHostIDToVifs[id]; ok {
+				if !vif.Equal(ovif) {
+					log.Info("platform gateway host vinterface changed")
+					return false
+				}
+			} else {
+				log.Info("platform gateway host vinterface changed")
+				return false
+			}
+		}
 	}
 
 	return true

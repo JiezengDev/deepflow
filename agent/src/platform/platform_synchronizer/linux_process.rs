@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -267,7 +267,9 @@ impl TryFrom<&OsProcRegexp> for ProcRegRewrite {
             )),
             OS_PROC_REGEXP_MATCH_TYPE_PARENT_PROC_NAME => Ok(Self::ParentProcessName(re, action)),
             OS_PROC_REGEXP_MATCH_TYPE_TAG => Ok(Self::Tag(re, action)),
-            _ => Err(regex::Error::__Nonexhaustive),
+            _ => Err(regex::Error::Syntax(
+                "regexp match type incorrect".to_string(),
+            )),
         }
     }
 }
@@ -310,7 +312,10 @@ impl ProcRegRewrite {
                     }
 
                     let Some(parent_proc) = pid_process_map.get(&(proc.ppid as u32)) else {
-                        error!("pid {} have no parent proc with ppid: {}", proc.pid,proc.ppid);
+                        error!(
+                            "pid {} have no parent proc with ppid: {}",
+                            proc.pid, proc.ppid
+                        );
                         return false;
                     };
                     if reg.is_match(&parent_proc.process_name.as_str()) {
@@ -595,7 +600,7 @@ fn merge_tag(child_tag: &mut Vec<OsAppTagKV>, parent_tag: &[OsAppTagKV]) {
 
 fn get_container_id(proc: &Process) -> Option<String> {
     let Ok(cgruop) = proc.cgroups() else {
-        return None
+        return None;
     };
 
     let mut path = "".to_string();
@@ -631,7 +636,7 @@ fn get_container_id(proc: &Process) -> Option<String> {
         Some(s.to_string())
     } else {
         // other cri likely have format like `${cri-prefix}-${container id}.scope`
-        let Some((_, sp))  = s.rsplit_once("-") else {
+        let Some((_, sp)) = s.rsplit_once("-") else {
             debug!("containerd cri path: `{:?}` get container id fail", path);
             return None;
         };

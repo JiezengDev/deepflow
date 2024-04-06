@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/manager/config"
 	"github.com/deepflowio/deepflow/server/controller/recorder"
+	recordercfg "github.com/deepflowio/deepflow/server/controller/recorder/config"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 )
 
@@ -120,6 +121,21 @@ func (m *Manager) GetKubernetesGatherResources(lcuuid string) ([]kubernetes_gath
 		k8sGatherResources = append(k8sGatherResources, k8sGatherTask.GetResource())
 	}
 	return k8sGatherResources, nil
+}
+
+func (m *Manager) TriggerKubernetesRefresh(domainLcuuid, subDomainLcuuid string, version int) error {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	cloudTask, ok := m.taskMap[domainLcuuid]
+	if !ok {
+		return errors.New(fmt.Sprintf("domain (%s) not found", domainLcuuid))
+	}
+	k8sGatherTaskMap := cloudTask.Cloud.GetKubernetesGatherTaskMap()
+	gather, ok := k8sGatherTaskMap[subDomainLcuuid]
+	if !ok {
+		return errors.New(fmt.Sprintf("domain (%s) not found gather (%s)", domainLcuuid, subDomainLcuuid))
+	}
+	return gather.PutRefreshSignal(version)
 }
 
 func (m *Manager) GetRecorder(domainLcuuid string) (recorder.Recorder, error) {
@@ -239,6 +255,7 @@ func (m *Manager) run(ctx context.Context) {
 
 func (m *Manager) Start() {
 	cloudcfg.SetCloudGlobalConfig(m.cfg.TaskCfg.CloudCfg)
+	recordercfg.Set(&m.cfg.TaskCfg.RecorderCfg)
 
 	log.Info("manager started")
 	ctx := context.Context(context.Background())

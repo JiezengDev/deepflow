@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -118,6 +118,10 @@ func (s *DFStats) WriteBlock(block *ckdb.Block) error {
 		}
 	}
 	return nil
+}
+
+func (s *DFStats) OrgID() uint16 {
+	return ckdb.DEFAULT_ORG_ID
 }
 
 func (s *DFStats) Release() {

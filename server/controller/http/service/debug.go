@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,6 +30,8 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/manager"
 	"github.com/deepflowio/deepflow/server/controller/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 )
 
 func GetCloudBasicInfos(filter map[string]string, m *manager.Manager) (resp []cloudmodel.BasicInfo, err error) {
@@ -55,6 +57,10 @@ func GetCloudResource(lcuuid string, m *manager.Manager) (resp cloudmodel.Resour
 	}
 }
 
+func TriggerKubernetesRefresh(domainLcuuid, subDomainLcuuid string, version int, m *manager.Manager) error {
+	return m.TriggerKubernetesRefresh(domainLcuuid, subDomainLcuuid, version)
+}
+
 func GetKubernetesGatherBasicInfos(lcuuid string, m *manager.Manager) (resp []kubernetes_gather_model.KubernetesGatherBasicInfo, err error) {
 	response, err := m.GetKubernetesGatherBasicInfos(lcuuid)
 	return response, err
@@ -73,19 +79,19 @@ func GetRecorderDomainCache(domainLcuuid, subDomainLcuuid string, m *manager.Man
 	}
 }
 
-func GetRecorderCacheDiffBaseDataSet(domainLcuuid, subDomainLcuuid string, m *manager.Manager) (resp cache.DiffBaseDataSet, err error) {
+func GetRecorderCacheDiffBaseDataSet(domainLcuuid, subDomainLcuuid string, m *manager.Manager) (resp diffbase.DataSet, err error) {
 	if recorder, err := m.GetRecorder(domainLcuuid); err == nil {
-		return recorder.GetCache(domainLcuuid, subDomainLcuuid).DiffBaseDataSet, nil
+		return *recorder.GetCache(domainLcuuid, subDomainLcuuid).DiffBaseDataSet, nil
 	} else {
-		return cache.DiffBaseDataSet{}, NewError(httpcommon.RESOURCE_NOT_FOUND, err.Error())
+		return diffbase.DataSet{}, NewError(httpcommon.RESOURCE_NOT_FOUND, err.Error())
 	}
 }
 
-func GetRecorderCacheToolDataSet(domainLcuuid, subDomainLcuuid string, m *manager.Manager) (resp cache.ToolDataSet, err error) {
+func GetRecorderCacheToolDataSet(domainLcuuid, subDomainLcuuid string, m *manager.Manager) (resp tool.DataSet, err error) {
 	if recorder, err := m.GetRecorder(domainLcuuid); err == nil {
-		return recorder.GetCache(domainLcuuid, subDomainLcuuid).ToolDataSet, nil
+		return *recorder.GetCache(domainLcuuid, subDomainLcuuid).ToolDataSet, nil
 	} else {
-		return cache.ToolDataSet{}, NewError(httpcommon.RESOURCE_NOT_FOUND, err.Error())
+		return tool.DataSet{}, NewError(httpcommon.RESOURCE_NOT_FOUND, err.Error())
 	}
 }
 
@@ -134,13 +140,11 @@ func GetGenesisSyncData(g *genesis.Genesis) (genesis.GenesisSyncData, error) {
 }
 
 func GetGenesisKubernetesData(g *genesis.Genesis, clusterID string) (map[string][]string, error) {
-	data, err := g.GetKubernetesResponse(clusterID)
-	return data, err
+	return g.GetKubernetesResponse(clusterID)
 }
 
 func GetGenesisPrometheusData(g *genesis.Genesis, clusterID string) ([]cloudmodel.PrometheusTarget, error) {
-	data, err := g.GetPrometheusResponse(clusterID)
-	return data, err
+	return g.GetPrometheusResponse(clusterID)
 }
 
 func GetAgentStats(g *genesis.Genesis, param string) ([]genesis.TridentStats, error) {

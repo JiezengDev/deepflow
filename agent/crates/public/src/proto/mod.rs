@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,5 @@ pub mod common;
 pub mod flow_log;
 pub mod integration;
 pub mod metric;
-pub mod protobuf_rpc;
 pub mod stats;
 pub mod trident;

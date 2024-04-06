@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,14 +20,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"sort"
 	"sync"
 	"time"
 
+	"github.com/bitly/go-simplejson"
 	mapset "github.com/deckarep/golang-set"
 	logging "github.com/op/go-logging"
+	cmap "github.com/orcaman/concurrent-map/v2"
 	"gorm.io/gorm"
 
-	"github.com/bitly/go-simplejson"
 	cloudcommon "github.com/deepflowio/deepflow/server/controller/cloud/common"
 	"github.com/deepflowio/deepflow/server/controller/cloud/config"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
@@ -36,6 +39,7 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/genesis"
 	"github.com/deepflowio/deepflow/server/controller/statsd"
+	"github.com/deepflowio/deepflow/server/libs/queue"
 )
 
 var log = logging.MustGetLogger("cloud")
@@ -49,6 +53,8 @@ type Cloud struct {
 	resource                model.Resource
 	platform                platform.Platform
 	taskCost                statsd.CloudTaskStatsd
+	domainRefreshSignal     *queue.OverwriteQueue
+	subDomainRefreshSignals cmap.ConcurrentMap[string, *queue.OverwriteQueue]
 	kubernetesGatherTaskMap map[string]*KubernetesGatherTask
 }
 
@@ -78,8 +84,10 @@ func NewCloud(domain mysql.Domain, cfg config.CloudConfig, ctx context.Context) 
 			ErrorState: common.RESOURCE_STATE_CODE_SUCCESS,
 		},
 		taskCost: statsd.CloudTaskStatsd{
-			TaskCost: make(map[string][]int),
+			TaskCost: make(map[string][]float64),
 		},
+		domainRefreshSignal:     queue.NewOverwriteQueue(fmt.Sprintf("cloud-task-%s", domain.Name), 1),
+		subDomainRefreshSignals: cmap.New[*queue.OverwriteQueue](),
 	}
 }
 
@@ -90,6 +98,7 @@ func (c *Cloud) Start() {
 
 func (c *Cloud) Stop() {
 	c.platform.ClearDebugLog()
+	c.domainRefreshSignal.Close()
 	if c.cCancel != nil {
 		c.cCancel()
 	}
@@ -103,18 +112,87 @@ func (c *Cloud) GetBasicInfo() model.BasicInfo {
 	return c.basicInfo
 }
 
+func (c *Cloud) GetDomainRefreshSignal() *queue.OverwriteQueue {
+	return c.domainRefreshSignal
+}
+
+func (c *Cloud) GetSubDomainRefreshSignals() cmap.ConcurrentMap[string, *queue.OverwriteQueue] {
+	return c.subDomainRefreshSignals
+}
+
+func (c *Cloud) suffixResourceOperation(resource model.Resource) model.Resource {
+	hostIPToHostName, vmLcuuidToHostName, err := cloudcommon.GetHostAndVmHostNameByDomain(c.basicInfo.Lcuuid)
+	if err != nil {
+		log.Errorf("cloud suffix operation get vtap info error : (%s)", err.Error())
+		return resource
+	}
+
+	vinterfaceLcuuidToIP := map[string]string{}
+	for _, ip := range resource.IPs {
+		vinterfaceLcuuidToIP[ip.VInterfaceLcuuid] = ip.IP
+	}
+	vmLcuuidToIPs := map[string][]string{}
+	for _, vinterface := range resource.VInterfaces {
+		if vinterface.DeviceType != common.VIF_DEVICE_TYPE_VM {
+			continue
+		}
+		ip, ok := vinterfaceLcuuidToIP[vinterface.Lcuuid]
+		if !ok || ip == "" {
+			continue
+		}
+		vmLcuuidToIPs[vinterface.DeviceLcuuid] = append(vmLcuuidToIPs[vinterface.DeviceLcuuid], ip)
+	}
+
+	var retHosts []model.Host
+	for _, host := range resource.Hosts {
+		// add hostname to host
+		if hostName, ok := hostIPToHostName[host.IP]; ok && host.Hostname == "" {
+			host.Hostname = hostName
+		}
+		retHosts = append(retHosts, host)
+	}
+
+	var retVMs []model.VM
+	for _, vm := range resource.VMs {
+		// return a default map, when not found cloud tags
+		if vm.CloudTags == nil {
+			vm.CloudTags = map[string]string{}
+		}
+		// select the first of the existing ips, when the ip is empty
+		if vm.IP == "" {
+			ips, ok := vmLcuuidToIPs[vm.Lcuuid]
+			if ok && len(ips) > 0 {
+				sort.Strings(ips)
+				vm.IP = ips[0]
+			}
+		}
+		// add hostname to vm
+		if hostName, ok := vmLcuuidToHostName[vm.Lcuuid]; ok && vm.Hostname == "" {
+			vm.Hostname = hostName
+		}
+		retVMs = append(retVMs, vm)
+	}
+	resource.Hosts = retHosts
+	resource.VMs = retVMs
+	return resource
+}
+
 func (c *Cloud) GetResource() model.Resource {
 	cResource := c.resource
 	if c.basicInfo.Type != common.KUBERNETES {
-		if cResource.ErrorState == common.RESOURCE_STATE_CODE_SUCCESS && cResource.Verified && len(cResource.VMs) > 0 {
+		if cResource.ErrorState == common.RESOURCE_STATE_CODE_SUCCESS && cResource.Verified {
 			cResource.SubDomainResources = c.getSubDomainData(cResource)
 			cResource = c.appendResourceVIPs(cResource)
 		}
+	} else {
+		cResource = c.getKubernetesData()
 	}
 
 	if cResource.Verified {
 		cResource = c.appendAddtionalResourcesData(cResource)
 		cResource = c.appendResourceProcess(cResource)
+		// don't move c.suffixResourceOperation, it need to always hold the last position
+		cResource = c.suffixResourceOperation(cResource)
 	}
 	return cResource
 }
@@ -134,29 +212,32 @@ func (c *Cloud) getCloudGatherInterval() int {
 	err := mysql.Db.Where("lcuuid = ?", c.basicInfo.Lcuuid).First(&domain).Error
 	if err != nil {
 		log.Warningf("get cloud gather interval failed: (%s)", err.Error())
-		return cloudcommon.CLOUD_SYNC_TIMER_MIN
+		return cloudcommon.CLOUD_SYNC_TIMER_DEFAULT
 	}
 	domainConfig, err := simplejson.NewJson([]byte(domain.Config))
 	if err != nil {
 		log.Warningf("parse domain (%s) config failed: (%s)", c.basicInfo.Name, err.Error())
-		return cloudcommon.CLOUD_SYNC_TIMER_MIN
+		return cloudcommon.CLOUD_SYNC_TIMER_DEFAULT
 	}
 	domainSyncTimer := domainConfig.Get("sync_timer").MustInt()
 	if domainSyncTimer == 0 {
-		return cloudcommon.CLOUD_SYNC_TIMER_MIN
+		return cloudcommon.CLOUD_SYNC_TIMER_DEFAULT
 	}
 	if domainSyncTimer < cloudcommon.CLOUD_SYNC_TIMER_MIN || domainSyncTimer > cloudcommon.CLOUD_SYNC_TIMER_MAX {
 		log.Warningf("cloud sync timer invalid: (%d)", domainSyncTimer)
-		return cloudcommon.CLOUD_SYNC_TIMER_MIN
+		return cloudcommon.CLOUD_SYNC_TIMER_DEFAULT
 	}
 	return domainSyncTimer
 }
 
 func (c *Cloud) getCloudData() {
 	var cResource model.Resource
+	var cloudCost float64
 	if c.basicInfo.Type != common.KUBERNETES {
 		var err error
+		startTime := time.Now()
 		cResource, err = c.platform.GetCloudData()
+		cloudCost = time.Now().Sub(startTime).Seconds()
 		// 这里因为任务内部没有对成功的状态赋值状态码，在这里统一处理了
 		if err == nil {
 			if cResource.ErrorState == 0 {
@@ -172,19 +253,28 @@ func (c *Cloud) getCloudData() {
 				ErrorState:   cResource.ErrorState,
 			}
 		}
-	} else {
-		cResource = c.getKubernetesData()
-	}
-
-	if len(cResource.VMs) == 0 {
-		cResource = model.Resource{
-			ErrorState:   cResource.ErrorState,
-			ErrorMessage: cResource.ErrorMessage,
+		if len(cResource.VMs) == 0 && c.basicInfo.Type != common.FILEREADER {
+			cResource = model.Resource{
+				ErrorState:   cResource.ErrorState,
+				ErrorMessage: "invalid vm count (0). " + cResource.ErrorMessage,
+			}
+		}
+		cResource.SyncAt = time.Now()
+		if cResource.ErrorState == common.RESOURCE_STATE_CODE_SUCCESS {
+			c.sendStatsd(cloudCost)
 		}
 	}
 
-	cResource.SyncAt = time.Now()
 	c.resource = cResource
+	// trigger recorder refresh domain resource
+	c.domainRefreshSignal.Put(struct{}{})
+}
+
+func (c *Cloud) sendStatsd(cloudCost float64) {
+	c.taskCost.TaskCost = map[string][]float64{
+		c.basicInfo.Lcuuid: []float64{cloudCost},
+	}
+	statsd.MetaStatsd.RegisterStatsdTable(c)
 }
 
 func (c *Cloud) run() {
@@ -204,16 +294,9 @@ func (c *Cloud) run() {
 	for {
 		select {
 		case <-ticker.C:
-			c.taskCost.TaskCost = map[string][]int{}
-			startTime := time.Now()
-
 			log.Infof("cloud (%s) assemble data starting", c.basicInfo.Name)
 			c.getCloudData()
 			log.Infof("cloud (%s) assemble data complete", c.basicInfo.Name)
-
-			c.taskCost.TaskCost[c.basicInfo.Lcuuid] = []int{int(time.Now().Sub(startTime).Seconds())}
-			statsd.MetaStatsd.RegisterStatsdTable(c)
-
 		case <-c.cCtx.Done():
 			log.Infof("cloud (%s) stopped", c.basicInfo.Name)
 			return
@@ -252,7 +335,7 @@ func (c *Cloud) runKubernetesGatherTask() {
 		}
 		c.mutex.Lock()
 		c.kubernetesGatherTaskMap[domain.Lcuuid] = kubernetesGatherTask
-		c.kubernetesGatherTaskMap[domain.Lcuuid].Start()
+		c.kubernetesGatherTaskMap[domain.Lcuuid].Start(c.domainRefreshSignal)
 		c.mutex.Unlock()
 
 	} else {
@@ -283,6 +366,11 @@ func (c *Cloud) runKubernetesGatherTask() {
 			c.mutex.Lock()
 			delete(c.kubernetesGatherTaskMap, lcuuid)
 			c.mutex.Unlock()
+			kGatherQueue, ok := c.subDomainRefreshSignals.Get(lcuuid)
+			if ok {
+				kGatherQueue.Close()
+				c.subDomainRefreshSignals.Remove(lcuuid)
+			}
 		}
 
 		// 对于新增的subDomain，启动Task，并纳入Manger管理
@@ -293,9 +381,12 @@ func (c *Cloud) runKubernetesGatherTask() {
 			if kubernetesGatherTask == nil {
 				continue
 			}
+
+			gatherQueue := queue.NewOverwriteQueue(fmt.Sprintf("sub-domain-task-%s", lcuuid), 1)
+			c.subDomainRefreshSignals.SetIfAbsent(lcuuid, gatherQueue)
 			c.mutex.Lock()
 			c.kubernetesGatherTaskMap[lcuuid] = kubernetesGatherTask
-			c.kubernetesGatherTaskMap[lcuuid].Start()
+			c.kubernetesGatherTaskMap[lcuuid].Start(gatherQueue)
 			c.mutex.Unlock()
 		}
 
@@ -315,10 +406,15 @@ func (c *Cloud) runKubernetesGatherTask() {
 					continue
 				}
 
+				gatherQueue, ok := c.subDomainRefreshSignals.Get(lcuuid)
+				if !ok {
+					gatherQueue = queue.NewOverwriteQueue(fmt.Sprintf("sub-domain-task-%s", lcuuid), 1)
+					c.subDomainRefreshSignals.Set(lcuuid, gatherQueue)
+				}
 				c.mutex.Lock()
 				delete(c.kubernetesGatherTaskMap, lcuuid)
 				c.kubernetesGatherTaskMap[lcuuid] = kubernetesGatherTask
-				c.kubernetesGatherTaskMap[lcuuid].Start()
+				c.kubernetesGatherTaskMap[lcuuid].Start(gatherQueue)
 				c.mutex.Unlock()
 			}
 		}
@@ -358,6 +454,7 @@ func (c *Cloud) appendAddtionalResourcesData(resource model.Resource) model.Reso
 	resource.LBs = append(resource.LBs, additionalResource.LB...)
 	resource.LBListeners = append(resource.LBListeners, additionalResource.LBListeners...)
 	resource.LBTargetServers = append(resource.LBTargetServers, additionalResource.LBTargetServers...)
+	resource.PeerConnections = append(resource.PeerConnections, additionalResource.PeerConnections...)
 	return resource
 }
 
@@ -387,9 +484,15 @@ func getContentFromAdditionalResource(domainUUID string) (*mysql.DomainAdditiona
 func (c *Cloud) appendCloudTags(resource model.Resource, additionalResource model.AdditionalResource) model.Resource {
 	chostCloudTags := additionalResource.CHostCloudTags
 	for i, chost := range resource.VMs {
-		if value, ok := chostCloudTags[chost.Lcuuid]; ok {
-			resource.VMs[i].CloudTags = value
+		value, ok := chostCloudTags[chost.Lcuuid]
+		if !ok {
+			continue
 		}
+		if len(chost.CloudTags) != 0 {
+			log.Infof("vm (%s) already tags (%v), do not need to add (%v)", chost.Name, chost.CloudTags, value)
+			continue
+		}
+		resource.VMs[i].CloudTags = value
 	}
 	podNamespaceCloudTags := additionalResource.PodNamespaceCloudTags
 	for i, podNamespace := range resource.PodNamespaces {
@@ -428,7 +531,7 @@ func (c *Cloud) appendResourceProcess(resource model.Resource) model.Resource {
 		return resource
 	}
 
-	vtapIDToLcuuid, err := GetVTapSubDomainMappingByDomain(c.basicInfo.Lcuuid)
+	vtapIDToLcuuid, err := cloudcommon.GetVTapSubDomainMappingByDomain(c.basicInfo.Lcuuid)
 	if err != nil {
 		log.Errorf("domain (%s) add process failed: %s", c.basicInfo.Name, err.Error())
 		return resource
@@ -439,13 +542,20 @@ func (c *Cloud) appendResourceProcess(resource model.Resource) model.Resource {
 		if !ok {
 			continue
 		}
+		name, processName := sProcess.Name, sProcess.ProcessName
+		if len(sProcess.Name) > c.cfg.ProcessNameLenMax {
+			name = sProcess.Name[:c.cfg.ProcessNameLenMax]
+		}
+		if len(sProcess.ProcessName) > c.cfg.ProcessNameLenMax {
+			processName = sProcess.ProcessName[:c.cfg.ProcessNameLenMax]
+		}
 		process := model.Process{
 			Lcuuid:      sProcess.Lcuuid,
-			Name:        sProcess.Name,
+			Name:        name,
 			VTapID:      sProcess.VtapID,
 			PID:         sProcess.PID,
 			NetnsID:     sProcess.NetnsID,
-			ProcessName: sProcess.ProcessName,
+			ProcessName: processName,
 			CommandLine: sProcess.CMDLine,
 			UserName:    sProcess.User,
 			ContainerID: sProcess.ContainerID,
@@ -480,7 +590,7 @@ func (c *Cloud) appendResourceVIPs(resource model.Resource) model.Resource {
 		return resource
 	}
 
-	vtapIDToLcuuid, err := GetVTapSubDomainMappingByDomain(c.basicInfo.Lcuuid)
+	vtapIDToLcuuid, err := cloudcommon.GetVTapSubDomainMappingByDomain(c.basicInfo.Lcuuid)
 	if err != nil {
 		log.Errorf("domain (%s) add vip failed: %s", c.basicInfo.Name, err.Error())
 		return resource
@@ -498,58 +608,4 @@ func (c *Cloud) appendResourceVIPs(resource model.Resource) model.Resource {
 		})
 	}
 	return resource
-}
-
-func GetVTapSubDomainMappingByDomain(domain string) (map[int]string, error) {
-	vtapIDToSubDomain := make(map[int]string)
-
-	var azs []mysql.AZ
-	err := mysql.Db.Where("domain = ?", domain).Find(&azs).Error
-	if err != nil {
-		return vtapIDToSubDomain, err
-	}
-	azLcuuids := []string{}
-	for _, az := range azs {
-		azLcuuids = append(azLcuuids, az.Lcuuid)
-	}
-
-	var podNodes []mysql.PodNode
-	err = mysql.Db.Where("domain = ?", domain).Find(&podNodes).Error
-	if err != nil {
-		return vtapIDToSubDomain, err
-	}
-	podNodeIDToSubDomain := make(map[int]string)
-	for _, podNode := range podNodes {
-		podNodeIDToSubDomain[podNode.ID] = podNode.SubDomain
-	}
-
-	var pods []mysql.Pod
-	err = mysql.Db.Where("domain = ?", domain).Find(&pods).Error
-	if err != nil {
-		return vtapIDToSubDomain, err
-	}
-	podIDToSubDomain := make(map[int]string)
-	for _, pod := range pods {
-		podIDToSubDomain[pod.ID] = pod.SubDomain
-	}
-
-	var vtaps []mysql.VTap
-	err = mysql.Db.Where("az IN ?", azLcuuids).Find(&vtaps).Error
-	if err != nil {
-		return vtapIDToSubDomain, err
-	}
-	for _, vtap := range vtaps {
-		vtapIDToSubDomain[vtap.ID] = ""
-		if vtap.Type == common.VTAP_TYPE_POD_HOST || vtap.Type == common.VTAP_TYPE_POD_VM {
-			if subDomain, ok := podNodeIDToSubDomain[vtap.LaunchServerID]; ok {
-				vtapIDToSubDomain[vtap.ID] = subDomain
-			}
-		} else if vtap.Type == common.VTAP_TYPE_K8S_SIDECAR {
-			if subDomain, ok := podIDToSubDomain[vtap.LaunchServerID]; ok {
-				vtapIDToSubDomain[vtap.ID] = subDomain
-			}
-		}
-	}
-
-	return vtapIDToSubDomain, nil
 }

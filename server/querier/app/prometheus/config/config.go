@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 package config
 
 type Prometheus struct {
+	Limit                   string          `default:"1000000" yaml:"limit"`
 	QPSLimit                int             `default:"100" yaml:"qps-limit"`
 	SeriesLimit             int             `default:"500" yaml:"series-limit"`
 	MaxSamples              int             `default:"50000000" yaml:"max-samples"`
@@ -24,12 +25,17 @@ type Prometheus struct {
 	RequestQueryWithDebug   bool            `default:"false" yaml:"request-query-with-debug"`
 	ExternalTagCacheSize    int             `default:"1024" yaml:"external-tag-cache-size"`
 	ExternalTagLoadInterval int             `default:"300" yaml:"external-tag-load-interval"`
+	ThanosReplicaLabels     []string        `yaml:"thanos-replica-labels"`
+	OperatorOffloading      bool            `default:"false" yaml:"operator-offloading"`
 	Cache                   PrometheusCache `yaml:"cache"`
 }
 
 type PrometheusCache struct {
-	Enabled                bool    `default:"true" yaml:"enabled"`
-	CacheItemSize          uint64  `default:"51200000" yaml:"cache-item-size"` // cache-item-size for each cache item, default: 50M
-	CacheMaxCount          int     `default:"1024" yaml:"cache-max-count"`     // cache-max-count for list of cache size
-	CacheMaxAllowDeviation float64 `default:"3600" yaml:"cache-max-allow-deviation"`
+	RemoteReadCache    bool   `default:"false" yaml:"remote-read-cache"`   // cache for database quering
+	ResponseCache      bool   `default:"false" yaml:"response-cache"`      // cache for query response (only operator offloading mode)
+	CacheItemSize      uint64 `default:"51200000" yaml:"cache-item-size"`  // cache-item-size for each cache item, default: 50M
+	CacheMaxCount      int    `default:"1024" yaml:"cache-max-count"`      // cache-max-count for list of cache size
+	CacheFirstTimeout  int    `default:"10" yaml:"cache-first-timeout"`    // time out for first cache item load, unit: s, default: 10s
+	CacheCleanInterval int    `default:"3600" yaml:"cache-clean-interval"` // clean interval for cache, unit: s, default: 1h
+	CacheAllowTimeGap  int    `default:"1" yaml:"cache-allow-time-gap"`    // when query end time - cache end time <= allow gap: not update cache, unit: s, default: 1s
 }

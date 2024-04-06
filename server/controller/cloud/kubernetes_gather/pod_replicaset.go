@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,13 +19,10 @@ package kubernetes_gather
 import (
 	"strings"
 
-	cloudcommon "github.com/deepflowio/deepflow/server/controller/cloud/common"
-	"github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/common"
-
 	"github.com/bitly/go-simplejson"
 	mapset "github.com/deckarep/golang-set"
-	uuid "github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/controller/cloud/model"
+	"github.com/deepflowio/deepflow/server/controller/common"
 )
 
 func (k *KubernetesGather) getReplicaSetsAndReplicaSetControllers() (podRSs []model.PodReplicaSet, podRSCs []model.PodGroup, err error) {
@@ -69,9 +66,7 @@ func (k *KubernetesGather) getReplicaSetsAndReplicaSetControllers() (podRSs []mo
 			log.Infof("replicaset,replicasetcontroller (%s) pod group not found", name)
 			continue
 		}
-		labels := metaData.Get("labels").MustMap()
-		labelSlice := cloudcommon.StringInterfaceMapKVs(labels, ":", 0)
-		labelString := strings.Join(labelSlice, ", ")
+		labelString := k.GetLabel(metaData.Get("labels").MustMap())
 		if !k.podGroupLcuuids.Contains(podGroupLcuuid) {
 			podGroupLcuuid = uID
 			// ReplicaSetController类型名称去掉最后的'-' + hash值
@@ -111,10 +106,10 @@ func (k *KubernetesGather) getReplicaSetsAndReplicaSetControllers() (podRSs []mo
 				Label:              labelString,
 				Type:               common.POD_GROUP_REPLICASET_CONTROLLER,
 				PodNum:             replicas,
-				RegionLcuuid:       k.RegionUuid,
+				RegionLcuuid:       k.RegionUUID,
 				AZLcuuid:           k.azLcuuid,
 				PodNamespaceLcuuid: namespaceLcuuid,
-				PodClusterLcuuid:   common.GetUUID(k.UuidGenerate, uuid.Nil),
+				PodClusterLcuuid:   k.podClusterLcuuid,
 			}
 			podRSCs = append(podRSCs, podRSC)
 		}
@@ -124,10 +119,10 @@ func (k *KubernetesGather) getReplicaSetsAndReplicaSetControllers() (podRSs []mo
 			PodNum:             replicas,
 			Label:              labelString,
 			PodGroupLcuuid:     podGroupLcuuid,
-			RegionLcuuid:       k.RegionUuid,
+			RegionLcuuid:       k.RegionUUID,
 			AZLcuuid:           k.azLcuuid,
 			PodNamespaceLcuuid: namespaceLcuuid,
-			PodClusterLcuuid:   common.GetUUID(k.UuidGenerate, uuid.Nil),
+			PodClusterLcuuid:   k.podClusterLcuuid,
 		}
 		podRSs = append(podRSs, podRS)
 		k.rsLcuuidToPodGroupLcuuid[uID] = podGroupLcuuid

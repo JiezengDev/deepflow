@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,24 +14,24 @@
  * limitations under the License.
  */
 
-use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
+use ahash::AHashMap;
 use ipnetwork::IpNetwork;
 use log::{debug, error};
 use lru::LruCache;
 use pnet::datalink::NetworkInterface;
 
-use crate::common::decapsulate::TunnelType;
-use crate::common::enums::TapType;
-use crate::common::lookup_key::LookupKey;
-use crate::common::platform_data::PlatformData;
-use crate::common::TapPort;
-use crate::utils::environment::is_tt_workload;
+use crate::{
+    common::{
+        decapsulate::TunnelType, enums::TapType, lookup_key::LookupKey,
+        platform_data::PlatformData, TapPort, Timestamp,
+    },
+    utils::environment::is_tt_workload,
+};
 use public::proto::common::TridentType;
 use public::utils::net::MacAddr;
 
@@ -55,7 +55,7 @@ struct L3Item {
     tap_type: TapType,
     tap_port: TapPort,
 
-    last: Duration,
+    last: Timestamp,
     from: u16,
 }
 
@@ -112,9 +112,8 @@ type TableLruCache = LruCache<L3Key, L3Item>;
 
 pub struct Forward {
     mac_ip_tables: RwLock<TableLruCache>,
-    vip_device_tables: RwLock<HashMap<u64, bool>>,
+    vip_device_tables: RwLock<AHashMap<u64, bool>>,
 
-    queue_count: usize,
     capacity: usize,
 }
 
@@ -123,15 +122,14 @@ impl Forward {
         assert!(queue_count < super::MAX_QUEUE_COUNT && queue_count > 0);
         Self {
             mac_ip_tables: RwLock::new(TableLruCache::new(NonZeroUsize::new(capacity).unwrap())),
-            vip_device_tables: RwLock::new(HashMap::new()),
-            queue_count,
+            vip_device_tables: RwLock::new(AHashMap::new()),
             capacity,
         }
     }
 
     fn update_vip_from_platforms(
         &self,
-        table: &mut HashMap<u64, bool>,
+        table: &mut AHashMap<u64, bool>,
         platforms: &Vec<Arc<PlatformData>>,
     ) {
         for platform in platforms {
@@ -175,7 +173,7 @@ impl Forward {
                         TunnelType::None,
                         0,
                     ),
-                    last: Duration::from_secs(0),
+                    last: Timestamp::ZERO,
                     from: FROM_CONTROLLER,
                     ip: ip.raw_ip,
                     mac,
@@ -249,7 +247,7 @@ impl Forward {
                         TunnelType::None,
                         0,
                     ),
-                    last: Duration::from_secs(0),
+                    last: Timestamp::ZERO,
                     from: FROM_CONFIG,
                     ip: ip.ip(),
                     mac,
@@ -275,7 +273,7 @@ impl Forward {
         self.update_l3_from_platforms(&mut mac_ip_table, platforms);
         self.update_l3_from_interfaces(trident_type, &mut mac_ip_table, interfaces);
 
-        let mut vip_device_table = HashMap::new();
+        let mut vip_device_table = AHashMap::new();
         self.update_vip_from_platforms(&mut vip_device_table, platforms);
         *self.vip_device_tables.write().unwrap() = vip_device_table
     }

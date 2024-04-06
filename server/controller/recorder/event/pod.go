@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,10 +20,10 @@ import (
 	"fmt"
 
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/common"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
-	. "github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 	"github.com/deepflowio/deepflow/server/libs/eventapi"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 )
@@ -31,16 +31,18 @@ import (
 type Pod struct {
 	EventManagerBase
 	deviceType int
+	tool       *IPTool
 }
 
-func NewPod(toolDS *cache.ToolDataSet, eq *queue.OverwriteQueue) *Pod {
+func NewPod(toolDS *tool.DataSet, eq *queue.OverwriteQueue) *Pod {
 	mng := &Pod{
-		EventManagerBase{
-			resourceType: RESOURCE_TYPE_POD_EN,
-			ToolDataSet:  toolDS,
-			Queue:        eq,
-		},
-		common.VIF_DEVICE_TYPE_POD,
+		newEventManagerBase(
+			ctrlrcommon.RESOURCE_TYPE_POD_EN,
+			toolDS,
+			eq,
+		),
+		ctrlrcommon.VIF_DEVICE_TYPE_POD,
+		newTool(toolDS),
 	}
 	return mng
 }
@@ -64,11 +66,12 @@ func (p *Pod) ProduceByAdd(items []*mysql.Pod) {
 			eventapi.TagVPCID(item.VPCID),
 			eventapi.TagPodClusterID(item.PodClusterID),
 			eventapi.TagPodGroupID(item.PodGroupID),
+			eventapi.TagPodServiceID(item.PodServiceID),
 			eventapi.TagPodNodeID(item.PodNodeID),
 			eventapi.TagPodNSID(item.PodNamespaceID),
 		}...)
 
-		l3DeviceOpts, ok := getL3DeviceOptionsByPodNodeID(p.ToolDataSet, item.PodNodeID)
+		l3DeviceOpts, ok := p.tool.getL3DeviceOptionsByPodNodeID(item.PodNodeID)
 		if ok {
 			opts = append(opts, l3DeviceOpts...)
 			p.createAndEnqueue(
@@ -93,7 +96,7 @@ func (p *Pod) ProduceByAdd(items []*mysql.Pod) {
 	}
 }
 
-func (p *Pod) ProduceByUpdate(cloudItem *cloudmodel.Pod, diffBase *cache.Pod) {
+func (p *Pod) ProduceByUpdate(cloudItem *cloudmodel.Pod, diffBase *diffbase.Pod) {
 	if diffBase.CreatedAt != cloudItem.CreatedAt {
 		var (
 			id   int
@@ -104,7 +107,7 @@ func (p *Pod) ProduceByUpdate(cloudItem *cloudmodel.Pod, diffBase *cache.Pod) {
 		if ok {
 			name, err = p.ToolDataSet.GetPodNameByID(id)
 			if err != nil {
-				log.Errorf("%v, %v", idByLcuuidNotFound(p.resourceType, diffBase.Lcuuid), err)
+				log.Error(p.org.LogPre("%v, %v", idByLcuuidNotFound(p.resourceType, diffBase.Lcuuid), err))
 			}
 		} else {
 			log.Error(nameByIDNotFound(p.resourceType, id))
@@ -115,7 +118,7 @@ func (p *Pod) ProduceByUpdate(cloudItem *cloudmodel.Pod, diffBase *cache.Pod) {
 		if oldPodNodeID != 0 {
 			oldPodNodeName, err = p.ToolDataSet.GetPodNodeNameByID(oldPodNodeID)
 			if err != nil {
-				log.Errorf("%v, %v", idByLcuuidNotFound(p.resourceType, diffBase.PodNodeLcuuid), err)
+				log.Error(p.org.LogPre("%v, %v", idByLcuuidNotFound(p.resourceType, diffBase.PodNodeLcuuid), err))
 			}
 		}
 
@@ -124,7 +127,7 @@ func (p *Pod) ProduceByUpdate(cloudItem *cloudmodel.Pod, diffBase *cache.Pod) {
 		if newPodNodeID != 0 {
 			newPodNodeName, err = p.ToolDataSet.GetPodNodeNameByID(newPodNodeID)
 			if err != nil {
-				log.Errorf("%v, %v", idByLcuuidNotFound(p.resourceType, cloudItem.PodNodeLcuuid), err)
+				log.Error(p.org.LogPre("%v, %v", idByLcuuidNotFound(p.resourceType, cloudItem.PodNodeLcuuid), err))
 			}
 		}
 
@@ -170,7 +173,7 @@ func (p *Pod) ProduceByDelete(lcuuids []string) {
 		if ok {
 			name, err = p.ToolDataSet.GetPodNameByID(id)
 			if err != nil {
-				log.Errorf("%v, %v", idByLcuuidNotFound(p.resourceType, lcuuid), err)
+				log.Error(p.org.LogPre("%v, %v", idByLcuuidNotFound(p.resourceType, lcuuid), err))
 			}
 		} else {
 			log.Error(nameByIDNotFound(p.resourceType, id))
@@ -181,7 +184,7 @@ func (p *Pod) ProduceByDelete(lcuuids []string) {
 }
 
 func (p *Pod) getIPNetworksByID(id int) (networkIDs []uint32, ips []string) {
-	ipNetworkMap, _ := p.ToolDataSet.EventToolDataSet.GetPodIPNetworkMapByID(id)
+	ipNetworkMap, _ := p.ToolDataSet.EventDataSet.GetPodIPNetworkMapByID(id)
 	for ip, nID := range ipNetworkMap {
 		networkIDs = append(networkIDs, uint32(nID))
 		ips = append(ips, ip.IP)

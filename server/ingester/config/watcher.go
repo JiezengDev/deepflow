@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -105,10 +105,15 @@ func (w *Watcher) Run() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		endpoints, err := w.getMyExpectedClickhouseEndpoints()
-		if err != nil {
-			log.Warning(err)
-			continue
+		var endpoints []Endpoint
+		for {
+			es, err := w.getMyExpectedClickhouseEndpoints()
+			if err == nil {
+				endpoints = es
+				break
+			}
+			log.Info(err)
+			time.Sleep(10 * time.Second)
 		}
 
 		if len(w.myClickhouseEndpoints) == 0 {

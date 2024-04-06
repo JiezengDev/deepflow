@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package cloud
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/config"
@@ -25,23 +26,25 @@ import (
 	kmodel "github.com/deepflowio/deepflow/server/controller/cloud/kubernetes_gather/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/libs/queue"
 )
 
 type KubernetesGatherTask struct {
-	kCtx             context.Context
-	kCancel          context.CancelFunc
-	interval         uint32
-	kubernetesGather *kubernetes_gather.KubernetesGather
-	resource         kmodel.KubernetesGatherResource
-	basicInfo        kmodel.KubernetesGatherBasicInfo
-	SubDomainConfig  string // 附属容器集群配置字段config
+	kCtx                context.Context
+	kCancel             context.CancelFunc
+	gatherCost          float64
+	SubDomainConfig     string // 附属容器集群配置字段config
+	resource            kmodel.KubernetesGatherResource
+	basicInfo           kmodel.KubernetesGatherBasicInfo
+	gatherRefreshSignal *queue.OverwriteQueue
+	kubernetesGather    *kubernetes_gather.KubernetesGather
 }
 
 func NewKubernetesGatherTask(
 	ctx context.Context, domain *mysql.Domain, subDomain *mysql.SubDomain, cfg config.CloudConfig, isSubDomain bool) *KubernetesGatherTask {
 	kubernetesGather := kubernetes_gather.NewKubernetesGather(domain, subDomain, cfg, isSubDomain)
 	if kubernetesGather == nil {
-		log.Errorf("kubernetes_gather (%s) task init faild", subDomain.Name)
+		log.Errorf("kubernetes_gather task (%s) init faild", domain.Name)
 		return nil
 	}
 	subDomainConfig := ""
@@ -64,9 +67,13 @@ func NewKubernetesGatherTask(
 		},
 		kCtx:             kCtx,
 		kCancel:          kCancel,
-		interval:         cfg.KubernetesGatherInterval,
 		kubernetesGather: kubernetesGather,
 		SubDomainConfig:  subDomainConfig,
+		gatherRefreshSignal: queue.NewOverwriteQueue(
+			fmt.Sprintf("kubernetes-gather-%s", kubernetesGather.Name),
+			1,
+			queue.OptionFlushIndicator(time.Duration(cfg.KubernetesGatherInterval)*time.Second), // 定时输入信号，用于定时刷新
+		),
 	}
 }
 
@@ -78,23 +85,34 @@ func (k *KubernetesGatherTask) GetResource() kmodel.KubernetesGatherResource {
 	return k.resource
 }
 
-func (k *KubernetesGatherTask) Start() {
+func (k *KubernetesGatherTask) GetGatherCost() float64 {
+	return k.gatherCost
+}
+
+func (k *KubernetesGatherTask) PutRefreshSignal(version int) error {
+	log.Infof("kubernetes gather (%s) get a refresh version (%d)", k.kubernetesGather.Name, version)
+	k.gatherRefreshSignal.Put(struct{}{})
+	return nil
+}
+
+func (k *KubernetesGatherTask) Start(rSignal *queue.OverwriteQueue) {
 	go func() {
-		k.run()
-		ticker := time.NewTicker(time.Second * time.Duration(k.interval))
+		k.run(rSignal)
 	LOOP:
 		for {
+			k.gatherRefreshSignal.Get()
+			k.run(rSignal)
 			select {
-			case <-ticker.C:
-				k.run()
 			case <-k.kCtx.Done():
 				break LOOP
+			default:
 			}
 		}
 	}()
 }
 
-func (k *KubernetesGatherTask) run() {
+func (k *KubernetesGatherTask) run(rSignal *queue.OverwriteQueue) {
+	startTime := time.Now()
 	log.Infof("kubernetes gather (%s) assemble data starting", k.kubernetesGather.Name)
 	kResource, err := k.kubernetesGather.GetKubernetesGatherData()
 	// 这里因为任务内部没有对成功的状态赋值状态码，在这里统一处理了
@@ -108,6 +126,12 @@ func (k *KubernetesGatherTask) run() {
 	}
 	k.resource = kResource
 	log.Infof("kubernetes gather (%s) assemble data complete", k.kubernetesGather.Name)
+	k.gatherCost = time.Now().Sub(startTime).Seconds()
+	if rSignal == nil {
+		log.Errorf("kubernetes gather (%s) refresh signal is nil")
+		return
+	}
+	rSignal.Put(struct{}{})
 }
 
 func (k *KubernetesGatherTask) Stop() {

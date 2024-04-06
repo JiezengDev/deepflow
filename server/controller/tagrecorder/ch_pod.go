@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,66 +17,85 @@
 package tagrecorder
 
 import (
+	"gorm.io/gorm/clause"
+
+	"github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type ChPod struct {
-	UpdaterBase[mysql.ChPod, IDKey]
+	SubscriberComponent[*message.PodFieldsUpdate, message.PodFieldsUpdate, mysql.Pod, mysql.ChPod, IDKey]
 	resourceTypeToIconID map[IconKey]int
 }
 
 func NewChPod(resourceTypeToIconID map[IconKey]int) *ChPod {
-	updater := &ChPod{
-		UpdaterBase[mysql.ChPod, IDKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_POD,
-		},
+	mng := &ChPod{
+		newSubscriberComponent[*message.PodFieldsUpdate, message.PodFieldsUpdate, mysql.Pod, mysql.ChPod, IDKey](
+			common.RESOURCE_TYPE_POD_EN, RESOURCE_TYPE_CH_POD,
+		),
 		resourceTypeToIconID,
 	}
-	updater.dataGenerator = updater
-	return updater
+	mng.subscriberDG = mng
+	return mng
 }
 
-func (p *ChPod) generateNewData() (map[IDKey]mysql.ChPod, bool) {
-	var pods []mysql.Pod
-	err := mysql.Db.Unscoped().Find(&pods).Error
-	if err != nil {
-		log.Errorf(dbQueryResourceFailed(p.resourceTypeName, err))
-		return nil, false
+// sourceToTarget implements SubscriberDataGenerator
+func (c *ChPod) sourceToTarget(source *mysql.Pod) (keys []IDKey, targets []mysql.ChPod) {
+	iconID := c.resourceTypeToIconID[IconKey{
+		NodeType: RESOURCE_TYPE_POD,
+	}]
+	sourceName := source.Name
+	if source.DeletedAt.Valid {
+		sourceName += " (deleted)"
 	}
 
-	keyToItem := make(map[IDKey]mysql.ChPod)
-	for _, pod := range pods {
-		if pod.DeletedAt.Valid {
-			keyToItem[IDKey{ID: pod.ID}] = mysql.ChPod{
-				ID:     pod.ID,
-				Name:   pod.Name + " (deleted)",
-				IconID: p.resourceTypeToIconID[IconKey{NodeType: RESOURCE_TYPE_POD}],
-			}
-		} else {
-			keyToItem[IDKey{ID: pod.ID}] = mysql.ChPod{
-				ID:     pod.ID,
-				Name:   pod.Name,
-				IconID: p.resourceTypeToIconID[IconKey{NodeType: RESOURCE_TYPE_POD}],
-			}
-		}
-	}
-	return keyToItem, true
+	keys = append(keys, IDKey{ID: source.ID})
+	targets = append(targets, mysql.ChPod{
+		ID:           source.ID,
+		Name:         sourceName,
+		PodClusterID: source.PodClusterID,
+		PodNsID:      source.PodNamespaceID,
+		PodNodeID:    source.PodNodeID,
+		PodGroupID:   source.PodGroupID,
+		IconID:       iconID,
+		PodServiceID: source.PodServiceID,
+	})
+	return
 }
 
-func (p *ChPod) generateKey(dbItem mysql.ChPod) IDKey {
-	return IDKey{ID: dbItem.ID}
-}
-
-func (p *ChPod) generateUpdateInfo(oldItem, newItem mysql.ChPod) (map[string]interface{}, bool) {
+// onResourceUpdated implements SubscriberDataGenerator
+func (c *ChPod) onResourceUpdated(sourceID int, fieldsUpdate *message.PodFieldsUpdate) {
 	updateInfo := make(map[string]interface{})
-	if oldItem.Name != newItem.Name {
-		updateInfo["name"] = newItem.Name
+	if fieldsUpdate.Name.IsDifferent() {
+		updateInfo["name"] = fieldsUpdate.Name.GetNew()
 	}
-	if oldItem.IconID != newItem.IconID {
-		updateInfo["icon_id"] = newItem.IconID
+	if fieldsUpdate.PodClusterID.IsDifferent() {
+		updateInfo["pod_cluster_id"] = fieldsUpdate.PodClusterID.GetNew()
+	}
+	if fieldsUpdate.PodNamespaceID.IsDifferent() {
+		updateInfo["pod_ns_id"] = fieldsUpdate.PodNamespaceID.GetNew()
+	}
+	if fieldsUpdate.PodNodeID.IsDifferent() {
+		updateInfo["pod_node_id"] = fieldsUpdate.PodNodeID.GetNew()
+	}
+	if fieldsUpdate.PodGroupID.IsDifferent() {
+		updateInfo["pod_group_id"] = fieldsUpdate.PodGroupID.GetNew()
+	}
+	if fieldsUpdate.PodServiceID.IsDifferent() {
+		updateInfo["pod_service_id"] = fieldsUpdate.PodServiceID.GetNew()
 	}
 	if len(updateInfo) > 0 {
-		return updateInfo, true
+		var chItem mysql.ChPod
+		mysql.Db.Where("id = ?", sourceID).First(&chItem)
+		c.SubscriberComponent.dbOperator.update(chItem, updateInfo, IDKey{ID: sourceID})
 	}
-	return nil, false
+}
+
+// softDeletedTargetsUpdated implements SubscriberDataGenerator
+func (c *ChPod) softDeletedTargetsUpdated(targets []mysql.ChPod) {
+	mysql.Db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"name"}),
+	}).Create(&targets)
 }

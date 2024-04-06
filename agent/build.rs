@@ -123,8 +123,6 @@ fn set_linkage() -> Result<(), Box<dyn Error>> {
 
     println!("cargo:rustc-link-lib=static=dwarf");
     println!("cargo:rustc-link-lib=static=bcc_bpf");
-    #[cfg(target_arch = "x86_64")]
-    println!("cargo:rustc-link-lib=static=pcap");
 
     println!("cargo:rustc-link-lib=static=elf");
 
@@ -134,6 +132,10 @@ fn set_linkage() -> Result<(), Box<dyn Error>> {
             println!("cargo:rustc-link-lib=dylib=pthread");
             println!("cargo:rustc-link-lib=dylib=z");
             println!("cargo:rustc-link-lib=dylib=stdc++");
+            #[cfg(target_arch = "x86_64")]
+            println!("cargo:rustc-link-lib=static=pcap");
+            #[cfg(target_arch = "aarch64")]
+            println!("cargo:rustc-link-lib=dylib=pcap");
         }
         "musl" => {
             #[cfg(target_arch = "x86_64")]
@@ -142,6 +144,7 @@ fn set_linkage() -> Result<(), Box<dyn Error>> {
             #[cfg(target_arch = "x86_64")]
             println!("cargo:rustc-link-lib=static=stdc++");
 
+            println!("cargo:rustc-link-lib=static=pcap");
             println!("cargo:rustc-link-lib=static=c");
             println!("cargo:rustc-link-lib=static=elf");
             println!("cargo:rustc-link-lib=static=m");
@@ -155,8 +158,73 @@ fn set_linkage() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn compile_wasm_plugin_proto() -> Result<(), Box<dyn Error>> {
+    tonic_build::configure()
+        .build_server(false)
+        .out_dir("src/plugin/wasm")
+        .compile(&["./src/plugin/WasmPluginApi.proto"], &["./src/plugin"])?;
+    Ok(())
+}
+
+fn make_pulsar_proto() -> Result<(), Box<dyn Error>> {
+    tonic_build::configure()
+        .field_attribute(".", "#[serde(skip_serializing_if = \"Option::is_none\")]")
+        .type_attribute(".", "#[derive(serde::Serialize,serde::Deserialize)]")
+        .build_server(false)
+        .out_dir("src/flow_generator/protocol_logs/mq")
+        .compile(
+            &["src/flow_generator/protocol_logs/mq/PulsarApi.proto"],
+            &["src/flow_generator/protocol_logs/mq"],
+        )?;
+
+    // remove `#[serde(skip_serializing_if = "Option::is_none")]` for non-optional fields
+    let filename = "src/flow_generator/protocol_logs/mq/pulsar.proto.rs";
+    let content = std::fs::read_to_string(filename)?;
+    let lines = content.lines().collect::<Vec<_>>();
+    let mut new_lines = Vec::new();
+    new_lines.push(*lines.get(0).unwrap());
+    for a in lines.windows(2) {
+        if a[1].contains("skip_serializing_if") && !a[0].contains("optional") {
+            continue;
+        }
+        new_lines.push(a[1]);
+    }
+    std::fs::write(filename, new_lines.join("\n"))?;
+    Command::new("cargo")
+        .args([
+            "fmt",
+            "--",
+            "src/flow_generator/protocol_logs/mq/pulsar.proto.rs",
+        ])
+        .spawn()?;
+    Ok(())
+}
+
+fn make_brpc_proto() -> Result<(), Box<dyn Error>> {
+    tonic_build::configure()
+        .type_attribute(".", "#[derive(serde::Serialize,serde::Deserialize)]")
+        .build_server(false)
+        .out_dir("src/flow_generator/protocol_logs/rpc/brpc")
+        .compile(
+            &["src/flow_generator/protocol_logs/rpc/brpc/baidu_rpc_meta.proto"],
+            &["src/flow_generator/protocol_logs/rpc"],
+        )?;
+
+    Command::new("cargo")
+        .args([
+            "fmt",
+            "--",
+            "src/flow_generator/protocol_logs/rpc/brpc.proto.rs",
+        ])
+        .spawn()?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     set_build_info()?;
+    compile_wasm_plugin_proto()?;
+    make_pulsar_proto()?;
+    make_brpc_proto()?;
     let target_os = env::var("CARGO_CFG_TARGET_OS")?;
     if target_os.as_str() == "linux" {
         set_build_libtrace()?;

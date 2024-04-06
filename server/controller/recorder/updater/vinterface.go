@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,31 +20,57 @@ import (
 	"strings"
 
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
-	"github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type VInterface struct {
-	UpdaterBase[cloudmodel.VInterface, mysql.VInterface, *cache.VInterface]
+	UpdaterBase[
+		cloudmodel.VInterface,
+		mysql.VInterface,
+		*diffbase.VInterface,
+		*message.VInterfaceAdd,
+		message.VInterfaceAdd,
+		*message.VInterfaceUpdate,
+		message.VInterfaceUpdate,
+		*message.VInterfaceFieldsUpdate,
+		message.VInterfaceFieldsUpdate,
+		*message.VInterfaceDelete,
+		message.VInterfaceDelete]
 }
 
-func NewVInterface(wholeCache *cache.Cache, cloudData []cloudmodel.VInterface, domainToolDataSet *cache.ToolDataSet) *VInterface {
+func NewVInterface(wholeCache *cache.Cache, cloudData []cloudmodel.VInterface, domainToolDataSet *tool.DataSet) *VInterface {
 	updater := &VInterface{
-		UpdaterBase[cloudmodel.VInterface, mysql.VInterface, *cache.VInterface]{
-			cache:             wholeCache,
-			domainToolDataSet: domainToolDataSet,
-			dbOperator:        db.NewVInterface(),
-			diffBaseData:      wholeCache.VInterfaces,
-			cloudData:         cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.VInterface,
+			mysql.VInterface,
+			*diffbase.VInterface,
+			*message.VInterfaceAdd,
+			message.VInterfaceAdd,
+			*message.VInterfaceUpdate,
+			message.VInterfaceUpdate,
+			*message.VInterfaceFieldsUpdate,
+			message.VInterfaceFieldsUpdate,
+			*message.VInterfaceDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_VINTERFACE_EN,
+			wholeCache,
+			db.NewVInterface().SetORG(wholeCache.GetORG()),
+			wholeCache.DiffBaseDataSet.VInterfaces,
+			cloudData,
+		),
 	}
+	updater.setDomainToolDataSet(domainToolDataSet)
 	updater.dataGenerator = updater
 	return updater
 }
 
-func (i *VInterface) getDiffBaseByCloudItem(cloudItem *cloudmodel.VInterface) (diffBase *cache.VInterface, exists bool) {
+func (i *VInterface) getDiffBaseByCloudItem(cloudItem *cloudmodel.VInterface) (diffBase *diffbase.VInterface, exists bool) {
 	diffBase, exists = i.diffBaseData[cloudItem.Lcuuid]
 	return
 }
@@ -59,21 +85,21 @@ func (i *VInterface) generateDBItemToAdd(cloudItem *cloudmodel.VInterface) (*mys
 				networkID, exists = i.domainToolDataSet.GetNetworkIDByLcuuid(cloudItem.NetworkLcuuid)
 			}
 			if !exists {
-				log.Errorf(resourceAForResourceBNotFound(
-					common.RESOURCE_TYPE_NETWORK_EN, cloudItem.NetworkLcuuid,
-					common.RESOURCE_TYPE_VINTERFACE_EN, cloudItem.Lcuuid,
-				))
+				log.Error(i.org.LogPre(resourceAForResourceBNotFound(
+					ctrlrcommon.RESOURCE_TYPE_NETWORK_EN, cloudItem.NetworkLcuuid,
+					ctrlrcommon.RESOURCE_TYPE_VINTERFACE_EN, cloudItem.Lcuuid,
+				)))
 				return nil, false
 			}
 		}
 	}
 	deviceID, exists := i.cache.ToolDataSet.GetDeviceIDByDeviceLcuuid(cloudItem.DeviceType, cloudItem.DeviceLcuuid)
 	if !exists {
-		log.Errorf(
+		log.Error(i.org.LogPre(
 			"device (type: %d, lcuuid: %s) for %s (lcuuid: %s) not found",
 			cloudItem.DeviceType, cloudItem.DeviceLcuuid,
-			common.RESOURCE_TYPE_VINTERFACE_EN, cloudItem.Lcuuid,
-		)
+			ctrlrcommon.RESOURCE_TYPE_VINTERFACE_EN, cloudItem.Lcuuid,
+		))
 		return nil, false
 	}
 
@@ -97,11 +123,12 @@ func (i *VInterface) generateDBItemToAdd(cloudItem *cloudmodel.VInterface) (*mys
 	return dbItem, true
 }
 
-func (i *VInterface) generateUpdateInfo(diffBase *cache.VInterface, cloudItem *cloudmodel.VInterface) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (i *VInterface) generateUpdateInfo(diffBase *diffbase.VInterface, cloudItem *cloudmodel.VInterface) (*message.VInterfaceFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.VInterfaceFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.NetworkLcuuid != cloudItem.NetworkLcuuid {
 		if cloudItem.NetworkLcuuid == "" {
-			updateInfo["subnetid"] = 0
+			mapInfo["subnetid"] = 0
 		} else {
 			networkID, exists := i.cache.ToolDataSet.GetNetworkIDByLcuuid(cloudItem.NetworkLcuuid)
 			if !exists {
@@ -109,33 +136,41 @@ func (i *VInterface) generateUpdateInfo(diffBase *cache.VInterface, cloudItem *c
 					networkID, exists = i.domainToolDataSet.GetNetworkIDByLcuuid(cloudItem.NetworkLcuuid)
 				}
 				if !exists {
-					log.Errorf(resourceAForResourceBNotFound(
-						common.RESOURCE_TYPE_NETWORK_EN, cloudItem.NetworkLcuuid,
-						common.RESOURCE_TYPE_VINTERFACE_EN, cloudItem.Lcuuid,
-					))
-					return nil, false
+					log.Error(i.org.LogPre(resourceAForResourceBNotFound(
+						ctrlrcommon.RESOURCE_TYPE_NETWORK_EN, cloudItem.NetworkLcuuid,
+						ctrlrcommon.RESOURCE_TYPE_VINTERFACE_EN, cloudItem.Lcuuid,
+					)))
+					return nil, nil, false
 				}
 			}
-			updateInfo["subnetid"] = networkID
+			mapInfo["subnetid"] = networkID
 		}
+		structInfo.NetworkID.SetNew(mapInfo["subnetid"].(int))
+		structInfo.NetworkLcuuid.Set(diffBase.NetworkLcuuid, cloudItem.NetworkLcuuid)
 	}
 	if diffBase.Name != cloudItem.Name {
-		updateInfo["name"] = cloudItem.Name
+		mapInfo["name"] = cloudItem.Name
+		structInfo.Name.Set(diffBase.Name, cloudItem.Name)
 	}
 	if diffBase.TapMac != cloudItem.TapMac {
-		updateInfo["tap_mac"] = cloudItem.TapMac
+		mapInfo["tap_mac"] = cloudItem.TapMac
+		structInfo.TapMac.Set(diffBase.TapMac, cloudItem.TapMac)
 	}
 	if diffBase.RegionLcuuid != cloudItem.RegionLcuuid {
-		updateInfo["region"] = cloudItem.RegionLcuuid
+		mapInfo["region"] = cloudItem.RegionLcuuid
+		structInfo.RegionLcuuid.Set(diffBase.RegionLcuuid, cloudItem.RegionLcuuid)
 	}
 	if diffBase.Type != cloudItem.Type {
-		updateInfo["iftype"] = cloudItem.Type
+		mapInfo["iftype"] = cloudItem.Type
+		structInfo.Type.Set(diffBase.Type, cloudItem.Type)
 	}
 	if diffBase.NetnsID != cloudItem.NetnsID {
-		updateInfo["netns_id"] = cloudItem.NetnsID
+		mapInfo["netns_id"] = cloudItem.NetnsID
+		structInfo.NetnsID.Set(diffBase.NetnsID, cloudItem.NetnsID)
 	}
 	if diffBase.VtapID != cloudItem.VTapID {
-		updateInfo["vtap_id"] = cloudItem.VTapID
+		mapInfo["vtap_id"] = cloudItem.VTapID
+		structInfo.VTapID.Set(diffBase.VtapID, cloudItem.VTapID)
 	}
-	return updateInfo, len(updateInfo) > 0
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

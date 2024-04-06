@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -83,20 +83,33 @@ const (
 	RESOURCE_TYPE_CH_IP_PORT        = "ch_ip_port"
 	RESOURCE_TYPE_CH_DEVICE_PORT    = "ch_device_port"
 
-	RESOURCE_TYPE_CH_NETWORK       = "ch_network"
-	RESOURCE_TYPE_CH_POD           = "ch_pod"
-	RESOURCE_TYPE_CH_POD_GROUP     = "ch_pod_group"
-	RESOURCE_TYPE_CH_POD_INGRESS   = "ch_pod_ingress"
-	RESOURCE_TYPE_CH_POD_NAMESPACE = "ch_pod_namespace"
-	RESOURCE_TYPE_CH_POD_NODE      = "ch_pod_node"
-	RESOURCE_TYPE_TAP_TYPE         = "ch_tap_type"
-	RESOURCE_TYPE_CH_VTAP          = "ch_vtap"
-	RESOURCE_TYPE_CH_VTAP_PORT     = "ch_vtap_port"
-	RESOURCE_TYPE_CH_LB_LISTENER   = "ch_lb_listener"
-	RESOURCE_TYPE_CH_STRING_ENUM   = "ch_string_enum"
-	RESOURCE_TYPE_CH_INT_ENUM      = "ch_int_enum"
-	RESOURCE_TYPE_CH_NODE_TYPE     = "ch_node_type"
-	RESOURCE_TYPE_CH_GPROCESS      = "ch_gprocess"
+	RESOURCE_TYPE_CH_NETWORK        = "ch_network"
+	RESOURCE_TYPE_CH_POD            = "ch_pod"
+	RESOURCE_TYPE_CH_POD_GROUP      = "ch_pod_group"
+	RESOURCE_TYPE_CH_POD_GROUP_TYPE = "ch_pod_group_type"
+	RESOURCE_TYPE_CH_POD_INGRESS    = "ch_pod_ingress"
+	RESOURCE_TYPE_CH_POD_NAMESPACE  = "ch_pod_namespace"
+	RESOURCE_TYPE_CH_POD_NODE       = "ch_pod_node"
+	RESOURCE_TYPE_TAP_TYPE          = "ch_tap_type"
+	RESOURCE_TYPE_CH_VTAP           = "ch_vtap"
+	RESOURCE_TYPE_CH_VTAP_PORT      = "ch_vtap_port"
+	RESOURCE_TYPE_CH_LB_LISTENER    = "ch_lb_listener"
+	RESOURCE_TYPE_CH_STRING_ENUM    = "ch_string_enum"
+	RESOURCE_TYPE_CH_INT_ENUM       = "ch_int_enum"
+	RESOURCE_TYPE_CH_NODE_TYPE      = "ch_node_type"
+	RESOURCE_TYPE_CH_GPROCESS       = "ch_gprocess"
+	RESOURCE_TYPE_CH_POD_SERVICE    = "ch_pod_service"
+	RESOURCE_TYPE_CH_CHOST          = "ch_chost"
+	RESOURCE_TYPE_CH_POLICY         = "ch_policy"
+	RESOURCE_TYPE_CH_NPB_TUNNEL     = "ch_npb_tunnel"
+	RESOURCE_TYPE_CH_ALARM_POLICY   = "ch_alarm_policy"
+
+	RESOURCE_TYPE_CH_POD_GROUP_DEPLOYMENT            = "pod_group_deployment"
+	RESOURCE_TYPE_CH_POD_GROUP_STATEFULSET           = "pod_group_statefulset"
+	RESOURCE_TYPE_CH_POD_GROUP_RC                    = "pod_group_rc"
+	RESOURCE_TYPE_CH_POD_GROUP_DAEMON_SET            = "pod_group_daemon_set"
+	RESOURCE_TYPE_CH_POD_GROUP_REPLICASET_CONTROLLER = "pod_group_replicaset_controller"
+	RESOURCE_TYPE_CH_POD_GROUP_CLONESET              = "pod_group_cloneset"
 
 	RESOURCE_TYPE_CH_PROMETHEUS_METRIC_APP_LABEL_LAYOUT = "ch_promytheus_metric_app_label_layout"
 	RESOURCE_TYPE_CH_TARGET_LABEL                       = "ch_target_label"
@@ -153,11 +166,19 @@ const (
 	CH_DICTIONARY_IP_RELATION = "ip_relation_map"
 	CH_DICTIONARY_IP_RESOURCE = "ip_resource_map"
 
+	CH_DICTIONARY_POD_SERVICE = "pod_service_map"
+	CH_DICTIONARY_CHOST       = "chost_map"
+
 	CH_STRING_DICTIONARY_ENUM = "string_enum_map"
 	CH_INT_DICTIONARY_ENUM    = "int_enum_map"
 
 	CH_DICTIONARY_NODE_TYPE = "node_type_map"
 	CH_DICTIONARY_GPROCESS  = "gprocess_map"
+
+	CH_DICTIONARY_POLICY     = "policy_map"
+	CH_DICTIONARY_NPB_TUNNEL = "npb_tunnel_map"
+
+	CH_DICTIONARY_ALARM_POLICY = "alarm_policy_map"
 
 	CH_TARGET_LABEL                       = "target_label_map"
 	CH_APP_LABEL                          = "app_label_map"
@@ -184,7 +205,7 @@ const (
 
 var CH_IP_RESOURCE_TAGS = []string{
 	"region_id", "region_name", "az_id", "az_name", "host_id", "host_name",
-	"chost_id", "chost_name", "vpc_id", "vpc_name", "subnet_id", "subnet_name",
+	"chost_id", "chost_name", "l3_epc_id", "l3_epc_name", "subnet_id", "subnet_name",
 	"router_id", "router_name", "dhcpgw_id", "dhcpgw_name", "lb_id", "lb_name",
 	"lb_listener_id", "lb_listener_name", "natgw_id", "natgw_name", "redis_id",
 	"redis_name", "rds_id", "rds_name", "pod_cluster_id", "pod_cluster_name",
@@ -202,7 +223,7 @@ const (
 		")\n" +
 		"PRIMARY KEY id\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(FLAT())"
 	CREATE_VPC_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -213,7 +234,7 @@ const (
 		")\n" +
 		"PRIMARY KEY id\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(FLAT())"
 	CREATE_TAP_TYPE_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -222,7 +243,7 @@ const (
 		")\n" +
 		"PRIMARY KEY value\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(FLAT())"
 	CREATE_VTAP_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -233,7 +254,7 @@ const (
 		")\n" +
 		"PRIMARY KEY id\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(FLAT())"
 	CREATE_DEVICE_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -241,11 +262,13 @@ const (
 		"    `deviceid` UInt64,\n" +
 		"    `name` String,\n" +
 		"    `icon_id` Int64,\n" +
-		"    `uid` String\n" +
+		"    `uid` String,\n" +
+		"    `hostname` String,\n" +
+		"    `ip` String\n" +
 		")\n" +
 		"PRIMARY KEY devicetype, deviceid\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(COMPLEX_KEY_HASHED())"
 	CREATE_VTAP_PORT_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -261,7 +284,7 @@ const (
 		")\n" +
 		"PRIMARY KEY vtap_id, tap_port\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(COMPLEX_KEY_HASHED())"
 	CREATE_PORT_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -277,7 +300,7 @@ const (
 		")\n" +
 		"PRIMARY KEY id, protocol, port\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(COMPLEX_KEY_HASHED())"
 	CREATE_IP_PORT_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -294,7 +317,7 @@ const (
 		")\n" +
 		"PRIMARY KEY ip, subnet_id, protocol, port\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(COMPLEX_KEY_HASHED())"
 	CREATE_DEVICE_PORT_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -311,7 +334,7 @@ const (
 		")\n" +
 		"PRIMARY KEY devicetype, deviceid, protocol, port\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(COMPLEX_KEY_HASHED())"
 	CREATE_SERVER_PORT_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -320,7 +343,7 @@ const (
 		")\n" +
 		"PRIMARY KEY server_port\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(FLAT())"
 	CREATE_IP_RELATION_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -339,7 +362,7 @@ const (
 		")\n" +
 		"PRIMARY KEY l3_epc_id, ip\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(COMPLEX_KEY_HASHED())"
 	CREATE_ID_NAME_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -348,7 +371,7 @@ const (
 		")\n" +
 		"PRIMARY KEY id\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(FLAT())"
 	CREATE_K8S_LABEL_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -360,7 +383,7 @@ const (
 		")\n" +
 		"PRIMARY KEY id, key\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(COMPLEX_KEY_HASHED())"
 	CREATE_K8S_LABELS_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -371,7 +394,7 @@ const (
 		")\n" +
 		"PRIMARY KEY id\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(FLAT())"
 	CREATE_IP_RESOURCE_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -386,8 +409,8 @@ const (
 		"    `host_name` String,\n" +
 		"    `chost_id` UInt64,\n" +
 		"    `chost_name` String,\n" +
-		"    `vpc_id` UInt64,\n" +
-		"    `vpc_name` String,\n" +
+		"    `l3_epc_id` UInt64,\n" +
+		"    `l3_epc_name` String,\n" +
 		"    `router_id` UInt64,\n" +
 		"    `router_name` String,\n" +
 		"    `dhcpgw_id` UInt64,\n" +
@@ -420,7 +443,7 @@ const (
 		")\n" +
 		"PRIMARY KEY ip, subnet_id\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(COMPLEX_KEY_HASHED())"
 	CREATE_STRING_ENUM_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -431,7 +454,7 @@ const (
 		")\n" +
 		"PRIMARY KEY tag_name, value\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(COMPLEX_KEY_HASHED())"
 	CREATE_INT_ENUM_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -442,7 +465,7 @@ const (
 		")\n" +
 		"PRIMARY KEY tag_name, value\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(COMPLEX_KEY_HASHED())"
 	CREATE_NODE_TYPE_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -451,7 +474,7 @@ const (
 		")\n" +
 		"PRIMARY KEY resource_type\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(FLAT())"
 	CREATE_CLOUD_TAG_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -461,7 +484,7 @@ const (
 		")\n" +
 		"PRIMARY KEY id, key\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(COMPLEX_KEY_HASHED())"
 	CREATE_CLOUD_TAGS_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -470,7 +493,7 @@ const (
 		")\n" +
 		"PRIMARY KEY id\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(FLAT())"
 	CREATE_OS_APP_TAG_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -480,7 +503,7 @@ const (
 		")\n" +
 		"PRIMARY KEY pid, key\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(COMPLEX_KEY_HASHED())"
 	CREATE_OS_APP_TAGS_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -489,7 +512,7 @@ const (
 		")\n" +
 		"PRIMARY KEY pid\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(FLAT())"
 
 	CREATE_K8S_ANNOTATION_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
@@ -502,7 +525,7 @@ const (
 		")\n" +
 		"PRIMARY KEY id, key\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(COMPLEX_KEY_HASHED())"
 	CREATE_K8S_ANNOTATIONS_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -513,7 +536,7 @@ const (
 		")\n" +
 		"PRIMARY KEY id\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(FLAT())"
 	CREATE_K8S_ENV_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -525,7 +548,7 @@ const (
 		")\n" +
 		"PRIMARY KEY id, key\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(COMPLEX_KEY_HASHED())"
 	CREATE_K8S_ENVS_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -536,7 +559,7 @@ const (
 		")\n" +
 		"PRIMARY KEY id\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(FLAT())"
 	CREATE_PROMETHEUS_LABEL_NAME_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -545,7 +568,7 @@ const (
 		")\n" +
 		"PRIMARY KEY id\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(FLAT())"
 	CREATE_PROMETHEUS_METRIC_APP_LABEL_LAYOUT_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -556,7 +579,7 @@ const (
 		")\n" +
 		"PRIMARY KEY id\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(COMPLEX_KEY_HASHED())"
 	CREATE_APP_LABEL_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -566,7 +589,7 @@ const (
 		")\n" +
 		"PRIMARY KEY label_name_id, label_value_id\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(COMPLEX_KEY_HASHED())"
 	CREATE_TARGET_LABEL_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -577,7 +600,7 @@ const (
 		")\n" +
 		"PRIMARY KEY metric_id, label_name_id, target_id\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(COMPLEX_KEY_HASHED())"
 	CREATE_PROMETHEUS_TARGET_LABEL_LAYOUT_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
 		"(\n" +
@@ -587,12 +610,108 @@ const (
 		")\n" +
 		"PRIMARY KEY target_id\n" +
 		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
-		"LIFETIME(MIN 0 MAX %d)\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
 		"LAYOUT(COMPLEX_KEY_HASHED())"
+	CREATE_POD_NS_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
+		"(\n" +
+		"    `id` UInt64,\n" +
+		"    `name` String,\n" +
+		"    `icon_id` Int64,\n" +
+		"    `pod_cluster_id` UInt64\n" +
+		")\n" +
+		"PRIMARY KEY id\n" +
+		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
+		"LAYOUT(FLAT())"
+	CREATE_POD_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
+		"(\n" +
+		"    `id` UInt64,\n" +
+		"    `name` String,\n" +
+		"    `icon_id` Int64,\n" +
+		"    `pod_cluster_id` UInt64,\n" +
+		"    `pod_ns_id` UInt64,\n" +
+		"    `pod_node_id` UInt64,\n" +
+		"    `pod_service_id` UInt64,\n" +
+		"    `pod_group_id` UInt64\n" +
+		")\n" +
+		"PRIMARY KEY id\n" +
+		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
+		"LAYOUT(FLAT())"
+	CREATE_POD_SERVICE_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
+		"(\n" +
+		"    `id` UInt64,\n" +
+		"    `name` String,\n" +
+		"    `pod_cluster_id` UInt64,\n" +
+		"    `pod_ns_id` UInt64\n" +
+		")\n" +
+		"PRIMARY KEY id\n" +
+		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
+		"LAYOUT(FLAT())"
+	CREATE_CHOST_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
+		"(\n" +
+		"    `id` UInt64,\n" +
+		"    `name` String,\n" +
+		"    `host_id` UInt64,\n" +
+		"    `l3_epc_id` UInt64,\n" +
+		"    `hostname` String,\n" +
+		"    `ip` String\n" +
+		")\n" +
+		"PRIMARY KEY id\n" +
+		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
+		"LAYOUT(FLAT())"
+	CREATE_CH_POD_GROUP_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
+		"(\n" +
+		"    `id` UInt64,\n" +
+		"    `name` String,\n" +
+		"    `pod_group_type` UInt64,\n" +
+		"    `icon_id` Int64,\n" +
+		"    `pod_cluster_id` UInt64,\n" +
+		"    `pod_ns_id` UInt64\n" +
+		")\n" +
+		"PRIMARY KEY id\n" +
+		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
+		"LAYOUT(FLAT())"
+	CREATE_CH_GPROCESS_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
+		"(\n" +
+		"    `id` UInt64,\n" +
+		"    `name` String,\n" +
+		"    `icon_id` Int64,\n" +
+		"    `chost_id` Int64,\n" +
+		"    `l3_epc_id` Int64\n" +
+		")\n" +
+		"PRIMARY KEY id\n" +
+		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
+		"LAYOUT(FLAT())"
+	CREATE_POLICY_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
+		"(\n" +
+		"    `tunnel_type` UInt64,\n" +
+		"    `acl_gid` UInt64,\n" +
+		"    `id` Int64,\n" +
+		"    `name` String\n" +
+		")\n" +
+		"PRIMARY KEY tunnel_type, acl_gid\n" +
+		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
+		"LAYOUT(COMPLEX_KEY_HASHED())"
+	CREATE_AlARM_POLICY_DICTIONARY_SQL = "CREATE DICTIONARY %s.%s\n" +
+		"(\n" +
+		"    `id` Int64,\n" +
+		"    `name` String,\n" +
+		"    `user_id` Int64\n" +
+		")\n" +
+		"PRIMARY KEY id\n" +
+		"SOURCE(MYSQL(PORT %s USER '%s' PASSWORD '%s' %s DB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n" +
+		"LIFETIME(MIN 30 MAX %d)\n" +
+		"LAYOUT(FLAT())"
 )
 
 const (
-	CREATE_APP_LABEL_LIVE_VIEW_SQL = "CREATE LIVE VIEW flow_tag.app_label_live_view\n" +
+	CREATE_APP_LABEL_LIVE_VIEW_SQL = "CREATE LIVE VIEW flow_tag.app_label_live_view WITH PERIODIC REFRESH %d\n" +
 		"(\n" +
 		"    `label_name_id` UInt64,\n" +
 		"    `label_value_id` UInt64,\n" +
@@ -600,7 +719,7 @@ const (
 		") AS\n" +
 		"SELECT *\n" +
 		"FROM flow_tag.app_label_map"
-	CREATE_TARGET_LABEL_LIVE_VIEW_SQL = "CREATE LIVE VIEW flow_tag.target_label_live_view\n" +
+	CREATE_TARGET_LABEL_LIVE_VIEW_SQL = "CREATE LIVE VIEW flow_tag.target_label_live_view WITH PERIODIC REFRESH %d\n" +
 		"(\n" +
 		"    `metric_id` UInt64,\n" +
 		"    `label_name_id` UInt64,\n" +
@@ -659,10 +778,10 @@ var CREATE_SQL_MAP = map[string]string{
 	CH_DICTIONARY_VPC:                    CREATE_VPC_DICTIONARY_SQL,
 	CH_DICTIONARY_VL2:                    CREATE_DICTIONARY_SQL,
 	CH_DICTIONARY_POD_CLUSTER:            CREATE_DICTIONARY_SQL,
-	CH_DICTIONARY_POD_NAMESPACE:          CREATE_DICTIONARY_SQL,
+	CH_DICTIONARY_POD_NAMESPACE:          CREATE_POD_NS_DICTIONARY_SQL,
 	CH_DICTIONARY_POD_NODE:               CREATE_DICTIONARY_SQL,
-	CH_DICTIONARY_POD_GROUP:              CREATE_DICTIONARY_SQL,
-	CH_DICTIONARY_POD:                    CREATE_DICTIONARY_SQL,
+	CH_DICTIONARY_POD_GROUP:              CREATE_CH_POD_GROUP_DICTIONARY_SQL,
+	CH_DICTIONARY_POD:                    CREATE_POD_DICTIONARY_SQL,
 	CH_DICTIONARY_DEVICE:                 CREATE_DEVICE_DICTIONARY_SQL,
 	CH_DICTIONARY_VTAP_PORT:              CREATE_VTAP_PORT_DICTIONARY_SQL,
 	CH_DICTIONARY_TAP_TYPE:               CREATE_TAP_TYPE_DICTIONARY_SQL,
@@ -688,7 +807,7 @@ var CREATE_SQL_MAP = map[string]string{
 	CH_DICTIONARY_POD_NS_CLOUD_TAGS:      CREATE_CLOUD_TAGS_DICTIONARY_SQL,
 	CH_DICTIONARY_OS_APP_TAG:             CREATE_OS_APP_TAG_DICTIONARY_SQL,
 	CH_DICTIONARY_OS_APP_TAGS:            CREATE_OS_APP_TAGS_DICTIONARY_SQL,
-	CH_DICTIONARY_GPROCESS:               CREATE_DICTIONARY_SQL,
+	CH_DICTIONARY_GPROCESS:               CREATE_CH_GPROCESS_DICTIONARY_SQL,
 	CH_DICTIONARY_POD_SERVICE_K8S_LABEL:  CREATE_K8S_LABEL_DICTIONARY_SQL,
 	CH_DICTIONARY_POD_SERVICE_K8S_LABELS: CREATE_K8S_LABELS_DICTIONARY_SQL,
 
@@ -698,6 +817,13 @@ var CREATE_SQL_MAP = map[string]string{
 	CH_DICTIONARY_POD_SERVICE_K8S_ANNOTATIONS: CREATE_K8S_ANNOTATIONS_DICTIONARY_SQL,
 	CH_DICTIONARY_POD_K8S_ENV:                 CREATE_K8S_ENV_DICTIONARY_SQL,
 	CH_DICTIONARY_POD_K8S_ENVS:                CREATE_K8S_ENVS_DICTIONARY_SQL,
+	CH_DICTIONARY_POD_SERVICE:                 CREATE_POD_SERVICE_DICTIONARY_SQL,
+	CH_DICTIONARY_CHOST:                       CREATE_CHOST_DICTIONARY_SQL,
+
+	CH_DICTIONARY_POLICY:     CREATE_POLICY_DICTIONARY_SQL,
+	CH_DICTIONARY_NPB_TUNNEL: CREATE_ID_NAME_DICTIONARY_SQL,
+
+	CH_DICTIONARY_ALARM_POLICY: CREATE_AlARM_POLICY_DICTIONARY_SQL,
 
 	CH_PROMETHEUS_LABEL_NAME:              CREATE_PROMETHEUS_LABEL_NAME_DICTIONARY_SQL,
 	CH_PROMETHEUS_METRIC_NAME:             CREATE_PROMETHEUS_LABEL_NAME_DICTIONARY_SQL,
@@ -722,20 +848,35 @@ var VTAP_TYPE_TO_DEVICE_TYPE = map[int]int{
 }
 
 var RESOURCE_TYPE_TO_NODE_TYPE = map[int]string{
-	common.VIF_DEVICE_TYPE_VM:             "chost",
-	common.VIF_DEVICE_TYPE_VROUTER:        "router",
-	common.VIF_DEVICE_TYPE_HOST:           RESOURCE_TYPE_HOST,
-	common.VIF_DEVICE_TYPE_DHCP_PORT:      "dhcpgw",
-	common.VIF_DEVICE_TYPE_POD:            RESOURCE_TYPE_POD,
-	common.VIF_DEVICE_TYPE_POD_SERVICE:    RESOURCE_TYPE_POD_SERVICE,
-	common.VIF_DEVICE_TYPE_REDIS_INSTANCE: "redis",
-	common.VIF_DEVICE_TYPE_RDS_INSTANCE:   "rds",
-	common.VIF_DEVICE_TYPE_POD_NODE:       RESOURCE_TYPE_POD_NODE,
-	common.VIF_DEVICE_TYPE_LB:             RESOURCE_TYPE_LB,
-	common.VIF_DEVICE_TYPE_NAT_GATEWAY:    "natgw",
-	common.VIF_DEVICE_TYPE_INTERNET:       RESOURCE_TYPE_INTERNET_IP,
-	common.VIF_DEVICE_TYPE_POD_GROUP:      RESOURCE_TYPE_POD_GROUP,
-	common.VIF_DEVICE_TYPE_SERVICE:        RESOURCE_TYPE_SERVICE,
-	common.VIF_DEVICE_TYPE_GPROCESS:       RESOURCE_TYPE_GPROCESS,
-	common.VIF_DEVICE_TYPE_IP:             RESOURCE_TYPE_IP,
+	common.VIF_DEVICE_TYPE_VM:                              "chost",
+	common.VIF_DEVICE_TYPE_VROUTER:                         "router",
+	common.VIF_DEVICE_TYPE_HOST:                            RESOURCE_TYPE_HOST,
+	common.VIF_DEVICE_TYPE_DHCP_PORT:                       "dhcpgw",
+	common.VIF_DEVICE_TYPE_POD:                             RESOURCE_TYPE_POD,
+	common.VIF_DEVICE_TYPE_POD_SERVICE:                     RESOURCE_TYPE_POD_SERVICE,
+	common.VIF_DEVICE_TYPE_REDIS_INSTANCE:                  "redis",
+	common.VIF_DEVICE_TYPE_RDS_INSTANCE:                    "rds",
+	common.VIF_DEVICE_TYPE_POD_NODE:                        RESOURCE_TYPE_POD_NODE,
+	common.VIF_DEVICE_TYPE_LB:                              RESOURCE_TYPE_LB,
+	common.VIF_DEVICE_TYPE_NAT_GATEWAY:                     "natgw",
+	common.VIF_DEVICE_TYPE_INTERNET:                        RESOURCE_TYPE_INTERNET_IP,
+	common.VIF_DEVICE_TYPE_POD_GROUP:                       RESOURCE_TYPE_POD_GROUP,
+	common.VIF_DEVICE_TYPE_SERVICE:                         RESOURCE_TYPE_SERVICE,
+	common.VIF_DEVICE_TYPE_GPROCESS:                        RESOURCE_TYPE_GPROCESS,
+	common.VIF_DEVICE_TYPE_POD_GROUP_DEPLOYMENT:            RESOURCE_TYPE_POD_GROUP,
+	common.VIF_DEVICE_TYPE_POD_GROUP_STATEFULSET:           RESOURCE_TYPE_POD_GROUP,
+	common.VIF_DEVICE_TYPE_POD_GROUP_RC:                    RESOURCE_TYPE_POD_GROUP,
+	common.VIF_DEVICE_TYPE_POD_GROUP_DAEMON_SET:            RESOURCE_TYPE_POD_GROUP,
+	common.VIF_DEVICE_TYPE_POD_GROUP_REPLICASET_CONTROLLER: RESOURCE_TYPE_POD_GROUP,
+	common.VIF_DEVICE_TYPE_POD_GROUP_CLONESET:              RESOURCE_TYPE_POD_GROUP,
+	common.VIF_DEVICE_TYPE_IP:                              RESOURCE_TYPE_IP,
+}
+
+var RESOURCE_POD_GROUP_TYPE_MAP = map[int]int{
+	common.POD_GROUP_DEPLOYMENT:            common.VIF_DEVICE_TYPE_POD_GROUP_DEPLOYMENT,
+	common.POD_GROUP_STATEFULSET:           common.VIF_DEVICE_TYPE_POD_GROUP_STATEFULSET,
+	common.POD_GROUP_RC:                    common.VIF_DEVICE_TYPE_POD_GROUP_RC,
+	common.POD_GROUP_DAEMON_SET:            common.VIF_DEVICE_TYPE_POD_GROUP_DAEMON_SET,
+	common.POD_GROUP_REPLICASET_CONTROLLER: common.VIF_DEVICE_TYPE_POD_GROUP_REPLICASET_CONTROLLER,
+	common.POD_GROUP_CLONESET:              common.VIF_DEVICE_TYPE_POD_GROUP_CLONESET,
 }

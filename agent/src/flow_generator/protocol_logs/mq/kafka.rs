@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,18 +21,25 @@ use crate::{
         flow::{L7PerfStats, L7Protocol, PacketDirection},
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
         l7_protocol_log::{KafkaInfoCache, L7ParseResult, L7ProtocolParserInterface, ParseParam},
+        meta_packet::EbpfFlags,
     },
+    config::handler::TraceType,
     flow_generator::{
         error::{Error, Result},
         protocol_logs::{
-            consts::KAFKA_REQ_HEADER_LEN,
-            pb_adapter::{ExtendedInfo, L7ProtocolSendLog, L7Request, L7Response},
+            consts::{
+                KAFKA_REQ_HEADER_LEN, KAFKA_RESP_HEADER_LEN, KAFKA_STATUS_CODE_CHECKER,
+                KAFKA_STATUS_CODE_OFFSET,
+            },
+            decode_base64_to_string,
+            pb_adapter::{ExtendedInfo, L7ProtocolSendLog, L7Request, L7Response, TraceInfo},
             value_is_default, value_is_negative, AppProtoHead, L7ResponseStatus, LogMessageType,
         },
     },
     utils::bytes::{read_i16_be, read_u16_be, read_u32_be},
 };
 
+const KAFKA_PRODUCE: u16 = 0;
 const KAFKA_FETCH: u16 = 1;
 
 #[derive(Serialize, Debug, Default, Clone)]
@@ -43,6 +50,10 @@ pub struct KafkaInfo {
 
     #[serde(rename = "request_id", skip_serializing_if = "value_is_default")]
     pub correlation_id: u32,
+    #[serde(skip_serializing_if = "value_is_default")]
+    pub trace_id: String,
+    #[serde(skip_serializing_if = "value_is_default")]
+    pub span_id: String,
 
     // request
     #[serde(rename = "request_length", skip_serializing_if = "value_is_negative")]
@@ -53,6 +64,9 @@ pub struct KafkaInfo {
     pub api_key: u16,
     #[serde(skip)]
     pub client_id: String,
+    // Extract only from KAFKA_PRODUCE and KAFKA_FETCH
+    #[serde(rename = "request_resource", skip_serializing_if = "value_is_default")]
+    pub topic_name: String,
 
     // reponse
     #[serde(rename = "response_length", skip_serializing_if = "value_is_negative")]
@@ -70,7 +84,10 @@ impl L7ProtocolInfoInterface for KafkaInfo {
         Some(self.correlation_id)
     }
 
-    fn merge_log(&mut self, other: crate::common::l7_protocol_info::L7ProtocolInfo) -> Result<()> {
+    fn merge_log(
+        &mut self,
+        other: &mut crate::common::l7_protocol_info::L7ProtocolInfo,
+    ) -> Result<()> {
         if let L7ProtocolInfo::KafkaInfo(other) = other {
             self.merge(other);
         }
@@ -88,21 +105,34 @@ impl L7ProtocolInfoInterface for KafkaInfo {
     fn is_tls(&self) -> bool {
         self.is_tls
     }
+
+    fn get_endpoint(&self) -> Option<String> {
+        if self.topic_name.is_empty() {
+            None
+        } else {
+            Some(self.topic_name.clone())
+        }
+    }
+
+    fn get_request_resource_length(&self) -> usize {
+        self.topic_name.len()
+    }
 }
 
 impl KafkaInfo {
     // https://kafka.apache.org/protocol.html
     const API_KEY_MAX: u16 = 67;
-    pub fn merge(&mut self, other: Self) {
+    pub fn merge(&mut self, other: &mut Self) {
         if self.resp_msg_size.is_none() {
             self.resp_msg_size = other.resp_msg_size;
         }
         if other.status != L7ResponseStatus::default() {
             self.status = other.status;
         }
-        if other.status_code != None {
+        if other.status_code.is_some() {
             self.status_code = other.status_code;
         }
+        crate::flow_generator::protocol_logs::swap_if!(self, topic_name, is_empty, other);
     }
 
     pub fn check(&self) -> bool {
@@ -189,13 +219,21 @@ impl KafkaInfo {
 impl From<KafkaInfo> for L7ProtocolSendLog {
     fn from(f: KafkaInfo) -> Self {
         let command_str = f.get_command();
+        let flags = if f.is_tls {
+            EbpfFlags::TLS.bits()
+        } else {
+            EbpfFlags::NONE.bits()
+        };
         let log = L7ProtocolSendLog {
             req_len: f.req_msg_size,
             resp_len: f.resp_msg_size,
             req: L7Request {
                 req_type: String::from(command_str),
+                resource: f.topic_name.clone(),
+                endpoint: f.topic_name,
                 ..Default::default()
             },
+            version: Some(f.api_version.to_string()),
             resp: L7Response {
                 status: f.status,
                 code: f.status_code,
@@ -203,24 +241,39 @@ impl From<KafkaInfo> for L7ProtocolSendLog {
             },
             ext_info: Some(ExtendedInfo {
                 request_id: Some(f.correlation_id),
+                x_request_id_0: Some(f.correlation_id.to_string()),
+                x_request_id_1: Some(f.correlation_id.to_string()),
                 ..Default::default()
             }),
+            trace_info: Some(TraceInfo {
+                trace_id: if f.trace_id.is_empty() {
+                    None
+                } else {
+                    Some(f.trace_id)
+                },
+                span_id: if f.span_id.is_empty() {
+                    None
+                } else {
+                    Some(f.span_id)
+                },
+                ..Default::default()
+            }),
+            flags,
             ..Default::default()
         };
         return log;
     }
 }
 
-#[derive(Clone, Serialize, Default)]
+#[derive(Default)]
 pub struct KafkaLog {
-    #[serde(skip)]
     perf_stats: Option<L7PerfStats>,
 }
 
 impl L7ProtocolParserInterface for KafkaLog {
     fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
         if !param.ebpf_type.is_raw_protocol()
-            || param.l4_protocol != IpProtocol::Tcp
+            || param.l4_protocol != IpProtocol::TCP
             || payload.len() < KAFKA_REQ_HEADER_LEN
         {
             return false;
@@ -237,6 +290,7 @@ impl L7ProtocolParserInterface for KafkaLog {
         };
         let mut info = KafkaInfo::default();
         Self::parse(self, payload, param.l4_protocol, param.direction, &mut info)?;
+        info.is_tls = param.is_tls();
 
         // handle kafka status code
         {
@@ -244,21 +298,23 @@ impl L7ProtocolParserInterface for KafkaLog {
             if let Some(previous) = log_cache.rrt_cache.get(&info.cal_cache_key(param)) {
                 match (previous.msg_type, info.msg_type) {
                     (LogMessageType::Request, LogMessageType::Response)
-                        if param.time > previous.time
-                            && param.time - previous.time > param.rrt_timeout as u64 =>
+                        if param.time < previous.time + param.rrt_timeout as u64 =>
                     {
                         if let Some(req) = previous.kafka_info.as_ref() {
                             self.set_status_code(
                                 req.api_key,
                                 req.api_version,
-                                read_i16_be(&payload[12..]),
+                                if payload.len() >= KAFKA_STATUS_CODE_CHECKER {
+                                    read_i16_be(&payload[KAFKA_STATUS_CODE_OFFSET..])
+                                } else {
+                                    0
+                                },
                                 &mut info,
                             )
                         }
                     }
                     (LogMessageType::Response, LogMessageType::Request)
-                        if previous.time > param.time
-                            && previous.time - param.time > param.rrt_timeout as u64 =>
+                        if previous.time < param.time + param.rrt_timeout as u64 =>
                     {
                         if let Some(resp) = previous.kafka_info.as_ref() {
                             self.set_status_code(
@@ -279,7 +335,11 @@ impl L7ProtocolParserInterface for KafkaLog {
             Some(KafkaInfoCache {
                 api_key: info.api_key,
                 api_version: info.api_version,
-                code: read_i16_be(&payload[12..]),
+                code: if payload.len() >= KAFKA_STATUS_CODE_CHECKER {
+                    read_i16_be(&payload[KAFKA_STATUS_CODE_OFFSET..])
+                } else {
+                    0
+                },
             }),
         )
         .map(|rrt| {
@@ -308,6 +368,270 @@ impl L7ProtocolParserInterface for KafkaLog {
 
 impl KafkaLog {
     const MSG_LEN_SIZE: usize = 4;
+    const MAX_TRACE_ID: usize = 255;
+
+    fn decode_varint(buf: &[u8]) -> (usize, usize) {
+        let mut shift = 0;
+        let mut n = 0;
+        let mut x = 0;
+        while shift < 64 {
+            if n >= buf.len() {
+                return (0, 0);
+            }
+            let b = buf[n] as usize;
+            n += 1;
+            // The following is divided into three steps:
+            // 1: b&0x7F: Get 7 bits of valid data
+            // 2: (b & 0x7F) << shift: Since shift is small-endian, it is necessary to move 7bits
+            //    to the high position for each Byte of data processed
+            // 3: Perform or operations on x with the current byte
+            // =======================================================================================
+            // 下面这个分成三步走:
+            // 1: b & 0x7F: 获取下7bits有效数据
+            // 2: (b & 0x7F) << shift: 由于是小端序, 所以每次处理一个Byte数据, 都需要向高位移动7bits
+            // 3: 将数据x和当前的这个字节数据 | 在一起
+            x |= (b & 0x7F) << shift;
+            if (b & 0x80) == 0 {
+                return (x, n);
+            }
+            shift += 7;
+        }
+        return (0, 0);
+    }
+
+    fn get_topics_name_offset(api_key: u16, api_version: u16) -> Option<usize> {
+        match api_key {
+            KAFKA_PRODUCE => {
+                if api_version <= 2 {
+                    // Offset for API version <= 2
+                    Some(24)
+                } else if api_version <= 8 {
+                    // Offset for API version <= 8
+                    // Produce Request (Version: 8) => transactional_id acks timeout_ms [topic_data]
+                    // transactional_id => NULLABLE_STRING
+                    // acks => INT16
+                    // timeout_ms => INT32
+                    // topic_data => name [partition_data]
+                    //     name => STRING
+                    //     partition_data => index records
+                    //     index => INT32
+                    //     records => RECORDS
+                    Some(26)
+                } else if api_version == 9 {
+                    // Offset for API version == 9
+                    // Produce Request (Version: 9) => transactional_id acks timeout_ms [topic_data] TAG_BUFFER
+                    // transactional_id => COMPACT_NULLABLE_STRING
+                    // acks => INT16
+                    // timeout_ms => INT32
+                    // topic_data => name [partition_data] TAG_BUFFER
+                    //     name => COMPACT_STRING
+                    //     partition_data => index records TAG_BUFFER
+                    //     index => INT32
+                    //     records => COMPACT_RECORDS
+                    Some(22)
+                } else {
+                    // Invalid API version
+                    None
+                }
+            }
+            KAFKA_FETCH => {
+                if api_version <= 2 {
+                    // Offset for API version <= 2
+                    Some(30)
+                } else if api_version == 3 {
+                    // Offset for API version == 3
+                    Some(34)
+                } else if api_version <= 6 {
+                    // Offset for API version <= 6
+                    Some(35)
+                } else if api_version <= 11 {
+                    // Fetch Request (Version: 11) => replica_id max_wait_ms min_bytes max_bytes isolation_level session_id session_epoch [topics] [forgotten_topics_data] rack_id
+                    // replica_id => INT32
+                    // max_wait_ms => INT32
+                    // min_bytes => INT32
+                    // max_bytes => INT32
+                    // isolation_level => INT8
+                    // session_id => INT32
+                    // session_epoch => INT32
+                    // topics => topic [partitions]
+                    //     topic => STRING
+                    //     partitions => partition current_leader_epoch fetch_offset log_start_offset partition_max_bytes
+                    //     partition => INT32
+                    //     current_leader_epoch => INT32
+                    //     fetch_offset => INT64
+                    //     log_start_offset => INT64
+                    //     partition_max_bytes => INT32
+                    // forgotten_topics_data => topic [partitions]
+                    //     topic => STRING
+                    //     partitions => INT32
+                    // rack_id => STRING
+                    Some(43)
+                } else if api_version == 12 {
+                    // Fetch Request (Version: 12) => replica_id max_wait_ms min_bytes max_bytes isolation_level session_id session_epoch [topics] [forgotten_topics_data] rack_id TAG_BUFFER
+                    // replica_id => INT32
+                    // max_wait_ms => INT32
+                    // min_bytes => INT32
+                    // max_bytes => INT32
+                    // isolation_level => INT8
+                    // session_id => INT32
+                    // session_epoch => INT32
+                    // topics => topic [partitions] TAG_BUFFER
+                    //     topic => COMPACT_STRING
+                    //     partitions => partition current_leader_epoch fetch_offset last_fetched_epoch log_start_offset partition_max_bytes TAG_BUFFER
+                    //     partition => INT32
+                    //     current_leader_epoch => INT32
+                    //    fetch_offset => INT64
+                    //     last_fetched_epoch => INT32
+                    //     log_start_offset => INT64
+                    //     partition_max_bytes => INT32
+                    // forgotten_topics_data => topic [partitions] TAG_BUFFER
+                    //     topic => COMPACT_STRING
+                    //     partitions => INT32
+                    // rack_id => COMPACT_STRING
+                    // TODO Some(39)
+                    Some(40)
+                } else {
+                    // Invalid API version
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn decode_topics_name(payload: &[u8], client_id_len: usize, info: &mut KafkaInfo) {
+        let Some(mut topic_offset) = Self::get_topics_name_offset(info.api_key, info.api_version)
+        else {
+            return;
+        };
+        topic_offset += client_id_len;
+        match (info.api_key, info.api_version) {
+            (KAFKA_PRODUCE, 9) | (KAFKA_FETCH, 12) if topic_offset + 1 < payload.len() => {
+                let (topic_count, offset) = Self::decode_varint(&payload[topic_offset..]);
+                if offset == 0 || topic_count <= 1 {
+                    return;
+                }
+                topic_offset += offset;
+                let (mut topic_name_len, offset) = Self::decode_varint(&payload[topic_offset..]);
+                if offset == 0 {
+                    return;
+                }
+                topic_offset += offset;
+                topic_name_len -= 1;
+                if topic_name_len <= payload[topic_offset..].len() {
+                    info.topic_name = String::from_utf8_lossy(
+                        &payload[topic_offset..topic_offset + topic_name_len],
+                    )
+                    .into_owned();
+                }
+            }
+            _ if topic_offset + 2 < payload.len() => {
+                let topic_name_len = read_u16_be(&payload[topic_offset..]) as usize;
+                if topic_name_len <= payload[topic_offset + 2..].len() {
+                    info.topic_name = String::from_utf8_lossy(
+                        &payload[topic_offset + 2..topic_offset + 2 + topic_name_len],
+                    )
+                    .into_owned();
+                }
+            }
+            _ => return,
+        }
+    }
+
+    // traceparent: 00-TRACEID-SPANID-01
+    fn decode_traceparent(payload: &str, info: &mut KafkaInfo) {
+        let tag = TraceType::TraceParent.as_str();
+        let mut start = 0;
+        let mut trace_id = "";
+        while start < payload.len() {
+            if !payload.is_char_boundary(start) {
+                break;
+            }
+            let index = payload[start..].find(tag);
+            if index.is_none() {
+                break;
+            }
+            let index = index.unwrap();
+
+            let start_index = payload[start + index..].find("00-");
+            if let Some(current_index) = start_index {
+                let trace_id_index = start + index + current_index + 3;
+                if !payload.is_char_boundary(trace_id_index) {
+                    start += index + tag.len();
+                    continue;
+                }
+                let trace_id_length = payload[trace_id_index..].len().min(Self::MAX_TRACE_ID);
+                if !payload.is_char_boundary(trace_id_index + trace_id_length) {
+                    start += index + tag.len();
+                    continue;
+                }
+                trace_id = &payload[trace_id_index..trace_id_index + trace_id_length];
+                break;
+            }
+            start += index + tag.len();
+        }
+
+        if trace_id.len() > 0 {
+            let mut segs = trace_id.split('-');
+            if let Some(seg) = segs.next() {
+                info.trace_id = seg.to_string();
+            }
+            if let Some(seg) = segs.next() {
+                info.span_id = seg.to_string();
+            }
+        }
+    }
+
+    // Example: 'sw8  1-{trace-id}-{other}'
+    fn decode_sw8(payload: &str, info: &mut KafkaInfo) {
+        let tag = TraceType::Sw8.as_str();
+        let mut start = 0;
+        let mut trace_id = "";
+        while start < payload.len() {
+            if !payload.is_char_boundary(start) {
+                break;
+            }
+            let index = payload[start..].find(tag);
+            if index.is_none() {
+                break;
+            }
+            let index = index.unwrap();
+
+            let start_index = payload[start + index..].find("1-");
+            if let Some(current_index) = start_index {
+                let trace_id_index = start + index + current_index + 2;
+                if !payload.is_char_boundary(trace_id_index) {
+                    start += index + tag.len();
+                    continue;
+                }
+                let trace_id_length = payload[trace_id_index..].len().min(Self::MAX_TRACE_ID);
+                if !payload.is_char_boundary(trace_id_index + trace_id_length) {
+                    start += index + tag.len();
+                    continue;
+                }
+                trace_id = &payload[trace_id_index..trace_id_index + trace_id_length];
+                break;
+            }
+            start += index + tag.len();
+        }
+
+        if trace_id.len() > 0 {
+            let mut segs = trace_id.split('-');
+            if let Some(seg) = segs.next() {
+                info.trace_id = decode_base64_to_string(seg);
+            }
+
+            if let (Some(parent_trace_segment_id), Some(parent_span_id)) =
+                (segs.next(), segs.next())
+            {
+                info.span_id = format!(
+                    "{}-{}",
+                    decode_base64_to_string(parent_trace_segment_id),
+                    parent_span_id
+                );
+            }
+        }
+    }
 
     // 协议识别的时候严格检查避免误识别，日志解析的时候不用严格检查因为可能有长度截断
     // ================================================================================
@@ -330,10 +654,15 @@ impl KafkaLog {
         info.api_version = read_u16_be(&payload[6..]);
         info.correlation_id = read_u32_be(&payload[8..]);
         info.client_id = String::from_utf8_lossy(&payload[14..14 + client_id_len]).into_owned();
-
         if !info.client_id.is_ascii() {
             return Err(Error::KafkaLogParseFailed);
         }
+        // topic
+        Self::decode_topics_name(payload, client_id_len, info);
+        // sw8
+        let payload = String::from_utf8_lossy(&payload[14 + client_id_len..]);
+        Self::decode_sw8(&payload, info);
+        Self::decode_traceparent(&payload, info);
         Ok(())
     }
 
@@ -351,18 +680,22 @@ impl KafkaLog {
         direction: PacketDirection,
         info: &mut KafkaInfo,
     ) -> Result<()> {
-        if proto != IpProtocol::Tcp {
+        if proto != IpProtocol::TCP {
             return Err(Error::InvalidIpProtocol);
         }
-        if payload.len() < KAFKA_REQ_HEADER_LEN {
-            return Err(Error::KafkaLogParseFailed);
-        }
+
         match direction {
             PacketDirection::ClientToServer => {
+                if payload.len() < KAFKA_REQ_HEADER_LEN {
+                    return Err(Error::KafkaLogParseFailed);
+                }
                 self.request(payload, false, info)?;
                 self.perf_stats.as_mut().map(|p| p.inc_req());
             }
             PacketDirection::ServerToClient => {
+                if payload.len() < KAFKA_RESP_HEADER_LEN {
+                    return Err(Error::KafkaLogParseFailed);
+                }
                 self.response(payload, info)?;
                 self.perf_stats.as_mut().map(|p| p.inc_resp());
             }
@@ -437,20 +770,28 @@ mod tests {
             };
 
             let mut kafka = KafkaLog::default();
-            let param = &ParseParam::new(packet as &MetaPacket, log_cache.clone(), true, true);
+            let param = &ParseParam::new(
+                packet as &MetaPacket,
+                log_cache.clone(),
+                Default::default(),
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Default::default(),
+                true,
+                true,
+            );
 
             let is_kafka = kafka.check_payload(payload, param);
             let info = kafka.parse_payload(payload, param);
             if let Ok(info) = info {
                 match info.unwrap_single() {
                     L7ProtocolInfo::KafkaInfo(i) => {
-                        output.push_str(&format!("{:?} is_kafka: {}\r\n", i, is_kafka));
+                        output.push_str(&format!("{:?} is_kafka: {}\n", i, is_kafka));
                     }
                     _ => unreachable!(),
                 }
             } else {
                 output.push_str(&format!(
-                    "{:?} is_kafka: {}\r\n",
+                    "{:?} is_kafka: {}\n",
                     KafkaInfo::default(),
                     is_kafka
                 ));
@@ -461,7 +802,12 @@ mod tests {
 
     #[test]
     fn check() {
-        let files = vec![("kafka.pcap", "kafka.result")];
+        let files = vec![
+            ("kafka.pcap", "kafka.result"),
+            ("produce.pcap", "produce.result"),
+            ("produce-v9.pcap", "produce-v9.result"),
+            ("kafka-sw8.pcap", "kafka-sw8.result"),
+        ];
 
         for item in files.iter() {
             let expected = fs::read_to_string(&Path::new(FILE_DIR).join(item.1)).unwrap();
@@ -494,6 +840,7 @@ mod tests {
                     rrt_count: 1,
                     rrt_sum: 4941,
                     rrt_max: 4941,
+                    ..Default::default()
                 },
             ),
             (
@@ -507,6 +854,7 @@ mod tests {
                     rrt_count: 1,
                     rrt_sum: 504829,
                     rrt_max: 504829,
+                    ..Default::default()
                 },
             ),
         ];
@@ -534,10 +882,51 @@ mod tests {
             if packet.get_l4_payload().is_some() {
                 let _ = kafka.parse_payload(
                     packet.get_l4_payload().unwrap(),
-                    &ParseParam::new(&*packet, rrt_cache.clone(), true, true),
+                    &ParseParam::new(
+                        &*packet,
+                        rrt_cache.clone(),
+                        Default::default(),
+                        #[cfg(any(target_os = "linux", target_os = "android"))]
+                        Default::default(),
+                        true,
+                        true,
+                    ),
                 );
             }
         }
         kafka.perf_stats.unwrap()
+    }
+
+    #[test]
+    fn trace_id() {
+        let payload =
+            "sw8-abckejaij,sw8  1-abcdefghi-jjaiejfeajf-1-jaifjei traceparent: 00-123456789-abcdefg-01".as_bytes();
+        let payload = String::from_utf8_lossy(payload);
+
+        let mut info = KafkaInfo::default();
+
+        KafkaLog::decode_sw8(&payload, &mut info);
+        assert_eq!(
+            info.trace_id, "abcdefghi",
+            "parse trace id {} unexcepted",
+            info.trace_id
+        );
+        assert_eq!(
+            info.span_id, "jjaiejfeajf-1",
+            "parse span id {} unexcepted",
+            info.span_id
+        );
+
+        KafkaLog::decode_traceparent(&payload, &mut info);
+        assert_eq!(
+            info.trace_id, "123456789",
+            "parse trace id {} unexcepted",
+            info.trace_id
+        );
+        assert_eq!(
+            info.span_id, "abcdefg",
+            "parse span id {} unexcepted",
+            info.span_id
+        );
     }
 }

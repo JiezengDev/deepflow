@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan PodIngressRules
+ * Copyright (c) 2024 Yunshan PodIngressRules
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 )
 
 type PodIngressRule struct {
@@ -37,7 +38,7 @@ func (r *PodIngressRule) OnUpdaterAdded(addedDBItems []*mysql.PodIngressRule) {
 	r.cache.AddPodIngressRules(addedDBItems)
 }
 
-func (r *PodIngressRule) OnUpdaterUpdated(cloudItem *cloudmodel.PodIngressRule, diffBase *cache.PodIngressRule) {
+func (r *PodIngressRule) OnUpdaterUpdated(cloudItem *cloudmodel.PodIngressRule, diffBase *diffbase.PodIngressRule) {
 }
 
 func (r *PodIngressRule) OnUpdaterDeleted(lcuuids []string) {

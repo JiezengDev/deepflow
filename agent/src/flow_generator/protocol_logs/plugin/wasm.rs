@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,7 +15,6 @@
  */
 
 use public::l7_protocol::{CustomProtocol, L7Protocol};
-use serde::Serialize;
 
 use crate::{
     common::{
@@ -26,21 +25,20 @@ use crate::{
     flow_generator::{protocol_logs::L7ResponseStatus, Error, Result},
 };
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Default)]
 pub struct WasmLog {
     proto_num: Option<u8>,
     proto_str: String,
-    #[serde(skip)]
     perf_stats: Option<L7PerfStats>,
 }
 
 impl L7ProtocolParserInterface for WasmLog {
     fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
-        let Some(vm) = param.wasm_vm.as_ref() else {
+        let mut vm_ref = param.wasm_vm.borrow_mut();
+        let Some(vm) = vm_ref.as_mut() else {
             return false;
         };
 
-        let mut vm = vm.borrow_mut();
         let res = vm.on_check_payload(&payload, &param);
         res.map(|(proto_num, proto_str)| {
             self.proto_num = Some(proto_num);
@@ -50,13 +48,13 @@ impl L7ProtocolParserInterface for WasmLog {
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
-        let Some(vm) = param.wasm_vm.as_ref() else {
+        let mut vm_ref = param.wasm_vm.borrow_mut();
+        let Some(vm) = vm_ref.as_mut() else {
             return Err(Error::WasmParseFail);
         };
         if self.perf_stats.is_none() && param.parse_perf {
             self.perf_stats = Some(L7PerfStats::default());
         }
-        let mut vm = vm.borrow_mut();
 
         if let Some(infos) = vm.on_parse_payload(payload, param, self.proto_num.unwrap()) {
             let l7_infos: Vec<L7ProtocolInfo> = infos

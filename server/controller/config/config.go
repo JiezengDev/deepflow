@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ import (
 	"strconv"
 
 	logging "github.com/op/go-logging"
-	"gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v2"
 
 	"github.com/deepflowio/deepflow/server/controller/db/clickhouse"
 	mysql "github.com/deepflowio/deepflow/server/controller/db/mysql/config"
@@ -39,17 +39,19 @@ import (
 
 var log = logging.MustGetLogger("config")
 
-type Roze struct {
-	Port    int `default:"20106" yaml:"port"`
+type IngesterApi struct {
+	Port    int `default:"30106" yaml:"port"`
 	Timeout int `default:"60" yaml:"timeout"`
 }
 
 type Specification struct {
-	VTapGroupMax               int `default:"1000" yaml:"vtap_group_max"`
-	VTapMaxPerGroup            int `default:"10000" yaml:"vtap_max_per_group"`
-	AZMaxPerServer             int `default:"10" yaml:"az_max_per_server"`
-	DataSourceMax              int `default:"25" yaml:"data_source_max"`
-	DataSourceRetentionTimeMax int `default:"24000" yaml:"data_source_retention_time_max"`
+	VTapGroupMax                 int `default:"1000" yaml:"vtap_group_max"`
+	VTapMaxPerGroup              int `default:"10000" yaml:"vtap_max_per_group"`
+	AZMaxPerServer               int `default:"10" yaml:"az_max_per_server"`
+	DataSourceMax                int `default:"25" yaml:"data_source_max"`
+	DataSourceRetentionTimeMax   int `default:"24000" yaml:"data_source_retention_time_max"`
+	DataSourceExtMetricsInterval int `default:"10" yaml:"data_source_ext_metrics_interval"`
+	DataSourcePrometheusInterval int `default:"10" yaml:"data_source_prometheus_interval"`
 }
 
 type DFWebService struct {
@@ -74,6 +76,9 @@ type ControllerConfig struct {
 	MasterControllerName           string `default:"" yaml:"master-controller-name"`
 	GrpcMaxMessageLength           int    `default:"104857600" yaml:"grpc-max-message-length"`
 	GrpcPort                       string `default:"20035" yaml:"grpc-port"`
+	SSLGrpcPort                    string `default:"20135" yaml:"ssl-grpc-port"`
+	AgentSSLCertFile               string `default:"/etc/ssl/server.key" yaml:"agent_ssl_cert_file"`
+	AgentSSLKeyFile                string `default:"/etc/ssl/server.pem" yaml:"agent_ssl_key_file"`
 	IngesterPort                   string `default:"20033" yaml:"ingester-port"`
 	GrpcNodePort                   string `default:"30035" yaml:"grpc-node-port"`
 	Kubeconfig                     string `yaml:"kubeconfig"`
@@ -89,8 +94,8 @@ type ControllerConfig struct {
 	RedisCfg      redis.Config                `yaml:"redis"`
 	ClickHouseCfg clickhouse.ClickHouseConfig `yaml:"clickhouse"`
 
-	Roze Roze          `yaml:"roze"`
-	Spec Specification `yaml:"spec"`
+	IngesterApi IngesterApi   `yaml:"ingester-api"`
+	Spec        Specification `yaml:"spec"`
 
 	MonitorCfg     monitor.MonitorConfig         `yaml:"monitor"`
 	ManagerCfg     manager.ManagerConfig         `yaml:"manager"`

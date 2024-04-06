@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 package dbwriter
 
 import (
+	"fmt"
 	"strconv"
 	"sync/atomic"
 
@@ -59,7 +60,6 @@ type ProfileWriter struct {
 	ckdbColdStorages  map[string]*ckdb.ColdStorage
 	ttl               int
 	writerConfig      baseconfig.CKWriterConfig
-	ckdbWatcher       *baseconfig.Watcher
 	ckWriter          *ckwriter.CKWriter
 	flowTagWriter     *flow_tag.FlowTagWriter
 
@@ -92,7 +92,6 @@ func NewProfileWriter(msgType datatype.MessageType, decoderIndex int, config *co
 		ckdbStoragePolicy: config.Base.CKDB.StoragePolicy,
 		ckdbColdStorages:  config.Base.GetCKDBColdStorages(),
 		ttl:               config.ProfileTTL,
-		ckdbWatcher:       config.Base.CKDB.Watcher,
 		writerConfig:      config.CKWriterConfig,
 		counter:           &Counter{},
 	}
@@ -101,13 +100,14 @@ func NewProfileWriter(msgType datatype.MessageType, decoderIndex int, config *co
 		writer.ckdbAddrs,
 		writer.ckdbUsername,
 		writer.ckdbPassword,
-		PROFILE_TABLE,
+		fmt.Sprintf("%s-%s-%d", msgType, PROFILE_TABLE, decoderIndex),
 		config.Base.CKDB.TimeZone,
 		table,
 		writer.writerConfig.QueueCount,
 		writer.writerConfig.QueueSize,
 		writer.writerConfig.BatchSize,
-		writer.writerConfig.FlushTimeout)
+		writer.writerConfig.FlushTimeout,
+		config.Base.CKDB.Watcher)
 	if err != nil {
 		log.Error(err)
 		return nil, err
@@ -119,7 +119,7 @@ func NewProfileWriter(msgType datatype.MessageType, decoderIndex int, config *co
 		BatchSize:    config.CKWriterConfig.BatchSize,
 		FlushTimeout: config.CKWriterConfig.FlushTimeout,
 	}
-	flowTagWriter, err := flow_tag.NewFlowTagWriter(decoderIndex, msgType.String(), PROFILE_DB, writer.ttl, DefaultPartition, config.Base, &flowTagWriterConfig)
+	flowTagWriter, err := flow_tag.NewFlowTagWriter(decoderIndex, msgType.String(), PROFILE_DB, writer.ttl, ckdb.TimeFuncTwelveHour, config.Base, &flowTagWriterConfig)
 	if err != nil {
 		return nil, err
 	}

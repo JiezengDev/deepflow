@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,22 +22,22 @@ use std::{
 };
 
 use bitflags::bitflags;
+use ipnet::IpNet;
 use serde::Serialize;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod arp;
-pub mod h2pack;
 
 mod error;
 pub use error::{Error, Result};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod ethtool;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use ethtool::*;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use linux::*;
 
 #[cfg(target_os = "windows")]
@@ -64,9 +64,10 @@ bitflags! {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use neli::consts::rtnl::{Iff, IffFlags};
-#[cfg(target_os = "linux")]
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl From<&IffFlags> for LinkFlags {
     fn from(flags: &IffFlags) -> Self {
         let mut fs = Self::default();
@@ -88,7 +89,7 @@ impl From<&IffFlags> for LinkFlags {
         fs
     }
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl From<u32> for LinkFlags {
     fn from(flags: u32) -> Self {
         Self::from_bits_truncate(flags)
@@ -105,10 +106,11 @@ pub struct Link {
     pub device_name: String,
     pub name: String,
     pub flags: LinkFlags,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub if_type: Option<String>,
     pub peer_index: Option<u32>,
     pub link_netnsid: Option<u32>,
+    pub stats: LinkStats,
 }
 
 impl PartialEq for Link {
@@ -131,6 +133,16 @@ impl Ord for Link {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct LinkStats {
+    pub rx_packets: u64,
+    pub tx_packets: u64,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub rx_dropped: u64,
+    pub tx_dropped: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Addr {
     pub if_index: u32,
@@ -139,11 +151,19 @@ pub struct Addr {
     pub prefix_len: u8,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct Route {
-    pub src_ip: IpAddr,
+    pub table: u32,
+    pub pref_src: Option<IpAddr>,
+    pub dst_ip: Option<IpNet>,
     pub oif_index: u32,
     pub gateway: Option<IpAddr>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Rule {
+    pub table: u32,
+    pub dst_ip: Option<IpNet>,
 }
 
 pub const MAC_ADDR_LEN: usize = 6;

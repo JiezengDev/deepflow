@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@
 package decoder
 
 import (
-	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -33,13 +32,13 @@ import (
 	"github.com/deepflowio/deepflow/server/ingester/event/dbwriter"
 	"github.com/deepflowio/deepflow/server/libs/codec"
 	"github.com/deepflowio/deepflow/server/libs/eventapi"
+	flow_metrics "github.com/deepflowio/deepflow/server/libs/flow-metrics"
+	"github.com/deepflowio/deepflow/server/libs/flow-metrics/pb"
 	"github.com/deepflowio/deepflow/server/libs/grpc"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 	"github.com/deepflowio/deepflow/server/libs/receiver"
 	"github.com/deepflowio/deepflow/server/libs/stats"
 	"github.com/deepflowio/deepflow/server/libs/utils"
-	"github.com/deepflowio/deepflow/server/libs/zerodoc"
-	"github.com/deepflowio/deepflow/server/libs/zerodoc/pb"
 )
 
 var log = logging.MustGetLogger("event.decoder")
@@ -162,10 +161,11 @@ func (d *Decoder) WritePerfEvent(vtapId uint16, e *pb.ProcEvent) {
 	s := dbwriter.AcquireEventStore()
 	s.HasMetrics = true
 	s.Time = uint32(time.Duration(e.StartTime) / time.Second)
+	s.SetId(s.Time, d.platformData.QueryAnalyzerID())
 	s.StartTime = int64(time.Duration(e.StartTime) / time.Microsecond)
 	s.EndTime = int64(time.Duration(e.EndTime) / time.Microsecond)
 	s.Duration = uint64(e.EndTime - e.StartTime)
-	s.NetnsID = e.NetnsId
+	s.PodID = e.PodId
 
 	if e.EventType == pb.EventType_IoEvent {
 		s.SignalSource = uint8(dbwriter.SIGNAL_SOURCE_IO)
@@ -173,30 +173,57 @@ func (d *Decoder) WritePerfEvent(vtapId uint16, e *pb.ProcEvent) {
 		s.SignalSource = uint8(e.EventType)
 	}
 
+	s.GProcessID = d.platformData.QueryProcessInfo(vtapId, e.Pid)
 	if e.IoEventData != nil {
 		ioData := e.IoEventData
 		s.EventType = strings.ToLower(ioData.Operation.String())
-		s.EventDescription = fmt.Sprintf("process %s (%d) %s %d bytes and took %dms", string(e.ProcessKname), e.Pid, s.EventType, ioData.BytesCount, ioData.Latency/uint64(time.Millisecond))
+		s.ProcessKName = string(e.ProcessKname)
 		s.AttributeNames = append(s.AttributeNames, "file_name", "thread_id", "coroutine_id")
 		s.AttributeValues = append(s.AttributeValues, string(ioData.Filename), strconv.Itoa(int(e.ThreadId)), strconv.Itoa(int(e.CoroutineId)))
 		s.Bytes = ioData.BytesCount
 		s.Duration = uint64(s.EndTime - s.StartTime)
 	}
 	s.VTAPID = vtapId
-	s.L3EpcID = d.platformData.QueryVtapEpc0(uint32(vtapId))
+	s.OrgId, s.TeamID = d.platformData.QueryVtapOrgAndTeamID(vtapId)
+	s.L3EpcID = d.platformData.QueryVtapEpc0(vtapId)
 
-	info := d.platformData.QueryNetnsIdInfo(uint32(s.VTAPID), s.NetnsID)
+	var info *grpc.Info
+	if e.PodId != 0 {
+		info = d.platformData.QueryPodIdInfo(e.PodId)
+	}
+
+	// if platformInfo cannot be obtained from PodId, finally fill with Vtap's platformInfo
+	if info == nil {
+		vtapInfo := d.platformData.QueryVtapInfo(vtapId)
+		if vtapInfo != nil {
+			vtapIP := net.ParseIP(vtapInfo.Ip)
+			if vtapIP != nil {
+				if ip4 := vtapIP.To4(); ip4 != nil {
+					s.IsIPv4 = true
+					s.IP4 = utils.IpToUint32(ip4)
+					info = d.platformData.QueryIPV4Infos(vtapInfo.EpcId, s.IP4)
+				} else {
+					s.IP6 = vtapIP
+					info = d.platformData.QueryIPV6Infos(vtapInfo.EpcId, s.IP6)
+				}
+			}
+		}
+	}
+
+	podGroupType := uint8(0)
 	if info != nil {
 		s.RegionID = uint16(info.RegionID)
 		s.AZID = uint16(info.AZID)
 		s.L3EpcID = info.EpcID
-
 		s.HostID = uint16(info.HostID)
-		s.PodID = info.PodID
+		if s.PodID == 0 {
+			s.PodID = info.PodID
+		}
 		s.PodNodeID = info.PodNodeID
 		s.PodNSID = uint16(info.PodNSID)
 		s.PodClusterID = uint16(info.PodClusterID)
 		s.PodGroupID = info.PodGroupID
+		podGroupType = info.PodGroupType
 		s.L3DeviceType = uint8(info.DeviceType)
 		s.L3DeviceID = info.DeviceID
 		s.SubnetID = uint16(info.SubnetID)
@@ -204,7 +231,7 @@ func (d *Decoder) WritePerfEvent(vtapId uint16, e *pb.ProcEvent) {
 		s.IP4 = info.IP4
 		s.IP6 = info.IP6
 		// if it is just Pod Node, there is no need to match the service
-		if ingestercommon.IsPodServiceIP(zerodoc.DeviceType(s.L3DeviceType), s.PodID, 0) {
+		if ingestercommon.IsPodServiceIP(flow_metrics.DeviceType(s.L3DeviceType), s.PodID, 0) {
 			s.ServiceID = d.platformData.QueryService(
 				s.PodID, s.PodNodeID, uint32(s.PodClusterID), s.PodGroupID, s.L3EpcID, !s.IsIPv4, s.IP4, s.IP6, 0, 0)
 		}
@@ -213,7 +240,7 @@ func (d *Decoder) WritePerfEvent(vtapId uint16, e *pb.ProcEvent) {
 	}
 
 	s.AutoInstanceID, s.AutoInstanceType = ingestercommon.GetAutoInstance(s.PodID, s.GProcessID, s.PodNodeID, s.L3DeviceID, uint8(s.L3DeviceType), s.L3EpcID)
-	s.AutoServiceID, s.AutoServiceType = ingestercommon.GetAutoService(s.ServiceID, s.PodGroupID, s.GProcessID, s.PodNodeID, s.L3DeviceID, uint8(s.L3DeviceType), s.L3EpcID)
+	s.AutoServiceID, s.AutoServiceType = ingestercommon.GetAutoService(s.ServiceID, s.PodGroupID, s.GProcessID, s.PodNodeID, s.L3DeviceID, uint8(s.L3DeviceType), podGroupType, s.L3EpcID)
 
 	s.AppInstance = strconv.Itoa(int(e.Pid))
 
@@ -265,6 +292,7 @@ func (d *Decoder) handleResourceEvent(event *eventapi.ResourceEvent) {
 	s := dbwriter.AcquireEventStore()
 	s.HasMetrics = false
 	s.Time = uint32(event.Time)
+	s.SetId(s.Time, d.platformData.QueryAnalyzerID())
 	s.StartTime = event.TimeMilli * 1000 // convert to microsecond
 	s.EndTime = s.StartTime
 
@@ -286,6 +314,7 @@ func (d *Decoder) handleResourceEvent(event *eventapi.ResourceEvent) {
 
 	}
 
+	podGroupType := uint8(0)
 	if event.IfNeedTagged {
 		s.Tagged = 1
 		resourceInfo := d.resourceInfoTable.QueryResourceInfo(event.InstanceType, event.InstanceID)
@@ -299,6 +328,7 @@ func (d *Decoder) handleResourceEvent(event *eventapi.ResourceEvent) {
 			s.PodNSID = uint16(resourceInfo.PodNSID)
 			s.PodClusterID = uint16(resourceInfo.PodClusterID)
 			s.PodGroupID = resourceInfo.PodGroupID
+			podGroupType = resourceInfo.PodGroupType
 			s.L3DeviceType = uint8(resourceInfo.L3DeviceType)
 			s.L3DeviceID = resourceInfo.L3DeviceID
 		}
@@ -317,6 +347,7 @@ func (d *Decoder) handleResourceEvent(event *eventapi.ResourceEvent) {
 		s.PodNSID = uint16(event.PodNSID)
 		s.PodClusterID = uint16(event.PodClusterID)
 		s.PodGroupID = event.PodGroupID
+		podGroupType = event.PodGroupType
 		s.L3DeviceType = uint8(event.L3DeviceType)
 		s.L3DeviceID = event.L3DeviceID
 
@@ -356,6 +387,7 @@ func (d *Decoder) handleResourceEvent(event *eventapi.ResourceEvent) {
 			s.PodNodeID,
 			s.L3DeviceID,
 			s.L3DeviceType,
+			podGroupType,
 			s.L3EpcID,
 		)
 
@@ -391,6 +423,7 @@ func (d *Decoder) writeAlarmEvent(event *alarm_event.AlarmEvent) {
 	s.Time = event.GetTimestamp()
 	s.Lcuuid = event.GetLcuuid()
 	s.User = event.GetUser()
+	s.UserId = event.GetUserId()
 
 	s.PolicyId = event.GetPolicyId()
 	s.PolicyName = event.GetPolicyName()

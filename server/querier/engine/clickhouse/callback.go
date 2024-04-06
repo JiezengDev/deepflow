@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -96,8 +96,16 @@ func TimeFill(args []interface{}) func(result *common.Result) error { // group b
 		groups := client.Group(seriesSort.Series, seriesSort.SortIndex[:len(seriesSort.SortIndex)-1], result.Schemas)
 
 		// fix start and end
-		start := (int(m.Time.TimeStart)+3600*8)/m.Time.Interval*m.Time.Interval - 3600*8
-		end := (int(m.Time.TimeEnd)+3600*8)/m.Time.Interval*m.Time.Interval - 3600*8
+		newTimeStart := int(m.Time.TimeStart)
+		newTimeEnd := int(m.Time.TimeEnd)
+		if m.Time.TimeStartOperator == ">" {
+			newTimeStart = int(m.Time.TimeStart) + m.Time.Interval
+		}
+		if m.Time.TimeEndOperator == "<" {
+			newTimeEnd = int(m.Time.TimeEnd) - m.Time.Interval
+		}
+		start := (newTimeStart-m.Time.Offset+3600*8)/m.Time.Interval*m.Time.Interval - 3600*8 + m.Time.Offset
+		end := (newTimeEnd-m.Time.Offset+3600*8)/m.Time.Interval*m.Time.Interval - 3600*8 + m.Time.Offset
 		end += (m.Time.WindowSize - 1) * m.Time.Interval
 		// length after fix
 		intervalLength := (end-start)/m.Time.Interval + 1
@@ -170,7 +178,7 @@ func TimeFill(args []interface{}) func(result *common.Result) error { // group b
 					case []interface{}:
 						newValue := value.([]interface{})
 						for i := range newValue {
-							indexOK := slices.Contains[int](groupIndexs, i)
+							indexOK := slices.Contains[[]int, int](groupIndexs, i)
 							if indexOK {
 								continue
 							}
@@ -205,7 +213,7 @@ func MacTranslate(args []interface{}) func(result *common.Result) error {
 			}
 		}
 		for i, column := range result.Columns {
-			if column.(string) == "tap_port_type" {
+			if column.(string) == "tap_port_type" || column.(string) == "capture_nic_type" {
 				macTypeIndex = i
 				break
 			}
@@ -216,7 +224,7 @@ func MacTranslate(args []interface{}) func(result *common.Result) error {
 			switch newValueSlice[macIndex].(type) {
 			case int:
 				newMac := utils.Uint64ToMac(uint64((newValueSlice[macIndex]).(int))).String()
-				if args[0].(string) == "tap_port" && macTypeIndex != -1 {
+				if (args[0].(string) == "tap_port" || args[0].(string) == "capture_nic") && macTypeIndex != -1 {
 					newMac = strings.TrimPrefix(newMac, "00:00:")
 					if newValueSlice[macTypeIndex].(int) == tag.TAP_PORT_MAC_0 || newValueSlice[macTypeIndex].(int) == tag.TAP_PORT_MAC_1 {
 						newValueSlice[macIndex] = newMac
@@ -234,6 +242,21 @@ func MacTranslate(args []interface{}) func(result *common.Result) error {
 			}
 		}
 		result.Values = newValues
+		return nil
+	}
+}
+
+func ColumnNameSwap(args []interface{}) func(result *common.Result) error {
+	return func(result *common.Result) error {
+		tagName := args[0].(string)
+		newColumnNames := make([]interface{}, len(result.Columns))
+		for i, columnName := range result.Columns {
+			if strings.HasPrefix(columnName.(string), tagName) {
+				columnName = strings.TrimPrefix(columnName.(string), tagName+"_")
+			}
+			newColumnNames[i] = columnName
+		}
+		result.Columns = newColumnNames
 		return nil
 	}
 }

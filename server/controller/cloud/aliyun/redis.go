@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -57,6 +57,11 @@ func (a *Aliyun) getRedisInstances(region model.Region) (
 			if redisName == "" {
 				redisName = redisId
 			}
+			redisStatus := redis.Get("InstanceStatus").MustString()
+			if redisStatus != "Normal" {
+				log.Infof("redis (%s) invalid status (%s)", redisName, redisStatus)
+				continue
+			}
 			vpcId := redis.Get("VpcId").MustString()
 			zoneId := redis.Get("ZoneId").MustString()
 
@@ -93,7 +98,8 @@ func (a *Aliyun) getRedisInstances(region model.Region) (
 				RegionLcuuid: a.getRegionLcuuid(region.Lcuuid),
 				InternalHost: internalHost,
 				PublicHost:   publicHost,
-				Version:      "Redis" + redis.Get("EngineVersion").MustString(),
+				State:        common.REDIS_STATE_RUNNING,
+				Version:      "Redis " + redis.Get("EngineVersion").MustString(),
 			}
 			retRedisInstances = append(retRedisInstances, retRedisInstance)
 			a.azLcuuidToResourceNum[retRedisInstance.AZLcuuid]++

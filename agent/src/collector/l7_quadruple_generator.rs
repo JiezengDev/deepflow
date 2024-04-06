@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,13 +26,17 @@ use arc_swap::access::Access;
 use log::{debug, info, warn};
 use thread::JoinHandle;
 
-use super::check_active;
-use super::{consts::*, MetricsType};
+use super::{
+    check_active,
+    consts::*,
+    round_to_minute,
+    types::{AppMeterWithFlow, MiniFlow},
+    MetricsType,
+};
 
-use crate::collector::round_to_minute;
 use crate::common::flow::{CloseType, L7Protocol, L7Stats, SignalSource};
 use crate::config::handler::{CollectorAccess, CollectorConfig};
-use crate::metric::meter::{AppAnomaly, AppLatency, AppMeter, AppMeterWithFlow, AppTraffic};
+use crate::metric::meter::{AppAnomaly, AppLatency, AppMeter, AppTraffic};
 use crate::rpc::get_timestamp;
 use crate::utils::{
     possible_host::PossibleHost,
@@ -41,7 +45,7 @@ use crate::utils::{
 use public::{
     buffer::BatchedBox,
     queue::{DebugSender, Error, Receiver},
-    utils::string::hash_endpoint,
+    utils::hash::hash_to_u64,
 };
 
 const FLOW_ID_LEN: usize = 8;
@@ -60,7 +64,9 @@ pub struct QgCounter {
 struct AppMeterWithL7Protocol {
     app_meter: AppMeter,
     endpoint: Option<String>,
+    endpoint_hash: u32,
     l7_protocol: L7Protocol,
+    biz_type: u8,
 }
 
 struct QuadrupleStash {
@@ -226,23 +232,23 @@ impl SubQuadGen {
                 .fetch_add(1, Ordering::Relaxed);
             return;
         }
+
         let slot = (((time_in_second - self.window_start).as_secs() / self.slot_interval) as usize)
             .min(self.stashs.len() - 1);
         let stash = &mut self.stashs[slot];
         let value = stash.l7_stats.get_mut(&l7_stats.flow_id);
         if let Some(meters) = value {
-            if let Some(meter) = meters.iter_mut().find(|m| m.endpoint == l7_stats.endpoint) {
+            if let Some(meter) = meters
+                .iter_mut()
+                .find(|m| m.endpoint == l7_stats.endpoint && m.biz_type == l7_stats.biz_type)
+            {
                 // flow L7Protocol of different client ports on the same server port may be inconsistent.
                 // unknown l7_protocol needs to be judged by the close_type and duration of the flow,
                 // so the L7Protocol of the same flow may be different. The principles are as follows:
                 // 1. Unknown l7_protocol can be overwritten by any protocol.
-                // 2. Other l7_protocol can be overwritten by other non-unknown l7_protocol
                 if l7_stats.l7_protocol == meter.l7_protocol {
                     meter.app_meter.sequential_merge(app_meter);
-                } else if meter.l7_protocol == L7Protocol::Unknown
-                    || (meter.l7_protocol == L7Protocol::Other
-                        && l7_stats.l7_protocol != L7Protocol::Unknown)
-                {
+                } else if meter.l7_protocol == L7Protocol::Unknown {
                     meter.l7_protocol = l7_stats.l7_protocol;
                     meter.app_meter = *app_meter;
                 }
@@ -251,47 +257,61 @@ impl SubQuadGen {
                     app_meter: *app_meter,
                     l7_protocol: l7_stats.l7_protocol,
                     endpoint: l7_stats.endpoint.clone(),
+                    endpoint_hash,
+                    biz_type: l7_stats.biz_type,
                 };
                 meters.push(meter);
             }
 
             // If l7_stats.flow.is_some(), set the flow of all meter belonging to this flow
             if let Some(tagged_flow) = &l7_stats.flow {
+                let flow = MiniFlow::from(&tagged_flow.flow);
                 let (is_active_host0, is_active_host1) =
-                    check_active(time_in_second.as_secs(), possible_host, &tagged_flow.flow);
+                    check_active(time_in_second.as_secs(), possible_host, &flow);
                 for meter in meters.drain(..) {
                     let app_meter = Box::new(AppMeterWithFlow {
                         app_meter: meter.app_meter,
-                        flow: tagged_flow.clone(),
+                        flow: flow.clone(),
                         l7_protocol: meter.l7_protocol,
-                        endpoint_hash,
-                        endpoint: meter.endpoint.clone(),
+                        endpoint_hash: meter.endpoint_hash,
+                        endpoint: meter.endpoint,
                         is_active_host0,
                         is_active_host1,
+                        time_in_second: tagged_flow.flow.flow_stat_time,
+                        biz_type: meter.biz_type,
                     });
                     stash.meters.push(app_meter);
                 }
             }
         } else {
+            // app_meter.traffic.request and app_meter.traffic.response are 0, there is no need to save
+            if app_meter.traffic.request == 0 && app_meter.traffic.response == 0 {
+                return;
+            }
             // If l7_stats.flow.is_some(), set the flow of all meter belonging to this flow
             if let Some(tagged_flow) = &l7_stats.flow {
+                let flow = MiniFlow::from(&tagged_flow.flow);
                 let (is_active_host0, is_active_host1) =
-                    check_active(time_in_second.as_secs(), possible_host, &tagged_flow.flow);
-                let app_meter = Box::new(AppMeterWithFlow {
+                    check_active(time_in_second.as_secs(), possible_host, &flow);
+                let boxed_app_meter = Box::new(AppMeterWithFlow {
                     app_meter: *app_meter,
-                    flow: tagged_flow.clone(),
+                    flow,
                     l7_protocol: l7_stats.l7_protocol,
                     endpoint_hash,
                     endpoint: l7_stats.endpoint.clone(),
                     is_active_host0,
                     is_active_host1,
+                    time_in_second: tagged_flow.flow.flow_stat_time,
+                    biz_type: l7_stats.biz_type,
                 });
-                stash.meters.push(app_meter);
+                stash.meters.push(boxed_app_meter);
             } else {
                 let meter = AppMeterWithL7Protocol {
                     app_meter: *app_meter,
                     l7_protocol: l7_stats.l7_protocol,
                     endpoint: l7_stats.endpoint.clone(),
+                    endpoint_hash,
+                    biz_type: l7_stats.biz_type,
                 };
                 let _ = stash.l7_stats.insert(l7_stats.flow_id, vec![meter]);
             }
@@ -531,14 +551,14 @@ impl L7QuadrupleGenerator {
 
     fn handle(
         &mut self,
+        config: &CollectorConfig,
         l7_stats: Option<BatchedBox<L7Stats>>,
         time_in_second: Duration,
-        config: &CollectorConfig,
     ) {
         let mut second_inject = false;
         let mut minute_inject = false;
-        if let Some(s) = self.second_quad_gen.as_mut() {
-            if config.vtap_flow_1s_enabled {
+        if config.vtap_flow_1s_enabled {
+            if let Some(s) = self.second_quad_gen.as_mut() {
                 second_inject = s.move_window(time_in_second);
             }
         }
@@ -551,9 +571,16 @@ impl L7QuadrupleGenerator {
         }
         let l7_stats = l7_stats.unwrap();
 
-        let endpoint_hash = hash_endpoint(&l7_stats.endpoint) as u32;
+        let endpoint_hash = match &l7_stats.endpoint {
+            Some(e) => hash_to_u64(e) as u32,
+            None => 0,
+        };
 
-        let app_meter = Self::generate_app_meter(&l7_stats, config.l7_metrics_enabled);
+        let app_meter = if config.l7_metrics_enabled {
+            Self::generate_app_meter(&l7_stats)
+        } else {
+            AppMeter::default()
+        };
 
         if second_inject {
             self.second_quad_gen.as_mut().unwrap().inject_app_meter(
@@ -576,12 +603,7 @@ impl L7QuadrupleGenerator {
         }
     }
 
-    fn generate_app_meter(l7_stats: &L7Stats, l7_metrics_enabled: bool) -> AppMeter {
-        let mut app_meter = AppMeter::default();
-
-        if !l7_metrics_enabled {
-            return app_meter;
-        }
+    fn generate_app_meter(l7_stats: &L7Stats) -> AppMeter {
         let (close_type, direction_score) = if let Some(tagged_flow) = &l7_stats.flow {
             (
                 tagged_flow.flow.close_type,
@@ -593,11 +615,11 @@ impl L7QuadrupleGenerator {
         let stats = &l7_stats.stats;
         match (l7_stats.l7_protocol, l7_stats.signal_source) {
             (
-                L7Protocol::Unknown | L7Protocol::Other,
+                L7Protocol::Unknown,
                 SignalSource::Packet | SignalSource::EBPF | SignalSource::XFlow,
             ) => {
                 // only L7Protocol is Unknown or Other and SignalSource != Otel will execute the following logic
-                app_meter = AppMeter {
+                AppMeter {
                     traffic: AppTraffic {
                         request: (close_type != CloseType::ForcedReport) as u32,
                         response: (close_type != CloseType::ForcedReport) as u32,
@@ -606,28 +628,24 @@ impl L7QuadrupleGenerator {
                     ..Default::default()
                 }
             }
-            (_, _) => {
-                app_meter = AppMeter {
-                    traffic: AppTraffic {
-                        request: stats.request_count,
-                        response: stats.response_count,
-                        direction_score: direction_score,
-                    },
-                    latency: AppLatency {
-                        rrt_max: stats.rrt_max,
-                        rrt_sum: stats.rrt_sum as u64,
-                        rrt_count: stats.rrt_count,
-                    },
-                    anomaly: AppAnomaly {
-                        client_error: stats.err_client_count,
-                        server_error: stats.err_server_count,
-                        timeout: stats.err_timeout,
-                    },
-                };
-            }
+            (_, _) => AppMeter {
+                traffic: AppTraffic {
+                    request: stats.request_count,
+                    response: stats.response_count,
+                    direction_score: direction_score,
+                },
+                latency: AppLatency {
+                    rrt_max: stats.rrt_max,
+                    rrt_sum: stats.rrt_sum as u64,
+                    rrt_count: stats.rrt_count,
+                },
+                anomaly: AppAnomaly {
+                    client_error: stats.err_client_count,
+                    server_error: stats.err_server_count,
+                    timeout: stats.err_timeout,
+                },
+            },
         }
-
-        app_meter
     }
 
     fn handler_routine(&mut self) {
@@ -642,7 +660,7 @@ impl L7QuadrupleGenerator {
                     if config.enabled {
                         for l7_stat in l7_recv_batch.drain(..) {
                             let time_in_second = l7_stat.time_in_second;
-                            self.handle(Some(l7_stat), time_in_second, &config);
+                            self.handle(&config, Some(l7_stat), time_in_second);
                         }
                     } else {
                         l7_recv_batch.clear();
@@ -656,9 +674,9 @@ impl L7QuadrupleGenerator {
                 }
                 Err(Error::Timeout) => {
                     self.handle(
+                        &config,
                         None,
                         get_timestamp(self.ntp_diff.load(Ordering::Relaxed)),
-                        &config,
                     );
                 }
                 Err(Error::Terminated(_, _)) => {

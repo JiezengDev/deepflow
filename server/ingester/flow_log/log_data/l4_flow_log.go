@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,9 +30,10 @@ import (
 	"github.com/deepflowio/deepflow/server/libs/ckdb"
 	"github.com/deepflowio/deepflow/server/libs/datatype"
 	"github.com/deepflowio/deepflow/server/libs/datatype/pb"
+	flow_metrics "github.com/deepflowio/deepflow/server/libs/flow-metrics"
 	"github.com/deepflowio/deepflow/server/libs/grpc"
 	"github.com/deepflowio/deepflow/server/libs/pool"
-	"github.com/deepflowio/deepflow/server/libs/zerodoc"
+	"github.com/deepflowio/deepflow/server/libs/utils"
 )
 
 const (
@@ -239,6 +240,8 @@ type KnowledgeGraph struct {
 	PodNSID1      uint16 `json:"pod_ns_id_1"`
 	PodGroupID0   uint32 `json:"pod_group_id_0"`
 	PodGroupID1   uint32 `json:"pod_group_id_1"`
+	PodGroupType0 uint8  `json:"pod_group_type_0"` // no need to store
+	PodGroupType1 uint8  `json:"pod_group_type_1"` // no need to store
 	PodID0        uint32 `json:"pod_id_0"`
 	PodID1        uint32 `json:"pod_id_1"`
 	PodClusterID0 uint16 `json:"pod_cluster_id_0"`
@@ -264,6 +267,9 @@ type KnowledgeGraph struct {
 
 	TagSource0 uint8
 	TagSource1 uint8
+
+	OrgId  uint16 // no need to store
+	TeamID uint16
 }
 
 var KnowledgeGraphColumns = []*ckdb.Column{
@@ -309,6 +315,8 @@ var KnowledgeGraphColumns = []*ckdb.Column{
 
 	ckdb.NewColumn("tag_source_0", ckdb.UInt8),
 	ckdb.NewColumn("tag_source_1", ckdb.UInt8),
+
+	ckdb.NewColumn("team_id", ckdb.UInt16),
 }
 
 func (k *KnowledgeGraph) WriteBlock(block *ckdb.Block) {
@@ -354,6 +362,7 @@ func (k *KnowledgeGraph) WriteBlock(block *ckdb.Block) {
 
 		k.TagSource0,
 		k.TagSource1,
+		k.TeamID,
 	)
 }
 
@@ -361,12 +370,12 @@ type FlowInfo struct {
 	CloseType    uint16 `json:"close_type"`
 	SignalSource uint16 `json:"signal_source"`
 	FlowID       uint64 `json:"flow_id"`
-	TapType      uint16 `json:"tap_type"`
+	TapType      uint8  `json:"capture_network_type_id"`
 	NatSource    uint8  `json:"nat_source"`
-	TapPortType  uint8  `json:"tap_port_type"` // 0: MAC, 1: IPv4, 2:IPv6, 3: ID
-	TapPort      uint32 `json:"tap_port"`
-	TapSide      string `json:"tap_side"`
-	VtapID       uint16 `json:"vtap_id"`
+	TapPortType  uint8  `json:"capture_nic_type"` // 0: MAC, 1: IPv4, 2:IPv6, 3: ID
+	TapPort      uint32 `json:"capture_nic"`
+	TapSide      string `json:"observation_point"`
+	VtapID       uint16 `json:"agent_id"`
 	L2End0       bool   `json:"l2_end_0"`
 	L2End1       bool   `json:"l2_end_1"`
 	L3End0       bool   `json:"l3_end_0"`
@@ -386,6 +395,7 @@ type FlowInfo struct {
 	NatRealPort1 uint16
 
 	DirectionScore uint8
+	RequestDomain  string
 }
 
 var FlowInfoColumns = []*ckdb.Column{
@@ -394,12 +404,12 @@ var FlowInfoColumns = []*ckdb.Column{
 	ckdb.NewColumn("close_type", ckdb.UInt16).SetIndex(ckdb.IndexSet),
 	ckdb.NewColumn("signal_source", ckdb.UInt16),
 	ckdb.NewColumn("flow_id", ckdb.UInt64).SetIndex(ckdb.IndexMinmax),
-	ckdb.NewColumn("tap_type", ckdb.UInt16),
+	ckdb.NewColumn("capture_network_type_id", ckdb.UInt8),
 	ckdb.NewColumn("nat_source", ckdb.UInt8),
-	ckdb.NewColumn("tap_port_type", ckdb.UInt8),
-	ckdb.NewColumn("tap_port", ckdb.UInt32),
-	ckdb.NewColumn("tap_side", ckdb.LowCardinalityString),
-	ckdb.NewColumn("vtap_id", ckdb.UInt16).SetIndex(ckdb.IndexSet),
+	ckdb.NewColumn("capture_nic_type", ckdb.UInt8),
+	ckdb.NewColumn("capture_nic", ckdb.UInt32),
+	ckdb.NewColumn("observation_point", ckdb.LowCardinalityString),
+	ckdb.NewColumn("agent_id", ckdb.UInt16).SetIndex(ckdb.IndexSet),
 	ckdb.NewColumn("l2_end_0", ckdb.UInt8).SetIndex(ckdb.IndexNone),
 	ckdb.NewColumn("l2_end_1", ckdb.UInt8).SetIndex(ckdb.IndexNone),
 	ckdb.NewColumn("l3_end_0", ckdb.UInt8).SetIndex(ckdb.IndexNone),
@@ -417,6 +427,7 @@ var FlowInfoColumns = []*ckdb.Column{
 	ckdb.NewColumn("nat_real_port_0", ckdb.UInt16),
 	ckdb.NewColumn("nat_real_port_1", ckdb.UInt16),
 	ckdb.NewColumn("direction_score", ckdb.UInt8).SetIndex(ckdb.IndexMinmax),
+	ckdb.NewColumn("request_domain", ckdb.String).SetIndex(ckdb.IndexBloomfilter),
 }
 
 func (f *FlowInfo) WriteBlock(block *ckdb.Block) {
@@ -447,7 +458,7 @@ func (f *FlowInfo) WriteBlock(block *ckdb.Block) {
 
 	block.WriteIPv4(f.NatRealIP0)
 	block.WriteIPv4(f.NatRealIP1)
-	block.Write(f.NatRealPort0, f.NatRealPort1, f.DirectionScore)
+	block.Write(f.NatRealPort0, f.NatRealPort1, f.DirectionScore, f.RequestDomain)
 }
 
 type Metrics struct {
@@ -465,28 +476,27 @@ type Metrics struct {
 	TotalByteRx   uint64 `json:"total_byte_rx,omitempty"`
 	L7Request     uint32 `json:"l7_request,omitempty"`
 	L7Response    uint32 `json:"l7_response,omitempty"`
+	L7ParseFailed uint32 `json:"l7_parse_failed,omitempty"`
 
-	RTT          uint32 `json:"rtt,omitempty"` // us
-	RTTClientSum uint32 `json:"rtt_client_sum,omitempty"`
-	RTTServerSum uint32 `json:"rtt_server_sum,omitempty"`
-	SRTSum       uint32 `json:"srt_sum,omitempty"`
-	ARTSum       uint32 `json:"art_sum,omitempty"`
-	RRTSum       uint64 `json:"rrt_sum,omitempty"`
-	CITSum       uint32 `json:"cit_sum,omitempty"`
+	RTT       uint32 `json:"rtt,omitempty"`         // us
+	RTTClient uint32 `json:"rtt_client,omitempty"`  // us
+	RTTServer uint32 `json:"rtt_server,omitempty"`  // us
+	TLSRTT    uint32 `json:"tls_rtt_sum,omitempty"` // us
 
-	RTTClientCount uint32 `json:"rtt_client_count,omitempty"`
-	RTTServerCount uint32 `json:"rtt_server_count,omitempty"`
-	SRTCount       uint32 `json:"srt_count,omitempty"`
-	ARTCount       uint32 `json:"art_count,omitempty"`
-	RRTCount       uint32 `json:"rrt_count,omitempty"`
-	CITCount       uint32 `json:"cit_count,omitempty"`
+	SRTSum uint32 `json:"srt_sum,omitempty"`
+	ARTSum uint32 `json:"art_sum,omitempty"`
+	RRTSum uint64 `json:"rrt_sum,omitempty"`
+	CITSum uint32 `json:"cit_sum,omitempty"`
 
-	RTTClientMax uint32 `json:"rtt_client_max,omitempty"` // us
-	RTTServerMax uint32 `json:"rtt_server_max,omitempty"` // us
-	SRTMax       uint32 `json:"srt_max,omitempty"`        // us
-	ARTMax       uint32 `json:"art_max,omitempty"`        // us
-	RRTMax       uint32 `json:"rrt_max,omitempty"`        // us
-	CITMax       uint32 `json:"cit_max,omitempty"`        // us
+	SRTCount uint32 `json:"srt_count,omitempty"`
+	ARTCount uint32 `json:"art_count,omitempty"`
+	RRTCount uint32 `json:"rrt_count,omitempty"`
+	CITCount uint32 `json:"cit_count,omitempty"`
+
+	SRTMax uint32 `json:"srt_max,omitempty"` // us
+	ARTMax uint32 `json:"art_max,omitempty"` // us
+	RRTMax uint32 `json:"rrt_max,omitempty"` // us
+	CITMax uint32 `json:"cit_max,omitempty"` // us
 
 	RetransTx       uint32 `json:"retrans_tx,omitempty"`
 	RetransRx       uint32 `json:"retrans_rx,omitempty"`
@@ -518,24 +528,23 @@ var MetricsColumns = []*ckdb.Column{
 	ckdb.NewColumn("total_byte_rx", ckdb.UInt64),
 	ckdb.NewColumn("l7_request", ckdb.UInt32),
 	ckdb.NewColumn("l7_response", ckdb.UInt32),
+	ckdb.NewColumn("l7_parse_failed", ckdb.UInt32),
 
 	ckdb.NewColumn("rtt", ckdb.Float64).SetComment("单位: 微秒"),
-	ckdb.NewColumn("rtt_client_sum", ckdb.Float64),
-	ckdb.NewColumn("rtt_server_sum", ckdb.Float64),
+	ckdb.NewColumn("rtt_client", ckdb.Float64).SetComment("单位: 微秒"),
+	ckdb.NewColumn("rtt_server", ckdb.Float64).SetComment("单位: 微秒"),
+	ckdb.NewColumn("tls_rtt", ckdb.Float64).SetComment("单位: 微秒"),
+
 	ckdb.NewColumn("srt_sum", ckdb.Float64),
 	ckdb.NewColumn("art_sum", ckdb.Float64),
 	ckdb.NewColumn("rrt_sum", ckdb.Float64),
 	ckdb.NewColumn("cit_sum", ckdb.Float64),
 
-	ckdb.NewColumn("rtt_client_count", ckdb.UInt64),
-	ckdb.NewColumn("rtt_server_count", ckdb.UInt64),
 	ckdb.NewColumn("srt_count", ckdb.UInt64),
 	ckdb.NewColumn("art_count", ckdb.UInt64),
 	ckdb.NewColumn("rrt_count", ckdb.UInt64),
 	ckdb.NewColumn("cit_count", ckdb.UInt64),
 
-	ckdb.NewColumn("rtt_client_max", ckdb.UInt32).SetComment("单位: 微秒"),
-	ckdb.NewColumn("rtt_server_max", ckdb.UInt32).SetComment("单位: 微秒"),
 	ckdb.NewColumn("srt_max", ckdb.UInt32).SetComment("单位: 微秒"),
 	ckdb.NewColumn("art_max", ckdb.UInt32).SetComment("单位: 微秒"),
 	ckdb.NewColumn("rrt_max", ckdb.UInt32).SetComment("单位: 微秒"),
@@ -571,24 +580,23 @@ func (m *Metrics) WriteBlock(block *ckdb.Block) {
 		m.TotalByteRx,
 		m.L7Request,
 		m.L7Response,
+		m.L7ParseFailed,
 
 		float64(m.RTT),
-		float64(m.RTTClientSum),
-		float64(m.RTTServerSum),
+		float64(m.RTTClient),
+		float64(m.RTTServer),
+		float64(m.TLSRTT),
+
 		float64(m.SRTSum),
 		float64(m.ARTSum),
 		float64(m.RRTSum),
 		float64(m.CITSum),
 
-		uint64(m.RTTClientCount),
-		uint64(m.RTTServerCount),
 		uint64(m.SRTCount),
 		uint64(m.ARTCount),
 		uint64(m.RRTCount),
 		uint64(m.CITCount),
 
-		m.RTTClientMax,
-		m.RTTServerMax,
 		m.SRTMax,
 		m.ARTMax,
 		m.RRTMax,
@@ -687,6 +695,14 @@ func (i *Internet) Fill(f *pb.Flow) {
 	i.Province1 = geo.QueryProvince(f.FlowKey.IpDst)
 }
 
+func isLocalIP(isIPv6 bool, ip4 uint32, ip6 net.IP) bool {
+	ip := ip6
+	if !isIPv6 {
+		ip = utils.IpFromUint32(ip4)
+	}
+	return !ip.IsGlobalUnicast()
+}
+
 func (k *KnowledgeGraph) fill(
 	platformData *grpc.PlatformInfoTable,
 	isIPv6, isVipInterface0, isVipInterface1 bool,
@@ -695,7 +711,7 @@ func (k *KnowledgeGraph) fill(
 	ip60, ip61 net.IP,
 	mac0, mac1 uint64,
 	gpID0, gpID1 uint32,
-	vtapId, netnsId0, netnsId1 uint32,
+	vtapId uint16, podId0, podId1 uint32,
 	port uint16,
 	tapSide uint32,
 	protocol layers.IPProtocol) {
@@ -705,9 +721,15 @@ func (k *KnowledgeGraph) fill(
 	// 对于VIP的流量，需要使用MAC来匹配
 	lookupByMac0, lookupByMac1 := isVipInterface0, isVipInterface1
 	// 对于本地的流量，也需要使用MAC来匹配
-	if tapSide == uint32(zerodoc.Local) {
-		lookupByMac0, lookupByMac1 = true, true
-	} else if tapSide == uint32(zerodoc.ClientProcess) || tapSide == uint32(zerodoc.ServerProcess) {
+	if tapSide == uint32(flow_metrics.Local) {
+		// for local non-unicast IPs, MAC matching is preferred.
+		if isLocalIP(isIPv6, ip40, ip60) {
+			lookupByMac0 = true
+		}
+		if isLocalIP(isIPv6, ip41, ip61) {
+			lookupByMac1 = true
+		}
+	} else if tapSide == uint32(flow_metrics.ClientProcess) || tapSide == uint32(flow_metrics.ServerProcess) {
 		// For ebpf traffic, if MAC is valid, MAC lookup is preferred
 		if mac0 != 0 {
 			lookupByMac0 = true
@@ -718,34 +740,49 @@ func (k *KnowledgeGraph) fill(
 	}
 	l3EpcMac0, l3EpcMac1 := mac0|uint64(l3EpcID0)<<48, mac1|uint64(l3EpcID1)<<48 // 使用l3EpcID和mac查找，防止跨AZ mac冲突
 
-	// use vtapId + netnsId to match first
-	if netnsId0 != 0 {
-		k.TagSource0 |= uint8(zerodoc.NetnsId)
-		info0 = platformData.QueryNetnsIdInfo(vtapId, netnsId0)
+	if gpID0 != 0 && podId0 == 0 {
+		vtapID, podId := platformData.QueryGprocessInfo(gpID0)
+		if podId != 0 && vtapID == vtapId {
+			podId0 = podId
+			k.TagSource0 |= uint8(flow_metrics.GpId)
+		}
 	}
-	if netnsId1 != 0 {
-		k.TagSource1 |= uint8(zerodoc.NetnsId)
-		info1 = platformData.QueryNetnsIdInfo(vtapId, netnsId1)
+	if gpID1 != 0 && podId1 == 0 {
+		vtapID, podId := platformData.QueryGprocessInfo(gpID1)
+		if podId != 0 && vtapID == vtapId {
+			podId1 = podId
+			k.TagSource1 |= uint8(flow_metrics.GpId)
+		}
+	}
+
+	// use podId to match first
+	if podId0 != 0 {
+		k.TagSource0 |= uint8(flow_metrics.PodId)
+		info0 = platformData.QueryPodIdInfo(podId0)
+	}
+	if podId1 != 0 {
+		k.TagSource1 |= uint8(flow_metrics.PodId)
+		info1 = platformData.QueryPodIdInfo(podId1)
 	}
 
 	if info0 == nil {
 		if lookupByMac0 {
-			k.TagSource0 |= uint8(zerodoc.Mac)
+			k.TagSource0 |= uint8(flow_metrics.Mac)
 			info0 = platformData.QueryMacInfo(l3EpcMac0)
 		}
 		if info0 == nil {
-			k.TagSource0 |= uint8(zerodoc.EpcIP)
+			k.TagSource0 |= uint8(flow_metrics.EpcIP)
 			info0 = common.RegetInfoFromIP(isIPv6, ip60, ip40, l3EpcID0, platformData)
 		}
 	}
 
 	if info1 == nil {
 		if lookupByMac1 {
-			k.TagSource1 |= uint8(zerodoc.Mac)
+			k.TagSource1 |= uint8(flow_metrics.Mac)
 			info1 = platformData.QueryMacInfo(l3EpcMac1)
 		}
 		if info1 == nil {
-			k.TagSource1 |= uint8(zerodoc.EpcIP)
+			k.TagSource1 |= uint8(flow_metrics.EpcIP)
 			info1 = common.RegetInfoFromIP(isIPv6, ip61, ip41, l3EpcID1, platformData)
 		}
 	}
@@ -768,6 +805,7 @@ func (k *KnowledgeGraph) fill(
 		k.PodNodeID0 = info0.PodNodeID
 		k.PodNSID0 = uint16(info0.PodNSID)
 		k.PodGroupID0 = info0.PodGroupID
+		k.PodGroupType0 = info0.PodGroupType
 		k.PodID0 = info0.PodID
 		k.PodClusterID0 = uint16(info0.PodClusterID)
 		k.SubnetID0 = uint16(info0.SubnetID)
@@ -781,6 +819,7 @@ func (k *KnowledgeGraph) fill(
 		k.PodNodeID1 = info1.PodNodeID
 		k.PodNSID1 = uint16(info1.PodNSID)
 		k.PodGroupID1 = info1.PodGroupID
+		k.PodGroupType1 = info1.PodGroupType
 		k.PodID1 = info1.PodID
 		k.PodClusterID1 = uint16(info1.PodClusterID)
 		k.SubnetID1 = uint16(info1.SubnetID)
@@ -794,30 +833,33 @@ func (k *KnowledgeGraph) fill(
 	}
 
 	// 0端如果是clusterIP或后端podIP需要匹配service_id
-	if common.IsPodServiceIP(zerodoc.DeviceType(k.L3DeviceType0), k.PodID0, 0) {
+	if common.IsPodServiceIP(flow_metrics.DeviceType(k.L3DeviceType0), k.PodID0, 0) {
 		k.ServiceID0 = platformData.QueryService(k.PodID0, k.PodNodeID0, uint32(k.PodClusterID0), k.PodGroupID0, l3EpcID0, isIPv6, ip40, ip60, protocol, 0)
 	}
-	if common.IsPodServiceIP(zerodoc.DeviceType(k.L3DeviceType1), k.PodID1, k.PodNodeID1) {
+	if common.IsPodServiceIP(flow_metrics.DeviceType(k.L3DeviceType1), k.PodID1, k.PodNodeID1) {
 		k.ServiceID1 = platformData.QueryService(k.PodID1, k.PodNodeID1, uint32(k.PodClusterID1), k.PodGroupID1, l3EpcID1, isIPv6, ip41, ip61, protocol, port)
 	}
 
 	k.AutoInstanceID0, k.AutoInstanceType0 = common.GetAutoInstance(k.PodID0, gpID0, k.PodNodeID0, k.L3DeviceID0, k.L3DeviceType0, k.L3EpcID0)
-	k.AutoServiceID0, k.AutoServiceType0 = common.GetAutoService(k.ServiceID0, k.PodGroupID0, gpID0, k.PodNodeID0, k.L3DeviceID0, k.L3DeviceType0, k.L3EpcID0)
+	k.AutoServiceID0, k.AutoServiceType0 = common.GetAutoService(k.ServiceID0, k.PodGroupID0, gpID0, k.PodNodeID0, k.L3DeviceID0, k.L3DeviceType0, k.PodGroupType0, k.L3EpcID0)
 
 	k.AutoInstanceID1, k.AutoInstanceType1 = common.GetAutoInstance(k.PodID1, gpID1, k.PodNodeID1, k.L3DeviceID1, k.L3DeviceType1, k.L3EpcID1)
-	k.AutoServiceID1, k.AutoServiceType1 = common.GetAutoService(k.ServiceID1, k.PodGroupID1, gpID1, k.PodNodeID1, k.L3DeviceID1, k.L3DeviceType1, k.L3EpcID1)
+	k.AutoServiceID1, k.AutoServiceType1 = common.GetAutoService(k.ServiceID1, k.PodGroupID1, gpID1, k.PodNodeID1, k.L3DeviceID1, k.L3DeviceType1, k.PodGroupType1, k.L3EpcID1)
+
+	k.OrgId, k.TeamID = platformData.QueryVtapOrgAndTeamID(vtapId)
+
 }
 
 func (k *KnowledgeGraph) FillL4(f *pb.Flow, isIPv6 bool, platformData *grpc.PlatformInfoTable) {
 	k.fill(platformData,
 		isIPv6, f.MetricsPeerSrc.IsVipInterface == 1, f.MetricsPeerDst.IsVipInterface == 1,
 		// The range of EPC ID is [-2,65533], if EPC ID < -2 needs to be transformed into the range.
-		zerodoc.MarshalInt32WithSpecialID(f.MetricsPeerSrc.L3EpcId), zerodoc.MarshalInt32WithSpecialID(f.MetricsPeerDst.L3EpcId),
+		flow_metrics.MarshalInt32WithSpecialID(f.MetricsPeerSrc.L3EpcId), flow_metrics.MarshalInt32WithSpecialID(f.MetricsPeerDst.L3EpcId),
 		f.FlowKey.IpSrc, f.FlowKey.IpDst,
 		f.FlowKey.Ip6Src, f.FlowKey.Ip6Dst,
 		f.FlowKey.MacSrc, f.FlowKey.MacDst,
 		f.MetricsPeerSrc.Gpid, f.MetricsPeerDst.Gpid,
-		0, 0, 0,
+		uint16(f.FlowKey.VtapId), 0, 0,
 		uint16(f.FlowKey.PortDst),
 		f.TapSide,
 		layers.IPProtocol(f.FlowKey.Proto))
@@ -825,7 +867,8 @@ func (k *KnowledgeGraph) FillL4(f *pb.Flow, isIPv6 bool, platformData *grpc.Plat
 
 func getStatus(t datatype.CloseType, p layers.IPProtocol) datatype.LogMessageStatus {
 	if t == datatype.CloseTypeTCPFin || t == datatype.CloseTypeForcedReport || t == datatype.CloseTypeTCPFinClientRst ||
-		(p != layers.IPProtocolTCP && t == datatype.CloseTypeTimeout) {
+		(p != layers.IPProtocolTCP && t == datatype.CloseTypeTimeout) ||
+		t == datatype.CloseTypeClientHalfClose || t == datatype.CloseTypeServerHalfClose {
 		return datatype.STATUS_OK
 	} else if t.IsClientError() {
 		return datatype.STATUS_CLIENT_ERROR
@@ -840,11 +883,11 @@ func (i *FlowInfo) Fill(f *pb.Flow) {
 	i.CloseType = uint16(f.CloseType)
 	i.SignalSource = uint16(f.SignalSource)
 	i.FlowID = f.FlowId
-	i.TapType = uint16(f.FlowKey.TapType)
+	i.TapType = uint8(f.FlowKey.TapType)
 	var natSource datatype.NATSource
 	i.TapPort, i.TapPortType, natSource, _ = datatype.TapPort(f.FlowKey.TapPort).SplitToPortTypeTunnel()
 	i.NatSource = uint8(natSource)
-	i.TapSide = zerodoc.TAPSideEnum(f.TapSide).String()
+	i.TapSide = flow_metrics.TAPSideEnum(f.TapSide).String()
 	i.VtapID = uint16(f.FlowKey.VtapId)
 
 	i.L2End0 = f.MetricsPeerSrc.IsL2End == 1
@@ -868,6 +911,7 @@ func (i *FlowInfo) Fill(f *pb.Flow) {
 	i.NatRealPort0 = uint16(f.MetricsPeerSrc.RealPort)
 	i.NatRealPort1 = uint16(f.MetricsPeerDst.RealPort)
 	i.DirectionScore = uint8(f.DirectionScore)
+	i.RequestDomain = f.RequestDomain
 }
 
 func (m *Metrics) Fill(f *pb.Flow) {
@@ -893,13 +937,12 @@ func (m *Metrics) Fill(f *pb.Flow) {
 		m.L7ServerError = p.L7.ErrServerCount
 		m.L7ServerTimeout = p.L7.ErrTimeout
 		m.L7Error = m.L7ClientError + m.L7ServerError
+		m.L7ParseFailed = p.L7FailedCount
 
 		m.RTT = p.Tcp.Rtt
-		m.RTTClientSum = p.Tcp.RttClientSum
-		m.RTTClientCount = p.Tcp.RttClientCount
-
-		m.RTTServerSum = p.Tcp.RttServerSum
-		m.RTTServerCount = p.Tcp.RttServerCount
+		m.RTTClient = p.Tcp.RttClientMax
+		m.RTTServer = p.Tcp.RttServerMax
+		m.TLSRTT = p.L7.TlsRtt
 
 		m.SRTSum = p.Tcp.SrtSum
 		m.SRTCount = p.Tcp.SrtCount
@@ -913,8 +956,6 @@ func (m *Metrics) Fill(f *pb.Flow) {
 		m.CITSum = p.Tcp.CitSum
 		m.CITCount = p.Tcp.CitCount
 
-		m.RTTClientMax = p.Tcp.RttClientMax
-		m.RTTServerMax = p.Tcp.RttServerMax
 		m.SRTMax = p.Tcp.SrtMax
 		m.ARTMax = p.Tcp.ArtMax
 		m.RRTMax = p.L7.RrtMax
@@ -945,7 +986,7 @@ func (f *L4FlowLog) Release() {
 
 func L4FlowLogColumns() []*ckdb.Column {
 	columns := []*ckdb.Column{}
-	columns = append(columns, ckdb.NewColumn("_id", ckdb.UInt64).SetCodec(ckdb.CodecDoubleDelta))
+	columns = append(columns, ckdb.NewColumn("_id", ckdb.UInt64))
 	columns = append(columns, DataLinkLayerColumns...)
 	columns = append(columns, KnowledgeGraphColumns...)
 	columns = append(columns, NetworkLayerColumns...)
@@ -967,6 +1008,10 @@ func (f *L4FlowLog) WriteBlock(block *ckdb.Block) {
 	f.Internet.WriteBlock(block)
 	f.FlowInfo.WriteBlock(block)
 	f.Metrics.WriteBlock(block)
+}
+
+func (f *L4FlowLog) OrgID() uint16 {
+	return f.KnowledgeGraph.OrgId
 }
 
 func (f *L4FlowLog) EndTime() time.Duration {

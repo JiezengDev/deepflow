@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -525,7 +525,14 @@ func (n *NodeInfo) registerTSDBToDB(tsdb *models.Analyzer) {
 				}
 			}
 		}
-		err = service.ConfigAnalyzerDataSource(tsdb.IP)
+
+		if IsStandaloneRunningMode() {
+			// in standalone mode, since all in one deployment and analyzer communication use 127.0.0.1
+			err = service.ConfigAnalyzerDataSource("127.0.0.1")
+		} else {
+			err = service.ConfigAnalyzerDataSource(tsdb.IP)
+		}
+
 		if err != nil {
 			log.Error(err)
 		}

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32,6 +32,10 @@ func (r *ReferenceCount) Reset() {
 
 func (r *ReferenceCount) AddReferenceCount() {
 	atomic.AddInt32((*int32)(r), 1)
+}
+
+func (r *ReferenceCount) AddReferenceCountN(n int32) {
+	atomic.AddInt32((*int32)(r), n)
 }
 
 func (r *ReferenceCount) SubReferenceCount() bool {

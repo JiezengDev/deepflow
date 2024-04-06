@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -242,10 +242,6 @@ impl ApiWatcher {
         self.thread.lock().unwrap().replace(handle);
     }
 
-    pub fn reset_session(&self, controller_ips: Vec<String>) {
-        self.session.reset_server_ip(controller_ips);
-    }
-
     async fn discover_resources(
         client: &Client,
         resource_config: &Vec<KubernetesResourceConfig>,
@@ -282,7 +278,10 @@ impl ApiWatcher {
             if r.disabled {
                 continue;
             }
-            let Some(index) = supported_resources.iter().position(|sr| &sr.name == &r.name) else {
+            let Some(index) = supported_resources
+                .iter()
+                .position(|sr| &sr.name == &r.name)
+            else {
                 warn!("resource {} not supported", r.name);
                 continue;
             };
@@ -313,8 +312,15 @@ impl ApiWatcher {
                 }
                 continue;
             }
-            let Some(index) = sr.group_versions.iter().position(|gv| &gv.group == &r.group && &gv.version == &r.version) else {
-                warn!("resource {} in group {}/{} not supported", r.name, r.group, r.version);
+            let Some(index) = sr
+                .group_versions
+                .iter()
+                .position(|gv| &gv.group == &r.group && &gv.version == &r.version)
+            else {
+                warn!(
+                    "resource {} in group {}/{} not supported",
+                    r.name, r.group, r.version
+                );
                 continue;
             };
             resources.push(Resource {
@@ -341,7 +347,10 @@ impl ApiWatcher {
             .await
             .map_err(|e| Error::KubernetesApiWatcher(format!("{}", e)))?;
         for api_resource in core_resources.resources {
-            let Some(index) = resources.iter().position(|r| &r.name == &api_resource.name && r.group_versions.iter().any(|gv| gv.group == "core")) else {
+            let Some(index) = resources.iter().position(|r| {
+                &r.name == &api_resource.name
+                    && r.group_versions.iter().any(|gv| gv.group == "core")
+            }) else {
                 continue;
             };
             debug!(
@@ -410,13 +419,20 @@ impl ApiWatcher {
 
                         for api_resource in api_resources.unwrap().resources {
                             let resource_name = api_resource.name;
-                            let Some(index) = resources.iter().position(|r| &r.name == &resource_name && r.group_versions.iter().any(|gv| gv.group == &group.name)) else {
+                            let Some(index) = resources.iter().position(|r| {
+                                &r.name == &resource_name
+                                    && r.group_versions.iter().any(|gv| gv.group == &group.name)
+                            }) else {
                                 continue;
                             };
-                            let Some(gv_index) = resources[index].group_versions.iter().position(|gv| gv.group == &group.name && gv.version == &version.version) else {
-                                debug!("skipped {} api in group {} with other version",
-                                    resource_name,
-                                    version.group_version
+                            let Some(gv_index) =
+                                resources[index].group_versions.iter().position(|gv| {
+                                    gv.group == &group.name && gv.version == &version.version
+                                })
+                            else {
+                                debug!(
+                                    "skipped {} api in group {} with other version",
+                                    resource_name, version.group_version
                                 );
                                 continue;
                             };
@@ -627,11 +643,13 @@ impl ApiWatcher {
         }
         let mut msg = {
             let config_guard = context.config.load();
+            let id = agent_id.read();
             KubernetesApiSyncRequest {
                 cluster_id: Some(config_guard.kubernetes_cluster_id.to_string()),
                 version: pb_version,
                 vtap_id: Some(config_guard.vtap_id as u32),
-                source_ip: Some(agent_id.read().ip.to_string()),
+                source_ip: Some(id.ip.to_string()),
+                team_id: Some(id.team_id.clone()),
                 error_msg: Some(
                     err_msgs
                         .lock()
@@ -760,14 +778,18 @@ impl ApiWatcher {
                 Ok(r) => break r,
                 Err(e) => {
                     warn!("{}", e);
-                    let config_guard = context.config.load();
-                    let msg = KubernetesApiSyncRequest {
-                        cluster_id: Some(config_guard.kubernetes_cluster_id.to_string()),
-                        version: Some(context.version.load(Ordering::SeqCst)),
-                        vtap_id: Some(config_guard.vtap_id as u32),
-                        source_ip: Some(agent_id.read().ip.to_string()),
-                        error_msg: Some(e.to_string()),
-                        entries: vec![],
+                    let msg = {
+                        let config_guard = context.config.load();
+                        let id = agent_id.read();
+                        KubernetesApiSyncRequest {
+                            cluster_id: Some(config_guard.kubernetes_cluster_id.to_string()),
+                            version: Some(context.version.load(Ordering::SeqCst)),
+                            vtap_id: Some(config_guard.vtap_id as u32),
+                            source_ip: Some(id.ip.to_string()),
+                            team_id: Some(id.team_id.clone()),
+                            error_msg: Some(e.to_string()),
+                            entries: vec![],
+                        }
                     };
                     if let Err(e) = context
                         .runtime

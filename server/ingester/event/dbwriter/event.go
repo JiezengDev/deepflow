@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package dbwriter
 
 import (
 	"net"
+	"sync/atomic"
 
 	basecommon "github.com/deepflowio/deepflow/server/ingester/common"
 	"github.com/deepflowio/deepflow/server/ingester/event/common"
@@ -43,6 +44,7 @@ const (
 
 type EventStore struct {
 	Time uint32 // s
+	_id  uint64
 
 	StartTime int64
 	EndTime   int64
@@ -52,9 +54,9 @@ type EventStore struct {
 	SignalSource     uint8 // Resource / File IO
 	EventType        string
 	EventDescription string
+	ProcessKName     string
 
 	GProcessID uint32
-	NetnsID    uint32
 
 	RegionID     uint16
 	AZID         uint16
@@ -74,6 +76,11 @@ type EventStore struct {
 	IP4          uint32
 	IP6          net.IP
 
+	// Not stored, only determines which database to store in.
+	// When Orgid is 0 or 1, it is stored in database 'event', otherwise stored in '<OrgId>_event'.
+	OrgId  uint16
+	TeamID uint16
+
 	AutoInstanceID   uint32
 	AutoInstanceType uint8
 	AutoServiceID    uint32
@@ -92,6 +99,7 @@ type EventStore struct {
 func (e *EventStore) WriteBlock(block *ckdb.Block) {
 	block.WriteDateTime(e.Time)
 	block.Write(
+		e._id,
 		e.StartTime,
 		e.EndTime,
 
@@ -100,9 +108,9 @@ func (e *EventStore) WriteBlock(block *ckdb.Block) {
 		e.SignalSource,
 		e.EventType,
 		e.EventDescription,
+		e.ProcessKName,
 
 		e.GProcessID,
-		e.NetnsID,
 
 		e.RegionID,
 		e.AZID,
@@ -123,6 +131,7 @@ func (e *EventStore) WriteBlock(block *ckdb.Block) {
 	block.WriteIPv6(e.IP6)
 
 	block.Write(
+		e.TeamID,
 		e.AutoInstanceID,
 		e.AutoInstanceType,
 		e.AutoServiceID,
@@ -141,6 +150,10 @@ func (e *EventStore) WriteBlock(block *ckdb.Block) {
 	}
 }
 
+func (e *EventStore) OrgID() uint16 {
+	return e.OrgId
+}
+
 func (e *EventStore) Table() string {
 	if e.HasMetrics {
 		return common.PERF_EVENT.TableName()
@@ -152,9 +165,18 @@ func (e *EventStore) Release() {
 	ReleaseEventStore(e)
 }
 
+var EventCounter uint32
+
+func (e *EventStore) SetId(time, analyzerID uint32) {
+	count := atomic.AddUint32(&EventCounter, 1)
+	// The high 32 bits of time, 23-32 bits represent analyzerId, the low 22 bits are counter
+	e._id = uint64(time)<<32 | uint64(analyzerID&0x3ff)<<22 | (uint64(count) & 0x3fffff)
+}
+
 func EventColumns(hasMetrics bool) []*ckdb.Column {
 	columns := []*ckdb.Column{
 		ckdb.NewColumn("time", ckdb.DateTime),
+		ckdb.NewColumn("_id", ckdb.UInt64),
 		ckdb.NewColumn("start_time", ckdb.DateTime64us).SetComment("精度: 微秒"),
 		ckdb.NewColumn("end_time", ckdb.DateTime64us).SetComment("精度: 微秒"),
 
@@ -163,9 +185,9 @@ func EventColumns(hasMetrics bool) []*ckdb.Column {
 		ckdb.NewColumn("signal_source", ckdb.UInt8).SetComment("事件来源"),
 		ckdb.NewColumn("event_type", ckdb.LowCardinalityString).SetComment("事件类型"),
 		ckdb.NewColumn("event_desc", ckdb.String).SetComment("事件信息"),
+		ckdb.NewColumn("process_kname", ckdb.String).SetComment("进程名"),
 
 		ckdb.NewColumn("gprocess_id", ckdb.UInt32).SetComment("全局进程ID"),
-		ckdb.NewColumn("netns_id", ckdb.UInt32).SetComment("网络命名空间ID"),
 
 		ckdb.NewColumn("region_id", ckdb.UInt16).SetComment("云平台区域ID"),
 		ckdb.NewColumn("az_id", ckdb.UInt16).SetComment("可用区ID"),
@@ -180,11 +202,13 @@ func EventColumns(hasMetrics bool) []*ckdb.Column {
 		ckdb.NewColumn("l3_device_type", ckdb.UInt8).SetComment("资源类型"),
 		ckdb.NewColumn("l3_device_id", ckdb.UInt32).SetComment("资源ID"),
 		ckdb.NewColumn("service_id", ckdb.UInt32).SetComment("服务ID"),
-		ckdb.NewColumn("vtap_id", ckdb.UInt16).SetComment("采集器ID"),
+		ckdb.NewColumn("agent_id", ckdb.UInt16).SetComment("采集器ID"),
 		ckdb.NewColumn("subnet_id", ckdb.UInt16),
 		ckdb.NewColumn("is_ipv4", ckdb.UInt8),
 		ckdb.NewColumn("ip4", ckdb.IPv4),
 		ckdb.NewColumn("ip6", ckdb.IPv6),
+
+		ckdb.NewColumn("team_id", ckdb.UInt16).SetComment("Team ID"),
 
 		ckdb.NewColumn("auto_instance_id", ckdb.UInt32),
 		ckdb.NewColumn("auto_instance_type", ckdb.UInt8),
@@ -192,7 +216,7 @@ func EventColumns(hasMetrics bool) []*ckdb.Column {
 		ckdb.NewColumn("auto_service_type", ckdb.UInt8),
 		ckdb.NewColumn("app_instance", ckdb.String).SetComment("app instance"),
 
-		ckdb.NewColumn("attribute_names", ckdb.ArrayString).SetComment("额外的属性"),
+		ckdb.NewColumn("attribute_names", ckdb.ArrayLowCardinalityString).SetComment("额外的属性"),
 		ckdb.NewColumn("attribute_values", ckdb.ArrayString).SetComment("额外的属性对应的值"),
 	}
 	if hasMetrics {
@@ -240,6 +264,8 @@ func (e *EventStore) GenerateNewFlowTags(cache *flow_tag.FlowTagCache) {
 		Table:   e.Table(),
 		VpcId:   e.L3EpcID,
 		PodNsId: e.PodNSID,
+		OrgId:   e.OrgId,
+		TeamID:  e.TeamID,
 	}
 	cache.Fields = cache.Fields[:0]
 	cache.FieldValues = cache.FieldValues[:0]
@@ -260,7 +286,7 @@ func (e *EventStore) GenerateNewFlowTags(cache *flow_tag.FlowTagCache) {
 				cache.FieldValueCache.Add(*flowTagInfo, e.Time)
 			}
 		}
-		tagFieldValue := flow_tag.AcquireFlowTag()
+		tagFieldValue := flow_tag.AcquireFlowTag(flow_tag.TagFieldValue)
 		tagFieldValue.Timestamp = e.Time
 		tagFieldValue.FlowTagInfo = *flowTagInfo
 		cache.FieldValues = append(cache.FieldValues, tagFieldValue)
@@ -274,7 +300,7 @@ func (e *EventStore) GenerateNewFlowTags(cache *flow_tag.FlowTagCache) {
 				cache.FieldCache.Add(*flowTagInfo, e.Time)
 			}
 		}
-		tagField := flow_tag.AcquireFlowTag()
+		tagField := flow_tag.AcquireFlowTag(flow_tag.TagField)
 		tagField.Timestamp = e.Time
 		tagField.FlowTagInfo = *flowTagInfo
 		cache.Fields = append(cache.Fields, tagField)

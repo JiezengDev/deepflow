@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,7 +25,6 @@ use std::{
 
 use public::enums::IpProtocol;
 
-use crate::flow_generator::protocol_logs::{pb_adapter::KeyVal, L7ResponseStatus, LogMessageType};
 use crate::{
     common::{
         ebpf::EbpfType,
@@ -37,6 +36,10 @@ use crate::{
 use crate::{
     common::{flow::PacketDirection, l7_protocol_log::L7ProtocolParserInterface},
     flow_generator::protocol_logs::plugin::shared_obj::SoLog,
+};
+use crate::{
+    config::OracleParseConfig,
+    flow_generator::protocol_logs::{pb_adapter::KeyVal, L7ResponseStatus, LogMessageType},
 };
 
 use super::{load_plugin, SoPluginFunc};
@@ -52,10 +55,10 @@ fn get_plugin() -> SoPluginFunc {
 
 fn get_req_param<'a>(
     rrt_cache: Rc<RefCell<L7PerfCache>>,
-    plugin: Rc<Vec<SoPluginFunc>>,
+    plugin: Rc<RefCell<Option<Vec<SoPluginFunc>>>>,
 ) -> ParseParam<'a> {
     ParseParam {
-        l4_protocol: IpProtocol::Tcp,
+        l4_protocol: IpProtocol::TCP,
         ip_src: IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
         ip_dst: IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
         port_src: 12345,
@@ -67,7 +70,7 @@ fn get_req_param<'a>(
             is_tls: false,
             is_req_end: false,
             is_resp_end: false,
-            process_kname: "test_wasm".to_string(),
+            process_kname: "test_wasm",
         }),
         packet_seq: 9999999,
         time: 12345678,
@@ -75,21 +78,21 @@ fn get_req_param<'a>(
         parse_perf: true,
         parse_config: None,
         l7_perf_cache: rrt_cache.clone(),
-        wasm_vm: None,
-        so_func: Some(plugin),
-        so_plugin_counter_map: None,
+        wasm_vm: Default::default(),
+        so_func: plugin,
         stats_counter: None,
         rrt_timeout: Duration::from_secs(10).as_micros() as usize,
         buf_size: 0,
+        oracle_parse_conf: OracleParseConfig::default(),
     }
 }
 
 fn get_resp_param<'a>(
     rrt_cache: Rc<RefCell<L7PerfCache>>,
-    plugin: Rc<Vec<SoPluginFunc>>,
+    plugin: Rc<RefCell<Option<Vec<SoPluginFunc>>>>,
 ) -> ParseParam<'a> {
     ParseParam {
-        l4_protocol: IpProtocol::Tcp,
+        l4_protocol: IpProtocol::TCP,
         ip_src: IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
         ip_dst: IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
         port_src: 8080,
@@ -102,7 +105,7 @@ fn get_resp_param<'a>(
             is_tls: false,
             is_req_end: false,
             is_resp_end: false,
-            process_kname: "test_wasm".to_string(),
+            process_kname: "test_wasm",
         }),
         packet_seq: 9999999,
         time: 12345679,
@@ -110,12 +113,12 @@ fn get_resp_param<'a>(
         parse_log: true,
         parse_config: None,
         l7_perf_cache: rrt_cache.clone(),
-        wasm_vm: None,
-        so_func: Some(plugin),
-        so_plugin_counter_map: None,
+        wasm_vm: Default::default(),
+        so_func: plugin,
         stats_counter: None,
         rrt_timeout: Duration::from_secs(10).as_micros() as usize,
         buf_size: 0,
+        oracle_parse_conf: OracleParseConfig::default(),
     }
 }
 
@@ -133,7 +136,7 @@ static RESP_PAYLOAD: [u8; 70] = [
 #[test]
 fn test_check() {
     let rrt_cache = Rc::new(RefCell::new(L7PerfCache::new(100)));
-    let param = get_req_param(rrt_cache, Rc::new(vec![get_plugin()]));
+    let param = get_req_param(rrt_cache, Rc::new(RefCell::new(Some(vec![get_plugin()]))));
     let mut p = SoLog::default();
     assert!(p.check_payload(&REQ_PAYLOAD, &param));
 }
@@ -150,7 +153,7 @@ fn test_parse() {
             val: "val2".into(),
         },
     ];
-    let plugin = Rc::new(vec![get_plugin()]);
+    let plugin = Rc::new(RefCell::new(Some(vec![get_plugin()])));
 
     let rrt_cache = Rc::new(RefCell::new(L7PerfCache::new(100)));
     let param = get_req_param(rrt_cache.clone(), plugin.clone());

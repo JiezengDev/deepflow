@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,10 +24,10 @@ import (
 
 	"github.com/deepflowio/deepflow/message/trident"
 	"github.com/deepflowio/deepflow/server/libs/datatype"
+	"github.com/deepflowio/deepflow/server/libs/flow-metrics"
 	"github.com/deepflowio/deepflow/server/libs/grpc"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 	"github.com/deepflowio/deepflow/server/libs/stats"
-	"github.com/deepflowio/deepflow/server/libs/zerodoc"
 
 	clickhouse "github.com/ClickHouse/clickhouse-go/v2"
 	logging "github.com/op/go-logging"
@@ -36,7 +36,7 @@ import (
 var log = logging.MustGetLogger("common")
 
 const (
-	MODULE_INGESTER             = "ingester."
+	MODULE_INGESTER             = "ingester_"
 	QUEUE_STATS_MODULE_INGESTER = queue.OptionModule(MODULE_INGESTER)
 )
 
@@ -144,8 +144,7 @@ const (
 	PodType     = 10
 	PodNodeType = 14
 
-	PodGroupType = 101
-	ServiceType  = 102
+	ServiceType = 102
 
 	ProcessType = 120
 )
@@ -166,11 +165,11 @@ func GetAutoInstance(podID, gpID, podNodeID, l3DeviceID uint32, l3DeviceType uin
 	return 0, IpType
 }
 
-func GetAutoService(serviceID, podGroupID, gpID, podNodeID, l3DeviceID uint32, l3DeviceType uint8, l3EpcID int32) (uint32, uint8) {
+func GetAutoService(serviceID, podGroupID, gpID, podNodeID, l3DeviceID uint32, l3DeviceType, podGroupType uint8, l3EpcID int32) (uint32, uint8) {
 	if serviceID > 0 {
 		return serviceID, ServiceType
 	} else if podGroupID > 0 {
-		return podGroupID, PodGroupType
+		return podGroupID, podGroupType
 	} else if gpID > 0 {
 		return gpID, ProcessType
 	} else if podNodeID > 0 {
@@ -183,7 +182,7 @@ func GetAutoService(serviceID, podGroupID, gpID, podNodeID, l3DeviceID uint32, l
 	return 0, IpType
 }
 
-func IsPodServiceIP(deviceType zerodoc.DeviceType, podId, podNodeId uint32) bool {
+func IsPodServiceIP(deviceType flow_metrics.DeviceType, podId, podNodeId uint32) bool {
 	// 如果是NodeIP,clusterIP或后端podIP需要匹配service_id
-	return deviceType == zerodoc.DeviceType(trident.DeviceType_DEVICE_TYPE_POD_SERVICE) || podId != 0 || podNodeId != 0
+	return deviceType == flow_metrics.DeviceType(trident.DeviceType_DEVICE_TYPE_POD_SERVICE) || podId != 0 || podNodeId != 0
 }

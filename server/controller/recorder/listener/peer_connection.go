@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan PeerConnections
+ * Copyright (c) 2024 Yunshan PeerConnections
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 )
 
 type PeerConnection struct {
@@ -37,7 +38,7 @@ func (c *PeerConnection) OnUpdaterAdded(addedDBItems []*mysql.PeerConnection) {
 	c.cache.AddPeerConnections(addedDBItems)
 }
 
-func (c *PeerConnection) OnUpdaterUpdated(cloudItem *cloudmodel.PeerConnection, diffBase *cache.PeerConnection) {
+func (c *PeerConnection) OnUpdaterUpdated(cloudItem *cloudmodel.PeerConnection, diffBase *diffbase.PeerConnection) {
 	diffBase.Update(cloudItem)
 }
 

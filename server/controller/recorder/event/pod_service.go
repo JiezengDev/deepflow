@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,10 +18,10 @@ package event
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/common"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
-	. "github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 	"github.com/deepflowio/deepflow/server/libs/eventapi"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 )
@@ -31,14 +31,14 @@ type PodService struct {
 	deviceType int
 }
 
-func NewPodService(toolDS *cache.ToolDataSet, eq *queue.OverwriteQueue) *PodService {
+func NewPodService(toolDS *tool.DataSet, eq *queue.OverwriteQueue) *PodService {
 	mng := &PodService{
-		EventManagerBase{
-			resourceType: RESOURCE_TYPE_POD_SERVICE_EN,
-			ToolDataSet:  toolDS,
-			Queue:        eq,
-		},
-		common.VIF_DEVICE_TYPE_POD_SERVICE,
+		newEventManagerBase(
+			ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN,
+			toolDS,
+			eq,
+		),
+		ctrlrcommon.VIF_DEVICE_TYPE_POD_SERVICE,
 	}
 	return mng
 }
@@ -75,7 +75,7 @@ func (p *PodService) ProduceByAdd(items []*mysql.PodService) {
 	}
 }
 
-func (p *PodService) ProduceByUpdate(cloudItem *cloudmodel.PodService, diffBase *cache.PodService) {
+func (p *PodService) ProduceByUpdate(cloudItem *cloudmodel.PodService, diffBase *diffbase.PodService) {
 }
 
 func (p *PodService) ProduceByDelete(lcuuids []string) {
@@ -87,7 +87,7 @@ func (p *PodService) ProduceByDelete(lcuuids []string) {
 			var err error
 			name, err = p.ToolDataSet.GetPodServiceNameByID(id)
 			if err != nil {
-				log.Errorf("%v, %v", idByLcuuidNotFound(p.resourceType, lcuuid), err)
+				log.Error(p.org.LogPre("%v, %v", idByLcuuidNotFound(p.resourceType, lcuuid), err))
 			}
 		} else {
 			log.Error(nameByIDNotFound(p.resourceType, id))

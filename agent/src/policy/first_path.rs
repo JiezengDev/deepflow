@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,12 +14,12 @@
  * limitations under the License.
  */
 
-use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, RwLock,
 };
 
+use ahash::AHashMap;
 use log::{info, warn};
 
 use super::fast_path::FastPath;
@@ -234,7 +234,7 @@ struct Table6Item {
 }
 
 pub struct FirstPath {
-    group_ip_map: Option<HashMap<u16, Vec<IpSegment>>>,
+    group_ip_map: Option<AHashMap<u16, Vec<IpSegment>>>,
 
     vector_4: Vector4,
     table_4: RwLock<Vec<Vec<Table4Item>>>,
@@ -247,7 +247,6 @@ pub struct FirstPath {
     fast: FastPath,
 
     fast_disable: bool,
-    queue_count: usize,
 
     memory_limit: AtomicU64,
 }
@@ -263,7 +262,7 @@ impl FirstPath {
 
     pub fn new(queue_count: usize, level: usize, map_size: usize, fast_disable: bool) -> FirstPath {
         FirstPath {
-            group_ip_map: Some(HashMap::new()),
+            group_ip_map: Some(AHashMap::new()),
             vector_4: Vector4::default(),
             table_4: RwLock::new(
                 std::iter::repeat(Vec::new())
@@ -280,14 +279,9 @@ impl FirstPath {
             current_level: level,
 
             fast: FastPath::new(queue_count, map_size),
-            queue_count,
             fast_disable,
             memory_limit: AtomicU64::new(0),
         }
-    }
-
-    pub fn update_map_size(&mut self, map_size: usize) {
-        self.fast.update_map_size(map_size)
     }
 
     pub fn update_interfaces(&mut self, ifaces: &Vec<Arc<PlatformData>>) {
@@ -296,7 +290,7 @@ impl FirstPath {
     }
 
     fn generate_group_ip_map(&mut self, groups: &Vec<Arc<IpGroupData>>) {
-        let mut group_ip_map: HashMap<u16, Vec<IpSegment>> = HashMap::new();
+        let mut group_ip_map: AHashMap<u16, Vec<IpSegment>> = AHashMap::new();
 
         for group in groups {
             if group.id == 0 {
@@ -618,11 +612,7 @@ impl FirstPath {
         ) as usize;
         for item in &self.table_4.read().unwrap()[index] {
             if field & &item.field.mask == item.field.field {
-                policy.merge_npb_action(
-                    &item.policy.npb_actions,
-                    item.policy.acl_id,
-                    Some(direction),
-                );
+                policy.merge_npb_actions(&item.policy.npb_actions, item.policy.acl_id, direction);
             }
         }
     }
@@ -640,11 +630,7 @@ impl FirstPath {
         ) as usize;
         for item in &self.table_6.read().unwrap()[index] {
             if field & &item.field.mask == item.field.field {
-                policy.merge_npb_action(
-                    &item.policy.npb_actions,
-                    item.policy.acl_id,
-                    Some(direction),
-                );
+                policy.merge_npb_actions(&item.policy.npb_actions, item.policy.acl_id, direction);
             }
         }
     }
@@ -665,12 +651,12 @@ impl FirstPath {
             key.backward_matched.as_ref().unwrap(),
         ) {
             (MatchedField::V4(forward), MatchedField::V4(backward)) => {
-                self.get_policy_from_table4(forward, DirectionType::Forward, policy);
-                self.get_policy_from_table4(backward, DirectionType::Backward, policy);
+                self.get_policy_from_table4(forward, DirectionType::FORWARD, policy);
+                self.get_policy_from_table4(backward, DirectionType::BACKWARD, policy);
             }
             (MatchedField::V6(forward), MatchedField::V6(backward)) => {
-                self.get_policy_from_table6(forward, DirectionType::Forward, policy);
-                self.get_policy_from_table6(backward, DirectionType::Backward, policy);
+                self.get_policy_from_table6(forward, DirectionType::FORWARD, policy);
+                self.get_policy_from_table6(backward, DirectionType::BACKWARD, policy);
             }
             _ => panic!("LookupKey({:?}) MatchedField version error.", key),
         }
@@ -687,14 +673,19 @@ impl FirstPath {
             self.get_policy_from_table(key, &endpoints, &mut policy);
         }
 
-        self.fast.add_policy(key, &policy, endpoints);
-
-        policy.format_npb_action();
+        let (forward_policy, forward_endpoints) = self.fast.add_policy(key, &policy, endpoints);
         if key.feature_flag.contains(FeatureFlags::DEDUP) {
-            policy.dedup(key);
+            let mut policy = PolicyData {
+                acl_id: forward_policy.acl_id,
+                action_flags: forward_policy.action_flags,
+                npb_actions: forward_policy.npb_actions.clone(),
+            };
+            // create new policy if changed
+            if policy.dedup(key) {
+                return Some((Arc::new(policy), forward_endpoints));
+            }
         }
-
-        return Some((Arc::new(policy), Arc::new(endpoints)));
+        return Some((forward_policy, forward_endpoints));
     }
 
     pub fn fast_get(
@@ -723,6 +714,10 @@ impl FirstPath {
 
     pub fn set_memory_limit(&self, limit: u64) {
         self.memory_limit.store(limit, Ordering::Relaxed);
+    }
+
+    pub fn reset_queue_size(&mut self, queue_count: usize) {
+        self.fast.reset_queue_size(queue_count);
     }
 }
 
@@ -788,6 +783,7 @@ mod tests {
                 1,
                 NpbTunnelType::VxLan,
                 TapSide::SRC,
+                DirectionType::ALL,
                 0,
             ),
         );

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ import (
 
 	"github.com/deepflowio/deepflow/server/libs/stats"
 	"github.com/deepflowio/deepflow/server/libs/utils"
+	"github.com/shirou/gopsutil/disk"
 	"github.com/shirou/gopsutil/load"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/net"
@@ -29,6 +30,7 @@ import (
 )
 
 const ENV_K8S_NODE_IP = "K8S_NODE_IP_FOR_DEEPFLOW"
+const DEFAULT_HOST = "127.0.0.1"
 
 func (m *Monitor) GetCpuPercent() float64 {
 	if percent, err := m.process.Percent(0); err == nil {
@@ -99,7 +101,7 @@ type Counter struct {
 	CPUNum     uint64  `statsd:"cpu-num"`
 }
 
-func NewMonitor() (*Monitor, error) {
+func NewMonitor(paths []string) (*Monitor, error) {
 	p, err := process.NewProcess(int32(os.Getpid()))
 	if err != nil {
 		return nil, err
@@ -108,7 +110,13 @@ func NewMonitor() (*Monitor, error) {
 		process: p,
 	}
 	myNodeIP, _ := os.LookupEnv(ENV_K8S_NODE_IP)
+	// If DeepFlow is not in K8S deployment mode, this environment variable may not exist, and myNodeIP is set to DEFAULT_HOST
+	if myNodeIP == "" {
+		myNodeIP = DEFAULT_HOST
+	}
 	stats.RegisterCountable("monitor", m, stats.OptionStatTags{"host_ip": myNodeIP})
+	NewDiskMonitor(paths, myNodeIP)
+
 	return m, nil
 }
 
@@ -133,4 +141,41 @@ func (m *Monitor) GetCounter() interface{} {
 
 func (m *Monitor) Stop() {
 	m.Close()
+}
+
+type DiskMonitor struct {
+	path string
+	utils.Closable
+}
+
+type DiskCounter struct {
+	Total       uint64  `statsd:"total"`
+	Free        uint64  `statsd:"free"`
+	Used        uint64  `statsd:"used"`
+	UsedPercent float64 `statsd:"used-percent"`
+}
+
+func (m *DiskMonitor) GetCounter() interface{} {
+	usage, err := disk.Usage(m.path)
+	if err != nil {
+		return &DiskCounter{}
+
+	}
+	return &DiskCounter{
+		Total:       usage.Total,
+		Free:        usage.Free,
+		Used:        usage.Used,
+		UsedPercent: usage.UsedPercent,
+	}
+}
+
+func (m *DiskMonitor) Stop() {
+	m.Close()
+}
+
+func NewDiskMonitor(paths []string, hostIp string) {
+	for _, path := range paths {
+		m := &DiskMonitor{path: path}
+		stats.RegisterCountable("monitor_disk", m, stats.OptionStatTags{"host_ip": hostIp, "path": path})
+	}
 }

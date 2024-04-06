@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -48,8 +48,10 @@ func New() *Table {
 	}
 }
 
+const indent = 2
+
 func (t *Table) SetHeader(keys []string) {
-	t.colSize = len(keys)
+	t.colSize = len(keys) + indent
 	for i, v := range keys {
 		t.parseDimension(v, i)
 	}
@@ -58,7 +60,8 @@ func (t *Table) SetHeader(keys []string) {
 
 func (t *Table) parseDimension(str string, colKey int) {
 	maxWidth := 0
-	if w := displayWidth(str); w > maxWidth {
+	w := displayWidth(str) + indent
+	if w > maxWidth {
 		maxWidth = w
 	}
 

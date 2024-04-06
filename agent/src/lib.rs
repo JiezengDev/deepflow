@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,9 +21,9 @@ pub mod common;
 mod config;
 pub mod debug;
 pub mod dispatcher;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod ebpf;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod ebpf_dispatcher;
 mod error;
 mod exception;
@@ -55,8 +55,11 @@ pub use {
         l7_protocol_log::LogCache as _LogCache,
         lookup_key::LookupKey as _LookupKey,
         platform_data::{IpSubnet as _IpSubnet, PlatformData as _PlatformData},
-        policy::{Acl as _Acl, Cidr as _Cidr, IpGroupData as _IpGroupData},
+        policy::{
+            Acl as _Acl, Cidr as _Cidr, Container as _Container, IpGroupData as _IpGroupData,
+        },
         port_range::PortRange as _PortRange,
+        Timestamp as _Timestamp,
     },
     flow_generator::flow_map::{
         Config as _FlowMapConfig, _new_flow_map_and_receiver, _new_meta_packet,
@@ -72,11 +75,73 @@ pub use {
     flow_generator::protocol_logs::LogMessageType as _LogMessageType,
     flow_generator::HttpLog,
     npb_pcap_policy::{
-        NpbAction as _NpbAction, NpbTunnelType as _NpbTunnelType, TapSide as _TapSide,
+        DirectionType as _DirectionType, NpbAction as _NpbAction, NpbTunnelType as _NpbTunnelType,
+        TapSide as _TapSide,
     },
     policy::first_path::FirstPath as _FirstPath,
     policy::labeler::Labeler as _Labeler,
 };
+
+#[allow(unused)]
+macro_rules! gen_sizes {
+    ($(#[$struct_meta:meta])*
+    $sv:vis struct $name:ident {
+        $($(#[$field_meta:meta])* $fv:vis $fname:ident: $ftype:ty),* $(,)?
+    }
+    ) => {
+        $(#[$struct_meta])*
+        $sv struct $name {
+            $($(#[$field_meta])* $fv $fname: $ftype,)*
+        }
+
+        impl $name {
+            pub fn print_sizes() {
+                println!("{}\t{} struct {{", std::mem::size_of::<$name>(), stringify!($name));
+                $(println!("{}\t\t{}: {},", std::mem::size_of::<$ftype>(), stringify!($fname), stringify!($ftype));)*
+                println!("\t}}");
+            }
+        }
+    };
+
+    ($(#[$struct_meta:meta])*
+    $sv:vis struct $name:ident (
+        $($(#[$field_meta:meta])* $fv:vis $ftype:ty),*
+    );
+    ) => {
+        $(#[$struct_meta])*
+        $sv struct $name ($($(#[$field_meta])* $fv $ftype),*);
+
+        impl $name {
+            pub fn print_sizes() {
+                println!("{}\t{} struct {{", std::mem::size_of::<$name>(), stringify!($name));
+                $(println!("{}\t\t{},", std::mem::size_of::<$ftype>(), stringify!($ftype));)*
+                println!("\t}}");
+            }
+        }
+    };
+
+    ($(#[$struct_meta:meta])*
+    $sv:vis enum $name:ident {
+        $($(#[$field_meta:meta])* $fname:ident($ftype:ty)),* $(,)?
+    }
+    ) => {
+        $(#[$struct_meta])*
+        $sv enum $name {
+            $($(#[$field_meta])* $fname($ftype),)*
+        }
+
+        impl $name {
+            pub fn print_sizes() {
+                println!("{}\t{} enum {{", std::mem::size_of::<$name>(), stringify!($name));
+                $(println!("{}\t\t{}: {},", std::mem::size_of::<$ftype>(), stringify!($fname), stringify!($ftype));)*
+                println!("\t}}");
+            }
+        }
+    };
+}
+
+#[allow(unused)]
+pub(crate) use gen_sizes;
 
 #[cfg(test)]
 mod tests {
@@ -109,12 +174,10 @@ mod tests {
             ("         |      ", crate::flow_generator::perf::tcp::PerfData),
             ("         -- ", crate::flow_generator::perf::udp::UdpPerf),
             ("         +> ", crate::flow_generator::protocol_logs::sql::PostgresqlLog),
-            ("         +> ", crate::flow_generator::protocol_logs::rpc::ProtobufRpcWrapLog),
             ("         +> ", crate::flow_generator::protocol_logs::rpc::SofaRpcLog),
             ("     -> ", crate::common::l7_protocol_log::L7ProtocolParser),
             ("         +- ", crate::flow_generator::protocol_logs::http::HttpLog),
             ("         +- ", crate::flow_generator::protocol_logs::dns::DnsLog),
-            ("         +- ", crate::flow_generator::protocol_logs::rpc::ProtobufRpcWrapLog),
             ("         +- ", crate::flow_generator::protocol_logs::rpc::SofaRpcLog),
             ("         +- ", crate::flow_generator::protocol_logs::sql::MysqlLog),
             ("         +- ", crate::flow_generator::protocol_logs::mq::KafkaLog),

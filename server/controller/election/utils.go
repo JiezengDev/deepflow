@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,6 +27,10 @@ import (
 
 // 功能：判断当前控制器是否为masterController
 func IsMasterController() (bool, error) {
+	// in standalone mode, the local machine is the master node because of all in one deployment
+	if common.IsStandaloneRunningMode() == true {
+		return true, nil
+	}
 	// get self host_ip
 	hostIP := os.Getenv(common.POD_IP_KEY)
 	if len(hostIP) == 0 {
@@ -45,6 +49,10 @@ func IsMasterController() (bool, error) {
 }
 
 func IsMasterControllerAndReturnIP() (bool, string, error) {
+	// in standalone mode, the local machine is the master node because of all in one deployment
+	if common.IsStandaloneRunningMode() == true {
+		return true, common.GetPodIP(), nil
+	}
 	// get self host_ip
 	hostIP := os.Getenv(common.POD_IP_KEY)
 	if len(hostIP) == 0 {

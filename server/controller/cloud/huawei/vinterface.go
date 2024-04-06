@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan VMs
+ * Copyright (c) 2024 Yunshan VMs
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,11 +44,10 @@ func (h *HuaWei) getVInterfaces() ([]model.DHCPPort, []model.VInterface, []model
 	var natRules []model.NATRule
 	vifRequiredAttrs := []string{"id", "mac_address", "network_id", "device_id", "device_owner"}
 	for project, token := range h.projectTokenMap {
-		jPorts, err := h.getRawData(
-			fmt.Sprintf("https://vpc.%s.%s/v1/%s/ports", project.name, h.config.Domain, project.id), token.token, "ports",
-		)
+		jPorts, err := h.getRawData(newRawDataGetContext(
+			fmt.Sprintf("https://vpc.%s.%s/v1/%s/ports", project.name, h.config.Domain, project.id), token.token, "ports", pageQueryMethodMarker,
+		))
 		if err != nil {
-			log.Errorf("request failed: %v", err)
 			return nil, nil, nil, nil, nil, err
 		}
 
@@ -170,25 +169,37 @@ func (h *HuaWei) formatIPsAndNATRules(jPort *simplejson.Json, vif model.VInterfa
 			continue
 		}
 		ipAddr := jIP.Get("ip_address").MustString()
+		var subnetLcuuid string
+		for _, subnet := range h.toolDataSet.networkLcuuidToSubnets[vif.NetworkLcuuid] {
+			if cloudcommon.IsIPInCIDR(ipAddr, subnet.CIDR) {
+				subnetLcuuid = subnet.Lcuuid
+				break
+			}
+		}
 		ips = append(
 			ips,
 			model.IP{
 				Lcuuid:           common.GenerateUUID(vif.Lcuuid + ipAddr),
 				VInterfaceLcuuid: vif.Lcuuid,
 				IP:               ipAddr,
-				SubnetLcuuid:     h.toolDataSet.networkLcuuidToSubnetLcuuid[vif.NetworkLcuuid],
+				SubnetLcuuid:     subnetLcuuid,
 				RegionLcuuid:     vif.RegionLcuuid,
 			},
 		)
 		h.toolDataSet.vinterfaceLcuuidToIPs[vif.Lcuuid] = append(h.toolDataSet.vinterfaceLcuuidToIPs[vif.Lcuuid], ipAddr)
-		if i == 0 && floatingIP != "" {
-			natRule = model.NATRule{
-				Lcuuid:           common.GenerateUUID(floatingIP + "_" + ipAddr),
-				Type:             cloudcommon.NAT_RULE_TYPE_DNAT,
-				Protocol:         cloudcommon.PROTOCOL_ALL,
-				FloatingIP:       floatingIP,
-				FixedIP:          ipAddr,
-				VInterfaceLcuuid: vif.Lcuuid,
+		if floatingIP != "" {
+			if i == 0 {
+				natRule = model.NATRule{
+					Lcuuid:           common.GenerateUUID(floatingIP + "_" + ipAddr),
+					Type:             cloudcommon.NAT_RULE_TYPE_DNAT,
+					Protocol:         cloudcommon.PROTOCOL_ALL,
+					FloatingIP:       floatingIP,
+					FixedIP:          ipAddr,
+					VInterfaceLcuuid: vif.Lcuuid,
+				}
+			} else {
+				natRule.FixedIP = natRule.FixedIP + "," + ipAddr
+				natRule.Lcuuid = common.GenerateUUID(floatingIP + "_" + natRule.FixedIP)
 			}
 		}
 	}
@@ -196,11 +207,10 @@ func (h *HuaWei) formatIPsAndNATRules(jPort *simplejson.Json, vif model.VInterfa
 }
 
 func (h *HuaWei) formatPublicIPs(project Project, token string) error {
-	jIPs, err := h.getRawData(
-		fmt.Sprintf("https://vpc.%s.%s/v1/%s/publicips", project.name, h.config.Domain, project.id), token, "publicips",
-	)
+	jIPs, err := h.getRawData(newRawDataGetContext(
+		fmt.Sprintf("https://vpc.%s.%s/v1/%s/publicips", project.name, h.config.Domain, project.id), token, "publicips", pageQueryMethodMarker,
+	))
 	if err != nil {
-		log.Errorf("request failed: %v", err)
 		return err
 	}
 

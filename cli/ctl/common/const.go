@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,8 @@
 
 package common
 
+import "time"
+
 const (
 	SUCCESS = "SUCCESS"
 
@@ -29,7 +31,7 @@ var RESOURCE_TYPES = []string{
 	"LBVMConnections", "PeerConnections", "CENs", "RedisInstances", "RDSInstances", "VInterfaces",
 	"IPs", "FloatingIPs", "PodClusters", "PodNodes", "VMPodNodeConnections", "PodNamespaces",
 	"PodGroups", "PodReplicaSets", "Pods", "PodServices", "PodServicePorts", "PodGroupPorts",
-	"PodIngresses", "PodIngressRules", "PodIngressRuleBackends", "Processes", "PrometheusTargets",
+	"PodIngresses", "PodIngressRules", "PodIngressRuleBackends", "Processes", "PrometheusTargets", "VIPs",
 }
 
 //go:generate stringer -type=DomainType -trimprefix=DOMAIN_TYPE_ -linecomment
@@ -57,6 +59,8 @@ const (
 	DOMAIN_TYPE_MICROSOFT_ACS     DomainType = 24 // microsoft_acs
 	DOMAIN_TYPE_BAIDU_BCE         DomainType = 25 // baidu_bce
 	DOMAIN_TYPE_ESHORE            DomainType = 26 // eshore
+	DOMAIN_TYPE_CLOUD_TOWER       DomainType = 27 // cloudtower
+	DOMAIN_TYPE_NFVO              DomainType = 28 // nfvo
 )
 
 var DomainTypes []DomainType = []DomainType{
@@ -79,6 +83,8 @@ var DomainTypes []DomainType = []DomainType{
 	DOMAIN_TYPE_MICROSOFT_ACS,
 	DOMAIN_TYPE_BAIDU_BCE,
 	DOMAIN_TYPE_ESHORE,
+	DOMAIN_TYPE_CLOUD_TOWER,
+	DOMAIN_TYPE_NFVO,
 }
 
 func GetDomainTypeByName(domainTypeName string) DomainType {
@@ -175,3 +181,16 @@ func GetVtapTapModeByName(tapModeName string) VtapTapMode {
 	}
 	return VTAP_TAP_MODE_LOCAL
 }
+
+//go:generate stringer -type=PluginType -trimprefix=PLUGIN_TYPE_ -linecomment
+type PluginType int
+
+const (
+	// attention: following line comments are used by `stringer`
+	PLUGIN_TYPE_WASM PluginType = 1 + iota
+	PLUGIN_TYPE_SO
+)
+
+var (
+	DefaultTimeout = time.Duration(time.Second * 30)
+)

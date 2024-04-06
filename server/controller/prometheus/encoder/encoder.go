@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,13 +44,14 @@ type Encoder struct {
 	working         bool
 	refreshInterval time.Duration
 
-	metricName   *metricName
-	labelName    *labelName
-	labelValue   *labelValue
-	labelLayout  *labelLayout
-	label        *label
-	metricLabel  *metricLabel
-	metricTarget *metricTarget
+	metricName      *metricName
+	labelName       *labelName
+	labelValue      *labelValue
+	LabelLayout     *labelLayout
+	label           *label
+	metricLabelName *metricLabelName
+	metricTarget    *metricTarget
+	target          *target
 }
 
 func GetSingleton() *Encoder {
@@ -67,11 +68,12 @@ func (e *Encoder) Init(ctx context.Context, cfg *prometheuscfg.Config) {
 	e.cancel = mCancel
 	e.metricName = newMetricName(cfg.ResourceMaxID1)
 	e.labelName = newLabelName(cfg.ResourceMaxID0)
-	e.labelValue = newLabelValue(cfg.ResourceMaxID1)
+	e.labelValue = newLabelValue()
 	e.label = newLabel()
-	e.labelLayout = newLabelLayout()
-	e.metricLabel = newMetricLabel(e.label)
-	e.metricTarget = newMetricTarget()
+	e.LabelLayout = newLabelLayout(cfg)
+	e.metricLabelName = newMetricLabelName(e.metricName, e.labelName)
+	e.target = newTarget(cfg.ResourceMaxID1)
+	e.metricTarget = newMetricTarget(e.target)
 	e.refreshInterval = time.Duration(cfg.EncoderCacheRefreshInterval) * time.Second
 	return
 }
@@ -79,6 +81,7 @@ func (e *Encoder) Init(ctx context.Context, cfg *prometheuscfg.Config) {
 func (e *Encoder) Start() error {
 	e.mux.Lock()
 	if e.working {
+		e.mux.Unlock()
 		return nil
 	}
 	e.working = true
@@ -88,6 +91,7 @@ func (e *Encoder) Start() error {
 	e.refresh()
 	go func() {
 		ticker := time.NewTicker(e.refreshInterval)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-e.ctx.Done():
@@ -110,33 +114,50 @@ func (e *Encoder) Stop() {
 	log.Info("prometheus encoder stopped")
 }
 
+func (e *Encoder) Refresh() error {
+	return e.refresh()
+}
+
 func (e *Encoder) refresh() error {
+	e.mux.Lock()
+	defer e.mux.Unlock()
+
+	log.Info("prometheus encoder refresh started")
 	e.label.refresh()
 	eg := &errgroup.Group{}
 	AppendErrGroup(eg, e.metricName.refresh)
 	AppendErrGroup(eg, e.labelName.refresh)
 	AppendErrGroup(eg, e.labelValue.refresh)
-	AppendErrGroup(eg, e.labelLayout.refresh)
-	AppendErrGroup(eg, e.metricLabel.refresh)
+	AppendErrGroup(eg, e.LabelLayout.refresh)
+	AppendErrGroup(eg, e.metricLabelName.refresh)
 	AppendErrGroup(eg, e.metricTarget.refresh)
-	return eg.Wait()
+	AppendErrGroup(eg, e.target.refresh)
+	err := eg.Wait()
+	log.Info("prometheus encoder refresh completed")
+	return err
 }
 
 func (e *Encoder) Encode(req *controller.SyncPrometheusRequest) (*controller.SyncPrometheusResponse, error) {
 	resp := new(controller.SyncPrometheusResponse)
-	egRunAhead := &errgroup.Group{}
-	AppendErrGroup(egRunAhead, e.encodeLabel, resp, req.GetLabels())
-	AppendErrGroup(egRunAhead, e.encodeLabelIndex, resp, req.GetMetricAppLabelLayouts())
-	err := egRunAhead.Wait()
+	eg1RunAhead := &errgroup.Group{}
+	AppendErrGroup(eg1RunAhead, e.encodeMetricName, resp, req.GetMetricNames())
+	AppendErrGroup(eg1RunAhead, e.encodeLabelName, resp, req.GetLabelNames())
+	AppendErrGroup(eg1RunAhead, e.encodeLabelValue, resp, req.GetLabelValues())
+	err := eg1RunAhead.Wait()
+	if err != nil {
+		return resp, err
+	}
+	eg2RunAhead := &errgroup.Group{}
+	AppendErrGroup(eg2RunAhead, e.encodeLabel, resp, req.GetLabels())
+	AppendErrGroup(eg2RunAhead, e.encodeLabelIndex, resp, req.GetMetricAppLabelLayouts())
+	AppendErrGroup(eg2RunAhead, e.encodeTarget, resp, req.GetTargets())
+	err = eg2RunAhead.Wait()
 	if err != nil {
 		return resp, err
 	}
 	eg := &errgroup.Group{}
-	AppendErrGroup(eg, e.encodeMetricName, resp, req.GetMetricNames())
-	AppendErrGroup(eg, e.encodeLabelName, resp, req.GetLabelNames())
-	AppendErrGroup(eg, e.encodeLabelValue, resp, req.GetLabelValues())
-	AppendErrGroup(eg, e.encodeMetricLabel, req.GetMetricLabels())
-	AppendErrGroup(eg, e.encodeMetricTarget, req.GetMetricTargets())
+	AppendErrGroup(eg, e.encodeMetricLabelName, resp, req.GetMetricLabelNames())
+	AppendErrGroup(eg, e.encodeMetricTarget, resp, req.GetMetricTargets())
 	err = eg.Wait()
 	return resp, err
 }
@@ -177,7 +198,7 @@ func (e *Encoder) encodeLabelValue(args ...interface{}) error {
 func (e *Encoder) encodeLabelIndex(args ...interface{}) error {
 	resp := args[0].(*controller.SyncPrometheusResponse)
 	layouts := args[1].([]*controller.PrometheusMetricAPPLabelLayoutRequest)
-	lis, err := e.labelLayout.encode(layouts)
+	lis, err := e.LabelLayout.encode(layouts)
 	if err != nil {
 		return err
 	}
@@ -196,20 +217,35 @@ func (e *Encoder) encodeLabel(args ...interface{}) error {
 	return nil
 }
 
-func (e *Encoder) encodeMetricLabel(args ...interface{}) error {
-	mls := args[0].([]*controller.PrometheusMetricLabelRequest)
-	err := e.metricLabel.encode(mls)
+func (e *Encoder) encodeMetricLabelName(args ...interface{}) error {
+	resp := args[0].(*controller.SyncPrometheusResponse)
+	metricLabelNames := args[1].([]*controller.PrometheusMetricLabelNameRequest)
+	encodedData, err := e.metricLabelName.encode(metricLabelNames)
 	if err != nil {
 		return err
 	}
+	resp.MetricLabelNames = encodedData
 	return nil
 }
 
 func (e *Encoder) encodeMetricTarget(args ...interface{}) error {
-	targets := args[0].([]*controller.PrometheusMetricTarget)
-	err := e.metricTarget.encode(targets)
+	resp := args[0].(*controller.SyncPrometheusResponse)
+	metricTargets := args[1].([]*controller.PrometheusMetricTargetRequest)
+	mts, err := e.metricTarget.encode(metricTargets)
 	if err != nil {
 		return err
 	}
+	resp.MetricTargets = mts
+	return nil
+}
+
+func (e *Encoder) encodeTarget(args ...interface{}) error {
+	resp := args[0].(*controller.SyncPrometheusResponse)
+	targets := args[1].([]*controller.PrometheusTargetRequest)
+	ts, err := e.target.encode(targets)
+	if err != nil {
+		return err
+	}
+	resp.Targets = ts
 	return nil
 }

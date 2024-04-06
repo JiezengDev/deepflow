@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ var DefaultVTapGroupConfig = &mysql.VTapGroupConfiguration{
 	MaxNpbBps:                     &DefaultMaxNpbBps,
 	MaxCPUs:                       &DefaultMaxCPUs,
 	MaxMemory:                     &DefaultMaxMemory,
+	PlatformSyncInterval:          &DefaultPlatformSyncInterval,
 	SyncInterval:                  &DefaultSyncInterval,
 	StatsInterval:                 &DefaultStatsInterval,
 	RsyslogEnabled:                &DefaultRsyslogEnabled,
@@ -82,6 +83,12 @@ var DefaultVTapGroupConfig = &mysql.VTapGroupConfiguration{
 	ProxyControllerPort:           &DefaultProxyControllerPort,
 	ProxyControllerIP:             &DefaultProxyControllerIP,
 	AnalyzerIP:                    &DefaultAnalyzerIP,
+	WasmPlugins:                   &DefaultWasmPlugins,
+	SoPlugins:                     &DefaultSoPlugins,
+
+	SystemLoadCircuitBreakerThreshold: &DefaultSystemLoadCircuitBreakerThreshold,
+	SystemLoadCircuitBreakerRecover:   &DefaultSystemLoadCircuitBreakerRecover,
+	SystemLoadCircuitBreakerMetric:    &DefaultSystemLoadCircuitBreakerMetric,
 }
 
 var (
@@ -89,6 +96,7 @@ var (
 	DefaultMaxNpbBps                     = int64(1000000000)
 	DefaultMaxCPUs                       = 1
 	DefaultMaxMemory                     = 768
+	DefaultPlatformSyncInterval          = 10
 	DefaultSyncInterval                  = 60
 	DefaultStatsInterval                 = 10
 	DefaultRsyslogEnabled                = 1
@@ -140,11 +148,17 @@ var (
 	DefaultSysFreeMemoryLimit            = 0
 	DefaultLogFileSize                   = 1000
 	DefaultHTTPLogXRequestID             = "X-Request-ID"
-	DefaultExternalAgentHTTPProxyEnabled = 1
+	DefaultExternalAgentHTTPProxyEnabled = 1 // 外部Agent数据HTTP代理开关
 	DefaultExternalAgentHTTPProxyPort    = 38086
 	DefaultPrometheusHttpAPIAddresses    = ""
 	DefaultAnalyzerPort                  = 30033
 	DefaultProxyControllerPort           = 30035
 	DefaultProxyControllerIP             = ""
 	DefaultAnalyzerIP                    = ""
+	DefaultWasmPlugins                   = ""
+	DefaultSoPlugins                     = ""
+
+	DefaultSystemLoadCircuitBreakerThreshold = float32(1.0)
+	DefaultSystemLoadCircuitBreakerRecover   = float32(0.9)
+	DefaultSystemLoadCircuitBreakerMetric    = "load15"
 )

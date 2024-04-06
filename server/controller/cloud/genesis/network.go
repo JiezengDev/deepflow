@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,9 +17,11 @@
 package genesis
 
 import (
+	"strconv"
+	"time"
+
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"strconv"
 
 	uuid "github.com/satori/go.uuid"
 )
@@ -29,8 +31,7 @@ func (g *Genesis) getNetworks() ([]model.Network, error) {
 	networks := []model.Network{}
 	networksData := g.genesisData.Networks
 
-	g.cloudStatsd.APICost["networks"] = []int{0}
-	g.cloudStatsd.APICount["networks"] = []int{len(networksData)}
+	g.cloudStatsd.RefreshAPIMoniter("networks", len(networksData), time.Time{})
 
 	for _, n := range networksData {
 		if n.SegmentationID == 0 {

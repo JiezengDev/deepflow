@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,16 +21,16 @@ import (
 )
 
 type ChNodeType struct {
-	UpdaterBase[mysql.ChNodeType, NodeTypeKey]
+	UpdaterComponent[mysql.ChNodeType, NodeTypeKey]
 }
 
 func NewChNodeType() *ChNodeType {
 	updater := &ChNodeType{
-		UpdaterBase[mysql.ChNodeType, NodeTypeKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_NODE_TYPE,
-		},
+		newUpdaterComponent[mysql.ChNodeType, NodeTypeKey](
+			RESOURCE_TYPE_CH_NODE_TYPE,
+		),
 	}
-	updater.dataGenerator = updater
+	updater.updaterDG = updater
 	return updater
 }
 

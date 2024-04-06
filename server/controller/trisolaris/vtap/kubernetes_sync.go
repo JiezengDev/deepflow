@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -189,7 +189,11 @@ func (k *KubernetesCluster) loadAndCheck(clearTime int) {
 		mgr.DeleteBatchFromID(deleteIDs)
 	}
 	if len(updateData) > 0 {
-		mgr.UpdateBulk(updateData)
+		for _, data := range updateData {
+			mgr.Updates(&models.KubernetesCluster{ID: data.ID}, map[string]interface{}{
+				"synced_at": data.SyncedAt,
+			})
+		}
 	}
 	k.updateCache(keyToCache)
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,72 +18,65 @@ package tagrecorder
 
 import (
 	"encoding/json"
-	"strings"
 
+	"github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type ChChostCloudTags struct {
-	UpdaterBase[mysql.ChChostCloudTags, CloudTagsKey]
+	SubscriberComponent[*message.VMFieldsUpdate, message.VMFieldsUpdate, mysql.VM, mysql.ChChostCloudTags, CloudTagsKey]
 }
 
 func NewChChostCloudTags() *ChChostCloudTags {
-	updater := &ChChostCloudTags{
-		UpdaterBase[mysql.ChChostCloudTags, CloudTagsKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_VM_CLOUD_TAGS,
-		},
+	mng := &ChChostCloudTags{
+		newSubscriberComponent[*message.VMFieldsUpdate, message.VMFieldsUpdate, mysql.VM, mysql.ChChostCloudTags, CloudTagsKey](
+			common.RESOURCE_TYPE_VM_EN, RESOURCE_TYPE_CH_VM_CLOUD_TAGS,
+		),
 	}
-	updater.dataGenerator = updater
-	return updater
+	mng.subscriberDG = mng
+	return mng
 }
 
-func (c *ChChostCloudTags) generateNewData() (map[CloudTagsKey]mysql.ChChostCloudTags, bool) {
-	var vms []mysql.VM
-	err := mysql.Db.Unscoped().Find(&vms).Error
-	if err != nil {
-		log.Errorf(dbQueryResourceFailed(c.resourceTypeName, err))
-		return nil, false
-	}
-
-	keyToItem := make(map[CloudTagsKey]mysql.ChChostCloudTags)
-	for _, vm := range vms {
-		cloudTagsMap := map[string]string{}
-		splitCloudTags := strings.Split(vm.CloudTags, ", ")
-		for _, singleCloudTag := range splitCloudTags {
-			splitSingleLabel := strings.Split(singleCloudTag, ":")
-			if len(splitSingleLabel) == 2 {
-				cloudTagsMap[splitSingleLabel[0]] = splitSingleLabel[1]
-			}
-		}
-		if len(cloudTagsMap) > 0 {
-			cloudTagsStr, err := json.Marshal(cloudTagsMap)
-			if err != nil {
-				log.Error(err)
-				return nil, false
-			}
-			key := CloudTagsKey{
-				ID: vm.ID,
-			}
-			keyToItem[key] = mysql.ChChostCloudTags{
-				ID:        vm.ID,
-				CloudTags: string(cloudTagsStr),
-			}
-		}
-	}
-	return keyToItem, true
-}
-
-func (c *ChChostCloudTags) generateKey(dbItem mysql.ChChostCloudTags) CloudTagsKey {
-	return CloudTagsKey{ID: dbItem.ID}
-}
-
-func (c *ChChostCloudTags) generateUpdateInfo(oldItem, newItem mysql.ChChostCloudTags) (map[string]interface{}, bool) {
+// onResourceUpdated implements SubscriberDataGenerator
+func (c *ChChostCloudTags) onResourceUpdated(sourceID int, fieldsUpdate *message.VMFieldsUpdate) {
 	updateInfo := make(map[string]interface{})
-	if oldItem.CloudTags != newItem.CloudTags {
-		updateInfo["cloud_tags"] = newItem.CloudTags
+	if fieldsUpdate.CloudTags.IsDifferent() {
+		bytes, err := json.Marshal(fieldsUpdate.CloudTags.GetNew())
+		if err != nil {
+			log.Error(err)
+			return
+		}
+		updateInfo["cloud_tags"] = string(bytes)
 	}
 	if len(updateInfo) > 0 {
-		return updateInfo, true
+		var chItem mysql.ChChostCloudTags
+		mysql.Db.Where("id = ?", sourceID).First(&chItem)
+		if chItem.ID == 0 {
+			c.SubscriberComponent.dbOperator.add(
+				[]CloudTagsKey{{ID: sourceID}},
+				[]mysql.ChChostCloudTags{{ID: sourceID, CloudTags: updateInfo["cloud_tags"].(string)}},
+			)
+		} else {
+			c.SubscriberComponent.dbOperator.update(chItem, updateInfo, CloudTagsKey{ID: sourceID})
+		}
 	}
-	return nil, false
+}
+
+// onResourceUpdated implements SubscriberDataGenerator
+func (c *ChChostCloudTags) sourceToTarget(item *mysql.VM) (keys []CloudTagsKey, targets []mysql.ChChostCloudTags) {
+	if len(item.CloudTags) == 0 {
+		return
+	}
+	bytes, err := json.Marshal(item.CloudTags)
+	if err != nil {
+		log.Error(err)
+		return
+	}
+	return []CloudTagsKey{{ID: item.ID}}, []mysql.ChChostCloudTags{{ID: item.ID, CloudTags: string(bytes)}}
+}
+
+// softDeletedTargetsUpdated implements SubscriberDataGenerator
+func (c *ChChostCloudTags) softDeletedTargetsUpdated(targets []mysql.ChChostCloudTags) {
+
 }

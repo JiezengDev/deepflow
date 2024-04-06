@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,10 +17,9 @@
 package event
 
 import (
-	"github.com/deepflowio/deepflow/server/controller/common"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
-	. "github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 	"github.com/deepflowio/deepflow/server/libs/eventapi"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 )
@@ -30,14 +29,14 @@ type RDSInstance struct {
 	deviceType int
 }
 
-func NewRDSInstance(toolDS *cache.ToolDataSet, eq *queue.OverwriteQueue) *RDSInstance {
+func NewRDSInstance(toolDS *tool.DataSet, eq *queue.OverwriteQueue) *RDSInstance {
 	return &RDSInstance{
-		EventManagerBase{
-			resourceType: RESOURCE_TYPE_RDS_INSTANCE_EN,
-			ToolDataSet:  toolDS,
-			Queue:        eq,
-		},
-		common.VIF_DEVICE_TYPE_RDS_INSTANCE,
+		newEventManagerBase(
+			ctrlrcommon.RESOURCE_TYPE_RDS_INSTANCE_EN,
+			toolDS,
+			eq,
+		),
+		ctrlrcommon.VIF_DEVICE_TYPE_RDS_INSTANCE,
 	}
 }
 
@@ -79,7 +78,7 @@ func (r *RDSInstance) ProduceByDelete(lcuuids []string) {
 			var err error
 			name, err = r.ToolDataSet.GetRDSInstanceNameByID(id)
 			if err != nil {
-				log.Errorf("%v, %v", idByLcuuidNotFound(r.resourceType, lcuuid), err)
+				log.Error(r.org.LogPre("%v, %v", idByLcuuidNotFound(r.resourceType, lcuuid), err))
 			}
 		} else {
 			log.Error(nameByIDNotFound(r.resourceType, id))

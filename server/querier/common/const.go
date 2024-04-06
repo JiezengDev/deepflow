@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,7 +30,17 @@ const (
 )
 
 const (
-	TAP_PORT_HOST     = "tap_port_host"
-	TAP_PORT_CHOST    = "tap_port_chost"
-	TAP_PORT_POD_NODE = "tap_port_pod_node"
+	HOST_HOSTNAME     = "host_hostname"
+	HOST_IP           = "host_ip"
+	CHOST_HOSTNAME    = "chost_hostname"
+	CHOST_IP          = "chost_ip"
+	POD_NODE_HOSTNAME = "pod_node_hostname"
+	POD_NODE_IP       = "pod_node_ip"
+
+	TAP_PORT_HOST        = "tap_port_host"
+	TAP_PORT_CHOST       = "tap_port_chost"
+	TAP_PORT_POD_NODE    = "tap_port_pod_node"
+	CAPTURE_NIC_HOST     = "capture_nic_host"
+	CAPTURE_NIC_CHOST    = "capture_nic_chost"
+	CAPTURE_NIC_POD_NODE = "capture_nic_pod_node"
 )

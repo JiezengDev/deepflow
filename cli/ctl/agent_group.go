@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/deepflowio/deepflow/cli/ctl/common"
+	"github.com/deepflowio/deepflow/cli/ctl/common/table"
 )
 
 func RegisterAgentGroupCommand() *cobra.Command {
@@ -84,7 +85,7 @@ func listAgentGroup(cmd *cobra.Command, args []string, output string) {
 		url += fmt.Sprintf("?name=%s", name)
 	}
 
-	response, err := common.CURLPerform("GET", url, nil, "")
+	response, err := common.CURLPerform("GET", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -95,12 +96,18 @@ func listAgentGroup(cmd *cobra.Command, args []string, output string) {
 		dataYaml, _ := yaml.JSONToYAML(dataJson)
 		fmt.Printf(string(dataYaml))
 	} else {
-		cmdFormat := "%-48s%s\n"
-		fmt.Printf(cmdFormat, "NAME", "ID")
+		t := table.New()
+		t.SetHeader([]string{"NAME", "ID"})
+		tableItems := [][]string{}
 		for i := range response.Get("DATA").MustArray() {
 			group := response.Get("DATA").GetIndex(i)
-			fmt.Printf(cmdFormat, group.Get("NAME").MustString(), group.Get("SHORT_UUID").MustString())
+			tableItems = append(tableItems, []string{
+				group.Get("NAME").MustString(),
+				group.Get("SHORT_UUID").MustString(),
+			})
 		}
+		t.AppendBulk(tableItems)
+		t.Render()
 	}
 }
 
@@ -115,7 +122,7 @@ func createAgentGroup(cmd *cobra.Command, args []string, groupID string) {
 
 	// 调用采集器组API，并输出返回结果
 	body := map[string]interface{}{"name": args[0], "group_id": groupID}
-	_, err := common.CURLPerform("POST", url, body, "")
+	_, err := common.CURLPerform("POST", url, body, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -131,7 +138,7 @@ func deleteAgentGroup(cmd *cobra.Command, args []string) {
 	server := common.GetServerInfo(cmd)
 	url := fmt.Sprintf("http://%s:%d/v1/vtap-groups/?name=%s", server.IP, server.Port, args[0])
 	// 调用采集器组API，获取lcuuid
-	response, err := common.CURLPerform("GET", url, nil, "")
+	response, err := common.CURLPerform("GET", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -142,7 +149,7 @@ func deleteAgentGroup(cmd *cobra.Command, args []string) {
 		lcuuid := group.Get("LCUUID").MustString()
 
 		url := fmt.Sprintf("http://%s:%d/v1/vtap-groups/%s/", server.IP, server.Port, lcuuid)
-		_, err := common.CURLPerform("DELETE", url, nil, "")
+		_, err := common.CURLPerform("DELETE", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return

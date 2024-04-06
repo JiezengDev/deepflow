@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,7 +35,7 @@ func (t *SuiteTest) TestForceDelete() {
 	if addedVM.ID == 0 {
 		fmt.Println("addedVM should not be null")
 	}
-	forceDelete[mysql.VM](time.Now().Add(time.Duration(-1) * time.Hour))
+	deleteExpired[mysql.VM](time.Now().Add(time.Duration(-1) * time.Hour))
 	mysql.Db.Unscoped().Where("lcuuid = ?", vm.Lcuuid).Find(&addedVM)
 	if addedVM.ID != 0 {
 		fmt.Println("addedVM should be null")

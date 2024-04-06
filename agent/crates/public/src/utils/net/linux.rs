@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@ use std::{
     time::Duration,
 };
 
+use ipnet::IpNet;
 use log::warn;
 use neli::{
     consts::{nl::*, rtnl::*, socket::*},
@@ -45,7 +46,9 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use super::parse_ip_slice;
 use super::{arp::lookup as arp_lookup, Error, Result};
-use super::{Addr, Link, LinkFlags, MacAddr, NeighborEntry, Route};
+use super::{Addr, Link, LinkFlags, LinkStats, MacAddr, NeighborEntry, Route, Rule};
+
+use crate::bytes::{read_u16_le, read_u32_le, read_u64_le};
 
 pub const IF_TYPE_IPVLAN: &'static str = "ipvlan";
 
@@ -58,14 +61,14 @@ const NETLINK_ERROR_NOADDR: i32 = -19;
 */
 
 pub fn neighbor_lookup(mut dest_addr: IpAddr) -> Result<NeighborEntry> {
-    let mut routes = route_get(&dest_addr)?;
-    if routes.is_empty() {
+    let routes = route_get(&dest_addr)?;
+    let Some(route) = routes.iter().find(|&r| r.pref_src.is_some()) else {
         return Err(Error::NeighborLookup(format!(
             "no such route with destination address=({})",
             dest_addr
         )));
-    }
-    let route = routes.swap_remove(0);
+    };
+    let src_addr = route.pref_src.unwrap();
 
     // 如果是外部网地址，那么能获取到gateway
     if let Some(gw) = route.gateway {
@@ -85,7 +88,7 @@ pub fn neighbor_lookup(mut dest_addr: IpAddr) -> Result<NeighborEntry> {
         }
     };
 
-    let target_mac = match (dest_addr, route.src_ip) {
+    let target_mac = match (dest_addr, src_addr) {
         (IpAddr::V4(dest_addr), IpAddr::V4(src_addr)) => {
             arp_lookup(&selected_interface, src_addr, dest_addr)?
         }
@@ -108,15 +111,13 @@ pub fn neighbor_lookup(mut dest_addr: IpAddr) -> Result<NeighborEntry> {
     }
 
     Ok(NeighborEntry {
-        src_addr: route.src_ip,
+        src_addr: src_addr,
         src_link: Link {
             if_index: index,
             mac_addr: MacAddr(mac.unwrap().octets()),
             name,
             flags: flags.into(),
-            if_type: None,
-            peer_index: None,
-            link_netnsid: None,
+            ..Default::default()
         },
         dest_addr,
         dest_mac_addr: target_mac,
@@ -213,6 +214,8 @@ fn to_multi_address(addr: Ipv6Addr) -> SockAddr {
     SockAddr::from(SocketAddrV6::new(multi, 0, 0, 0))
 }
 
+const MIN_RTNL_LINK_STATS64_LEN: usize = 64;
+
 fn request_link_info(name: Option<&str>) -> Result<Vec<Link>> {
     let rtattrs = match name {
         Some(n) => RtBuffer::from_iter(
@@ -265,6 +268,7 @@ fn request_link_info(name: Option<&str>) -> Result<Vec<Link>> {
             let mut peer_index = None;
             let mut if_name = None;
             let mut link_netnsid = None;
+            let mut link_stats = None;
 
             for attr in payload.rtattrs.iter() {
                 match attr.rta_type {
@@ -273,9 +277,8 @@ fn request_link_info(name: Option<&str>) -> Result<Vec<Link>> {
                     }
                     Ifla::Linkinfo => {
                         let info = attr.rta_payload.as_ref();
-                        let len = u16::from_le_bytes(*<&[u8; 2]>::try_from(&info[..2]).unwrap());
-                        let attr_type =
-                            u16::from_le_bytes(*<&[u8; 2]>::try_from(&info[2..4]).unwrap());
+                        let len = read_u16_le(&info[..2]);
+                        let attr_type = read_u16_le(&info[2..4]);
 
                         if let Some(attr_payload) = info.get(4..len as usize) {
                             // INFO_KIND 排列payload第一， IFLA_INFO_KIND = 1
@@ -295,15 +298,42 @@ fn request_link_info(name: Option<&str>) -> Result<Vec<Link>> {
                     }
                     Ifla::Link => {
                         if let Some(payload) = attr.rta_payload.as_ref().get(..4) {
-                            peer_index =
-                                Some(u32::from_le_bytes(*<&[u8; 4]>::try_from(payload).unwrap()));
+                            peer_index = Some(read_u32_le(payload));
                         }
                     }
                     Ifla::LinkNetnsid => {
                         if let Some(payload) = attr.rta_payload.as_ref().get(..4) {
-                            link_netnsid =
-                                Some(u32::from_le_bytes(*<&[u8; 4]>::try_from(payload).unwrap()));
+                            link_netnsid = Some(read_u32_le(payload));
                         }
+                    }
+                    Ifla::Stats64 if attr.rta_payload.len() >= MIN_RTNL_LINK_STATS64_LEN => {
+                        /* the buffer is rtnl_link_stat64
+
+                        link: https://github.com/torvalds/linux/blob/1c59d383390f970b891b503b7f79b63a02db2ec5/include/uapi/linux/if_link.h#L218C27-L218C27
+
+                            struct rtnl_link_stats64 {
+                                __u64   rx_packets;
+                                __u64   tx_packets;
+                                __u64   rx_bytes;
+                                __u64   tx_bytes;
+                                __u64   rx_errors;
+                                __u64   tx_errors;
+                                __u64   rx_dropped;
+                                __u64   tx_dropped;
+
+                                ... (more)
+                            }
+
+                        */
+                        let payload = attr.rta_payload.as_ref();
+                        link_stats = Some(LinkStats {
+                            rx_packets: read_u64_le(payload),
+                            tx_packets: read_u64_le(&payload[8..]),
+                            rx_bytes: read_u64_le(&payload[16..]),
+                            tx_bytes: read_u64_le(&payload[24..]),
+                            rx_dropped: read_u64_le(&payload[48..]),
+                            tx_dropped: read_u64_le(&payload[56..]),
+                        });
                     }
                     _ => {}
                 }
@@ -318,6 +348,7 @@ fn request_link_info(name: Option<&str>) -> Result<Vec<Link>> {
                     if_type,
                     peer_index,
                     link_netnsid,
+                    stats: link_stats.unwrap_or_default(),
                 });
             }
         }
@@ -448,6 +479,53 @@ pub fn addr_list() -> Result<Vec<Addr>> {
     Ok(addrs)
 }
 
+fn route_send_req(req: Nlmsghdr<Rtm, Rtmsg>) -> Result<Vec<Route>> {
+    let mut socket = NlSocketHandle::connect(NlFamily::Route, None, &[])?;
+    socket.send(req)?;
+
+    let mut routes = vec![];
+    for m in socket.iter::<NlTypeWrapper, Rtmsg>(false) {
+        let m = m?;
+        if let NlTypeWrapper::Rtm(_) = m.nl_type {
+            let payload = m.get_payload()?;
+
+            let mut table = None;
+            let mut pref_src = None;
+            let mut dst_ip = None;
+            let mut oif_index = None;
+            let mut gateway = None;
+            for attr in payload.rtattrs.iter() {
+                match attr.rta_type {
+                    Rta::Table => {
+                        if let Ok(bs) = <&[u8; 4]>::try_from(attr.rta_payload.as_ref()) {
+                            table.replace(u32::from_le_bytes(*bs));
+                        }
+                    }
+                    Rta::Prefsrc => pref_src = parse_ip_slice(attr.rta_payload.as_ref()),
+                    Rta::Dst => dst_ip = parse_ip_slice(attr.rta_payload.as_ref()),
+                    Rta::Oif => {
+                        if let Ok(bs) = <&[u8; 4]>::try_from(attr.rta_payload.as_ref()) {
+                            oif_index.replace(u32::from_le_bytes(*bs));
+                        }
+                    }
+                    Rta::Gateway => gateway = parse_ip_slice(attr.rta_payload.as_ref()),
+                    _ => (),
+                }
+            }
+            if let (Some(table), Some(oif_index)) = (table, oif_index) {
+                routes.push(Route {
+                    table,
+                    pref_src,
+                    dst_ip: dst_ip.and_then(|ip| IpNet::new(ip, payload.rtm_dst_len).ok()),
+                    oif_index,
+                    gateway,
+                });
+            }
+        }
+    }
+    Ok(routes)
+}
+
 pub fn route_get(dest: &IpAddr) -> Result<Vec<Route>> {
     let msg = {
         let (rtm_family, rtm_dst_len, buf): (_, _, Buffer) = match dest {
@@ -469,49 +547,14 @@ pub fn route_get(dest: &IpAddr) -> Result<Vec<Route>> {
                 .collect(),
         }
     };
-    let req = Nlmsghdr::new(
+    route_send_req(Nlmsghdr::new(
         None,
         Rtm::Getroute,
         NlmFFlags::new(&[NlmF::Request]),
         None,
         None,
         NlPayload::Payload(msg),
-    );
-    let mut socket = NlSocketHandle::connect(NlFamily::Route, None, &[])?;
-    socket.send(req)?;
-
-    let mut routes = vec![];
-    for m in socket.iter::<NlTypeWrapper, Rtmsg>(false) {
-        let m = m?;
-        if let NlTypeWrapper::Rtm(_) = m.nl_type {
-            let payload = m.get_payload()?;
-
-            let mut src_ip = None;
-            let mut oif_index = None;
-            let mut gateway = None;
-            for attr in payload.rtattrs.iter() {
-                match attr.rta_type {
-                    Rta::Prefsrc => src_ip = parse_ip_slice(attr.rta_payload.as_ref()),
-                    Rta::Oif => {
-                        oif_index = <&[u8; 4]>::try_from(attr.rta_payload.as_ref())
-                            .ok()
-                            .map(|x| u32::from_le_bytes(*x))
-                    }
-                    Rta::Gateway => gateway = parse_ip_slice(attr.rta_payload.as_ref()),
-                    _ => (),
-                }
-            }
-            match (src_ip, oif_index) {
-                (Some(src_ip), Some(oif_index)) => routes.push(Route {
-                    src_ip,
-                    oif_index,
-                    gateway,
-                }),
-                _ => (),
-            }
-        }
-    }
-    Ok(routes)
+    ))
 }
 
 pub fn get_route_src_ip_and_mac(dest: &IpAddr) -> Result<(IpAddr, MacAddr)> {
@@ -546,10 +589,10 @@ pub fn get_route_src_ip(dest: &IpAddr) -> Result<IpAddr> {
 
 fn get_route_src_ip_and_ifindex(dest: &IpAddr) -> Result<(IpAddr, u32)> {
     let routes = route_get(dest)?;
-    if routes.is_empty() {
+    let Some(route) = routes.iter().find(|&r| r.pref_src.is_some()) else {
         return Err(Error::NoRouteToHost(dest.to_string()));
-    }
-    Ok((routes[0].src_ip, routes[0].oif_index))
+    };
+    Ok((route.pref_src.unwrap(), routes[0].oif_index))
 }
 
 pub fn get_route_src_ip_interface_name(dest_addr: &IpAddr) -> Result<String> {
@@ -561,6 +604,85 @@ pub fn get_route_src_ip_interface_name(dest_addr: &IpAddr) -> Result<String> {
         }
     }
     return Err(Error::LinkNotFound(dest_addr.to_string()));
+}
+
+pub fn route_list() -> Result<Vec<Route>> {
+    let msg = Rtmsg {
+        rtm_family: RtAddrFamily::Unspecified,
+        rtm_dst_len: 0,
+        rtm_src_len: 0,
+        rtm_tos: 0,
+        rtm_table: RtTable::Unspec,
+        rtm_protocol: Rtprot::Unspec,
+        rtm_scope: RtScope::Universe,
+        rtm_type: Rtn::Unspec,
+        rtm_flags: RtmFFlags::empty(),
+        rtattrs: Default::default(),
+    };
+    route_send_req(Nlmsghdr::new(
+        None,
+        Rtm::Getroute,
+        NlmFFlags::new(&[NlmF::Request, NlmF::Dump]),
+        None,
+        None,
+        NlPayload::Payload(msg),
+    ))
+}
+
+pub fn rule_list() -> Result<Vec<Rule>> {
+    let msg = Rtmsg {
+        rtm_family: RtAddrFamily::Unspecified,
+        rtm_dst_len: 0,
+        rtm_src_len: 0,
+        rtm_tos: 0,
+        rtm_table: RtTable::Unspec,
+        rtm_protocol: Rtprot::Unspec,
+        rtm_scope: RtScope::Universe,
+        rtm_type: Rtn::Unspec,
+        rtm_flags: RtmFFlags::empty(),
+        rtattrs: Default::default(),
+    };
+    let req = Nlmsghdr::new(
+        None,
+        Rtm::Getrule,
+        NlmFFlags::new(&[NlmF::Request, NlmF::Dump]),
+        None,
+        None,
+        NlPayload::Payload(msg),
+    );
+    let mut socket = NlSocketHandle::connect(NlFamily::Route, None, &[])?;
+    socket.send(req)?;
+
+    let mut rules = vec![];
+    for m in socket.iter::<NlTypeWrapper, Rtmsg>(false) {
+        let m = m?;
+        if m.nl_type != Rtm::Newrule.into() {
+            continue;
+        }
+
+        let payload = m.get_payload()?;
+
+        let mut table = None;
+        let mut dst_ip = None;
+        for attr in payload.rtattrs.iter() {
+            match attr.rta_type {
+                Rta::Table => {
+                    if let Ok(bs) = <&[u8; 4]>::try_from(attr.rta_payload.as_ref()) {
+                        table.replace(u32::from_le_bytes(*bs));
+                    }
+                }
+                Rta::Dst => dst_ip = parse_ip_slice(attr.rta_payload.as_ref()),
+                _ => (),
+            }
+        }
+        if let Some(table) = table {
+            rules.push(Rule {
+                table,
+                dst_ip: dst_ip.and_then(|ip| IpNet::new(ip, payload.rtm_dst_len).ok()),
+            });
+        }
+    }
+    Ok(rules)
 }
 
 fn read_u8_from_file<P: AsRef<Path>>(path: P) -> Option<u8> {

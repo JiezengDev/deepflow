@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@ use std::{
 use log::{error, warn};
 use serde::{Serialize, Serializer};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use super::super::ebpf::{MSG_REQUEST, MSG_REQUEST_END, MSG_RESPONSE, MSG_RESPONSE_END};
 use super::{
     decapsulate::TunnelType,
@@ -37,7 +37,7 @@ use super::{
 };
 
 use crate::{
-    common::{endpoint::EPC_FROM_INTERNET, timestamp_to_micros, Timestamp},
+    common::{endpoint::EPC_INTERNET, timestamp_to_micros, Timestamp},
     metric::document::Direction,
 };
 use crate::{
@@ -49,6 +49,7 @@ use crate::{
 use public::utils::net::MacAddr;
 use public::{
     buffer::BatchedBox,
+    packet::SECONDS_IN_MINUTE,
     proto::{common::TridentType, flow_log},
 };
 
@@ -81,10 +82,10 @@ pub enum CloseType {
 
 impl CloseType {
     pub fn is_client_error(self) -> bool {
-        self == CloseType::ClientSynRepeat
-            || self == CloseType::TcpClientRst
+        self == CloseType::TcpClientRst
             || self == CloseType::ClientHalfClose
             || self == CloseType::ClientSourcePortReuse
+            || self == CloseType::ServerSynAckRepeat
             || self == CloseType::ClientEstablishReset
     }
 
@@ -92,10 +93,10 @@ impl CloseType {
         self == CloseType::TcpServerRst
             || self == CloseType::Timeout
             || self == CloseType::ServerHalfClose
-            || self == CloseType::ServerSynAckRepeat
             || self == CloseType::ServerReset
             || self == CloseType::ServerQueueLack
             || self == CloseType::ServerEstablishReset
+            || self == CloseType::ClientSynRepeat
     }
 }
 
@@ -456,12 +457,8 @@ impl From<TcpPerfStats> for flow_log::TcpPerfStats {
             srt_max: p.srt_max,
             art_max: p.art_max,
             rtt: p.rtt,
-            rtt_client_sum: p.rtt_client_sum,
-            rtt_server_sum: p.rtt_server_sum,
             srt_sum: p.srt_sum,
             art_sum: p.art_sum,
-            rtt_client_count: p.rtt_client_count,
-            rtt_server_count: p.rtt_server_count,
             srt_count: p.srt_count,
             art_count: p.art_count,
             counts_peer_tx: Some(p.counts_peers[0].into()),
@@ -472,6 +469,7 @@ impl From<TcpPerfStats> for flow_log::TcpPerfStats {
             cit_max: p.cit_max,
             syn_count: p.syn_count,
             synack_count: p.synack_count,
+            ..Default::default()
         }
     }
 }
@@ -484,6 +482,7 @@ pub struct FlowPerfStats {
     pub l7: L7PerfStats,
     pub l4_protocol: L4Protocol,
     pub l7_protocol: L7Protocol,
+    pub l7_failed_count: u32,
 }
 
 impl FlowPerfStats {
@@ -492,17 +491,26 @@ impl FlowPerfStats {
             self.l4_protocol = other.l4_protocol;
         }
 
-        if self.l7_protocol == L7Protocol::Unknown
-            || (self.l7_protocol == L7Protocol::Other && other.l7_protocol != L7Protocol::Unknown)
-        {
+        if self.l7_protocol == L7Protocol::Unknown && other.l7_protocol != L7Protocol::Unknown {
             self.l7_protocol = other.l7_protocol;
         }
+
+        self.l7_failed_count = self.l7_failed_count.max(other.l7_failed_count);
+
         self.tcp.sequential_merge(&other.tcp);
         self.l7.sequential_merge(&other.l7);
     }
 
     pub fn reverse(&mut self) {
         self.tcp.reverse()
+    }
+
+    pub fn reset_on_plugin_reload(&mut self) {
+        if matches!(self.l7_protocol, L7Protocol::Custom) {
+            self.l7 = Default::default();
+            self.l7_protocol = Default::default();
+            self.l7_failed_count = Default::default();
+        }
     }
 }
 
@@ -523,6 +531,7 @@ impl From<FlowPerfStats> for flow_log::FlowPerfStats {
             l7: Some(p.l7.into()),
             l4_protocol: p.l4_protocol as u32,
             l7_protocol: p.l7_protocol as u32,
+            l7_failed_count: p.l7_failed_count,
         }
     }
 }
@@ -536,6 +545,7 @@ pub struct L7Stats {
     pub l7_protocol: L7Protocol,
     pub signal_source: SignalSource,
     pub time_in_second: Duration,
+    pub biz_type: u8,
 }
 
 #[derive(Serialize, Debug, Default, Clone, PartialEq, Eq)]
@@ -553,6 +563,7 @@ pub struct L7PerfStats {
     pub rrt_count: u32, // u32可记录40000M时延, 一条流在一分钟内的请求数远无法达到此数值
     pub rrt_sum: u64,   // us RRT(Request Response Time)
     pub rrt_max: u32,   // us agent保证在3600s以内
+    pub tls_rtt: u32,
 }
 
 impl L7PerfStats {
@@ -567,6 +578,7 @@ impl L7PerfStats {
         if self.rrt_max < other.rrt_max {
             self.rrt_max = other.rrt_max
         }
+        self.tls_rtt += other.tls_rtt;
     }
 
     pub fn merge_perf(
@@ -576,6 +588,7 @@ impl L7PerfStats {
         req_err: u32,
         resp_err: u32,
         rrt: u64,
+        tls_rtt: u64,
     ) {
         self.request_count += req_count;
         self.response_count += resp_count;
@@ -587,26 +600,33 @@ impl L7PerfStats {
             self.rrt_sum += rrt;
             self.rrt_count += 1;
         }
+        if tls_rtt != 0 {
+            self.tls_rtt += tls_rtt as u32;
+        }
     }
 
     pub fn inc_req(&mut self) {
-        self.merge_perf(1, 0, 0, 0, 0);
+        self.merge_perf(1, 0, 0, 0, 0, 0);
     }
 
     pub fn inc_resp(&mut self) {
-        self.merge_perf(0, 1, 0, 0, 0);
+        self.merge_perf(0, 1, 0, 0, 0, 0);
     }
 
     pub fn inc_req_err(&mut self) {
-        self.merge_perf(0, 0, 1, 0, 0);
+        self.merge_perf(0, 0, 1, 0, 0, 0);
     }
 
     pub fn inc_resp_err(&mut self) {
-        self.merge_perf(0, 0, 0, 1, 0);
+        self.merge_perf(0, 0, 0, 1, 0, 0);
     }
 
     pub fn update_rrt(&mut self, rrt: u64) {
-        self.merge_perf(0, 0, 0, 0, rrt);
+        self.merge_perf(0, 0, 0, 0, rrt, 0);
+    }
+
+    pub fn update_tls_rtt(&mut self, tls_rtt: u64) {
+        self.merge_perf(0, 0, 0, 0, 0, tls_rtt);
     }
 }
 
@@ -621,6 +641,7 @@ impl From<L7PerfStats> for flow_log::L7PerfStats {
             rrt_count: p.rrt_count,
             rrt_sum: p.rrt_sum,
             rrt_max: p.rrt_max,
+            tls_rtt: p.tls_rtt,
         }
     }
 }
@@ -869,7 +890,7 @@ impl Display for PacketDirection {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl From<u8> for PacketDirection {
     fn from(msg_type: u8) -> Self {
         match msg_type {
@@ -928,6 +949,8 @@ pub struct Flow {
     pub reversed: bool,
     pub tap_side: TapSide,
     #[serde(skip)]
+    pub directions: [Direction; 2],
+    #[serde(skip)]
     pub acl_gids: Vec<u16>,
     #[serde(skip)]
     pub otel_service: Option<String>,
@@ -935,8 +958,11 @@ pub struct Flow {
     pub otel_instance: Option<String>,
     #[serde(skip)]
     pub last_endpoint: Option<String>,
+    #[serde(skip)]
+    pub last_biz_type: u8,
     pub direction_score: u8,
-    pub netns_id: u32,
+    pub pod_id: u32,
+    pub request_domain: String,
 }
 
 fn tunnel_is_none(t: &TunnelField) -> bool {
@@ -944,6 +970,12 @@ fn tunnel_is_none(t: &TunnelField) -> bool {
 }
 
 impl Flow {
+    pub fn start_time_in_minute(&self) -> u64 {
+        let second_in_minute = self.start_time.as_secs() % SECONDS_IN_MINUTE;
+        (self.flow_stat_time.as_secs() - second_in_minute) / SECONDS_IN_MINUTE * SECONDS_IN_MINUTE
+            + second_in_minute
+    }
+
     fn swap_flow_ip_and_real_ip(&mut self) {
         let metric = &mut self.flow_metrics_peers[PacketDirection::ClientToServer as usize];
         swap(&mut self.flow_key.port_src, &mut metric.nat_real_port);
@@ -1000,6 +1032,10 @@ impl Flow {
         let nat_source = other.flow_key.tap_port.get_nat_source();
         if nat_source > self.flow_key.tap_port.get_nat_source() {
             self.flow_key.tap_port.set_nat_source(nat_source);
+        }
+
+        if !other.request_domain.is_empty() {
+            self.request_domain = other.request_domain.clone();
         }
     }
 
@@ -1107,13 +1143,12 @@ impl Flow {
             return;
         }
         // 链路追踪统计位置
-        let [src_tap_side, dst_tap_side] =
-            get_direction(&*self, trident_type, cloud_gateway_traffic);
+        self.directions = get_direction(&*self, trident_type, cloud_gateway_traffic);
 
-        if src_tap_side != Direction::None && dst_tap_side == Direction::None {
-            self.tap_side = src_tap_side.into();
-        } else if src_tap_side == Direction::None && dst_tap_side != Direction::None {
-            self.tap_side = dst_tap_side.into();
+        if self.directions[0] != Direction::None && self.directions[1] == Direction::None {
+            self.tap_side = self.directions[0].into();
+        } else if self.directions[0] == Direction::None && self.directions[1] != Direction::None {
+            self.tap_side = self.directions[1].into();
         }
     }
 
@@ -1130,14 +1165,14 @@ impl fmt::Display for Flow {
             "flow_id:{} signal_source:{:?} tunnel:{} close_type:{:?} is_active_service:{} is_new_flow:{} queue_hash:{} \
         syn_seq:{} synack_seq:{} last_keepalive_seq:{} last_keepalive_ack:{} flow_stat_time:{:?} \
         \t start_time:{:?} end_time:{:?} duration:{:?} \
-        \t vlan:{} eth_type:{:?} reversed:{} otel_service:{:?} otel_instance:{:?} flow_key:{} \
+        \t vlan:{} eth_type:{:?} reversed:{} otel_service:{:?} otel_instance:{:?} request_domain:{:?} flow_key:{} \
         \n\t flow_metrics_peers_src:{:?} \
         \n\t flow_metrics_peers_dst:{:?} \
         \n\t flow_perf_stats:{:?}",
             self.flow_id, self.signal_source, self.tunnel, self.close_type, self.is_active_service, self.is_new_flow, self.queue_hash,
             self.syn_seq, self.synack_seq, self.last_keepalive_seq, self.last_keepalive_ack, self.flow_stat_time,
             self.start_time, self.end_time, self.duration,
-            self.vlan, self.eth_type, self.reversed, self.otel_service, self.otel_instance, self.flow_key,
+            self.vlan, self.eth_type, self.reversed, self.otel_service, self.otel_instance, self.request_domain, self.flow_key,
             self.flow_metrics_peers[0],
             self.flow_metrics_peers[1],
             self.flow_perf_stats
@@ -1181,6 +1216,7 @@ impl From<Flow> for flow_log::Flow {
             last_keepalive_ack: f.last_keepalive_ack,
             acl_gids: f.acl_gids.into_iter().map(|g| g as u32).collect(),
             direction_score: f.direction_score as u32,
+            request_domain: f.request_domain,
         }
     }
 }
@@ -1194,16 +1230,6 @@ pub fn get_direction(
     let dst_ep = &flow.flow_metrics_peers[FLOW_METRICS_PEER_DST];
 
     match flow.signal_source {
-        SignalSource::OTel => {
-            // The direction of otel data is obtained according to flow.tap_side.
-            return if flow.tap_side == TapSide::ClientApp {
-                [Direction::ClientAppToServer, Direction::None]
-            } else if flow.tap_side == TapSide::ServerApp {
-                [Direction::None, Direction::ServerAppToClient]
-            } else {
-                [Direction::None, Direction::None]
-            };
-        }
         SignalSource::EBPF => {
             // For eBPF data, the direction can be calculated directly through l2_end,
             // and its l2_end has been set in MetaPacket::from_ebpf().
@@ -1223,7 +1249,7 @@ pub fn get_direction(
             return [Direction::None, Direction::None];
         }
         _ => {
-            // Data from otel may not have mac_src and mac_dst
+            // workload and container collector need to collect loopback port flow
             if flow.flow_key.mac_src == flow.flow_key.mac_dst
                 && (is_tt_pod(trident_type) || is_tt_workload(trident_type))
             {
@@ -1254,7 +1280,7 @@ pub fn get_direction(
             TridentType::TtDedicatedPhysicalMachine => {
                 //  接入网络
                 if tap_type != TapType::Cloud {
-                    if l3_epc_id != EPC_FROM_INTERNET {
+                    if l3_epc_id != EPC_INTERNET {
                         return (Direction::ClientToServer, Direction::ServerToClient);
                     }
                 } else {
@@ -1504,13 +1530,6 @@ pub fn get_direction(
     const FLOW_METRICS_PEER_DST: usize = 1;
 
     let flow_key = &flow.flow_key;
-
-    // Workload和容器采集器需采集loopback口流量
-    if flow_key.mac_src == flow_key.mac_dst
-        && (is_tt_workload(trident_type) || is_tt_pod(trident_type))
-    {
-        return [Direction::None, Direction::LocalToLocal];
-    }
 
     // 全景图统计
     let tunnel = &flow.tunnel;

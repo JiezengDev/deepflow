@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 )
 
 type VPC struct {
@@ -36,7 +37,7 @@ func (v *VPC) OnUpdaterAdded(addedDBItems []*mysql.VPC) {
 	v.cache.AddVPCs(addedDBItems)
 }
 
-func (v *VPC) OnUpdaterUpdated(cloudItem *cloudmodel.VPC, diffBase *cache.VPC) {
+func (v *VPC) OnUpdaterUpdated(cloudItem *cloudmodel.VPC, diffBase *diffbase.VPC) {
 	diffBase.Update(cloudItem)
 }
 

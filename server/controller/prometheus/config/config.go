@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,4 +21,6 @@ type Config struct {
 	EncoderCacheRefreshInterval      int `default:"3600" yaml:"encoder_cache_refresh_interval"`
 	ResourceMaxID0                   int `default:"64000" yaml:"resource_max_id_0"`
 	ResourceMaxID1                   int `default:"499999" yaml:"resource_max_id_1"`
+	APPLabelIndexMax                 int `default:"256" yaml:"app_label_index"`
+	DataCleanInterval                int `default:"1440" yaml:"data_clean_interval"`
 }

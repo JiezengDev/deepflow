@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,13 +14,12 @@
  * limitations under the License.
  */
 
+mod brpc;
 mod dubbo;
-mod protobuf_rpc;
 mod sofa_rpc;
 
-pub use dubbo::{DubboHeader, DubboInfo, DubboLog};
-pub use protobuf_rpc::{get_protobuf_rpc_parser, ProtobufRpcInfo, ProtobufRpcWrapLog};
+pub use brpc::{BrpcInfo, BrpcLog};
+pub use dubbo::{DubboInfo, DubboLog};
 pub use sofa_rpc::{
-    decode_new_rpc_trace_context, decode_new_rpc_trace_context_with_type, SofaRpcInfo, SofaRpcLog,
-    SOFA_NEW_RPC_TRACE_CTX_KEY,
+    decode_new_rpc_trace_context_with_type, SofaRpcInfo, SofaRpcLog, SOFA_NEW_RPC_TRACE_CTX_KEY,
 };

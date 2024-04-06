@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,30 +18,55 @@ package updater
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
-	"github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type SecurityGroup struct {
-	UpdaterBase[cloudmodel.SecurityGroup, mysql.SecurityGroup, *cache.SecurityGroup]
+	UpdaterBase[
+		cloudmodel.SecurityGroup,
+		mysql.SecurityGroup,
+		*diffbase.SecurityGroup,
+		*message.SecurityGroupAdd,
+		message.SecurityGroupAdd,
+		*message.SecurityGroupUpdate,
+		message.SecurityGroupUpdate,
+		*message.SecurityGroupFieldsUpdate,
+		message.SecurityGroupFieldsUpdate,
+		*message.SecurityGroupDelete,
+		message.SecurityGroupDelete]
 }
 
 func NewSecurityGroup(wholeCache *cache.Cache, cloudData []cloudmodel.SecurityGroup) *SecurityGroup {
 	updater := &SecurityGroup{
-		UpdaterBase[cloudmodel.SecurityGroup, mysql.SecurityGroup, *cache.SecurityGroup]{
-			cache:        wholeCache,
-			dbOperator:   db.NewSecurityGroup(),
-			diffBaseData: wholeCache.SecurityGroups,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.SecurityGroup,
+			mysql.SecurityGroup,
+			*diffbase.SecurityGroup,
+			*message.SecurityGroupAdd,
+			message.SecurityGroupAdd,
+			*message.SecurityGroupUpdate,
+			message.SecurityGroupUpdate,
+			*message.SecurityGroupFieldsUpdate,
+			message.SecurityGroupFieldsUpdate,
+			*message.SecurityGroupDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_SECURITY_GROUP_EN,
+			wholeCache,
+			db.NewSecurityGroup().SetORG(wholeCache.GetORG()),
+			wholeCache.DiffBaseDataSet.SecurityGroups,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
 }
 
-func (g *SecurityGroup) getDiffBaseByCloudItem(cloudItem *cloudmodel.SecurityGroup) (diffBase *cache.SecurityGroup, exists bool) {
+func (g *SecurityGroup) getDiffBaseByCloudItem(cloudItem *cloudmodel.SecurityGroup) (diffBase *diffbase.SecurityGroup, exists bool) {
 	diffBase, exists = g.diffBaseData[cloudItem.Lcuuid]
 	return
 }
@@ -57,10 +82,10 @@ func (g *SecurityGroup) generateDBItemToAdd(cloudItem *cloudmodel.SecurityGroup)
 	if cloudItem.VPCLcuuid != "" {
 		vpcID, exists := g.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)
 		if !exists {
-			log.Errorf(resourceAForResourceBNotFound(
-				common.RESOURCE_TYPE_VPC_EN, cloudItem.VPCLcuuid,
-				common.RESOURCE_TYPE_SECURITY_GROUP_EN, cloudItem.Lcuuid,
-			))
+			log.Error(g.org.LogPre(resourceAForResourceBNotFound(
+				ctrlrcommon.RESOURCE_TYPE_VPC_EN, cloudItem.VPCLcuuid,
+				ctrlrcommon.RESOURCE_TYPE_SECURITY_GROUP_EN, cloudItem.Lcuuid,
+			)))
 			return nil, false
 		}
 		dbItem.VPCID = vpcID
@@ -68,20 +93,21 @@ func (g *SecurityGroup) generateDBItemToAdd(cloudItem *cloudmodel.SecurityGroup)
 	return dbItem, true
 }
 
-func (g *SecurityGroup) generateUpdateInfo(diffBase *cache.SecurityGroup, cloudItem *cloudmodel.SecurityGroup) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (g *SecurityGroup) generateUpdateInfo(diffBase *diffbase.SecurityGroup, cloudItem *cloudmodel.SecurityGroup) (*message.SecurityGroupFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.SecurityGroupFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
-		updateInfo["name"] = cloudItem.Name
+		mapInfo["name"] = cloudItem.Name
+		structInfo.Name.Set(diffBase.Name, cloudItem.Name)
 	}
 	if diffBase.Label != cloudItem.Label {
-		updateInfo["label"] = cloudItem.Label
+		mapInfo["label"] = cloudItem.Label
+		structInfo.Label.Set(diffBase.Label, cloudItem.Label)
 	}
 	if diffBase.RegionLcuuid != cloudItem.RegionLcuuid {
-		updateInfo["region"] = cloudItem.RegionLcuuid
+		mapInfo["region"] = cloudItem.RegionLcuuid
+		structInfo.RegionLcuuid.Set(diffBase.RegionLcuuid, cloudItem.RegionLcuuid)
 	}
 
-	if len(updateInfo) > 0 {
-		return updateInfo, true
-	}
-	return nil, false
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

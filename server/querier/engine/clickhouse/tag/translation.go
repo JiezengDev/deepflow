@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,10 +21,13 @@ import (
 	"strconv"
 	"strings"
 
+	"golang.org/x/exp/slices"
+
 	"github.com/deepflowio/deepflow/server/querier/common"
 )
 
 var TagResoureMap = GenerateTagResoureMap()
+var FlowTagResourceMap = GenerateFlowTagTagResoureMap()
 var DEVICE_MAP = map[string]int{
 	"chost":       VIF_DEVICE_TYPE_VM,
 	"router":      VIF_DEVICE_TYPE_VROUTER,
@@ -36,14 +39,29 @@ var DEVICE_MAP = map[string]int{
 	"natgw":       VIF_DEVICE_TYPE_NAT_GATEWAY,
 }
 var TAP_PORT_DEVICE_MAP = map[string]int{
-	common.TAP_PORT_HOST:     VIF_DEVICE_TYPE_HOST,
-	common.TAP_PORT_CHOST:    VIF_DEVICE_TYPE_VM,
-	common.TAP_PORT_POD_NODE: VIF_DEVICE_TYPE_POD_NODE,
+	common.TAP_PORT_HOST:        VIF_DEVICE_TYPE_HOST,
+	common.TAP_PORT_CHOST:       VIF_DEVICE_TYPE_VM,
+	common.TAP_PORT_POD_NODE:    VIF_DEVICE_TYPE_POD_NODE,
+	common.CAPTURE_NIC_HOST:     VIF_DEVICE_TYPE_HOST,
+	common.CAPTURE_NIC_CHOST:    VIF_DEVICE_TYPE_VM,
+	common.CAPTURE_NIC_POD_NODE: VIF_DEVICE_TYPE_POD_NODE,
+}
+var HOSTNAME_IP_DEVICE_MAP = map[string]struct {
+	ResourceType int
+	ResourceName string
+	FieldName    string
+}{
+	common.HOST_HOSTNAME:     {ResourceType: VIF_DEVICE_TYPE_HOST, ResourceName: "host", FieldName: "hostname"},
+	common.HOST_IP:           {ResourceType: VIF_DEVICE_TYPE_HOST, ResourceName: "host", FieldName: "ip"},
+	common.CHOST_HOSTNAME:    {ResourceType: VIF_DEVICE_TYPE_VM, ResourceName: "chost", FieldName: "hostname"},
+	common.CHOST_IP:          {ResourceType: VIF_DEVICE_TYPE_VM, ResourceName: "chost", FieldName: "ip"},
+	common.POD_NODE_HOSTNAME: {ResourceType: VIF_DEVICE_TYPE_POD_NODE, ResourceName: "pod_node", FieldName: "hostname"},
+	common.POD_NODE_IP:       {ResourceType: VIF_DEVICE_TYPE_POD_NODE, ResourceName: "pod_node", FieldName: "ip"},
 }
 
-var INT_ENUM_TAG = []string{"close_type", "eth_type", "signal_source", "is_ipv4", "l7_ip_protocol", "type", "l7_protocol", "protocol", "response_status", "server_port", "status", "tap_port_type", "tunnel_tier", "tunnel_type", "instance_type", "nat_source", "role", "event_level", "policy_level", "policy_app_type"}
+var INT_ENUM_TAG = []string{"close_type", "eth_type", "signal_source", "is_ipv4", "l7_ip_protocol", "type", "l7_protocol", "protocol", "response_status", "server_port", "status", "capture_nic_type", "tunnel_tier", "tunnel_type", "instance_type", "nat_source", "role", "event_level", "policy_level", "policy_app_type", "is_tls"}
 var INT_ENUM_PEER_TAG = []string{"resource_gl0_type", "resource_gl1_type", "resource_gl2_type", "tcp_flags_bit", "auto_instance_type", "auto_service_type"}
-var STRING_ENUM_TAG = []string{"tap_side", "event_type", "profile_language_type"}
+var STRING_ENUM_TAG = []string{"observation_point", "event_type", "profile_language_type"}
 
 func GenerateTagResoureMap() map[string]map[string]*Tag {
 	tagResourceMap := make(map[string]map[string]*Tag)
@@ -53,10 +71,14 @@ func GenerateTagResoureMap() map[string]map[string]*Tag {
 		for _, suffix := range []string{"", "_0", "_1"} {
 			resourceIDSuffix := resourceStr + "_id" + suffix
 			resourceNameSuffix := resourceStr + suffix
+			groupNotNullFilter := ""
+			if !slices.Contains[[]string, string]([]string{"region", "az", "subnet", "pod_cluster"}, resourceStr) {
+				groupNotNullFilter = resourceIDSuffix + "!=0"
+			}
 			tagResourceMap[resourceIDSuffix] = map[string]*Tag{
 				"default": NewTag(
 					"",
-					resourceIDSuffix+"!=0",
+					groupNotNullFilter,
 					"",
 					"",
 				),
@@ -64,7 +86,7 @@ func GenerateTagResoureMap() map[string]map[string]*Tag {
 			tagResourceMap[resourceNameSuffix] = map[string]*Tag{
 				"default": NewTag(
 					"dictGet(flow_tag."+resourceStr+"_map, 'name', (toUInt64("+resourceIDSuffix+")))",
-					resourceIDSuffix+"!=0",
+					groupNotNullFilter,
 					"toUInt64("+resourceIDSuffix+") IN (SELECT id FROM flow_tag."+resourceStr+"_map WHERE name %s %s)",
 					"toUInt64("+resourceIDSuffix+") IN (SELECT id FROM flow_tag."+resourceStr+"_map WHERE %s(name,%s))",
 				),
@@ -132,7 +154,7 @@ func GenerateTagResoureMap() map[string]map[string]*Tag {
 		tagResourceMap[l2VpcNameSuffix] = map[string]*Tag{
 			"default": NewTag(
 				"dictGet(flow_tag.l3_epc_map, 'name', (toUInt64("+l2EPCIDSuffix+")))",
-				l2EPCIDSuffix+"!=-2",
+				l2EPCIDSuffix+"!=0",
 				"toUInt64("+l2EPCIDSuffix+") IN (SELECT id FROM flow_tag.l3_epc_map WHERE name %s %s)",
 				"toUInt64("+l2EPCIDSuffix+") IN (SELECT id FROM flow_tag.l3_epc_map WHERE %s(name,%s))",
 			),
@@ -244,8 +266,8 @@ func GenerateTagResoureMap() map[string]map[string]*Tag {
 				"default": NewTag(
 					"if("+deviceTypeSuffix+"="+deviceTypeValueStr+", dictGet(flow_tag.device_map, 'name', (toUInt64("+deviceTypeValueStr+"),toUInt64("+deviceIDSuffix+"))), '')",
 					deviceIDSuffix+"!=0 AND "+deviceTypeSuffix+"="+deviceTypeValueStr,
-					"toUInt64("+deviceIDSuffix+") IN (SELECT deviceid FROM flow_tag.device_map WHERE name %s %s) AND "+deviceTypeSuffix+"="+deviceTypeValueStr,
-					"toUInt64("+deviceIDSuffix+") IN (SELECT deviceid FROM flow_tag.device_map WHERE %s(name,%s)) AND "+deviceTypeSuffix+"="+deviceTypeValueStr,
+					"toUInt64("+deviceIDSuffix+") IN (SELECT deviceid FROM flow_tag.device_map WHERE name %s %s AND devicetype="+deviceTypeValueStr+") AND "+deviceTypeSuffix+"="+deviceTypeValueStr,
+					"toUInt64("+deviceIDSuffix+") IN (SELECT deviceid FROM flow_tag.device_map WHERE %s(name,%s) AND devicetype="+deviceTypeValueStr+") AND "+deviceTypeSuffix+"="+deviceTypeValueStr,
 				),
 				"node_type": NewTag(
 					"'"+resourceStr+"'",
@@ -266,10 +288,27 @@ func GenerateTagResoureMap() map[string]map[string]*Tag {
 	// 采集器名称
 	tagResourceMap["vtap"] = map[string]*Tag{
 		"default": NewTag(
-			"dictGet(flow_tag.vtap_map, 'name', toUInt64(vtap_id))",
+			"dictGet(flow_tag.vtap_map, 'name', toUInt64(agent_id))",
 			"",
-			"toUInt64(vtap_id) IN (SELECT id FROM flow_tag.vtap_map WHERE name %s %s)",
-			"toUInt64(vtap_id) IN (SELECT id FROM flow_tag.vtap_map WHERE %s(name,%s))",
+			"toUInt64(agent_id) IN (SELECT id FROM flow_tag.vtap_map WHERE name %s %s)",
+			"toUInt64(agent_id) IN (SELECT id FROM flow_tag.vtap_map WHERE %s(name,%s))",
+		),
+	}
+	tagResourceMap["agent"] = map[string]*Tag{
+		"default": NewTag(
+			"dictGet(flow_tag.vtap_map, 'name', toUInt64(agent_id))",
+			"",
+			"toUInt64(agent_id) IN (SELECT id FROM flow_tag.vtap_map WHERE name %s %s)",
+			"toUInt64(agent_id) IN (SELECT id FROM flow_tag.vtap_map WHERE %s(name,%s))",
+		),
+	}
+	// 采集器名称ID
+	tagResourceMap["vtap_id"] = map[string]*Tag{
+		"default": NewTag(
+			"agent_id",
+			"",
+			"agent_id %s %s",
+			"",
 		),
 	}
 
@@ -556,7 +595,7 @@ func GenerateTagResoureMap() map[string]map[string]*Tag {
 
 	// vtap对应资源
 	vtapResource := "'device_type','device_id','device_name','icon_id','host_id','host_name'"
-	gwDictGet := fmt.Sprintf("dictGet(flow_tag.vtap_port_map, (%s),(toUInt64(vtap_id),toUInt64(tap_port)))", vtapResource)
+	gwDictGet := fmt.Sprintf("dictGet(flow_tag.vtap_port_map, (%s),(toUInt64(agent_id),toUInt64(capture_nic)))", vtapResource)
 	tagResourceMap["resource_from_vtap"] = map[string]*Tag{
 		"default": NewTag(
 			gwDictGet,
@@ -767,18 +806,27 @@ func GenerateTagResoureMap() map[string]map[string]*Tag {
 	// 采集点ID
 	tagResourceMap["tap_id"] = map[string]*Tag{
 		"default": NewTag(
-			"tap_type",
+			"capture_network_type_id",
 			"",
-			"tap_type %s %s",
+			"capture_network_type_id %s %s",
 			"",
 		)}
 	// 采集点
 	tagResourceMap["tap"] = map[string]*Tag{
 		"default": NewTag(
-			"dictGet(flow_tag.tap_type_map, 'name', toUInt64(tap_type))",
+			"dictGet(flow_tag.tap_type_map, 'name', toUInt64(capture_network_type_id))",
 			"",
-			"toUInt64(tap_type) IN (SELECT value FROM flow_tag.tap_type_map WHERE name %s %s)",
-			"toUInt64(tap_type) IN (SELECT value FROM flow_tag.tap_type_map WHERE %s(name,%s))",
+			"toUInt64(capture_network_type_id) IN (SELECT value FROM flow_tag.tap_type_map WHERE name %s %s)",
+			"toUInt64(capture_network_type_id) IN (SELECT value FROM flow_tag.tap_type_map WHERE %s(name,%s))",
+		)}
+
+	// 采集网络类型
+	tagResourceMap["capture_network_type"] = map[string]*Tag{
+		"default": NewTag(
+			"dictGet(flow_tag.tap_type_map, 'name', toUInt64(capture_network_type_id))",
+			"",
+			"toUInt64(capture_network_type_id) IN (SELECT value FROM flow_tag.tap_type_map WHERE name %s %s)",
+			"toUInt64(capture_network_type_id) IN (SELECT value FROM flow_tag.tap_type_map WHERE %s(name,%s))",
 		)}
 
 	// 响应码
@@ -805,13 +853,29 @@ func GenerateTagResoureMap() map[string]map[string]*Tag {
 			"_id %s %s AND time=toDateTime(bitShiftRight(%v, 32))",
 			"",
 		)}
+	// tap_port
+	tagResourceMap["tap_port"] = map[string]*Tag{
+		"default": NewTag(
+			"capture_nic",
+			"",
+			"",
+			"",
+		)}
 	// 采集位置名称
 	tagResourceMap["tap_port_name"] = map[string]*Tag{
 		"default": NewTag(
-			"if(tap_port_type in (0,1,2),dictGet(flow_tag.vtap_port_map, 'name', (toUInt64(vtap_id),toUInt64(tap_port))),'')",
+			"if(capture_nic_type in (0,1,2),dictGet(flow_tag.vtap_port_map, 'name', (toUInt64(agent_id),toUInt64(capture_nic))),'')",
 			"",
-			"toUInt64(tap_port) IN (SELECT tap_port FROM flow_tag.vtap_port_map WHERE name %s %s)",
-			"toUInt64(tap_port) IN (SELECT tap_port FROM flow_tag.vtap_port_map WHERE %s(name,%s))",
+			"(toUInt64(agent_id), toUInt64(capture_nic)) IN (SELECT vtap_id, tap_port FROM flow_tag.vtap_port_map WHERE name %s %s)",
+			"(toUInt64(agent_id), toUInt64(capture_nic)) IN (SELECT vtap_id, tap_port FROM flow_tag.vtap_port_map WHERE %s(name,%s))",
+		)}
+	// 采集网卡名称
+	tagResourceMap["capture_nic_name"] = map[string]*Tag{
+		"default": NewTag(
+			"if(capture_nic_type in (0,1,2),dictGet(flow_tag.vtap_port_map, 'name', (toUInt64(agent_id),toUInt64(capture_nic))),'')",
+			"",
+			"(toUInt64(agent_id), toUInt64(capture_nic)) IN (SELECT vtap_id, tap_port FROM flow_tag.vtap_port_map WHERE name %s %s)",
+			"(toUInt64(agent_id), toUInt64(capture_nic)) IN (SELECT vtap_id, tap_port FROM flow_tag.vtap_port_map WHERE %s(name,%s))",
 		)}
 	// Nat Real IP
 	for _, suffix := range []string{"", "_0", "_1"} {
@@ -826,6 +890,13 @@ func GenerateTagResoureMap() map[string]map[string]*Tag {
 			)}
 	}
 	// Tunnel IP
+	tagResourceMap["tunnel_tx_ip"] = map[string]*Tag{
+		"default": NewTag(
+			"",
+			"",
+			"(if(tunnel_is_ipv4=1, hex(tunnel_tx_ip4_0), hex(tunnel_tx_ip6_0)) %s %s OR if(tunnel_is_ipv4=1, hex(tunnel_tx_ip4_1), hex(tunnel_tx_ip6_1)) %s %s)",
+			"",
+		)}
 	tagResourceMap["tunnel_tx_ip_0"] = map[string]*Tag{
 		"default": NewTag(
 			"if(tunnel_is_ipv4, IPv4NumToString(tunnel_tx_ip4_0), IPv6NumToString(tunnel_tx_ip6_0))",
@@ -838,6 +909,13 @@ func GenerateTagResoureMap() map[string]map[string]*Tag {
 			"if(tunnel_is_ipv4, IPv4NumToString(tunnel_tx_ip4_1), IPv6NumToString(tunnel_tx_ip6_1))",
 			"",
 			"if(tunnel_is_ipv4=1, hex(tunnel_tx_ip4_1), hex(tunnel_tx_ip6_1)) %s %s",
+			"",
+		)}
+	tagResourceMap["tunnel_rx_ip"] = map[string]*Tag{
+		"default": NewTag(
+			"",
+			"",
+			"(if(tunnel_is_ipv4=1, hex(tunnel_rx_ip4_0), hex(tunnel_rx_ip6_0)) %s %s OR if(tunnel_is_ipv4=1, hex(tunnel_rx_ip4_1), hex(tunnel_rx_ip6_1)) %s %s)",
 			"",
 		)}
 	tagResourceMap["tunnel_rx_ip_0"] = map[string]*Tag{
@@ -870,6 +948,25 @@ func GenerateTagResoureMap() map[string]map[string]*Tag {
 			"",
 			"",
 		)}
+	// pod_group_type
+	for _, suffix := range []string{"", "_0", "_1"} {
+		podGroupIDSuffix := "pod_group_id" + suffix
+		podGroupTypeSuffix := "pod_group_type" + suffix
+		tagResourceMap[podGroupTypeSuffix] = map[string]*Tag{
+			"default": NewTag(
+				"dictGet(flow_tag.pod_group_map, 'pod_group_type', (toUInt64("+podGroupIDSuffix+")))",
+				podGroupIDSuffix+"!=0",
+				"toUInt64("+podGroupIDSuffix+") IN (SELECT id FROM flow_tag.pod_group_map WHERE pod_group_type %s %s) AND "+podGroupIDSuffix+"!=0",
+				"",
+			),
+			"enum": NewTag(
+				"dictGetOrDefault(flow_tag.int_enum_map, 'name', ('%s',toUInt64(dictGet(flow_tag.pod_group_map, 'pod_group_type', (toUInt64("+podGroupIDSuffix+"))))), dictGet(flow_tag.pod_group_map, 'pod_group_type', (toUInt64("+podGroupIDSuffix+"))))",
+				"",
+				"toUInt64(dictGet(flow_tag.pod_group_map, 'pod_group_type', (toUInt64("+podGroupIDSuffix+")))) IN (SELECT value FROM flow_tag.int_enum_map WHERE name %s %s and tag_name='%s') AND "+podGroupIDSuffix+"!=0",
+				"toUInt64(dictGet(flow_tag.pod_group_map, 'pod_group_type', (toUInt64("+podGroupIDSuffix+")))) IN (SELECT value FROM flow_tag.int_enum_map WHERE %s(name,%s) and tag_name='%s') AND "+podGroupIDSuffix+"!=0",
+			),
+		}
+	}
 	// enum_tag
 	for _, enumName := range INT_ENUM_TAG {
 		tagResourceMap[enumName] = map[string]*Tag{
@@ -929,6 +1026,36 @@ func GenerateTagResoureMap() map[string]map[string]*Tag {
 			),
 		}
 	}
+	// tap_side & Enum(tap_side)
+	tagResourceMap["tap_side"] = map[string]*Tag{
+		"enum": NewTag(
+			"dictGetOrDefault(flow_tag.string_enum_map, 'name', ('%s',observation_point), observation_point)",
+			"",
+			"observation_point IN (SELECT value FROM flow_tag.string_enum_map WHERE name %s %s and tag_name='%s')",
+			"observation_point IN (SELECT value FROM flow_tag.string_enum_map WHERE %s(name,%s) and tag_name='%s')",
+		),
+		"default": NewTag(
+			"observation_point",
+			"",
+			"observation_point %s %s",
+			"%s (observation_point, %s)",
+		),
+	}
+	// tap_port_type & Enum(tap_port_type)
+	tagResourceMap["tap_port_type"] = map[string]*Tag{
+		"enum": NewTag(
+			"dictGetOrDefault(flow_tag.int_enum_map, 'name', ('%s',toUInt64(capture_nic_type)), capture_nic_type)",
+			"",
+			"toUInt64(capture_nic_type) IN (SELECT value FROM flow_tag.int_enum_map WHERE name %s %s and tag_name='%s')",
+			"toUInt64(capture_nic_type) IN (SELECT value FROM flow_tag.int_enum_map WHERE %s(name,%s) and tag_name='%s')",
+		),
+		"default": NewTag(
+			"capture_nic_type",
+			"",
+			"capture_nic_type %s %s",
+			"%s(capture_nic_type,%s)",
+		),
+	}
 	// Pcap
 	tagResourceMap["has_pcap"] = map[string]*Tag{
 		"default": NewTag(
@@ -958,18 +1085,267 @@ func GenerateTagResoureMap() map[string]map[string]*Tag {
 		deviceTypeValueStr := strconv.Itoa(deviceTypeValue)
 		tagResourceMap[tapPortResource] = map[string]*Tag{
 			"default": NewTag(
-				"dictGet(flow_tag.vtap_port_map, 'device_name', (toUInt64(vtap_id),toUInt64(tap_port)))",
-				"(toUInt64(vtap_id),toUInt64(tap_port)) IN (SELECT vtap_id,tap_port FROM flow_tag.vtap_port_map WHERE tap_port!=0 AND device_type="+deviceTypeValueStr+")",
-				"(toUInt64(vtap_id),toUInt64(tap_port)) IN (SELECT vtap_id,tap_port FROM flow_tag.vtap_port_map WHERE tap_port!=0 AND device_type="+deviceTypeValueStr+" AND device_name %s %s)",
-				"(toUInt64(vtap_id),toUInt64(tap_port)) IN (SELECT vtap_id,tap_port FROM flow_tag.vtap_port_map WHERE tap_port!=0 AND device_type="+deviceTypeValueStr+" AND %s(device_name,%s))",
+				"dictGet(flow_tag.vtap_port_map, 'device_name', (toUInt64(agent_id),toUInt64(capture_nic)))",
+				"(toUInt64(agent_id),toUInt64(capture_nic)) IN (SELECT vtap_id,tap_port FROM flow_tag.vtap_port_map WHERE tap_port!=0 AND device_type="+deviceTypeValueStr+")",
+				"(toUInt64(agent_id),toUInt64(capture_nic)) IN (SELECT vtap_id,tap_port FROM flow_tag.vtap_port_map WHERE tap_port!=0 AND device_type="+deviceTypeValueStr+" AND device_name %s %s)",
+				"(toUInt64(agent_id),toUInt64(capture_nic)) IN (SELECT vtap_id,tap_port FROM flow_tag.vtap_port_map WHERE tap_port!=0 AND device_type="+deviceTypeValueStr+" AND %s(device_name,%s))",
 			)}
 		tagResourceMap[tapPortResourceID] = map[string]*Tag{
 			"default": NewTag(
-				"dictGet(flow_tag.vtap_port_map, 'device_id', (toUInt64(vtap_id),toUInt64(tap_port)))",
-				"(toUInt64(vtap_id),toUInt64(tap_port)) IN (SELECT vtap_id,tap_port FROM flow_tag.vtap_port_map WHERE tap_port!=0 AND device_type="+deviceTypeValueStr+")",
-				"(toUInt64(vtap_id),toUInt64(tap_port)) IN (SELECT vtap_id,tap_port FROM flow_tag.vtap_port_map WHERE tap_port!=0 AND device_type="+deviceTypeValueStr+" AND device_id %s %s)",
+				"dictGet(flow_tag.vtap_port_map, 'device_id', (toUInt64(agent_id),toUInt64(capture_nic)))",
+				"(toUInt64(agent_id),toUInt64(capture_nic)) IN (SELECT vtap_id,tap_port FROM flow_tag.vtap_port_map WHERE tap_port!=0 AND device_type="+deviceTypeValueStr+")",
+				"(toUInt64(agent_id),toUInt64(capture_nic)) IN (SELECT vtap_id,tap_port FROM flow_tag.vtap_port_map WHERE tap_port!=0 AND device_type="+deviceTypeValueStr+" AND device_id %s %s)",
 				"",
 			)}
 	}
+	// Policy
+	tagResourceMap["policy_id"] = map[string]*Tag{
+		"default": NewTag(
+			"if(tunnel_ip_id=0,dictGet(flow_tag.policy_map, 'id', (toUInt64(0),toUInt64(acl_gid))),dictGet(flow_tag.policy_map, 'id', (toUInt64(1),toUInt64(acl_gid))))",
+			"",
+			"if(tunnel_ip_id=0,dictGet(flow_tag.policy_map, 'id', (toUInt64(0),toUInt64(acl_gid))),dictGet(flow_tag.policy_map, 'id', (toUInt64(1),toUInt64(acl_gid)))) %s %s",
+			"",
+		),
+	}
+	tagResourceMap["policy"] = map[string]*Tag{
+		"default": NewTag(
+			"if(tunnel_ip_id=0,dictGet(flow_tag.policy_map, 'name', (toUInt64(0),toUInt64(acl_gid))),dictGet(flow_tag.policy_map, 'name', (toUInt64(1),toUInt64(acl_gid))))",
+			"",
+			"(if(tunnel_ip_id=0,toUInt64(0),toUInt64(1)),toUInt64(acl_gid)) IN (SELECT tunnel_type,acl_gid FROM flow_tag.policy_map WHERE name %s %s)",
+			"(if(tunnel_ip_id=0,toUInt64(0),toUInt64(1)),toUInt64(acl_gid)) IN (SELECT tunnel_type,acl_gid FROM flow_tag.policy_map WHERE %s(name,%s))",
+		),
+	}
+	// Npb Tunnel
+	tagResourceMap["npb_tunnel_id"] = map[string]*Tag{
+		"default": NewTag(
+			"tunnel_ip_id",
+			"",
+			"tunnel_ip_id %s %s",
+			"",
+		),
+	}
+	tagResourceMap["npb_tunnel"] = map[string]*Tag{
+		"default": NewTag(
+			"dictGet(flow_tag.npb_tunnel_map, 'name', toUInt64(tunnel_ip_id))",
+			"",
+			"toUInt64(tunnel_ip_id) IN (SELECT id FROM flow_tag.npb_tunnel_map WHERE name %s %s)",
+			"toUInt64(tunnel_ip_id) IN (SELECT id FROM flow_tag.npb_tunnel_map WHERE %s(name,%s))",
+		),
+	}
+
+	for _, suffix := range []string{"", "_0", "_1"} {
+		for resource, fieldInfo := range HOSTNAME_IP_DEVICE_MAP {
+			deviceTypeValue := fieldInfo.ResourceType
+			deviceTypeValueStr := strconv.Itoa(deviceTypeValue)
+
+			fieldName := fieldInfo.FieldName
+			resourceStr := fieldInfo.ResourceName
+
+			resourceIDSuffix := resource + "_id" + suffix
+			resourceSuffix := resource + suffix
+			if deviceTypeValue == VIF_DEVICE_TYPE_VM {
+				deviceTypeSuffix := "l3_device_type" + suffix
+				idNameSuffix := "l3_device_id" + suffix
+				tagResourceMap[resourceIDSuffix] = map[string]*Tag{
+					"default": NewTag(
+						"if("+deviceTypeSuffix+"="+deviceTypeValueStr+","+idNameSuffix+", 0)",
+						idNameSuffix+"!=0 AND "+deviceTypeSuffix+"="+deviceTypeValueStr,
+						idNameSuffix+" %s %s AND "+deviceTypeSuffix+"="+deviceTypeValueStr,
+						"",
+					)}
+				tagResourceMap[resourceSuffix] = map[string]*Tag{
+					"default": NewTag(
+						"if("+deviceTypeSuffix+"="+deviceTypeValueStr+", "+
+							"dictGet(flow_tag.device_map, '"+fieldName+"', "+
+							"(toUInt64("+deviceTypeValueStr+"),toUInt64("+idNameSuffix+"))), '')",
+						idNameSuffix+"!=0 AND "+deviceTypeSuffix+"="+deviceTypeValueStr,
+						"toUInt64("+idNameSuffix+") IN (SELECT deviceid FROM flow_tag.device_map "+
+							"WHERE "+fieldName+" %s %s AND devicetype="+deviceTypeValueStr+") "+
+							"AND "+deviceTypeSuffix+"="+deviceTypeValueStr,
+						"toUInt64("+idNameSuffix+") IN (SELECT deviceid FROM flow_tag.device_map "+
+							"WHERE %s("+fieldName+",%s) AND devicetype="+deviceTypeValueStr+") "+
+							"AND "+deviceTypeSuffix+"="+deviceTypeValueStr,
+					),
+					"node_type": NewTag(
+						"'"+resourceStr+"'",
+						"",
+						"",
+						"",
+					),
+					"icon_id": NewTag(
+						"if("+deviceTypeSuffix+"="+deviceTypeValueStr+", dictGet(flow_tag.device_map, 'icon_id', (toUInt64("+deviceTypeValueStr+"),toUInt64("+idNameSuffix+"))), 0)",
+						"",
+						"",
+						"",
+					)}
+			} else {
+				idNameSuffix := fieldInfo.ResourceName + "_id" + suffix
+				var iconIdTrans string
+				if deviceTypeValue == VIF_DEVICE_TYPE_HOST {
+					iconIdTrans = "dictGet(flow_tag.device_map, 'icon_id', (toUInt64(" + deviceTypeValueStr + "),toUInt64(" + idNameSuffix + ")))"
+				} else {
+					iconIdTrans = "dictGet(flow_tag." + resourceStr + "_map, 'icon_id', (toUInt64(" + idNameSuffix + ")))"
+				}
+
+				tagResourceMap[resourceIDSuffix] = map[string]*Tag{
+					"default": NewTag(
+						idNameSuffix,
+						idNameSuffix+"!=0",
+						idNameSuffix+" %s %s",
+						"",
+					)}
+				tagResourceMap[resourceSuffix] = map[string]*Tag{
+					"default": NewTag(
+						"dictGet(flow_tag.device_map, '"+fieldName+"', (toUInt64("+deviceTypeValueStr+"),toUInt64("+idNameSuffix+")))",
+						idNameSuffix+"!=0",
+						"toUInt64("+idNameSuffix+") IN (SELECT deviceid FROM flow_tag.device_map WHERE "+fieldName+" %s %s AND devicetype="+deviceTypeValueStr+")",
+						"toUInt64("+idNameSuffix+") IN (SELECT deviceid FROM flow_tag.device_map WHERE %s("+fieldName+",%s) AND devicetype="+deviceTypeValueStr+")",
+					),
+					"node_type": NewTag(
+						"'"+resourceStr+"'",
+						"",
+						"",
+						"",
+					),
+					"icon_id": NewTag(iconIdTrans, "", "", "")}
+			}
+		}
+	}
+	// X_Request_ID
+	tagResourceMap["x_request_id"] = map[string]*Tag{
+		"default": NewTag(
+			"",
+			"",
+			"x_request_id_0 %s %s OR x_request_id_1 %s %s",
+			"",
+		),
+	}
+	// Syscall_Thread
+	tagResourceMap["syscall_thread"] = map[string]*Tag{
+		"default": NewTag(
+			"",
+			"",
+			"syscall_thread_0 %s %s OR syscall_thread_1 %s %s",
+			"",
+		),
+	}
+	// Syscall_Coroutine
+	tagResourceMap["syscall_coroutine"] = map[string]*Tag{
+		"default": NewTag(
+			"",
+			"",
+			"syscall_coroutine_0 %s %s OR syscall_coroutine_1 %s %s",
+			"",
+		),
+	}
+	// Syscall_Cap_Seq
+	tagResourceMap["syscall_cap_seq"] = map[string]*Tag{
+		"default": NewTag(
+			"",
+			"",
+			"syscall_cap_seq_0 %s %s OR syscall_cap_seq_1 %s %s",
+			"",
+		),
+	}
+	// Syscall_Trace_ID
+	tagResourceMap["syscall_trace_id"] = map[string]*Tag{
+		"default": NewTag(
+			"",
+			"",
+			"syscall_trace_id_request %s %s OR syscall_trace_id_response %s %s",
+			"",
+		),
+	}
+	// Tcp_Seq
+	tagResourceMap["tcp_seq"] = map[string]*Tag{
+		"default": NewTag(
+			"",
+			"",
+			"req_tcp_seq %s %s OR resp_tcp_seq %s %s",
+			"",
+		),
+	}
+	return tagResourceMap
+}
+
+func GenerateFlowTagTagResoureMap() map[string]map[string]*Tag {
+	tagResourceMap := make(map[string]map[string]*Tag)
+
+	tagResourceMap["value"] = map[string]*Tag{
+		"default": NewTag(
+			"",
+			"",
+			"value %s %s",
+			"%s(value, %s)",
+		),
+	}
+	tagResourceMap["display_name"] = map[string]*Tag{
+		"default": NewTag(
+			"",
+			"",
+			"display_name %s %s",
+			"%s (display_name,%s)",
+		),
+	}
+
+	tagResourceMap["other_id"] = map[string]*Tag{
+		"default": NewTag(
+			"",
+			"",
+			"%s %s %s",
+			"%s (%s, %s)",
+		),
+	}
+
+	tagResourceMap["ip_resource_name"] = map[string]*Tag{
+		"default": NewTag(
+			"",
+			"",
+			"%s_name %s %s",
+			"%s (%s_name, %s)",
+		),
+	}
+	tagResourceMap["other_name"] = map[string]*Tag{
+		"default": NewTag(
+			"",
+			"",
+			"toUInt64(%s_id) IN (SELECT id FROM flow_tag.%s WHERE name %s %s)",
+			"toUInt64(%s_id) IN (SELECT id FROM flow_tag.%s WHERE %s(name,%s))",
+		),
+	}
+	tagResourceMap["device_name"] = map[string]*Tag{
+		"default": NewTag(
+			"",
+			"",
+			"toUInt64(%s_id) IN (SELECT deviceid FROM flow_tag.device_map WHERE name %s %s AND devicetype=%d)",
+			"toUInt64(%s_id) IN (SELECT deviceid FROM flow_tag.device_map WHERE %s(name,%s) AND devicetype=%d )",
+		),
+	}
+
+	//enum
+	tagResourceMap["enum_tag_id"] = map[string]*Tag{
+		"default": NewTag(
+			"",
+			"",
+			"value %s %s",
+			"%s (value, %s)",
+		),
+	}
+
+	tagResourceMap["enum_tag_name"] = map[string]*Tag{
+		"default": NewTag(
+			"",
+			"",
+			"name %s %s",
+			"%s (name, %s)",
+		),
+		"enum": NewTag(
+			"",
+			"",
+			"name %s %s",
+			"%s (name, %s)",
+		),
+	}
+
 	return tagResourceMap
 }

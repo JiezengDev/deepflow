@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -133,8 +133,7 @@ bitflags! {
         const TAP_PORT = 1<<49;
         const L7_PROTOCOL = 1<<51;
 
-        const TAG_TYPE = 1<<62;
-        const TAG_VALUE = 1<<63;
+        const TUNNEL_IP_ID = 1<<62;
     }
 }
 
@@ -271,18 +270,6 @@ impl From<SpanKind> for TapSide {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-#[repr(u8)]
-pub enum TagType {
-    TunnelIpId = 4,
-}
-
-impl Default for TagType {
-    fn default() -> Self {
-        TagType::TunnelIpId
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Tagger {
     pub code: Code,
@@ -304,7 +291,7 @@ pub struct Tagger {
     pub tap_side: TapSide,
     pub protocol: IpProtocol,
     pub acl_gid: u16,
-    pub server_port: u16,
+    pub server_port: u16, // tunnel_ip_id also uses this field
     pub vtap_id: u16,
     pub tap_port: TapPort,
     pub tap_type: TapType,
@@ -313,13 +300,12 @@ pub struct Tagger {
     pub gpid: u32,
     pub gpid_1: u32,
 
-    pub tag_type: TagType,
-    pub tag_value: u16,
     pub otel_service: Option<String>,
     pub otel_instance: Option<String>,
     pub endpoint: Option<String>,
+    pub biz_type: u8,
     pub signal_source: SignalSource,
-    pub netns_id: u32,
+    pub pod_id: u32,
 }
 
 impl Default for Tagger {
@@ -348,13 +334,12 @@ impl Default for Tagger {
             gpid: 0,
             gpid_1: 0,
 
-            tag_type: TagType::default(),
-            tag_value: 0,
             otel_service: None,
             otel_instance: None,
             endpoint: None,
             signal_source: SignalSource::default(),
-            netns_id: 0,
+            pod_id: 0,
+            biz_type: 0,
         }
     }
 }
@@ -393,7 +378,7 @@ impl From<Tagger> for metric::MiniTag {
                 l3_epc_id: t.l3_epc_id as i32,
                 l3_epc_id1: t.l3_epc_id1 as i32,
                 mac: t.mac.into(),
-                mac1: t.mac.into(),
+                mac1: t.mac1.into(),
                 direction: t.direction as u32,
                 tap_side: TapSide::from(t.direction) as u32,
                 protocol: u8::from(t.protocol) as u32,
@@ -403,15 +388,14 @@ impl From<Tagger> for metric::MiniTag {
                 tap_port: t.tap_port.0,
                 tap_type: u16::from(t.tap_type) as u32,
                 l7_protocol: t.l7_protocol as u32,
-                tag_type: t.tag_type as u32,
-                tag_value: t.tag_value as u32,
                 gpid: t.gpid,
                 gpid1: t.gpid_1,
                 signal_source: t.signal_source as u32,
                 app_service: t.otel_service.unwrap_or_default(),
                 app_instance: t.otel_instance.unwrap_or_default(),
                 endpoint: t.endpoint.unwrap_or_default(),
-                netns_id: t.netns_id,
+                pod_id: t.pod_id,
+                biz_type: t.biz_type as u32,
             }),
         }
     }

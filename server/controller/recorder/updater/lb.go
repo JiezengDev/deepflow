@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,30 +18,55 @@ package updater
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
-	"github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type LB struct {
-	UpdaterBase[cloudmodel.LB, mysql.LB, *cache.LB]
+	UpdaterBase[
+		cloudmodel.LB,
+		mysql.LB,
+		*diffbase.LB,
+		*message.LBAdd,
+		message.LBAdd,
+		*message.LBUpdate,
+		message.LBUpdate,
+		*message.LBFieldsUpdate,
+		message.LBFieldsUpdate,
+		*message.LBDelete,
+		message.LBDelete]
 }
 
 func NewLB(wholeCache *cache.Cache, cloudData []cloudmodel.LB) *LB {
 	updater := &LB{
-		UpdaterBase[cloudmodel.LB, mysql.LB, *cache.LB]{
-			cache:        wholeCache,
-			dbOperator:   db.NewLB(),
-			diffBaseData: wholeCache.LBs,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.LB,
+			mysql.LB,
+			*diffbase.LB,
+			*message.LBAdd,
+			message.LBAdd,
+			*message.LBUpdate,
+			message.LBUpdate,
+			*message.LBFieldsUpdate,
+			message.LBFieldsUpdate,
+			*message.LBDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_LB_EN,
+			wholeCache,
+			db.NewLB().SetORG(wholeCache.GetORG()),
+			wholeCache.DiffBaseDataSet.LBs,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
 }
 
-func (l *LB) getDiffBaseByCloudItem(cloudItem *cloudmodel.LB) (diffBase *cache.LB, exists bool) {
+func (l *LB) getDiffBaseByCloudItem(cloudItem *cloudmodel.LB) (diffBase *diffbase.LB, exists bool) {
 	diffBase, exists = l.diffBaseData[cloudItem.Lcuuid]
 	return
 }
@@ -49,10 +74,10 @@ func (l *LB) getDiffBaseByCloudItem(cloudItem *cloudmodel.LB) (diffBase *cache.L
 func (l *LB) generateDBItemToAdd(cloudItem *cloudmodel.LB) (*mysql.LB, bool) {
 	vpcID, exists := l.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
-			common.RESOURCE_TYPE_VPC_EN, cloudItem.VPCLcuuid,
-			common.RESOURCE_TYPE_LB_EN, cloudItem.Lcuuid,
-		))
+		log.Error(l.org.LogPre(resourceAForResourceBNotFound(
+			ctrlrcommon.RESOURCE_TYPE_VPC_EN, cloudItem.VPCLcuuid,
+			ctrlrcommon.RESOURCE_TYPE_LB_EN, cloudItem.Lcuuid,
+		)))
 		return nil, false
 	}
 
@@ -70,23 +95,25 @@ func (l *LB) generateDBItemToAdd(cloudItem *cloudmodel.LB) (*mysql.LB, bool) {
 	return dbItem, true
 }
 
-func (l *LB) generateUpdateInfo(diffBase *cache.LB, cloudItem *cloudmodel.LB) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (l *LB) generateUpdateInfo(diffBase *diffbase.LB, cloudItem *cloudmodel.LB) (*message.LBFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.LBFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
-		updateInfo["name"] = cloudItem.Name
+		mapInfo["name"] = cloudItem.Name
+		structInfo.Name.Set(diffBase.Name, cloudItem.Name)
 	}
 	if diffBase.Model != cloudItem.Model {
-		updateInfo["model"] = cloudItem.Model
+		mapInfo["model"] = cloudItem.Model
+		structInfo.Model.Set(diffBase.Model, cloudItem.Model)
 	}
 	if diffBase.VIP != cloudItem.VIP {
-		updateInfo["vip"] = cloudItem.VIP
+		mapInfo["vip"] = cloudItem.VIP
+		structInfo.VIP.Set(diffBase.VIP, cloudItem.VIP)
 	}
 	if diffBase.RegionLcuuid != cloudItem.RegionLcuuid {
-		updateInfo["region"] = cloudItem.RegionLcuuid
+		mapInfo["region"] = cloudItem.RegionLcuuid
+		structInfo.RegionLcuuid.Set(diffBase.RegionLcuuid, cloudItem.RegionLcuuid)
 	}
 
-	if len(updateInfo) > 0 {
-		return updateInfo, true
-	}
-	return nil, false
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

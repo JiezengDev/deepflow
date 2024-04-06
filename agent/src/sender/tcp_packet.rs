@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -152,6 +152,10 @@ impl TcpPacketSender {
                                         let now = SystemTime::now()
                                             .duration_since(SystemTime::UNIX_EPOCH)
                                             .unwrap();
+                                        // If the local timestamp adjustment requires recalculating the interval
+                                        if last_err_time > now {
+                                            last_err_time = now;
+                                        }
                                         if now > last_err_time + ERR_INTERVAL {
                                             warn!("send tcp packet failed: {}", e);
                                             last_err_time = now;

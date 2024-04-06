@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,12 +24,12 @@ import (
 	"time"
 
 	"github.com/golang/protobuf/proto"
-
 	logging "github.com/op/go-logging"
 	v1 "go.opentelemetry.io/proto/otlp/trace/v1"
 
 	"github.com/deepflowio/deepflow/server/ingester/common"
-	"github.com/deepflowio/deepflow/server/ingester/flow_log/exporter"
+	"github.com/deepflowio/deepflow/server/ingester/flow_log/config"
+	"github.com/deepflowio/deepflow/server/ingester/flow_log/exporters"
 	"github.com/deepflowio/deepflow/server/ingester/flow_log/log_data"
 	"github.com/deepflowio/deepflow/server/ingester/flow_log/throttler"
 	"github.com/deepflowio/deepflow/server/ingester/flow_tag"
@@ -79,7 +79,8 @@ type Decoder struct {
 	inQueue       queue.QueueReader
 	throttler     *throttler.ThrottlingQueue
 	flowTagWriter *flow_tag.FlowTagWriter
-	otlpExporter  *exporter.OtlpExporter
+	exporters     *exporters.Exporters
+	cfg           *config.Config
 	debugEnabled  bool
 
 	fieldsBuf      []interface{}
@@ -95,7 +96,8 @@ func NewDecoder(
 	inQueue queue.QueueReader,
 	throttler *throttler.ThrottlingQueue,
 	flowTagWriter *flow_tag.FlowTagWriter,
-	otlpExporter *exporter.OtlpExporter,
+	exporters *exporters.Exporters,
+	cfg *config.Config,
 ) *Decoder {
 	return &Decoder{
 		index:          index,
@@ -104,7 +106,8 @@ func NewDecoder(
 		inQueue:        inQueue,
 		throttler:      throttler,
 		flowTagWriter:  flowTagWriter,
-		otlpExporter:   otlpExporter,
+		exporters:      exporters,
+		cfg:            cfg,
 		debugEnabled:   log.IsEnabledFor(logging.DEBUG),
 		fieldsBuf:      make([]interface{}, 0, 64),
 		fieldValuesBuf: make([]interface{}, 0, 64),
@@ -242,7 +245,7 @@ func (d *Decoder) sendOpenMetetry(vtapID uint16, tracesData *v1.TracesData) {
 		log.Debugf("decoder %d vtap %d recv otel: %s", d.index, vtapID, tracesData)
 	}
 	d.counter.Count++
-	ls := log_data.OTelTracesDataToL7FlowLogs(vtapID, tracesData, d.platformData)
+	ls := log_data.OTelTracesDataToL7FlowLogs(vtapID, tracesData, d.platformData, d.cfg)
 	for _, l := range ls {
 		l.AddReferenceCount()
 		if !d.throttler.SendWithThrottling(l) {
@@ -251,7 +254,7 @@ func (d *Decoder) sendOpenMetetry(vtapID uint16, tracesData *v1.TracesData) {
 			d.fieldsBuf, d.fieldValuesBuf = d.fieldsBuf[:0], d.fieldValuesBuf[:0]
 			l.GenerateNewFlowTags(d.flowTagWriter.Cache)
 			d.flowTagWriter.WriteFieldsAndFieldValuesInCache()
-			d.otlpExport(l)
+			d.export(l)
 		}
 		l.Release()
 	}
@@ -293,10 +296,9 @@ func (d *Decoder) sendFlow(flow *pb.TaggedFlow) {
 	}
 }
 
-func (d *Decoder) otlpExport(l *log_data.L7FlowLog) {
-	if d.otlpExporter != nil && d.otlpExporter.IsExportData(datatype.SignalSource(l.SignalSource)) {
-		l.AddReferenceCount()
-		d.otlpExporter.Put(l)
+func (d *Decoder) export(l *log_data.L7FlowLog) {
+	if d.exporters != nil {
+		d.exporters.Put(l, d.index)
 	}
 }
 
@@ -305,20 +307,18 @@ func (d *Decoder) sendProto(proto *pb.AppProtoLogsData) {
 		log.Debugf("decoder %d recv proto: %s", d.index, proto)
 	}
 
-	dropped := false
-	l := log_data.ProtoLogToL7FlowLog(proto, d.platformData)
+	l := log_data.ProtoLogToL7FlowLog(proto, d.platformData, d.cfg)
 	l.AddReferenceCount()
-	if d.throttler.SendWithThrottling(l) {
+	sent := d.throttler.SendWithThrottling(l)
+	if sent {
 		if d.flowTagWriter != nil {
 			d.fieldsBuf, d.fieldValuesBuf = d.fieldsBuf[:0], d.fieldValuesBuf[:0]
 			l.GenerateNewFlowTags(d.flowTagWriter.Cache)
 			d.flowTagWriter.WriteFieldsAndFieldValuesInCache()
 		}
-		d.otlpExport(l)
-	} else {
-		dropped = true
+		d.export(l)
 	}
-	d.updateCounter(datatype.L7Protocol(proto.Base.Head.Proto), dropped)
+	d.updateCounter(datatype.L7Protocol(proto.Base.Head.Proto), !sent)
 	l.Release()
 	proto.Release()
 
@@ -332,7 +332,7 @@ func (d *Decoder) updateCounter(l7Protocol datatype.L7Protocol, dropped bool) {
 		drop = 1
 	}
 	switch l7Protocol {
-	case datatype.L7_PROTOCOL_HTTP_1, datatype.L7_PROTOCOL_HTTP_2, datatype.L7_PROTOCOL_HTTP_1_TLS, datatype.L7_PROTOCOL_HTTP_2_TLS:
+	case datatype.L7_PROTOCOL_HTTP_1, datatype.L7_PROTOCOL_HTTP_2:
 		d.counter.L7HTTPCount++
 		d.counter.L7HTTPDropCount += drop
 	case datatype.L7_PROTOCOL_DNS:
@@ -358,4 +358,5 @@ func (d *Decoder) flush() {
 		d.throttler.SendWithThrottling(nil)
 		d.throttler.SendWithoutThrottling(nil)
 	}
+	d.export(nil)
 }

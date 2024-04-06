@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,14 +23,17 @@ import (
 	"net"
 	"time"
 
+	"github.com/deepflowio/deepflow/server/ingester/config"
 	"github.com/deepflowio/deepflow/server/ingester/flow_log/common"
+	flowlogCfg "github.com/deepflowio/deepflow/server/ingester/flow_log/config"
 	"github.com/deepflowio/deepflow/server/ingester/flow_tag"
 	"github.com/deepflowio/deepflow/server/libs/ckdb"
 	"github.com/deepflowio/deepflow/server/libs/datatype"
 	"github.com/deepflowio/deepflow/server/libs/datatype/pb"
+	flow_metrics "github.com/deepflowio/deepflow/server/libs/flow-metrics"
 	"github.com/deepflowio/deepflow/server/libs/grpc"
 	"github.com/deepflowio/deepflow/server/libs/pool"
-	"github.com/deepflowio/deepflow/server/libs/zerodoc"
+	"github.com/deepflowio/deepflow/server/libs/utils"
 
 	"github.com/google/gopacket/layers"
 	logging "github.com/op/go-logging"
@@ -56,22 +59,21 @@ type L7Base struct {
 
 	// 流信息
 	FlowID       uint64 `json:"flow_id"`
-	TapType      uint8  `json:"tap_type"`
+	TapType      uint8  `json:"capture_network_type_id"`
 	NatSource    uint8  `json:"nat_source"`
-	TapPortType  uint8  `json:"tap_port_type"`
+	TapPortType  uint8  `json:"capture_nic_type"`
 	SignalSource uint16 `json:"signal_source"`
 	TunnelType   uint8  `json:"tunnel_type"`
-	TapPort      uint32 `json:"tap_port"`
-	TapSide      string `json:"tap_side"`
-	VtapID       uint16 `json:"vtap_id"`
+	TapPort      uint32 `json:"capture_nic"`
+	TapSide      string `json:"observation_point"`
+	VtapID       uint16 `json:"agent_id"`
 	ReqTcpSeq    uint32 `json:"req_tcp_seq"`
 	RespTcpSeq   uint32 `json:"resp_tcp_seq"`
 	StartTime    int64  `json:"start_time"` // us
 	EndTime      int64  `json:"end_time"`   // us
 	GPID0        uint32
 	GPID1        uint32
-	NetnsID0     uint32
-	NetnsID1     uint32
+	BizType      uint8
 
 	ProcessID0             uint32
 	ProcessID1             uint32
@@ -81,6 +83,8 @@ type L7Base struct {
 	SyscallTraceIDResponse uint64
 	SyscallThread0         uint32
 	SyscallThread1         uint32
+	SyscallCoroutine0      uint64
+	SyscallCoroutine1      uint64
 	SyscallCapSeq0         uint32
 	SyscallCapSeq1         uint32
 }
@@ -105,22 +109,21 @@ func L7BaseColumns() []*ckdb.Column {
 
 		// 流信息
 		ckdb.NewColumn("flow_id", ckdb.UInt64).SetIndex(ckdb.IndexMinmax),
-		ckdb.NewColumn("tap_type", ckdb.UInt8).SetIndex(ckdb.IndexSet),
+		ckdb.NewColumn("capture_network_type_id", ckdb.UInt8).SetIndex(ckdb.IndexSet),
 		ckdb.NewColumn("nat_source", ckdb.UInt8).SetIndex(ckdb.IndexSet),
-		ckdb.NewColumn("tap_port_type", ckdb.UInt8).SetIndex(ckdb.IndexNone),
+		ckdb.NewColumn("capture_nic_type", ckdb.UInt8).SetIndex(ckdb.IndexNone),
 		ckdb.NewColumn("signal_source", ckdb.UInt16).SetIndex(ckdb.IndexNone),
 		ckdb.NewColumn("tunnel_type", ckdb.UInt8).SetIndex(ckdb.IndexNone),
-		ckdb.NewColumn("tap_port", ckdb.UInt32).SetIndex(ckdb.IndexNone),
-		ckdb.NewColumn("tap_side", ckdb.LowCardinalityString),
-		ckdb.NewColumn("vtap_id", ckdb.UInt16).SetIndex(ckdb.IndexSet),
+		ckdb.NewColumn("capture_nic", ckdb.UInt32).SetIndex(ckdb.IndexNone),
+		ckdb.NewColumn("observation_point", ckdb.LowCardinalityString),
+		ckdb.NewColumn("agent_id", ckdb.UInt16).SetIndex(ckdb.IndexSet),
 		ckdb.NewColumn("req_tcp_seq", ckdb.UInt32),
 		ckdb.NewColumn("resp_tcp_seq", ckdb.UInt32),
 		ckdb.NewColumn("start_time", ckdb.DateTime64us).SetComment("精度: 微秒"),
 		ckdb.NewColumn("end_time", ckdb.DateTime64us).SetComment("精度: 微秒"),
 		ckdb.NewColumn("gprocess_id_0", ckdb.UInt32).SetComment("全局客户端进程ID"),
 		ckdb.NewColumn("gprocess_id_1", ckdb.UInt32).SetComment("全局服务端进程ID"),
-		ckdb.NewColumn("netns_id_0", ckdb.UInt32).SetComment("客户端网络命名空间ID"),
-		ckdb.NewColumn("netns_id_1", ckdb.UInt32).SetComment("服务端网络命名空间ID"),
+		ckdb.NewColumn("biz_type", ckdb.UInt8).SetComment("Business Type"),
 
 		ckdb.NewColumn("process_id_0", ckdb.Int32).SetComment("客户端进程ID"),
 		ckdb.NewColumn("process_id_1", ckdb.Int32).SetComment("服务端进程ID"),
@@ -130,6 +133,8 @@ func L7BaseColumns() []*ckdb.Column {
 		ckdb.NewColumn("syscall_trace_id_response", ckdb.UInt64).SetComment("SyscallTraceID-响应"),
 		ckdb.NewColumn("syscall_thread_0", ckdb.UInt32).SetComment("Syscall线程-请求"),
 		ckdb.NewColumn("syscall_thread_1", ckdb.UInt32).SetComment("Syscall线程-响应"),
+		ckdb.NewColumn("syscall_coroutine_0", ckdb.UInt64).SetComment("Request Syscall Coroutine"),
+		ckdb.NewColumn("syscall_coroutine_1", ckdb.UInt64).SetComment("Response Syscall Coroutine"),
 		ckdb.NewColumn("syscall_cap_seq_0", ckdb.UInt32).SetComment("Syscall序列号-请求"),
 		ckdb.NewColumn("syscall_cap_seq_1", ckdb.UInt32).SetComment("Syscall序列号-响应"),
 	)
@@ -166,8 +171,7 @@ func (f *L7Base) WriteBlock(block *ckdb.Block) {
 		f.EndTime,
 		f.GPID0,
 		f.GPID1,
-		f.NetnsID0,
-		f.NetnsID1,
+		f.BizType,
 
 		int32(f.ProcessID0),
 		int32(f.ProcessID1),
@@ -177,6 +181,8 @@ func (f *L7Base) WriteBlock(block *ckdb.Block) {
 		f.SyscallTraceIDResponse,
 		f.SyscallThread0,
 		f.SyscallThread1,
+		f.SyscallCoroutine0,
+		f.SyscallCoroutine1,
 		f.SyscallCapSeq0,
 		f.SyscallCapSeq1)
 }
@@ -191,6 +197,7 @@ type L7FlowLog struct {
 	L7ProtocolStr string
 	Version       string
 	Type          uint8
+	IsTLS         uint8
 
 	RequestType     string
 	RequestDomain   string
@@ -211,6 +218,7 @@ type L7FlowLog struct {
 	XRequestId0     string
 	XRequestId1     string
 	TraceId         string
+	TraceIdIndex    uint64
 	SpanId          string
 	ParentSpanId    string
 	SpanKind        uint8
@@ -232,22 +240,25 @@ type L7FlowLog struct {
 
 	MetricsNames  []string
 	MetricsValues []float64
+
+	Events string
 }
 
 func L7FlowLogColumns() []*ckdb.Column {
 	l7Columns := []*ckdb.Column{}
-	l7Columns = append(l7Columns, ckdb.NewColumn("_id", ckdb.UInt64).SetCodec(ckdb.CodecDoubleDelta))
+	l7Columns = append(l7Columns, ckdb.NewColumn("_id", ckdb.UInt64))
 	l7Columns = append(l7Columns, L7BaseColumns()...)
 	l7Columns = append(l7Columns,
 		ckdb.NewColumn("l7_protocol", ckdb.UInt8).SetIndex(ckdb.IndexNone).SetComment("0:未知 1:其他, 20:http1, 21:http2, 40:dubbo, 60:mysql, 80:redis, 100:kafka, 101:mqtt, 120:dns"),
 		ckdb.NewColumn("l7_protocol_str", ckdb.LowCardinalityString).SetIndex(ckdb.IndexNone).SetComment("应用协议"),
 		ckdb.NewColumn("version", ckdb.LowCardinalityString).SetComment("协议版本"),
 		ckdb.NewColumn("type", ckdb.UInt8).SetIndex(ckdb.IndexNone).SetComment("日志类型, 0:请求, 1:响应, 2:会话"),
+		ckdb.NewColumn("is_tls", ckdb.UInt8),
 
 		ckdb.NewColumn("request_type", ckdb.LowCardinalityString).SetComment("请求类型, HTTP请求方法、SQL命令类型、NoSQL命令类型、MQ命令类型、DNS查询类型"),
-		ckdb.NewColumn("request_domain", ckdb.String).SetComment("请求域名, HTTP主机名、RPC服务名称、DNS查询域名"),
-		ckdb.NewColumn("request_resource", ckdb.String).SetComment("请求资源, HTTP路径、RPC方法名称、SQL命令、NoSQL命令"),
-		ckdb.NewColumn("endpoint", ckdb.String).SetComment("端点"),
+		ckdb.NewColumn("request_domain", ckdb.String).SetIndex(ckdb.IndexBloomfilter).SetComment("请求域名, HTTP主机名、RPC服务名称、DNS查询域名"),
+		ckdb.NewColumn("request_resource", ckdb.String).SetIndex(ckdb.IndexBloomfilter).SetComment("请求资源, HTTP路径、RPC方法名称、SQL命令、NoSQL命令"),
+		ckdb.NewColumn("endpoint", ckdb.String).SetIndex(ckdb.IndexBloomfilter).SetComment("端点"),
 		ckdb.NewColumn("request_id", ckdb.UInt64Nullable).SetComment("请求ID, HTTP请求ID、RPC请求ID、MQ请求ID、DNS请求ID"),
 
 		ckdb.NewColumn("response_status", ckdb.UInt8).SetComment("响应状态 0:正常, 1:异常 ,2:不存在，3:服务端异常, 4:客户端异常"),
@@ -256,9 +267,10 @@ func L7FlowLogColumns() []*ckdb.Column {
 		ckdb.NewColumn("response_result", ckdb.String).SetComment("响应结果, DNS解析地址"),
 
 		ckdb.NewColumn("http_proxy_client", ckdb.String).SetComment("HTTP代理客户端"),
-		ckdb.NewColumn("x_request_id_0", ckdb.String).SetComment("XRequestID0"),
-		ckdb.NewColumn("x_request_id_1", ckdb.String).SetComment("XRequestID1"),
-		ckdb.NewColumn("trace_id", ckdb.String).SetComment("TraceID"),
+		ckdb.NewColumn("x_request_id_0", ckdb.String).SetIndex(ckdb.IndexBloomfilter).SetComment("XRequestID0"),
+		ckdb.NewColumn("x_request_id_1", ckdb.String).SetIndex(ckdb.IndexBloomfilter).SetComment("XRequestID1"),
+		ckdb.NewColumn("trace_id", ckdb.String).SetIndex(ckdb.IndexBloomfilter).SetComment("TraceID"),
+		ckdb.NewColumn("trace_id_index", ckdb.UInt64).SetIndex(ckdb.IndexMinmax).SetComment("TraceIDIndex"),
 		ckdb.NewColumn("span_id", ckdb.String).SetComment("SpanID"),
 		ckdb.NewColumn("parent_span_id", ckdb.String).SetComment("ParentSpanID"),
 		ckdb.NewColumn("span_kind", ckdb.UInt8Nullable).SetComment("SpanKind"),
@@ -271,10 +283,11 @@ func L7FlowLogColumns() []*ckdb.Column {
 		ckdb.NewColumn("sql_affected_rows", ckdb.UInt64Nullable).SetComment("sql影响行数"),
 		ckdb.NewColumn("direction_score", ckdb.UInt8).SetIndex(ckdb.IndexMinmax),
 
-		ckdb.NewColumn("attribute_names", ckdb.ArrayString).SetComment("额外的属性"),
+		ckdb.NewColumn("attribute_names", ckdb.ArrayLowCardinalityString).SetComment("额外的属性"),
 		ckdb.NewColumn("attribute_values", ckdb.ArrayString).SetComment("额外的属性对应的值"),
-		ckdb.NewColumn("metrics_names", ckdb.ArrayString).SetComment("额外的指标"),
+		ckdb.NewColumn("metrics_names", ckdb.ArrayLowCardinalityString).SetComment("额外的指标"),
 		ckdb.NewColumn("metrics_values", ckdb.ArrayFloat64).SetComment("额外的指标对应的值"),
+		ckdb.NewColumn("events", ckdb.String).SetComment("OTel events"),
 	)
 	return l7Columns
 }
@@ -288,12 +301,14 @@ func (h *L7FlowLog) WriteBlock(block *ckdb.Block) {
 		h.L7ProtocolStr,
 		h.Version,
 		h.Type,
+		h.IsTLS,
+
 		h.RequestType,
 		h.RequestDomain,
 		h.RequestResource,
 		h.Endpoint,
-
 		h.RequestId,
+
 		h.ResponseStatus,
 		h.ResponseCode,
 		h.ResponseException,
@@ -303,6 +318,7 @@ func (h *L7FlowLog) WriteBlock(block *ckdb.Block) {
 		h.XRequestId0,
 		h.XRequestId1,
 		h.TraceId,
+		h.TraceIdIndex,
 		h.SpanId,
 		h.ParentSpanId,
 		h.spanKind,
@@ -317,8 +333,13 @@ func (h *L7FlowLog) WriteBlock(block *ckdb.Block) {
 		h.AttributeNames,
 		h.AttributeValues,
 		h.MetricsNames,
-		h.MetricsValues)
+		h.MetricsValues,
+		h.Events,
+	)
+}
 
+func (h *L7FlowLog) OrgID() uint16 {
+	return h.KnowledgeGraph.OrgId
 }
 
 func base64ToHexString(str string) string {
@@ -332,25 +353,46 @@ func base64ToHexString(str string) string {
 	return str
 }
 
-func (h *L7FlowLog) Fill(l *pb.AppProtoLogsData, platformData *grpc.PlatformInfoTable) {
+// for empty traceId, the traceId-index is the value of the previous traceId-index + 1, not 0.
+// when the traceId-index data is stored in CK, the generated minmax index will have min non-zero, which improves the filtering performance of the minmax index
+var lastTraceIdIndex uint64
+
+func parseTraceIdIndex(traceId string, traceIdIndexCfg *config.TraceIdWithIndex) uint64 {
+	if !traceIdIndexCfg.Enabled {
+		return 0
+	}
+	if len(traceId) == 0 {
+		return lastTraceIdIndex + 1
+	}
+	index, err := utils.GetTraceIdIndex(traceId, traceIdIndexCfg.TypeIsIncrementalId, traceIdIndexCfg.FormatIsHex, traceIdIndexCfg.IncrementalIdLocation.Start, traceIdIndexCfg.IncrementalIdLocation.Length)
+	if err != nil {
+		log.Debugf("parse traceIdIndex failed err %s", err)
+		return lastTraceIdIndex + 1
+	}
+	lastTraceIdIndex = index
+	return index
+}
+
+func (h *L7FlowLog) Fill(l *pb.AppProtoLogsData, platformData *grpc.PlatformInfoTable, cfg *flowlogCfg.Config) {
 	h.L7Base.Fill(l, platformData)
 
 	h.Type = uint8(l.Base.Head.MsgType)
+	h.IsTLS = uint8(l.Flags & 0x1)
 	h.L7Protocol = uint8(l.Base.Head.Proto)
 	if l.ExtInfo != nil && l.ExtInfo.ProtocolStr != "" {
 		h.L7ProtocolStr = l.ExtInfo.ProtocolStr
 	} else {
-		h.L7ProtocolStr = datatype.L7Protocol(h.L7Protocol).String()
+		h.L7ProtocolStr = datatype.L7Protocol(h.L7Protocol).String(h.IsTLS == 1)
 	}
 
 	h.ResponseStatus = uint8(datatype.STATUS_NOT_EXIST)
 	h.ResponseDuration = l.Base.Head.Rrt / uint64(time.Microsecond)
 	// 协议结构统一, 不再为每个协议定义单独结构
-	h.fillL7FlowLog(l)
+	h.fillL7FlowLog(l, cfg)
 }
 
 // requestLength,responseLength 等于 -1 会认为是没有值. responseCode=-32768 会认为没有值
-func (h *L7FlowLog) fillL7FlowLog(l *pb.AppProtoLogsData) {
+func (h *L7FlowLog) fillL7FlowLog(l *pb.AppProtoLogsData, cfg *flowlogCfg.Config) {
 	h.Version = l.Version
 	h.requestLength = int64(l.ReqLen)
 	h.responseLength = int64(l.RespLen)
@@ -374,7 +416,10 @@ func (h *L7FlowLog) fillL7FlowLog(l *pb.AppProtoLogsData) {
 		h.ResponseResult = l.Resp.Result
 		h.responseCode = l.Resp.Code
 		h.ResponseStatus = uint8(l.Resp.Status)
-		h.fillExceptionDesc(l)
+		h.ResponseException = l.Resp.Exception
+		if h.ResponseException == "" {
+			h.fillExceptionDesc(l)
+		}
 
 		if h.responseCode != datatype.L7PROTOCOL_LOG_RESP_CODE_NONE {
 			h.ResponseCode = &h.responseCode
@@ -407,12 +452,15 @@ func (h *L7FlowLog) fillL7FlowLog(l *pb.AppProtoLogsData) {
 		}
 		h.AttributeNames = append(h.AttributeNames, l.ExtInfo.AttributeNames...)
 		h.AttributeValues = append(h.AttributeValues, l.ExtInfo.AttributeValues...)
+		h.MetricsNames = append(h.MetricsNames, l.ExtInfo.MetricsNames...)
+		h.MetricsValues = append(h.MetricsValues, l.ExtInfo.MetricsValues...)
 	}
 	if l.TraceInfo != nil {
 		h.SpanId = l.TraceInfo.SpanId
 		h.TraceId = l.TraceInfo.TraceId
 		h.ParentSpanId = l.TraceInfo.ParentSpanId
 	}
+	h.TraceIdIndex = parseTraceIdIndex(h.TraceId, &cfg.Base.TraceIdWithIndex)
 
 	// 处理内置协议特殊情况
 	switch datatype.L7Protocol(h.L7Protocol) {
@@ -424,7 +472,7 @@ func (h *L7FlowLog) fillL7FlowLog(l *pb.AppProtoLogsData) {
 			}
 			h.RequestId = &h.requestId
 		}
-	case datatype.L7_PROTOCOL_PROTOBUF_RPC, datatype.L7_PROTOCOL_SOFARPC:
+	case datatype.L7_PROTOCOL_SOFARPC:
 		// assume protobuf and sofa rpc Always have request_id and maybe equal to 0
 		h.RequestId = &h.requestId
 	}
@@ -436,8 +484,7 @@ func (h *L7FlowLog) fillExceptionDesc(l *pb.AppProtoLogsData) {
 	}
 	code := l.Resp.Code
 	switch datatype.L7Protocol(h.L7Protocol) {
-	case datatype.L7_PROTOCOL_HTTP_1, datatype.L7_PROTOCOL_HTTP_2,
-		datatype.L7_PROTOCOL_HTTP_1_TLS, datatype.L7_PROTOCOL_HTTP_2_TLS:
+	case datatype.L7_PROTOCOL_HTTP_1, datatype.L7_PROTOCOL_HTTP_2:
 		h.ResponseException = GetHTTPExceptionDesc(uint16(code))
 	case datatype.L7_PROTOCOL_DNS:
 		h.ResponseException = GetDNSExceptionDesc(uint16(code))
@@ -516,7 +563,7 @@ func (b *L7Base) Fill(log *pb.AppProtoLogsData, platformData *grpc.PlatformInfoT
 		b.SignalSource = uint16(datatype.SIGNAL_SOURCE_EBPF)
 	}
 	b.TunnelType = uint8(tunnelType)
-	b.TapSide = zerodoc.TAPSideEnum(l.TapSide).String()
+	b.TapSide = flow_metrics.TAPSideEnum(l.TapSide).String()
 	b.VtapID = uint16(l.VtapId)
 	b.ReqTcpSeq = l.ReqTcpSeq
 	b.RespTcpSeq = l.RespTcpSeq
@@ -524,8 +571,7 @@ func (b *L7Base) Fill(log *pb.AppProtoLogsData, platformData *grpc.PlatformInfoT
 	b.EndTime = int64(l.EndTime) / int64(time.Microsecond)
 	b.GPID0 = l.Gpid_0
 	b.GPID1 = l.Gpid_1
-	b.NetnsID0 = l.NetnsId_0
-	b.NetnsID1 = l.NetnsId_1
+	b.BizType = uint8(l.BizType)
 
 	b.ProcessID0 = l.ProcessId_0
 	b.ProcessID1 = l.ProcessId_1
@@ -535,25 +581,14 @@ func (b *L7Base) Fill(log *pb.AppProtoLogsData, platformData *grpc.PlatformInfoT
 	b.SyscallTraceIDResponse = l.SyscallTraceIdResponse
 	b.SyscallThread0 = l.SyscallTraceIdThread_0
 	b.SyscallThread1 = l.SyscallTraceIdThread_1
+	b.SyscallCoroutine0 = l.SyscallCoroutine_0
+	b.SyscallCoroutine1 = l.SyscallCoroutine_1
 	b.SyscallCapSeq0 = l.SyscallCapSeq_0
 	b.SyscallCapSeq1 = l.SyscallCapSeq_1
 
 	// 知识图谱
 	b.Protocol = uint8(log.Base.Protocol)
-	if l.Gpid_0 != 0 && l.NetnsId_0 == 0 {
-		vtapId, netnsId := platformData.QueryGprocessInfo(l.Gpid_0)
-		if netnsId != 0 && l.VtapId == vtapId {
-			b.NetnsID0 = netnsId
-			b.TagSource0 |= uint8(zerodoc.GpId)
-		}
-	}
-	if l.Gpid_1 != 0 && l.NetnsId_1 == 0 {
-		vtapId, netnsId := platformData.QueryGprocessInfo(l.Gpid_0)
-		if netnsId != 0 && l.VtapId == vtapId {
-			b.NetnsID1 = netnsId
-			b.TagSource1 |= uint8(zerodoc.GpId)
-		}
-	}
+
 	b.KnowledgeGraph.FillL7(l, platformData, layers.IPProtocol(b.Protocol))
 }
 
@@ -566,7 +601,7 @@ func (k *KnowledgeGraph) FillL7(l *pb.AppProtoLogsBaseInfo, platformData *grpc.P
 		l.Ip6Src, l.Ip6Dst,
 		l.MacSrc, l.MacDst,
 		l.Gpid_0, l.Gpid_1,
-		l.VtapId, l.NetnsId_0, l.NetnsId_1,
+		uint16(l.VtapId), l.PodId_0, l.PodId_1,
 		uint16(l.PortDst),
 		l.TapSide,
 		protocol,
@@ -596,10 +631,10 @@ func ReleaseL7FlowLog(l *L7FlowLog) {
 
 var L7FlowLogCounter uint32
 
-func ProtoLogToL7FlowLog(l *pb.AppProtoLogsData, platformData *grpc.PlatformInfoTable) *L7FlowLog {
+func ProtoLogToL7FlowLog(l *pb.AppProtoLogsData, platformData *grpc.PlatformInfoTable, cfg *flowlogCfg.Config) *L7FlowLog {
 	h := AcquireL7FlowLog()
 	h._id = genID(uint32(l.Base.EndTime/uint64(time.Second)), &L7FlowLogCounter, platformData.QueryAnalyzerID())
-	h.Fill(l, platformData)
+	h.Fill(l, platformData, cfg)
 	return h
 }
 
@@ -620,6 +655,16 @@ func (h *L7FlowLog) GenerateNewFlowTags(cache *flow_tag.FlowTagCache) {
 	attributeNames := append(h.AttributeNames, extraFieldNamesNeedWriteFlowTag[:]...)
 	attributeValues := append(h.AttributeValues, extraFieldValuesNeedWriteFlowTag[:]...)
 
+	// avoid panic caused by different attributes lengths
+	namesLen, valuesLen := len(attributeNames), len(attributeValues)
+	minNamesLen := namesLen
+	if namesLen != valuesLen {
+		log.Warningf("the lengths of AttributeNames(%v) and attributeValues(%v) is different", attributeNames, attributeValues)
+		if namesLen > valuesLen {
+			minNamesLen = valuesLen
+		}
+	}
+
 	cache.Fields = cache.Fields[:0]
 	cache.FieldValues = cache.FieldValues[:0]
 
@@ -630,9 +675,11 @@ func (h *L7FlowLog) GenerateNewFlowTags(cache *flow_tag.FlowTagCache) {
 			Table:   common.L7_FLOW_ID.String(),
 			VpcId:   L3EpcIDs[idx],
 			PodNsId: PodNSIDs[idx],
+			OrgId:   h.OrgId,
+			TeamID:  h.TeamID,
 		}
 
-		for i, name := range attributeNames {
+		for i, name := range attributeNames[:minNamesLen] {
 			if attributeValues[i] == "" {
 				continue
 			}
@@ -650,7 +697,7 @@ func (h *L7FlowLog) GenerateNewFlowTags(cache *flow_tag.FlowTagCache) {
 					cache.FieldValueCache.Add(*flowTagInfo, time)
 				}
 			}
-			tagFieldValue := flow_tag.AcquireFlowTag()
+			tagFieldValue := flow_tag.AcquireFlowTag(flow_tag.TagFieldValue)
 			tagFieldValue.Timestamp = time
 			tagFieldValue.FlowTagInfo = *flowTagInfo
 			cache.FieldValues = append(cache.FieldValues, tagFieldValue)
@@ -668,7 +715,7 @@ func (h *L7FlowLog) GenerateNewFlowTags(cache *flow_tag.FlowTagCache) {
 					cache.FieldCache.Add(*flowTagInfo, time)
 				}
 			}
-			tagField := flow_tag.AcquireFlowTag()
+			tagField := flow_tag.AcquireFlowTag(flow_tag.TagField)
 			tagField.Timestamp = time
 			tagField.FlowTagInfo = *flowTagInfo
 			cache.Fields = append(cache.Fields, tagField)
@@ -686,7 +733,7 @@ func (h *L7FlowLog) GenerateNewFlowTags(cache *flow_tag.FlowTagCache) {
 					cache.FieldCache.Add(*flowTagInfo, time)
 				}
 			}
-			tagField := flow_tag.AcquireFlowTag()
+			tagField := flow_tag.AcquireFlowTag(flow_tag.TagField)
 			tagField.Timestamp = time
 			tagField.FlowTagInfo = *flowTagInfo
 			cache.Fields = append(cache.Fields, tagField)

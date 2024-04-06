@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,18 +14,18 @@
  * limitations under the License.
  */
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::mem;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::process::{self, Command};
+use std::process::Command;
 use std::str::FromStr;
 use std::sync::{
     self,
     atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
-    Arc, Weak,
+    Arc, Condvar, Weak,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
@@ -38,15 +38,18 @@ use prost::Message;
 use rand::RngCore;
 use sysinfo::{System, SystemExt};
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::{
+    broadcast,
+    mpsc::{self, UnboundedSender},
+};
 use tokio::task::JoinHandle;
 use tokio::time;
 
 use super::ntp::{NtpMode, NtpPacket, NtpTime};
 
-use crate::common::endpoint::EPC_FROM_INTERNET;
+use crate::common::endpoint::EPC_INTERNET;
 use crate::common::policy::Acl;
-use crate::common::policy::{Cidr, IpGroupData, PeerConnection};
+use crate::common::policy::{Cidr, Container, IpGroupData, PeerConnection};
 use crate::common::NORMAL_EXIT_WITH_RESTART;
 use crate::common::{FlowAclListener, PlatformData as VInterface, DEFAULT_CONTROLLER_PORT};
 use crate::config::RuntimeConfig;
@@ -60,14 +63,19 @@ use crate::utils::{
     },
     stats,
 };
-use public::proto::common::TridentType;
-use public::proto::trident::{self as tp, Exception, TapMode};
-use public::utils::net::{addr_list, is_unicast_link_local, MacAddr};
+use public::{
+    proto::{
+        common::TridentType,
+        trident::{self as tp, Exception, TapMode},
+    },
+    utils::net::{is_unicast_link_local, MacAddr},
+};
 
 const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(60);
 const RPC_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const NANOS_IN_SECOND: i64 = Duration::from_secs(1).as_nanos() as i64;
 const SECOND: Duration = Duration::from_secs(1);
+const DEFAULT_NTP_MAX_INTERVAL: Duration = Duration::from_secs(60);
 
 pub struct StaticConfig {
     pub version_info: &'static VersionInfo,
@@ -82,6 +90,7 @@ pub struct StaticConfig {
     pub kubernetes_cluster_name: Option<String>,
 
     pub override_os_hostname: Option<String>,
+    pub agent_unique_identifier: crate::config::AgentIdType,
 }
 
 const EMPTY_VERSION_INFO: &'static trident::VersionInfo = &trident::VersionInfo {
@@ -106,6 +115,7 @@ impl Default for StaticConfig {
             kubernetes_cluster_id: Default::default(),
             kubernetes_cluster_name: Default::default(),
             override_os_hostname: None,
+            agent_unique_identifier: Default::default(),
         }
     }
 }
@@ -122,6 +132,9 @@ pub struct Status {
     pub proxy_port: u16,
     pub sync_interval: Duration,
     pub ntp_enabled: bool,
+    pub first: bool,
+    pub ntp_max_interval: Duration,
+    pub ntp_min_interval: Duration,
 
     // GRPC数据
     pub local_epc: i32,
@@ -151,8 +164,11 @@ impl Default for Status {
             proxy_port: DEFAULT_CONTROLLER_PORT,
             sync_interval: DEFAULT_SYNC_INTERVAL,
             ntp_enabled: false,
+            first: true,
+            ntp_min_interval: Duration::from_secs(10),
+            ntp_max_interval: Duration::from_secs(300),
 
-            local_epc: EPC_FROM_INTERNET,
+            local_epc: EPC_INTERNET,
             version_platform_data: 0,
             version_acls: 0,
             version_groups: 0,
@@ -251,7 +267,6 @@ impl Status {
                         warn!("{:?}: {}", item, result.unwrap_err());
                     }
                 }
-
                 self.update_platform_data(version, interfaces, peers, cidrs);
             } else {
                 error!("Invalid platform data.");
@@ -267,10 +282,11 @@ impl Status {
         if config.tap_mode == TapMode::Analyzer {
             return;
         }
-        let mut local_mac_map = HashMap::new();
+        let mut local_mac_map = HashSet::new();
         for mac in macs {
-            let _ = local_mac_map.insert(u64::from(*mac), true);
+            let _ = local_mac_map.insert(u64::from(*mac));
         }
+
         let region_id = config.region_id;
         let pod_cluster_id = config.pod_cluster_id;
         let mut vinterfaces = Vec::new();
@@ -286,9 +302,7 @@ impl Status {
                 viface.skip_mac = !is_tap_interface;
             }
 
-            if let Some(v) = local_mac_map.get(&viface.mac) {
-                viface.is_local = *v;
-            }
+            viface.is_local = local_mac_map.contains(&viface.mac);
             vinterfaces.push(Arc::new(viface));
         }
 
@@ -404,12 +418,15 @@ impl Status {
     }
 }
 
+type NtpState = Arc<(sync::Mutex<bool>, Condvar)>;
+
 pub struct Synchronizer {
     pub static_config: Arc<StaticConfig>,
     pub agent_id: Arc<RwLock<AgentId>>,
     pub status: Arc<RwLock<Status>>,
 
     trident_state: TridentState,
+    ntp_state: NtpState,
 
     session: Arc<Session>,
     // 策略模块和NPB带宽检测会用到
@@ -426,10 +443,12 @@ pub struct Synchronizer {
     ntp_diff: Arc<AtomicI64>,
     agent_mode: RunningMode,
     standalone_runtime_config: Option<PathBuf>,
+    agent_id_tx: Arc<broadcast::Sender<AgentId>>,
 }
 
 impl Synchronizer {
     const LOG_THRESHOLD: usize = 3;
+
     pub fn new(
         runtime: Arc<Runtime>,
         session: Arc<Session>,
@@ -441,9 +460,12 @@ impl Synchronizer {
         kubernetes_cluster_id: String,
         kubernetes_cluster_name: Option<String>,
         override_os_hostname: Option<String>,
+        agent_unique_identifier: crate::config::AgentIdType,
         exception_handler: ExceptionHandler,
         agent_mode: RunningMode,
         standalone_runtime_config: Option<PathBuf>,
+        agent_id_tx: Arc<broadcast::Sender<AgentId>>,
+        ntp_diff: Arc<AtomicI64>,
     ) -> Synchronizer {
         Synchronizer {
             static_config: Arc::new(StaticConfig {
@@ -456,9 +478,11 @@ impl Synchronizer {
                 kubernetes_cluster_id,
                 kubernetes_cluster_name,
                 override_os_hostname,
+                agent_unique_identifier,
             }),
             agent_id: Arc::new(RwLock::new(agent_id)),
             trident_state,
+            ntp_state: Arc::new((sync::Mutex::new(false), Condvar::new())),
             status: Default::default(),
             session,
             running: Arc::new(AtomicBool::new(false)),
@@ -468,19 +492,11 @@ impl Synchronizer {
             exception_handler,
 
             max_memory: Default::default(),
-            ntp_diff: Default::default(),
+            ntp_diff,
             agent_mode,
             standalone_runtime_config,
+            agent_id_tx,
         }
-    }
-
-    pub fn reset_session(&self, controller_ips: Vec<String>, agent_id: AgentId) {
-        self.session.reset_server_ip(controller_ips);
-
-        *self.agent_id.write() = agent_id;
-
-        self.status.write().proxy_ip = None;
-        self.status.write().proxy_port = DEFAULT_CONTROLLER_PORT;
     }
 
     pub fn reset_version(&self) {
@@ -556,17 +572,24 @@ impl Synchronizer {
             ctrl_ip: Some(agent_id.ip.to_string()),
             tap_mode: Some(static_config.tap_mode.into()),
             host: Some(status.hostname.clone()),
-            host_ips: addr_list().map_or(vec![], |xs| {
-                xs.into_iter()
-                    .filter_map(|x| {
-                        if is_excluded_ip_addr(x.ip_addr) {
-                            None
-                        } else {
-                            Some(x.ip_addr.to_string())
-                        }
-                    })
-                    .collect()
-            }),
+            host_ips: {
+                #[cfg(target_os = "linux")]
+                let addrs = public::netns::addr_list_in_netns(&public::netns::NsFile::Root);
+                #[cfg(any(target_os = "windows", target_os = "android"))]
+                let addrs = public::utils::net::addr_list();
+
+                addrs.map_or(vec![], |xs| {
+                    xs.into_iter()
+                        .filter_map(|x| {
+                            if is_excluded_ip_addr(x.ip_addr) {
+                                None
+                            } else {
+                                Some(x.ip_addr.to_string())
+                            }
+                        })
+                        .collect()
+                })
+            },
             cpu_num: Some(static_config.env.cpu_num),
             memory_size: Some(static_config.env.memory_size),
             arch: Some(static_config.env.arch.clone()),
@@ -576,6 +599,9 @@ impl Synchronizer {
             kubernetes_cluster_id: Some(static_config.kubernetes_cluster_id.clone()),
             kubernetes_cluster_name: static_config.kubernetes_cluster_name.clone(),
             kubernetes_force_watch: Some(running_in_only_watch_k8s_mode()),
+            agent_unique_identifier: Some(tp::AgentIdentifier::from(
+                static_config.agent_unique_identifier,
+            ) as i32),
 
             ..Default::default()
         }
@@ -612,10 +638,18 @@ impl Synchronizer {
         }
     }
 
+    fn parse_containers(resp: &tp::SyncResponse) -> Vec<Arc<Container>> {
+        let mut containers = vec![];
+        for item in &resp.containers {
+            containers.push(Arc::new(Container::from(item)));
+        }
+        return containers;
+    }
+
     fn parse_segment(
         tap_mode: tp::TapMode,
         resp: &tp::SyncResponse,
-    ) -> (Vec<tp::Segment>, Vec<MacAddr>) {
+    ) -> (Vec<tp::Segment>, Vec<MacAddr>, Vec<MacAddr>) {
         let segments = if tap_mode == tp::TapMode::Analyzer {
             resp.remote_segments.clone()
         } else {
@@ -626,8 +660,18 @@ impl Synchronizer {
             warn!("Segment is empty, in {:?} mode.", tap_mode);
         }
         let mut macs = Vec::new();
+        let mut gateway_vmacs = Vec::new();
         for segment in &segments {
-            for mac_str in &segment.mac {
+            let vm_macs = &segment.mac;
+            let vmacs = &segment.vmac;
+            if vm_macs.len() != vmacs.len() {
+                warn!(
+                    "Invalid segment the length of vmMacs and vMacs is inconsistent: {:?}",
+                    segment
+                );
+                continue;
+            }
+            for (mac_str, vmac_str) in vm_macs.iter().zip(vmacs) {
                 let mac = MacAddr::from_str(mac_str.as_str());
                 if mac.is_err() {
                     warn!(
@@ -637,10 +681,21 @@ impl Synchronizer {
                     );
                     continue;
                 }
+
+                let vmac = MacAddr::from_str(vmac_str.as_str());
+                if vmac.is_err() {
+                    warn!(
+                        "Malformed VM vmac {}, response rejected: {}",
+                        vmac_str,
+                        vmac.unwrap_err()
+                    );
+                    continue;
+                }
                 macs.push(mac.unwrap());
+                gateway_vmacs.push(vmac.unwrap());
             }
         }
-        return (segments, macs);
+        return (segments, macs, gateway_vmacs);
     }
 
     // Note that both 'status' and 'flow_acl_listener' will be locked here, and other places where 'status'
@@ -649,6 +704,7 @@ impl Synchronizer {
         remote: (String, u16),
         mut resp: tp::SyncResponse,
         trident_state: &TridentState,
+        ntp_state: &NtpState,
         static_config: &Arc<StaticConfig>,
         status: &Arc<RwLock<Status>>,
         flow_acl_listener: &Arc<sync::Mutex<Vec<Box<dyn FlowAclListener>>>>,
@@ -695,32 +751,49 @@ impl Synchronizer {
 
         max_memory.store(runtime_config.max_memory, Ordering::Relaxed);
 
-        let (_, macs) = Self::parse_segment(runtime_config.tap_mode, &resp);
+        let containers = Self::parse_containers(&resp);
+        for listener in flow_acl_listener.lock().unwrap().iter_mut() {
+            listener.containers_change(&containers);
+        }
+        let (_, macs, gateway_vmac_addrs) = Self::parse_segment(runtime_config.tap_mode, &resp);
 
-        let mut status = status.write();
-        status.proxy_ip = if runtime_config.proxy_controller_ip.len() > 0 {
+        let mut status_guard = status.write();
+        status_guard.proxy_ip = if runtime_config.proxy_controller_ip.len() > 0 {
             Some(runtime_config.proxy_controller_ip.clone())
         } else {
             Some(static_config.controller_ip.clone())
         };
-        status.proxy_port = runtime_config.proxy_controller_port;
-        status.sync_interval = Duration::from_secs(runtime_config.sync_interval);
-        status.ntp_enabled = runtime_config.ntp_enabled;
-        let updated_platform = status.get_platform_data(&resp);
+        status_guard.proxy_port = runtime_config.proxy_controller_port;
+        status_guard.sync_interval = Duration::from_secs(runtime_config.sync_interval);
+        status_guard.ntp_enabled = runtime_config.ntp_enabled;
+        status_guard.ntp_max_interval = runtime_config.yaml_config.ntp_max_interval;
+        status_guard.ntp_min_interval = runtime_config.yaml_config.ntp_min_interval;
+        let updated_platform = status_guard.get_platform_data(&resp);
         if updated_platform {
-            status.modify_platform(&macs, &runtime_config);
+            status_guard.modify_platform(&macs, &runtime_config);
         }
-        let mut updated = status.get_ip_groups(&resp) || updated_platform;
-        updated = status.get_flow_acls(&resp) || updated;
-        updated = status.get_local_epc(&runtime_config) || updated;
+        let mut updated = status_guard.get_ip_groups(&resp) || updated_platform;
+        updated = status_guard.get_flow_acls(&resp) || updated;
+        updated = status_guard.get_local_epc(&runtime_config) || updated;
+        let wait_ntp = status_guard.ntp_enabled && status_guard.first;
+        drop(status_guard);
         if updated {
+            let (ntp_state, ncond) = &**ntp_state;
+            if wait_ntp {
+                let ntp_state_guard = ntp_state.lock().unwrap();
+                // Here, it is necessary to wait for the NTP synchronization timestamp to start
+                // collecting traffic and avoid using incorrect timestamps
+                drop(ncond.wait(ntp_state_guard).unwrap());
+            }
+            let status_guard = status.write();
             // 更新策略相关
             let last = SystemTime::now();
             info!("Grpc version ip-groups: {}, interfaces, peer-connections and cidrs: {}, flow-acls: {}",
-            status.version_groups, status.version_platform_data, status.version_acls);
+            status_guard.version_groups, status_guard.version_platform_data, status_guard.version_acls);
             let mut policy_error = false;
             for listener in flow_acl_listener.lock().unwrap().iter_mut() {
-                if let Err(e) = status.trigger_flow_acl(runtime_config.trident_type, listener) {
+                if let Err(e) = status_guard.trigger_flow_acl(runtime_config.trident_type, listener)
+                {
                     warn!("OnPolicyChange: {}.", e);
                     policy_error = true;
                 }
@@ -735,24 +808,27 @@ impl Synchronizer {
             info!("Grpc finish update cost {:?} on {} listener, {} ip-groups, {} interfaces, {} peer-connections, {} cidrs, {} flow-acls",
                 now.duration_since(last).unwrap_or(Duration::from_secs(0)),
                 flow_acl_listener.lock().unwrap().len(),
-                status.ip_groups.len(),
-                status.interfaces.len(),
-                status.peers.len(),
-                status.cidrs.len(),
-                status.acls.len(),
+                status_guard.ip_groups.len(),
+                status_guard.interfaces.len(),
+                status_guard.peers.len(),
+                status_guard.cidrs.len(),
+                status_guard.acls.len(),
             );
         }
-        let blacklist = status.get_blacklist(&resp);
-        drop(status);
+        let mut status_guard = status.write();
+        let blacklist = status_guard.get_blacklist(&resp);
+        status_guard.first = false;
+        drop(status_guard);
 
         let (trident_state, cvar) = &**trident_state;
-        if !runtime_config.enabled {
+        if !runtime_config.enabled || exception_handler.has(Exception::SystemLoadCircuitBreaker) {
             *trident_state.lock().unwrap() = trident::State::Disabled(Some(runtime_config));
         } else {
             *trident_state.lock().unwrap() = trident::State::ConfigChanged(ChangedConfig {
                 runtime_config,
                 blacklist,
                 vm_mac_addrs: macs,
+                gateway_vmac_addrs,
                 tap_types: resp.tap_types,
             });
         }
@@ -779,6 +855,7 @@ impl Synchronizer {
         let flow_acl_listener = self.flow_acl_listener.clone();
         let exception_handler = self.exception_handler.clone();
         let ntp_diff = self.ntp_diff.clone();
+        let ntp_state = self.ntp_state.clone();
         self.threads.lock().push(self.runtime.spawn(async move {
             let mut grpc_failed_count = 0;
             while running.load(Ordering::SeqCst) {
@@ -862,6 +939,7 @@ impl Synchronizer {
                         session.get_current_server(),
                         message,
                         &trident_state,
+                        &ntp_state,
                         &static_config,
                         &status,
                         &flow_acl_listener,
@@ -894,8 +972,8 @@ impl Synchronizer {
                         // 与控制器失联的时间超过设置的逃逸时间，这里直接重启主要有两个原因：
                         // 1. 如果仅是停用系统无法回收全部的内存资源
                         // 2. 控制器地址可能是通过域明解析的，如果域明解析发生变更需要重启来触发重新解析
-                        time::sleep(Duration::from_secs(1)).await;
-                        process::exit(NORMAL_EXIT_WITH_RESTART);
+                        crate::utils::notify_exit(NORMAL_EXIT_WITH_RESTART);
+                        return;
                     }
                 }
             }
@@ -917,14 +995,21 @@ impl Synchronizer {
         let status = self.status.clone();
         let running = self.running.clone();
         let ntp_diff = self.ntp_diff.clone();
+        let ntp_state = self.ntp_state.clone();
         self.runtime.spawn(async move {
             while running.load(Ordering::SeqCst) {
-                let (enabled, sync_interval) = {
+                let (enabled, sync_interval, max_interval, min_interval, first) = {
                     let reader = status.read();
-                    (reader.ntp_enabled, reader.sync_interval)
+                    (reader.ntp_enabled, reader.sync_interval, reader.ntp_max_interval.as_nanos() as i64, reader.ntp_min_interval.as_nanos() as i64, reader.first)
                 };
 
                 if !enabled {
+                    let diff = ntp_diff.load(Ordering::Relaxed);
+                    if diff > max_interval {
+                        warn!("Closing NTP causes the timestamp to fall back by {}s, and the agent needs to be restarted.", diff/NANOS_IN_SECOND);
+                        crate::utils::notify_exit(NORMAL_EXIT_WITH_RESTART);
+                        return;
+                    }
                     ntp_diff.store(0, Ordering::Relaxed);
                     time::sleep(sync_interval).await;
                     continue;
@@ -995,11 +1080,29 @@ impl Synchronizer {
                 // Correct the received message's origin time using the actual
                 // transmit time.
                 resp_packet.ts_orig = NtpTime::from(&send_time).0;
-                let offset = resp_packet.offset(&recv_time);
-                ntp_diff.store(
-                    offset / NANOS_IN_SECOND * NANOS_IN_SECOND,
-                    Ordering::Relaxed,
-                );
+                let offset = resp_packet.offset(&recv_time) / NANOS_IN_SECOND * NANOS_IN_SECOND;
+                match ntp_diff.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
+                    if (x > offset && x - offset >= min_interval)
+                        || (offset > x && offset - x >= min_interval)
+                    {
+                        info!("NTP Set time offset {}s.", offset / NANOS_IN_SECOND);
+                        Some(offset)
+                    } else {
+                        None
+                    }
+                }) {
+                    Ok(last_offset) => {
+                        if !first && (last_offset > offset && last_offset - offset >= max_interval) {
+                            warn!("Openning NTP causes the timestamp to fall back by {}s, and the agent needs to be restarted.", offset/ NANOS_IN_SECOND);
+                            crate::utils::notify_exit(NORMAL_EXIT_WITH_RESTART);
+                            return;
+                        }
+                    }
+                    _ =>{},
+                }
+
+                let (_, cond) = &*ntp_state;
+                cond.notify_all();
 
                 time::sleep(sync_interval).await;
             }
@@ -1021,6 +1124,7 @@ impl Synchronizer {
             .grpc_upgrade_with_statsd(tp::UpgradeRequest {
                 ctrl_ip: Some(agent_id.ip.to_string()),
                 ctrl_mac: Some(agent_id.mac.to_string()),
+                team_id: Some(agent_id.team_id.clone()),
             })
             .await;
         if let Err(m) = response {
@@ -1149,6 +1253,7 @@ impl Synchronizer {
         let max_memory = self.max_memory.clone();
         let mut sync_interval = DEFAULT_SYNC_INTERVAL;
         let standalone_runtime_config = self.standalone_runtime_config.as_ref().unwrap().clone();
+        let flow_acl_listener = self.flow_acl_listener.clone();
         self.threads.lock().push(self.runtime.spawn(async move {
             while running.load(Ordering::SeqCst) {
                 let runtime_config =
@@ -1164,6 +1269,18 @@ impl Synchronizer {
                             continue;
                         }
                     };
+
+                for listener in flow_acl_listener.lock().unwrap().iter_mut() {
+                    let _ = listener.flow_acl_change(
+                        runtime_config.trident_type,
+                        runtime_config.epc_id as i32,
+                        &vec![],
+                        &vec![],
+                        &vec![],
+                        &vec![],
+                        &vec![],
+                    );
+                }
 
                 max_memory.store(runtime_config.max_memory, Ordering::Relaxed);
                 let new_sync_interval = Duration::from_secs(runtime_config.sync_interval);
@@ -1199,6 +1316,7 @@ impl Synchronizer {
         let max_memory = self.max_memory.clone();
         let exception_handler = self.exception_handler.clone();
         let ntp_diff = self.ntp_diff.clone();
+        let ntp_state = self.ntp_state.clone();
         self.threads.lock().push(self.runtime.spawn(async move {
             let mut grpc_failed_count = 0;
             while running.load(Ordering::SeqCst) {
@@ -1257,6 +1375,7 @@ impl Synchronizer {
                     session.get_current_server(),
                     response.unwrap().into_inner(),
                     &trident_state,
+                    &ntp_state,
                     &static_config,
                     &status,
                     &flow_acl_listener,
@@ -1264,6 +1383,7 @@ impl Synchronizer {
                     &exception_handler,
                     &escape_tx,
                 );
+
                 let (new_revision, proxy_ip, proxy_port, new_sync_interval) = {
                     let status = status.read();
                     (
@@ -1281,8 +1401,8 @@ impl Synchronizer {
                             *ts.lock().unwrap() = trident::State::Terminated;
                             cvar.notify_one();
                             warn!("agent upgrade is successful and restarts normally, deepflow-agent restart...");
-                            time::sleep(Duration::from_secs(1)).await;
-                            process::exit(NORMAL_EXIT_WITH_RESTART);
+                            crate::utils::notify_exit(NORMAL_EXIT_WITH_RESTART);
+                            return;
                         },
                         Err(e) => {
                             exception_handler.set(Exception::ControllerSocketError);
@@ -1307,10 +1427,28 @@ impl Synchronizer {
         }));
     }
 
+    async fn watch_agent_id(
+        mut agent_id_rx: broadcast::Receiver<AgentId>,
+        agent_id: Arc<RwLock<AgentId>>,
+        status: Arc<RwLock<Status>>,
+    ) {
+        while let Ok(new_agent_id) = agent_id_rx.recv().await {
+            *agent_id.write() = new_agent_id;
+            status.write().proxy_ip = None;
+            status.write().proxy_port = DEFAULT_CONTROLLER_PORT;
+        }
+    }
+
     pub fn start(&self) {
         if self.running.swap(true, Ordering::SeqCst) {
             return;
         }
+        let agent_id = self.agent_id.clone();
+        let status = self.status.clone();
+        let agent_id_rx = self.agent_id_tx.subscribe();
+        self.runtime.spawn(async move {
+            Self::watch_agent_id(agent_id_rx, agent_id, status).await;
+        });
         match self.agent_mode {
             RunningMode::Managed => {
                 self.run_ntp_sync();
@@ -1379,13 +1517,7 @@ impl RuntimeEnvironment {
                 sys.name().unwrap_or_default(),
                 sys.os_version().unwrap_or_default()
             ),
-            kernel_version: sys
-                .kernel_version()
-                .unwrap_or_default()
-                .split('-')
-                .next()
-                .unwrap_or_default()
-                .into(),
+            kernel_version: sys.kernel_version().unwrap_or_default(),
         }
     }
 }

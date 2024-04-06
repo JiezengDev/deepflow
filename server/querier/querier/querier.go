@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,9 +30,10 @@ import (
 	"github.com/deepflowio/deepflow/server/libs/logger"
 	"github.com/deepflowio/deepflow/server/libs/stats"
 	prometheus_router "github.com/deepflowio/deepflow/server/querier/app/prometheus/router"
+	tracing_adapter "github.com/deepflowio/deepflow/server/querier/app/tracing-adapter/router"
 	"github.com/deepflowio/deepflow/server/querier/common"
 	"github.com/deepflowio/deepflow/server/querier/config"
-	"github.com/deepflowio/deepflow/server/querier/engine/clickhouse"
+	"github.com/deepflowio/deepflow/server/querier/engine/clickhouse/trans_prometheus"
 	profile_router "github.com/deepflowio/deepflow/server/querier/profile/router"
 	"github.com/deepflowio/deepflow/server/querier/router"
 	"github.com/deepflowio/deepflow/server/querier/statsd"
@@ -45,10 +46,15 @@ func Start(configPath, serverLogFile string) {
 	ServerCfg := config.DefaultConfig()
 	ServerCfg.Load(configPath)
 	config.Cfg = &ServerCfg.QuerierConfig
+	config.TraceConfig = &ServerCfg.TraceIdWithIndex
 	cfg := ServerCfg.QuerierConfig
 	bytes, _ := yaml.Marshal(cfg)
 	log.Info("==================== Launching DeepFlow-Server-Querier ====================")
 	log.Infof("querier config:\n%s", string(bytes))
+
+	// statsd
+	statsd.QuerierCounter = statsd.NewCounter()
+	statsd.RegisterCountableForIngester("querier_count", statsd.QuerierCounter)
 
 	// engine加载数据库tag/metric等信息
 	err := Load()
@@ -58,11 +64,7 @@ func Start(configPath, serverLogFile string) {
 	}
 
 	// prometheus dict cache
-	go clickhouse.GeneratePrometheusMap()
-
-	// statsd
-	statsd.QuerierCounter = statsd.NewCounter()
-	statsd.RegisterCountableForIngester("querier_count", statsd.QuerierCounter)
+	go trans_prometheus.GeneratePrometheusMap()
 
 	// init opentelemetry
 	if cfg.OtelEndpoint != "" {
@@ -83,6 +85,7 @@ func Start(configPath, serverLogFile string) {
 	router.QueryRouter(r)
 	profile_router.ProfileRouter(r, &cfg)
 	prometheus_router.PrometheusRouter(r)
+	tracing_adapter.TracingAdapterRouter(r)
 	registerRouterCounter(r.Routes())
 	// TODO: 增加router
 	if err := r.Run(fmt.Sprintf(":%d", cfg.ListenPort)); err != nil {

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,7 +40,7 @@ import (
 
 var log = logging.MustGetLogger("stats")
 
-var remoteType = REMOTE_TYPE_INFLUXDB
+var remoteType = REMOTE_TYPE_DFSTATSD
 
 type StatSource struct {
 	modulePrefix string
@@ -61,7 +61,7 @@ func (s *StatSource) String() string {
 
 var (
 	processName       string
-	processNameJoiner string = "."
+	processNameJoiner string = "_"
 	hostname          string
 	lock              sync.Mutex
 	preHooks          []func()
@@ -97,7 +97,12 @@ func registerCountable(modulePrefix, module string, countable Countable, opts ..
 	if source.tags == nil {
 		source.tags = OptionStatTags{}
 	}
-	source.tags["host"] = hostname
+	// if already has tag "host", add tag "_host"
+	if _, ok := source.tags["host"]; ok {
+		source.tags["_host"] = hostname
+	} else {
+		source.tags["host"] = hostname
+	}
 	lock.Lock()
 	statSources.Remove(func(x interface{}) bool {
 		closed := x.(*StatSource).countable.Closed()
@@ -146,8 +151,7 @@ func counterToFields(counter interface{}) models.Fields {
 	return fields
 }
 
-func collectBatchPoints() client.BatchPoints {
-	timestamp := time.Now()
+func collectBatchPoints(timestamp time.Time) client.BatchPoints {
 	bp, _ := client.NewBatchPoints(client.BatchPointsConfig{Precision: "s"})
 	lock.Lock()
 	statSources.Remove(func(x interface{}) bool {
@@ -209,10 +213,14 @@ func sendStatsd(bp client.BatchPoints) {
 		module := point.Name()
 		tags := point.Tags()
 		tagsOption := make([]string, 0, len(tags)*2)
+		hasHost := false
 		for key, value := range tags {
+			if !hasHost && key == "host" {
+				hasHost = true
+			}
 			tagsOption = append(tagsOption, key, strings.Replace(value, ":", "-", -1))
 		}
-		if hostname != "" { // specified hostname
+		if hostname != "" && !hasHost { // specified hostname
 			tagsOption = append(tagsOption, "host", hostname)
 		}
 		fields, _ := point.Fields()
@@ -291,8 +299,8 @@ func nextRemote() error {
 	return nil
 }
 
-func runOnce() {
-	bp := collectBatchPoints()
+func runOnce(timestamp time.Time) {
+	bp := collectBatchPoints(timestamp)
 
 	if len(remotes) == 0 && len(dfRemote) == 0 {
 		return
@@ -324,6 +332,7 @@ func runOnce() {
 func run() {
 	time.Sleep(time.Second) // wait logger init
 
+	var lastTick int64
 	for range time.NewTicker(TICK_CYCLE).C {
 		lock.Lock()
 		hooks := preHooks
@@ -333,7 +342,16 @@ func run() {
 		}
 
 		if statSources.Len() > 0 {
-			runOnce()
+			now := time.Now()
+			nowTick := now.Unix() / TICK_COUNT
+			// Prevent the time interval between two executions from being too small, causing two pieces of data to appear in one time period, and causing abnormal query aggregation results.
+			if nowTick == lastTick {
+				log.Warningf("the running interval is too short, cancel this execution. now time: %s", now)
+				continue
+			}
+
+			runOnce(now)
+			lastTick = nowTick
 		}
 	}
 }
@@ -366,7 +384,11 @@ func setHostname(name string) {
 	hostname = name
 	lock.Lock()
 	for it := statSources.Iterator(); !it.Empty(); it.Next() {
-		it.Value().(*StatSource).tags["host"] = hostname
+		if _, ok := it.Value().(*StatSource).tags["_host"]; ok {
+			it.Value().(*StatSource).tags["_host"] = hostname
+		} else {
+			it.Value().(*StatSource).tags["host"] = hostname
+		}
 	}
 	lock.Unlock()
 }

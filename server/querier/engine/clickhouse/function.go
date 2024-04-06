@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,8 +25,11 @@ import (
 	"strconv"
 	"strings"
 
+	"golang.org/x/exp/slices"
+
 	"github.com/deepflowio/deepflow/server/querier/common"
 	"github.com/deepflowio/deepflow/server/querier/config"
+	chCommon "github.com/deepflowio/deepflow/server/querier/engine/clickhouse/common"
 	"github.com/deepflowio/deepflow/server/querier/engine/clickhouse/metrics"
 	"github.com/deepflowio/deepflow/server/querier/engine/clickhouse/tag"
 	"github.com/deepflowio/deepflow/server/querier/engine/clickhouse/view"
@@ -46,6 +49,8 @@ const (
 	TAG_FUNCTION_TOPK                       = "topK"
 	TAG_FUNCTION_NEW_TAG                    = "newTag"
 	TAG_FUNCTION_ENUM                       = "enum"
+	TAG_FUNCTION_FAST_FILTER                = "FastFilter"
+	TAG_FUNCTION_FAST_TRANS                 = "FastTrans"
 )
 
 const INTERVAL_1D = 86400
@@ -54,7 +59,7 @@ var TAG_FUNCTIONS = []string{
 	TAG_FUNCTION_NODE_TYPE, TAG_FUNCTION_ICON_ID, TAG_FUNCTION_MASK, TAG_FUNCTION_TIME,
 	TAG_FUNCTION_TO_UNIX_TIMESTAMP_64_MICRO, TAG_FUNCTION_TO_STRING, TAG_FUNCTION_IF,
 	TAG_FUNCTION_UNIQ, TAG_FUNCTION_ANY, TAG_FUNCTION_TOPK, TAG_FUNCTION_TO_UNIX_TIMESTAMP,
-	TAG_FUNCTION_NEW_TAG, TAG_FUNCTION_ENUM,
+	TAG_FUNCTION_NEW_TAG, TAG_FUNCTION_ENUM, TAG_FUNCTION_FAST_FILTER, TAG_FUNCTION_FAST_TRANS,
 }
 
 type Function interface {
@@ -78,7 +83,11 @@ func GetTagFunction(name string, args []string, alias, db, table string) (Statem
 	}
 }
 
-func GetAggFunc(name string, args []string, alias string, db string, table string, ctx context.Context) (Statement, int, string, error) {
+func GetAggFunc(name string, args []string, alias string, db string, table string, ctx context.Context, isDerivative bool, derivativeGroupBy []string, derivativeArgs []string) (Statement, int, string, error) {
+	if name == view.FUNCTION_TOPK || name == view.FUNCTION_ANY {
+		return GetTopKTrans(name, args, alias, db, table, ctx)
+	}
+
 	var levelFlag int
 	field := args[0]
 	field = strings.Trim(field, "`")
@@ -101,7 +110,7 @@ func GetAggFunc(name string, args []string, alias string, db string, table strin
 	}
 	unit := strings.ReplaceAll(function.UnitOverwrite, "$unit", metricStruct.Unit)
 	// 判断算子是否支持单层
-	if db == "flow_metrics" {
+	if db != chCommon.DB_NAME_FLOW_LOG {
 		unlayFuns := metrics.METRICS_TYPE_UNLAY_FUNCTIONS[metricStruct.Type]
 		if common.IsValueInSliceString(name, unlayFuns) {
 			levelFlag = view.MODEL_METRICS_LEVEL_FLAG_UNLAY
@@ -111,8 +120,103 @@ func GetAggFunc(name string, args []string, alias string, db string, table strin
 	} else {
 		levelFlag = view.MODEL_METRICS_LEVEL_FLAG_UNLAY
 	}
+	if isDerivative {
+		levelFlag = view.MODEL_METRICS_LEVEL_FLAG_LAYERED
+	}
 	return &AggFunction{
-		Metrics: metricStruct,
+		Metrics:           metricStruct,
+		Name:              name,
+		Args:              args,
+		Alias:             alias,
+		IsDerivative:      isDerivative,
+		DerivativeArgs:    derivativeArgs,
+		DerivativeGroupBy: derivativeGroupBy,
+	}, levelFlag, unit, nil
+}
+
+func GetTopKTrans(name string, args []string, alias string, db string, table string, ctx context.Context) (Statement, int, string, error) {
+	function, ok := metrics.METRICS_FUNCTIONS_MAP[name]
+	if !ok {
+		return nil, 0, "", nil
+	}
+
+	var fields []string
+	if name == view.FUNCTION_TOPK {
+		fields = args[:len(args)-1]
+	} else if name == view.FUNCTION_ANY {
+		fields = args
+	}
+	if name == view.FUNCTION_TOPK {
+		topCountStr := args[len(args)-1]
+		topCount, err := strconv.Atoi(topCountStr)
+		if err != nil {
+			return nil, 0, "", fmt.Errorf("function [%s] argument is not int [%s]", view.FUNCTION_TOPK, topCountStr)
+		}
+		if topCount < 1 || topCount > 100 {
+			return nil, 0, "", fmt.Errorf("function [%s] argument [%s] value range is incorrect, it should be within [1, 100]", view.FUNCTION_TOPK, topCountStr)
+		}
+	}
+	levelFlag := view.MODEL_METRICS_LEVEL_FLAG_UNLAY
+
+	fieldsLen := len(fields)
+	dbFields := make([]string, fieldsLen)
+	conditions := make([]string, 0, fieldsLen)
+
+	var metricStruct *metrics.Metrics
+	for i, field := range fields {
+
+		field = strings.Trim(field, "`")
+		metricStruct, ok = metrics.GetAggMetrics(field, db, table, ctx)
+		if !ok || metricStruct.Type == metrics.METRICS_TYPE_ARRAY {
+			return nil, 0, "", nil
+		}
+		dbFields[i] = metricStruct.DBField
+		condition := metricStruct.Condition
+
+		// enum tag
+		tagEnum := strings.TrimSuffix(field, "_0")
+		tagEnum = strings.TrimSuffix(tagEnum, "_1")
+		tagDes, getTagOK := tag.GetTag(field, db, table, "enum")
+		tagDescription, tagOK := tag.TAG_DESCRIPTIONS[tag.TagDescriptionKey{
+			DB: db, Table: table, TagName: field,
+		}]
+		if getTagOK {
+			if tagOK {
+				enumFileName := strings.TrimSuffix(tagDescription.EnumFile, "."+config.Cfg.Language)
+				dbFields[i] = fmt.Sprintf(tagDes.TagTranslator, enumFileName)
+			} else {
+				dbFields[i] = fmt.Sprintf(tagDes.TagTranslator, tagEnum)
+			}
+		}
+
+		if condition == "" && metricStruct.TagType != "int" {
+			condition = dbFields[i] + " != ''"
+			conditions = append(conditions, condition)
+		}
+
+		// 判断算子是否支持单层
+		if levelFlag == view.MODEL_METRICS_LEVEL_FLAG_UNLAY && db != chCommon.DB_NAME_FLOW_LOG {
+			unlayFuns := metrics.METRICS_TYPE_UNLAY_FUNCTIONS[metricStruct.Type]
+			if !common.IsValueInSliceString(name, unlayFuns) {
+				levelFlag = view.MODEL_METRICS_LEVEL_FLAG_LAYERED
+			}
+		}
+	}
+
+	metricStructCopy := *metricStruct
+	metricStructCopy.DBField = strings.Join(dbFields, ", ")
+	metricStructCopy.Condition = strings.Join(conditions, " AND ")
+	if fieldsLen > 1 {
+		metricStructCopy.DBField = "(" + metricStructCopy.DBField + ")"
+		if metricStructCopy.Condition != "" {
+			metricStructCopy.Condition = "(" + strings.Join(conditions, " AND ") + ")"
+		}
+	}
+
+	unit := strings.ReplaceAll(function.UnitOverwrite, "$unit", metricStruct.Unit)
+
+	return &AggFunction{
+		Metrics: &metricStructCopy,
 		Name:    name,
 		Args:    args,
 		Alias:   alias,
@@ -200,9 +304,12 @@ type AggFunction struct {
 	// 指标量内容
 	Metrics *metrics.Metrics
 	// 解析获得的参数
-	Name  string
-	Args  []string
-	Alias string
+	Name              string
+	Args              []string
+	Alias             string
+	IsDerivative      bool
+	DerivativeArgs    []string
+	DerivativeGroupBy []string
 }
 
 func (f *AggFunction) SetAlias(alias string) {
@@ -214,21 +321,81 @@ func (f *AggFunction) FormatInnerTag(m *view.Model) (innerAlias string) {
 	case metrics.METRICS_TYPE_COUNTER, metrics.METRICS_TYPE_GAUGE:
 		// 计数类和油标类，内层结构为sum
 		// 内层算子使用默认alias
-		innerFunction := view.DefaultFunction{
-			Name:   view.FUNCTION_SUM,
-			Fields: []view.Node{&view.Field{Value: f.Metrics.DBField}},
+		var innerFunction view.DefaultFunction
+		// Inner layer derivative
+		if f.IsDerivative {
+			args := []string{}
+			if len(f.DerivativeArgs) > 1 {
+				args = append(args, f.DerivativeArgs[1:]...)
+			}
+			innerFunction = view.DefaultFunction{
+				Name:           view.FUNCTION_DERIVATIVE,
+				Fields:         []view.Node{&view.Field{Value: f.Metrics.DBField}},
+				DerivativeArgs: f.DerivativeArgs,
+				Args:           args,
+			}
+		} else {
+			innerFunction = view.DefaultFunction{
+				Name:   view.FUNCTION_SUM,
+				Fields: []view.Node{&view.Field{Value: f.Metrics.DBField}},
+			}
 		}
 		innerAlias = innerFunction.SetAlias("", true)
 		innerFunction.SetFlag(view.METRICS_FLAG_INNER)
 		innerFunction.Init()
 		m.AddTag(&innerFunction)
 		return innerAlias
-	case metrics.METRICS_TYPE_DELAY:
+	case metrics.METRICS_TYPE_DELAY, metrics.METRICS_TYPE_BOUNDED_GAUGE:
 		// 时延类，内层结构为groupArray，忽略0值
 		innerFunction := view.DefaultFunction{
 			Name:       view.FUNCTION_GROUP_ARRAY,
 			Fields:     []view.Node{&view.Field{Value: f.Metrics.DBField}},
 			IgnoreZero: true,
+		}
+		// When using max, and min operators. The inner layer uses itself
+		if slices.Contains([]string{view.FUNCTION_MAX, view.FUNCTION_MIN}, f.Name) {
+			innerFunction = view.DefaultFunction{
+				Name:       f.Name,
+				Fields:     []view.Node{&view.Field{Value: f.Metrics.DBField}},
+				IgnoreZero: true,
+			}
+		}
+		if f.Name == view.FUNCTION_AVG {
+			// delay class, inner structure is sum (x)/sum (y)
+			if strings.Contains(f.Metrics.DBField, "/") {
+				divFields := strings.Split(f.Metrics.DBField, "/")
+				divField_0 := view.DefaultFunction{
+					Name:   view.FUNCTION_SUM,
+					Fields: []view.Node{&view.Field{Value: divFields[0]}},
+				}
+				divField_1 := view.DefaultFunction{
+					Name:   view.FUNCTION_SUM,
+					Fields: []view.Node{&view.Field{Value: divFields[1]}},
+				}
+				innerFunction := view.DivFunction{
+					DefaultFunction: view.DefaultFunction{
+						Name:   view.FUNCTION_DIV,
+						Fields: []view.Node{&divField_0, &divField_1},
+					},
+					DivType: view.FUNCTION_DIV_TYPE_0DIVIDER_AS_NULL,
+				}
+				innerAlias = innerFunction.SetAlias("", true)
+				innerFunction.SetFlag(view.METRICS_FLAG_INNER)
+				innerFunction.Init()
+				m.AddTag(&innerFunction)
+				return innerAlias
+			} else {
+				innerFunction := view.DefaultFunction{
+					Name:       f.Name,
+					Fields:     []view.Node{&view.Field{Value: f.Metrics.DBField}},
+					IgnoreZero: true,
+				}
+				innerAlias = innerFunction.SetAlias("", true)
+				innerFunction.SetFlag(view.METRICS_FLAG_INNER)
+				innerFunction.Init()
+				m.AddTag(&innerFunction)
+				return innerAlias
+			}
 		}
 		innerAlias = innerFunction.SetAlias("", true)
 		innerFunction.SetFlag(view.METRICS_FLAG_INNER)
@@ -294,19 +461,24 @@ func (f *AggFunction) Trans(m *view.Model) view.Node {
 		outFunc.SetArgs(f.Args[1:])
 	}
 	if m.MetricsLevelFlag == view.MODEL_METRICS_LEVEL_FLAG_LAYERED {
+		// When Avg is forced (due to the need for other metrics in the same statement)
+		// to use two layers of SQL calculation, the calculation logic of AAvg is directly used
+		if f.Name == view.FUNCTION_AVG {
+			outFunc = view.GetFunc(view.FUNC_NAME_MAP[view.FUNCTION_AAVG])
+		}
 		innerAlias := f.FormatInnerTag(m)
 		switch f.Metrics.Type {
 		case metrics.METRICS_TYPE_COUNTER, metrics.METRICS_TYPE_GAUGE:
 			// 计数类和油标类，null需要补成0
 			outFunc.SetFillNullAsZero(true)
-		case metrics.METRICS_TYPE_DELAY:
+		case metrics.METRICS_TYPE_DELAY, metrics.METRICS_TYPE_BOUNDED_GAUGE:
 			// 时延类和商值类，忽略0值
-			outFunc.SetIsGroupArray(true)
-			outFunc.SetIgnoreZero(true)
-		case metrics.METRICS_TYPE_QUOTIENT:
+			// When using avg, max, and min operators. The outer layer uses itself
+			if !slices.Contains([]string{view.FUNCTION_AVG, view.FUNCTION_MAX, view.FUNCTION_MIN}, f.Name) {
+				outFunc.SetIsGroupArray(true)
+			}
 			outFunc.SetIgnoreZero(true)
 		case metrics.METRICS_TYPE_PERCENTAGE:
-			// 比例类，null需要补成0
 			outFunc.SetFillNullAsZero(true)
 			outFunc.SetMath("*100")
 		case metrics.METRICS_TYPE_TAG:
@@ -315,15 +487,30 @@ func (f *AggFunction) Trans(m *view.Model) view.Node {
 		outFunc.SetFields([]view.Node{&view.Field{Value: innerAlias}})
 	} else if m.MetricsLevelFlag == view.MODEL_METRICS_LEVEL_FLAG_UNLAY {
 		switch f.Metrics.Type {
-		case metrics.METRICS_TYPE_COUNTER:
-			if m.DB == "flow_metrics" {
-				outFunc.SetFillNullAsZero(true)
+		case metrics.METRICS_TYPE_COUNTER, metrics.METRICS_TYPE_GAUGE:
+			// Counter/Gauge type weighted average
+			if f.Name == view.FUNCTION_AVG {
+				outFunc = view.GetFunc(view.FUNCTION_COUNTER_AVG)
+			}
+		case metrics.METRICS_TYPE_BOUNDED_GAUGE:
+			if f.Name == view.FUNCTION_AVG {
+				outFunc = view.GetFunc(view.FUNC_NAME_MAP[view.FUNCTION_AAVG])
 			}
 		case metrics.METRICS_TYPE_DELAY:
+			// Delay type weighted average
+			if f.Name == view.FUNCTION_AVG {
+				outFunc = view.GetFunc(view.FUNCTION_DELAY_AVG)
+			}
 			outFunc.SetIgnoreZero(true)
+		case metrics.METRICS_TYPE_QUOTIENT:
+			// Quotient type weighted average
+			if f.Name == view.FUNCTION_AVG {
+				outFunc = view.GetFunc(view.FUNCTION_DELAY_AVG)
+			}
 		case metrics.METRICS_TYPE_PERCENTAGE:
-			if m.DB == "flow_metrics" {
-				outFunc.SetFillNullAsZero(true)
+			// Percentage type weighted average
+			if f.Name == view.FUNCTION_AVG {
+				outFunc = view.GetFunc(view.FUNCTION_DELAY_AVG)
 			}
 			outFunc.SetMath("*100")
 		}
@@ -395,6 +582,7 @@ type Time struct {
 	TimeField  string
 	Interval   int
 	WindowSize int
+	Offset     int
 	Fill       string
 }
 
@@ -417,12 +605,19 @@ func (t *Time) Trans(m *view.Model) error {
 	if len(t.Args) > 3 {
 		t.Fill = t.Args[3]
 	}
+	if len(t.Args) > 4 {
+		t.Offset, err = strconv.Atoi(t.Args[4])
+		if err != nil {
+			return err
+		}
+	}
 	m.Time.Interval = t.Interval
 	if m.Time.Interval > 0 && m.Time.Interval < m.Time.DatasourceInterval {
 		m.Time.Interval = m.Time.DatasourceInterval
 	}
 	m.Time.WindowSize = t.WindowSize
 	m.Time.Fill = t.Fill
+	m.Time.Offset = t.Offset
 	m.Time.Alias = t.Alias
 	return nil
 }
@@ -449,10 +644,27 @@ func (t *Time) Format(m *view.Model) {
 	var innerTimeField string
 	if m.MetricsLevelFlag == view.MODEL_METRICS_LEVEL_FLAG_LAYERED {
 		innerTimeField = "_" + t.TimeField
-		withValue := fmt.Sprintf(
-			"toStartOfInterval(%s, %s(%d))",
-			t.TimeField, toDatasourceIntervalFunction, datasourceInterval,
-		)
+		withValue := ""
+		if m.IsDerivative {
+			offset := m.Time.Offset
+			if offset > 0 {
+				withValue = fmt.Sprintf(
+					"toStartOfInterval(time-%d, %s(%d)) + %s(arrayJoin([%s]) * %d) + %d",
+					offset, toIntervalFunction, interval, toIntervalFunction, windows, interval, offset,
+				)
+			} else {
+				withValue = fmt.Sprintf(
+					"toStartOfInterval(time, %s(%d)) + %s(arrayJoin([%s]) * %d)",
+					toIntervalFunction, interval, toIntervalFunction, windows, interval,
+				)
+			}
+		} else {
+			withValue = fmt.Sprintf(
+				"toStartOfInterval(%s, %s(%d))",
+				t.TimeField, toDatasourceIntervalFunction, datasourceInterval,
+			)
+		}
+
 		withAlias := "_" + t.TimeField
 		withs := []view.Node{&view.With{Value: withValue, Alias: withAlias}}
 		m.AddTag(&view.Tag{Value: withAlias, Withs: withs, Flag: view.NODE_FLAG_METRICS_INNER})
@@ -460,16 +672,30 @@ func (t *Time) Format(m *view.Model) {
 	} else if m.MetricsLevelFlag == view.MODEL_METRICS_LEVEL_FLAG_UNLAY {
 		innerTimeField = t.TimeField
 	}
-	withValue := fmt.Sprintf(
-		"toStartOfInterval(%s, %s(%d)) + %s(arrayJoin([%s]) * %d)",
-		innerTimeField, toIntervalFunction, interval, toIntervalFunction, windows, interval,
-	)
+	offset := m.Time.Offset
+	withValue := ""
+	if offset > 0 {
+		withValue = fmt.Sprintf(
+			"toStartOfInterval(%s-%d, %s(%d)) + %s(arrayJoin([%s]) * %d) + %d",
+			innerTimeField, offset, toIntervalFunction, interval, toIntervalFunction, windows, interval, offset,
+		)
+	} else {
+		withValue = fmt.Sprintf(
+			"toStartOfInterval(%s, %s(%d)) + %s(arrayJoin([%s]) * %d)",
+			innerTimeField, toIntervalFunction, interval, toIntervalFunction, windows, interval,
+		)
+	}
 	withAlias := "_" + strings.Trim(t.Alias, "`")
 	withs := []view.Node{&view.With{Value: withValue, Alias: withAlias}}
 	tagField := fmt.Sprintf("toUnixTimestamp(`%s`)", withAlias)
-	m.AddTag(&view.Tag{Value: tagField, Alias: t.Alias, Flag: view.NODE_FLAG_METRICS_OUTER, Withs: withs})
+	if m.IsDerivative {
+		tagField = fmt.Sprintf("toUnixTimestamp(`%s`)", innerTimeField)
+		m.AddTag(&view.Tag{Value: tagField, Alias: t.Alias, Flag: view.NODE_FLAG_METRICS_OUTER})
+	} else {
+		m.AddTag(&view.Tag{Value: tagField, Alias: t.Alias, Flag: view.NODE_FLAG_METRICS_OUTER, Withs: withs})
+	}
 	m.AddGroup(&view.Group{Value: t.Alias, Flag: view.GROUP_FLAG_METRICS_OUTER})
-	if m.Time.Fill != "" && m.Time.Interval > 0 {
+	if (m.Time.Fill == "0" || m.Time.Fill == "none" || m.Time.Fill == "null") && m.Time.Interval > 0 {
 		m.AddCallback("time", TimeFill([]interface{}{m}))
 	}
 }
@@ -520,17 +746,31 @@ func (f *TagFunction) Check() error {
 			return errors.New(fmt.Sprintf("function %s not support %s", f.Name, f.Args[0]))
 		}
 	case TAG_FUNCTION_ENUM:
-		_, ok := tag.GetTag(strings.Trim(f.Args[0], "`"), f.DB, f.Table, f.Name)
-		if !ok {
+		if f.DB == "flow_tag" {
+			_, ok := tag.GetTag("enum_tag_name", f.DB, f.Table, f.Name)
+			if !ok {
+				return errors.New(fmt.Sprintf("function %s not support %s", f.Name, f.Args[0]))
+			}
+		} else {
+			_, ok := tag.GetTag(strings.Trim(f.Args[0], "`"), f.DB, f.Table, f.Name)
+			if !ok {
+				return errors.New(fmt.Sprintf("function %s not support %s", f.Name, f.Args[0]))
+			}
+		}
+	case TAG_FUNCTION_FAST_FILTER:
+		if strings.Trim(f.Args[0], "`") != "trace_id" {
 			return errors.New(fmt.Sprintf("function %s not support %s", f.Name, f.Args[0]))
 		}
 	}
 	return nil
+
 }
 
 func (f *TagFunction) Trans(m *view.Model) view.Node {
 	fields := f.Args
 	switch f.Name {
+	case TAG_FUNCTION_ANY:
+		f.Name = "any"
 	case TAG_FUNCTION_TOPK:
 		f.Name = fmt.Sprintf("topK(%s)", f.Args[len(f.Args)-1])
 		fields = fields[:len(f.Args)-1]
@@ -568,10 +808,20 @@ func (f *TagFunction) Trans(m *view.Model) view.Node {
 				f.Value = "'" + nodeType + "'"
 			}
 		}
+
+		if strings.HasPrefix(f.Args[0], "is_internet") {
+			m.AddGroup(&view.Group{Value: fmt.Sprintf("`%s`", strings.Trim(f.Alias, "`"))})
+		}
+
 		return f.getViewNode()
 	case TAG_FUNCTION_ICON_ID:
 		tagDes, _ := tag.GetTag(f.Args[0], f.DB, f.Table, f.Name)
 		f.Withs = []view.Node{&view.With{Value: tagDes.TagTranslator, Alias: f.Alias}}
+
+		if strings.HasPrefix(f.Args[0], "is_internet") {
+			m.AddGroup(&view.Group{Value: fmt.Sprintf("`%s`", strings.Trim(f.Alias, "`"))})
+		}
+
 		return f.getViewNode()
 	case TAG_FUNCTION_TO_STRING:
 		if common.IsValueInSliceString(f.Args[0], []string{"start_time", "end_time"}) {
@@ -587,6 +837,15 @@ func (f *TagFunction) Trans(m *view.Model) view.Node {
 		node := f.getViewNode()
 		// node.(*view.Tag).Flag = view.NODE_FLAG_METRICS_TOP
 		return node
+	case TAG_FUNCTION_FAST_TRANS:
+		if f.DB == chCommon.DB_NAME_PROMETHEUS && f.Args[0] == "tag" {
+			_, labelFastTranslatorStr, _ := GetPrometheusAllTagTranslator(f.Table)
+			f.Value = labelFastTranslatorStr
+		}
+		if f.Alias == "" {
+			f.Alias = fmt.Sprintf("fast_trans_%s", f.Args[0])
+		}
+		return f.getViewNode()
 	case TAG_FUNCTION_ENUM:
 		var tagFilter string
 		tagEnum := strings.TrimSuffix(f.Args[0], "_0")
@@ -634,6 +893,8 @@ func (f *TagFunction) Trans(m *view.Model) view.Node {
 	if len(fields) > 1 {
 		if f.Name == "if" {
 			withValue = fmt.Sprintf("%s(%s)", f.Name, strings.Join(values, ","))
+		} else if strings.HasPrefix(f.Name, "topK") || strings.HasPrefix(f.Name, "any") {
+			withValue = fmt.Sprintf("%s((%s))", f.Name, strings.Join(values, ","))
 		} else {
 			withValue = fmt.Sprintf("%s([%s])", f.Name, strings.Join(values, ","))
 		}

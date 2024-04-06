@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@ use npb_pcap_policy::{NpbTunnelType, PolicyData};
 use public::{
     counter::{CounterType, CounterValue, OwnedCountable},
     leaky_bucket::LeakyBucket,
+    proto::trident::VlanMode,
     queue::DebugSender,
 };
 
@@ -100,7 +101,7 @@ impl NpbHandler {
         _mtu: usize,
         _pseudo_tunnel_header: [Vec<u8>; NpbTunnelType::Max as usize],
         _underlay_vlan_header_size: usize,
-        _overlay_vlan: bool,
+        _overlay_vlan_mode: VlanMode,
         _bps_limit: Arc<LeakyBucket>,
         _counter: Arc<NpbHandlerCounter>,
         _sender: DebugSender<(u64, usize, Vec<u8>)>,

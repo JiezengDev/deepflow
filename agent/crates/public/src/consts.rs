@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
-#[cfg(target_os = "linux")]
+use std::time::Duration;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub const PROCESS_NAME: &str = "deepflow-agent";
 #[cfg(target_os = "windows")]
 pub const PROCESS_NAME: &str = "deepflow-agent.exe";
@@ -46,6 +48,16 @@ mod platform_consts {
     pub const COREFILE_FORMAT: &'static str = "core";
     pub const DEFAULT_COREFILE_PATH: &'static str = "/tmp";
     pub const DEFAULT_LIBVIRT_XML_PATH: &'static str = "/etc/libvirt/qemu";
+}
+
+/* TODO: fix constants for android */
+#[cfg(target_os = "android")]
+mod platform_consts {
+    pub const DEFAULT_LOG_FILE: &'static str = "/var/log/deepflow-agent/deepflow-agent.log";
+    pub const DEFAULT_CONF_FILE: &'static str = "/etc/deepflow-agent.yaml";
+    pub const DEFAULT_TRIDENT_CONF_FILE: &'static str = "/etc/trident.yaml";
+    pub const COREFILE_FORMAT: &'static str = "core";
+    pub const DEFAULT_COREFILE_PATH: &'static str = "/tmp";
 }
 
 #[cfg(target_os = "windows")]
@@ -100,6 +112,9 @@ pub const FIELD_OFFSET_TCP_WIN: usize = 48;
 pub const FIELD_OFFSET_TCPV6_WIN: usize = 68;
 pub const FIELD_OFFSET_VXLAN_FLAGS: usize = 42;
 pub const FIELD_OFFSET_VXLAN_VNI: usize = 46;
+pub const FIELD_OFFSET_GENEVE_VERSION: usize = 42;
+pub const FIELD_OFFSET_GENEVE_PROTOCOL: usize = 44;
+pub const FIELD_OFFSET_GENEVE_VNI: usize = 46;
 
 pub const FIELD_LEN_DA: usize = 6;
 pub const FIELD_LEN_SA: usize = 6;
@@ -165,6 +180,7 @@ pub const ERSPAN_I_HEADER_SIZE: usize = 0;
 pub const ERSPAN_II_HEADER_SIZE: usize = 8;
 pub const ERSPAN_III_HEADER_SIZE: usize = 12;
 pub const ERSPAN_III_SUBHEADER_SIZE: usize = 8;
+pub const GENEVE_HEADER_SIZE: usize = 8;
 pub const TCP_HEADER_SIZE: usize = 20;
 
 // min packet size
@@ -382,6 +398,15 @@ pub const GRE_SEQ_LEN: usize = 4;
 pub const GRE_KEY_LEN: usize = 4;
 pub const GRE_CSUM_LEN: usize = 4;
 
+pub const GENEVE_VERSION_OFFSET: usize = 0;
+pub const GENEVE_PROTOCOL_OFFSET: usize = 2;
+pub const GENEVE_VNI_OFFSET: usize = 4;
+
+pub const GENEVE_OPTION_LENGTH_MASK: u8 = 0x3f;
+
+pub const GENEVE_VERSION_SHIFT: u8 = 6;
+pub const GENEVE_VNI_SHIFT: u32 = 8;
+
 pub const IP_IHL_OFFSET: usize = 0;
 pub const IP6_PROTO_OFFSET: usize = 6;
 pub const IP6_SIP_OFFSET: usize = 20; // 用于解析tunnel，仅使用后四个字节
@@ -404,3 +429,7 @@ pub const L7_PROTOCOL_INFERENCE_TTL: usize = 60;
 // RawPcap
 pub const PCAP_MAGIC: u32 = 0xa1b2c3d4;
 pub const RECORD_HEADER_LEN: usize = 16;
+
+// GRPC
+pub const GRPC_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const GRPC_SESSION_TIMEOUT: Duration = Duration::from_secs(30);

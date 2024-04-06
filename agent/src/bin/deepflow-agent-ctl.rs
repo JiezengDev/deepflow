@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,12 +28,12 @@ use clap::{ArgEnum, Parser, Subcommand};
 #[cfg(target_os = "linux")]
 use flate2::write::ZlibDecoder;
 
-#[cfg(target_os = "linux")]
-use deepflow_agent::debug::PlatformMessage;
 use deepflow_agent::debug::{
     Beacon, Client, Message, Module, PolicyMessage, RpcMessage, DEBUG_QUEUE_IDLE_TIMEOUT,
     DEEPFLOW_AGENT_BEACON,
 };
+#[cfg(target_os = "linux")]
+use deepflow_agent::debug::{EbpfMessage, PlatformMessage};
 use public::{consts::DEFAULT_CONTROLLER_PORT, debug::QueueMessage};
 
 const ERR_PORT_MSG: &str = "error: The following required arguments were not provided:
@@ -65,6 +65,10 @@ enum ControllerCmd {
     Queue(QueueCmd),
     /// get information about the policy
     Policy(PolicyCmd),
+    #[cfg(target_os = "linux")]
+    /// get information about the ebpf
+    Ebpf(EbpfCmd),
+    /// get information about the deepflow-agent
     List,
 }
 
@@ -134,6 +138,52 @@ struct AnalyzingArgs {
     /// eg: deepflow-agent-ctl policy analyzing --id 10
     #[clap(long, parse(try_from_str))]
     id: Option<u32>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Parser)]
+struct EbpfCmd {
+    #[clap(subcommand)]
+    subcmd: EbpfSubCmd,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Subcommand, Debug)]
+enum EbpfSubCmd {
+    /// monitor datadump
+    Datadump(EbpfArgs),
+    /// monitor cpdbg
+    Cpdbg(EbpfArgs),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Parser)]
+struct EbpfArgs {
+    /// Set datadump pid
+    ///
+    /// eg: deepflow-agent-ctl ebpf datadump --pid 10001
+    #[clap(long, parse(try_from_str), default_value_t = 0)]
+    pid: u32,
+    /// Set datadump name
+    ///
+    /// eg: deepflow-agent-ctl ebpf datadump --name nginx
+    #[clap(long, parse(try_from_str), default_value = "")]
+    name: String,
+    /// Set datadump app protocol
+    ///
+    /// App Protocol: All(0), Other(1),
+    ///   HTTP1(20), HTTP2(21), Dubbo(40), SofaRPC(43),
+    ///   MySQL(60), PostGreSQL(61), Oracle(62), Redis(80),
+    ///   Kafka(100), MQTT(101), DNS(120), TLS(121),
+    ///
+    /// eg: deepflow-agent-ctl ebpf datadump --proto 20
+    #[clap(long, parse(try_from_str), default_value_t = 0)]
+    proto: u8,
+    /// Set datadump/cpdbg duration
+    ///
+    /// eg: deepflow-agent-ctl ebpf datadump --duration 10
+    #[clap(long, parse(try_from_str), default_value_t = 30)]
+    duration: u16,
 }
 
 #[cfg(target_os = "linux")]
@@ -246,13 +296,26 @@ impl Controller {
             ControllerCmd::List => self.list(),
             ControllerCmd::Queue(c) => self.queue(c),
             ControllerCmd::Policy(c) => self.policy(c),
+            #[cfg(target_os = "linux")]
+            ControllerCmd::Ebpf(c) => self.ebpf(c),
         }
     }
 
     fn new_client(&self) -> Result<Client> {
+        let addr = match self.addr {
+            IpAddr::V4(a) => IpAddr::V4(a),
+            IpAddr::V6(a) => {
+                if let Some(v4) = a.to_ipv4() {
+                    IpAddr::V4(v4)
+                } else {
+                    IpAddr::V6(a)
+                }
+            }
+        };
+
         let client = Client::new(
             (
-                self.addr,
+                addr,
                 self.port.expect("need input a port to connect debugger"),
             )
                 .into(),
@@ -349,7 +412,9 @@ impl Controller {
         client.send_to(msg)?;
 
         loop {
-            let resp = client.recv::<RpcMessage>()?;
+            let Ok(resp) = client.recv::<RpcMessage>() else {
+                continue;
+            };
             match resp {
                 RpcMessage::Acls(v)
                 | RpcMessage::PlatformData(v)
@@ -389,7 +454,9 @@ impl Controller {
             println!("available queues: ");
 
             loop {
-                let res = client.recv::<QueueMessage>()?;
+                let Ok(res) = client.recv::<QueueMessage>() else {
+                    continue;
+                };
                 match res {
                     QueueMessage::Names(e) => match e {
                         Some(e) => {
@@ -418,7 +485,9 @@ impl Controller {
             };
             client.send_to(msg)?;
 
-            let res = client.recv::<QueueMessage>()?;
+            let Ok(res) = client.recv::<QueueMessage>() else {
+                return Ok(());
+            };
             match res {
                 QueueMessage::Fin => {
                     println!("turn off all queues successful");
@@ -435,7 +504,9 @@ impl Controller {
                 msg: QueueMessage::Off(s.clone()),
             };
             client.send_to(msg)?;
-            let res = client.recv::<QueueMessage>()?;
+            let Ok(res) = client.recv::<QueueMessage>() else {
+                return Ok(());
+            };
             match res {
                 QueueMessage::Fin => {
                     println!("turn off queue={} successful", s);
@@ -459,14 +530,18 @@ impl Controller {
             };
             client.send_to(msg)?;
 
-            let res = client.recv::<QueueMessage>()?;
+            let Ok(res) = client.recv::<QueueMessage>() else {
+                return Ok(());
+            };
             if let QueueMessage::Err(e) = res {
                 return Err(anyhow!(e));
             }
             println!("loading queue item...");
             let mut seq = 0;
             loop {
-                let res = client.recv::<QueueMessage>()?;
+                let Ok(res) = client.recv::<QueueMessage>() else {
+                    continue;
+                };
                 match res {
                     QueueMessage::Send(e) => {
                         println!("MSG-{} {}", seq, e);
@@ -509,7 +584,9 @@ impl Controller {
             println!("Interface Index \t MAC address");
 
             loop {
-                let res = client.recv::<PlatformMessage>()?;
+                let Ok(res) = client.recv::<PlatformMessage>() else {
+                    continue;
+                };
                 match res {
                     PlatformMessage::MacMappings(e) => {
                         match e {
@@ -542,7 +619,9 @@ impl Controller {
                 };
                 client.send_to(msg)?;
                 loop {
-                    let res = client.recv::<PlatformMessage>()?;
+                    let Ok(res) = client.recv::<PlatformMessage>() else {
+                        continue;
+                    };
                     match res {
                         PlatformMessage::Version(v) => {
                             /*
@@ -567,7 +646,9 @@ impl Controller {
             client.send_to(msg)?;
             let mut decoder = ZlibDecoder::new(vec![]);
             loop {
-                let res = client.recv::<PlatformMessage>()?;
+                let Ok(res) = client.recv::<PlatformMessage>() else {
+                    continue;
+                };
                 match res {
                     PlatformMessage::Watcher(v) => {
                         /*
@@ -602,7 +683,9 @@ impl Controller {
                 })?;
 
                 loop {
-                    let res = client.recv::<PolicyMessage>()?;
+                    let Ok(res) = client.recv::<PolicyMessage>() else {
+                        continue;
+                    };
                     match res {
                         PolicyMessage::Context(c) => println!("{}", c),
                         PolicyMessage::Done => return Ok(()),
@@ -622,7 +705,9 @@ impl Controller {
 
                 let mut count = 1;
                 loop {
-                    let res = client.recv::<PolicyMessage>()?;
+                    let Ok(res) = client.recv::<PolicyMessage>() else {
+                        continue;
+                    };
                     match res {
                         PolicyMessage::Title(t) => {
                             println!("{}", t);
@@ -645,12 +730,54 @@ impl Controller {
                     msg: PolicyMessage::Analyzing(args.id.unwrap_or_default()),
                 })?;
 
-                let res = client.recv::<PolicyMessage>()?;
+                let Ok(res) = client.recv::<PolicyMessage>() else {
+                    return Ok(());
+                };
                 match res {
                     PolicyMessage::Context(c) => println!("{}", c),
                     _ => unreachable!(),
                 }
                 Ok(())
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ebpf(&self, c: EbpfCmd) -> Result<()> {
+        if self.port.is_none() {
+            return Err(anyhow!(ERR_PORT_MSG));
+        }
+
+        let mut client = self.new_client()?;
+        match c.subcmd {
+            EbpfSubCmd::Cpdbg(arg) => {
+                client.send_to(Message {
+                    module: Module::Ebpf,
+                    msg: EbpfMessage::Cpdbg(arg.duration),
+                })?;
+            }
+            EbpfSubCmd::Datadump(arg) => {
+                client.send_to(Message {
+                    module: Module::Ebpf,
+                    msg: EbpfMessage::DataDump((arg.pid, arg.name, arg.proto, arg.duration)),
+                })?;
+            }
+        }
+
+        loop {
+            let Ok(res) = client.recv::<EbpfMessage>() else {
+                continue;
+            };
+            match res {
+                EbpfMessage::Context((seq, c)) => {
+                    println!("SEQ {}: {}", seq, String::from_utf8_lossy(&c))
+                }
+                EbpfMessage::Done => return Ok(()),
+                EbpfMessage::Error(e) => {
+                    println!("{}", e);
+                    return Ok(());
+                }
+                _ => unreachable!(),
             }
         }
     }

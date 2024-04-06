@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
  */
 
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,7 +40,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/deepflowio/deepflow/cli/ctl/common"
-	"github.com/deepflowio/deepflow/cli/ctl/common/jsonparser"
+	"github.com/deepflowio/deepflow/cli/ctl/common/table"
 	"github.com/deepflowio/deepflow/cli/ctl/example"
 )
 
@@ -142,7 +142,7 @@ func listSubDomain(cmd *cobra.Command, args []string, output string) error {
 	if domain != "" {
 		filter["domain"] = domain
 	}
-	response, err := common.GetByFilter(url, nil, filter)
+	response, err := common.GetByFilter(url, nil, filter, []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		return err
 	}
@@ -153,25 +153,35 @@ func listSubDomain(cmd *cobra.Command, args []string, output string) error {
 		fmt.Printf(string(yData))
 		return nil
 	}
-	var (
-		nameMaxSize       = jsonparser.GetTheMaxSizeOfAttr(response.Get("DATA"), "NAME")
-		lcuuidMaxSize     = jsonparser.GetTheMaxSizeOfAttr(response.Get("DATA"), "LCUUID")
-		domainMaxSize     = jsonparser.GetTheMaxSizeOfAttr(response.Get("DATA"), "DOMAIN")
-		domainNameMaxSize = jsonparser.GetTheMaxSizeOfAttr(response.Get("DATA"), "DOMAIN_NAME")
-		clusterIDMaxSize  = jsonparser.GetTheMaxSizeOfAttr(response.Get("DATA"), "CLUSTER_ID")
-	)
-	cmdFormat := "%-*s %-*s %-*s %-*s %-*s\n"
-	fmt.Printf(cmdFormat, nameMaxSize, "NAME", clusterIDMaxSize, "CLUSTER_ID", lcuuidMaxSize, "LCUUID",
-		domainNameMaxSize, "DOMAIN_NAME", domainMaxSize, "DOMAIN")
+	t := table.New()
+	t.SetHeader([]string{"NAME", "CLUSTER_ID", "LCUUID", "DOMAIN_NAME", "DOMAIN"})
+	tableItems := [][]string{}
 	for i := range response.Get("DATA").MustArray() {
 		sb := response.Get("DATA").GetIndex(i)
-		fmt.Printf(cmdFormat,
-			nameMaxSize, sb.Get("NAME").MustString(),
-			clusterIDMaxSize, sb.Get("CLUSTER_ID").MustString(),
-			lcuuidMaxSize, sb.Get("LCUUID").MustString(),
-			domainNameMaxSize, sb.Get("DOMAIN_NAME").MustString(),
-			domainMaxSize, sb.Get("DOMAIN").MustString())
+		name := sb.Get("NAME").MustString()
+		var nameChineseCount int
+		for _, b := range name {
+			if common.IsChineseChar(string(b)) {
+				nameChineseCount += 1
+			}
+		}
+		dName := sb.Get("DOMAIN_NAME").MustString()
+		var dNameChineseCount int
+		for _, d := range dName {
+			if common.IsChineseChar(string(d)) {
+				dNameChineseCount += 1
+			}
+		}
+		tableItems = append(tableItems, []string{
+			name,
+			sb.Get("CLUSTER_ID").MustString(),
+			sb.Get("LCUUID").MustString(),
+			dName,
+			sb.Get("DOMAIN").MustString(),
+		})
 	}
+	t.AppendBulk(tableItems)
+	t.Render()
 	return nil
 }
 
@@ -184,15 +194,15 @@ func createSubDomain(cmd *cobra.Command, fileName string) error {
 		return err
 	}
 
-	server := common.GetServerInfo(cmd)
-	domainLcuuid, err := getLcuuidByDomainName(server, body["DOMAIN_NAME"].(string), body)
+	domainLcuuid, err := getLcuuidByDomainName(cmd, body["DOMAIN_NAME"].(string), body)
 	if err != nil {
 		return err
 	}
 	body["DOMAIN"] = domainLcuuid
 
+	server := common.GetServerInfo(cmd)
 	url := fmt.Sprintf("http://%s:%d/v2/sub-domains/", server.IP, server.Port)
-	_, err = common.CURLPerform("POST", url, body, "")
+	_, err = common.CURLPerform("POST", url, body, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		return err
 	}
@@ -212,13 +222,13 @@ func updateSubDomain(cmd *cobra.Command, args []string, fileName string) error {
 		return errors.New("cluster_id is required")
 	}
 	clusterID := args[0]
-	server := common.GetServerInfo(cmd)
-	lcuuid, err := getLcuuidByClusterID(server, clusterID)
+	lcuuid, err := getLcuuidByClusterID(cmd, clusterID)
 	if err != nil {
 		return err
 	}
+	server := common.GetServerInfo(cmd)
 	url := fmt.Sprintf("http://%s:%d/v2/sub-domains/%s/", server.IP, server.Port, lcuuid)
-	_, err = common.CURLPerform("PATCH", url, body, "")
+	_, err = common.CURLPerform("PATCH", url, body, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		return err
 	}
@@ -257,23 +267,24 @@ func deleteSubDomain(cmd *cobra.Command, args []string) error {
 	}
 	clusterID := args[0]
 
-	server := common.GetServerInfo(cmd)
-	lcuuid, err := getLcuuidByClusterID(server, clusterID)
+	lcuuid, err := getLcuuidByClusterID(cmd, clusterID)
 	if err != nil {
 		return err
 	}
+	server := common.GetServerInfo(cmd)
 	url := fmt.Sprintf("http://%s:%d/v2/sub-domains/%s/", server.IP, server.Port, lcuuid)
-	_, err = common.CURLPerform("DELETE", url, nil, "")
+	_, err = common.CURLPerform("DELETE", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func getLcuuidByDomainName(server *common.Server, domainName string,
+func getLcuuidByDomainName(cmd *cobra.Command, domainName string,
 	body map[string]interface{}) (string, error) {
+	server := common.GetServerInfo(cmd)
 	url := fmt.Sprintf("http://%s:%d/v2/domains", server.IP, server.Port)
-	response, err := common.GetByFilter(url, body, common.Filter{"name": domainName})
+	response, err := common.GetByFilter(url, body, common.Filter{"name": domainName}, []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		return "", err
 	}
@@ -292,9 +303,10 @@ func getLcuuidByDomainName(server *common.Server, domainName string,
 	return domainLcuuid, nil
 }
 
-func getLcuuidByClusterID(server *common.Server, clusterID string) (string, error) {
+func getLcuuidByClusterID(cmd *cobra.Command, clusterID string) (string, error) {
+	server := common.GetServerInfo(cmd)
 	url := fmt.Sprintf("http://%s:%d/v2/sub-domains", server.IP, server.Port)
-	response, err := common.GetByFilter(url, nil, common.Filter{"cluster_id": clusterID})
+	response, err := common.GetByFilter(url, nil, common.Filter{"cluster_id": clusterID}, []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		return "", err
 	}

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,9 +18,9 @@ package statsd
 
 import (
 	"fmt"
-	"math"
 	"os"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/deepflowio/deepflow/server/controller/common"
@@ -28,7 +28,7 @@ import (
 	"github.com/deepflowio/deepflow/server/libs/codec"
 	"github.com/deepflowio/deepflow/server/libs/stats"
 	"github.com/deepflowio/deepflow/server/libs/stats/pb"
-	"github.com/op/go-logging"
+	logging "github.com/op/go-logging"
 )
 
 var log = logging.MustGetLogger("statsd")
@@ -57,7 +57,10 @@ func (s *StatsdMonitor) RegisterStatsdTable(statter Statsdtable) {
 
 	if dfstatsdClient == nil {
 		var err error
-		dfstatsdClient, err = stats.NewUDPClient(stats.UDPConfig{fmt.Sprintf("%s:%d", s.host, s.port), 1400})
+		dfstatsdClient, err = stats.NewUDPClient(stats.UDPConfig{
+			Addr:        fmt.Sprintf("%s:%d", s.host, s.port),
+			PayloadSize: 1400,
+		})
 		if err != nil {
 			log.Warningf("connect (%s:%d) stats udp server failed: %s", s.host, s.port, err.Error())
 			return
@@ -74,6 +77,7 @@ func (s *StatsdMonitor) RegisterStatsdTable(statter Statsdtable) {
 
 	// collect
 	timeStamp := time.Now().Unix()
+	dfStats := &pb.Stats{}
 	for _, e := range statter.GetStatter().Element {
 		for mfName, mfValues := range e.MetricsFloatNameToValues {
 			name := common.DEEPFLOW_STATSD_PREFIX + "_" + e.VirtualTableName
@@ -90,27 +94,26 @@ func (s *StatsdMonitor) RegisterStatsdTable(statter Statsdtable) {
 
 			metricsFloatNames := []string{}
 			metricsFloatValues := []float64{}
-			var vSum int
+			var vSum float64
 			for _, v := range mfValues {
 				vSum += v
 			}
 			switch e.MetricType {
-			case "Inc":
+			case MetricInc:
 				metricsFloatNames = []string{"count"}
-				metricsFloatValues = []float64{float64(vSum)}
-			case "Timing":
-				vLen := len(mfValues)
-				vAVG := math.Ceil(float64(vSum / vLen))
+				metricsFloatValues = []float64{vSum}
+			case MetricTiming:
+				vLen := float64(len(mfValues))
+				vAVG, _ := strconv.ParseFloat(fmt.Sprintf("%.3f", vSum/vLen), 64)
 				metricsFloatNames = []string{"avg", "len"}
 				if vLen == 1 && vAVG == 0 {
 					vLen = 0
 				}
-				metricsFloatValues = []float64{vAVG, float64(vLen)}
+				metricsFloatValues = []float64{vAVG, vLen}
 			default:
 				continue
 			}
 
-			dfStats := pb.AcquireDFStats()
 			dfStats.Timestamp = uint64(timeStamp)
 			dfStats.Name = name
 			dfStats.TagNames = tagNames

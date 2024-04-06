@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -104,6 +104,10 @@
                                                                  | clean the VmParseCtx and merge the KeyVal to HttpInfo attribute|
                                                                  +----------------------------------------------------------------+
 */
+
+#[path = "wasm_plugin.rs"]
+pub mod wasm_plugin;
+
 mod abi_export;
 mod abi_import;
 mod host;
@@ -113,18 +117,20 @@ mod test;
 mod vm;
 
 use host::{
-    StoreDataType, EXPORT_FUNC_CHECK_PAYLOAD, EXPORT_FUNC_GET_HOOK_BITMAP, EXPORT_FUNC_ON_HTTP_REQ,
-    EXPORT_FUNC_ON_HTTP_RESP, EXPORT_FUNC_PARSE_PAYLOAD, IMPORT_FUNC_HOST_READ_HTTP_RESULT,
-    IMPORT_FUNC_HOST_READ_L7_PROTOCOL_INFO, IMPORT_FUNC_HOST_READ_STR_RESULT,
-    IMPORT_FUNC_VM_READ_CTX_BASE, IMPORT_FUNC_VM_READ_HTTP_REQ, IMPORT_FUNC_VM_READ_HTTP_RESP,
-    IMPORT_FUNC_VM_READ_PAYLOAD, IMPORT_FUNC_WASM_LOG, LOG_LEVEL_ERR, LOG_LEVEL_INFO,
-    LOG_LEVEL_WARN, WASM_MODULE_NAME,
+    StoreDataType, EXPORT_FUNC_CHECK_PAYLOAD, EXPORT_FUNC_GET_CUSTOM_MESSAGE_HOOK,
+    EXPORT_FUNC_GET_HOOK_BITMAP, EXPORT_FUNC_ON_CUSTOM_MESSAGE, EXPORT_FUNC_ON_HTTP_REQ,
+    EXPORT_FUNC_ON_HTTP_RESP, EXPORT_FUNC_PARSE_PAYLOAD, IMPORT_FUNC_HOST_READ_L7_PROTOCOL_INFO,
+    IMPORT_FUNC_HOST_READ_STR_RESULT, IMPORT_FUNC_VM_READ_CTX_BASE,
+    IMPORT_FUNC_VM_READ_CUSTOM_MESSAGE, IMPORT_FUNC_VM_READ_HTTP_REQ,
+    IMPORT_FUNC_VM_READ_HTTP_RESP, IMPORT_FUNC_VM_READ_PAYLOAD, IMPORT_FUNC_WASM_LOG,
+    LOG_LEVEL_ERR, LOG_LEVEL_INFO, LOG_LEVEL_WARN, WASM_MODULE_NAME,
 };
 use public::bytes::read_u16_be;
-use vm::{VmCtxBase, VmHttpReqCtx, VmHttpRespCtx, VmParseCtx, VmResult};
+use vm::{VmCtxBase, VmHttpReqCtx, VmHttpRespCtx, VmOnCustomMessageCtx, VmParseCtx, VmResult};
 
-pub use host::{get_all_wasm_export_func_name, init_wasmtime, WasmVm};
-pub use metric::{get_wasm_metric_counter_map_key, WasmCounter, WasmCounterMap};
+pub use host::WasmData;
+pub use host::WasmVm;
+pub use metric::WasmCounter;
 
 #[macro_export]
 macro_rules! wasm_info {
@@ -203,6 +209,7 @@ pub fn read_wasm_str(data: &[u8], offset: &mut usize) -> Option<String> {
 
 pub(super) const HOOK_POINT_HTTP_REQ: u128 = 1 << 127;
 pub(super) const HOOK_POINT_HTTP_RESP: u128 = 1 << 126;
+pub(super) const HOOK_POINT_ON_CUSTOM_MESSAGE: u128 = 1 << 125;
 
 pub(super) const HOOK_POINT_PAYLOAD_PARSE: u128 = 1;
 

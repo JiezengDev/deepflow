@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -45,7 +45,6 @@ use crate::{
     utils::bytes::read_u16_be,
 };
 use public::{
-    netns::NsFile,
     proto::{common::TridentType, trident::IfMacSource},
     utils::net::{Link, MacAddr},
 };
@@ -74,7 +73,7 @@ impl LocalModeDispatcher {
             base.ntp_diff.clone(),
             &base.flow_map_config.load(),
             Some(base.packet_sequence_output_queue.clone()), // Enterprise Edition Feature: packet-sequence
-            &base.stats,
+            base.stats.clone(),
             false, // !from_ebpf
         );
 
@@ -83,7 +82,7 @@ impl LocalModeDispatcher {
                 flow: &base.flow_map_config.load(),
                 log_parser: &base.log_parse_config.load(),
                 collector: &base.collector_config.load(),
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 ebpf: None,
             };
 
@@ -115,7 +114,7 @@ impl LocalModeDispatcher {
             }
             #[cfg(target_os = "windows")]
             let (mut packet, mut timestamp) = recved.unwrap();
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             let (packet, mut timestamp) = recved.unwrap();
 
             let pipeline = {
@@ -126,12 +125,14 @@ impl LocalModeDispatcher {
                     continue;
                 } else {
                     // send to one of the pipelines if packet is LLDP
-                    let mut eth_type = read_u16_be(&packet.data[FIELD_OFFSET_ETH_TYPE..]);
-                    if eth_type == EthernetType::Dot1Q {
+                    let mut eth_type: EthernetType =
+                        read_u16_be(&packet.data[FIELD_OFFSET_ETH_TYPE..]).into();
+                    if eth_type == EthernetType::DOT1Q {
                         eth_type =
-                            read_u16_be(&packet.data[FIELD_OFFSET_ETH_TYPE + VLAN_HEADER_SIZE..]);
+                            read_u16_be(&packet.data[FIELD_OFFSET_ETH_TYPE + VLAN_HEADER_SIZE..])
+                                .into();
                     }
-                    if eth_type != EthernetType::LinkLayerDiscovery {
+                    if eth_type != EthernetType::LINK_LAYER_DISCOVERY {
                         continue;
                     }
                     pipelines.iter().next().unwrap().1.clone()
@@ -163,7 +164,7 @@ impl LocalModeDispatcher {
 
             let tunnel_type_bitmap = base.tunnel_type_bitmap.lock().unwrap().clone();
 
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             let decap_length = match BaseDispatcher::decap_tunnel(
                 packet.data,
                 &base.tap_type_handler,
@@ -247,7 +248,7 @@ impl LocalModeDispatcher {
                 base.npb_dedup_enabled.load(Ordering::Relaxed),
             );
             flow_map.inject_meta_packet(&config, &mut meta_packet);
-            let mini_packet = MiniPacket::new(overlay_packet, &meta_packet);
+            let mini_packet = MiniPacket::new(overlay_packet, &meta_packet, 0);
             for h in pipeline.handlers.iter_mut() {
                 h.handle(&mini_packet);
             }
@@ -261,7 +262,7 @@ impl LocalModeDispatcher {
             }
             if base
                 .tap_interface_whitelist
-                .next_sync(meta_packet.lookup_key.timestamp)
+                .next_sync(meta_packet.lookup_key.timestamp.into())
             {
                 base.need_update_bpf.store(true, Ordering::Relaxed);
             }
@@ -277,14 +278,14 @@ impl LocalModeDispatcher {
         #[cfg(target_os = "linux")]
         return LocalModeDispatcherListener::new(self.base.listener(), self.extractor.clone());
 
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "android"))]
         return LocalModeDispatcherListener::new(self.base.listener());
     }
 }
 
 impl LocalModeDispatcher {
-    pub(super) fn switch_recv_engine(&mut self, pcap_interfaces: Vec<Link>) -> Result<()> {
-        self.base.switch_recv_engine(pcap_interfaces)
+    pub(super) fn switch_recv_engine(&mut self, config: &DispatcherConfig) -> Result<()> {
+        self.base.switch_recv_engine(config)
     }
 }
 
@@ -309,8 +310,9 @@ impl LocalModeDispatcherListener {
         }
     }
 
-    pub(super) fn netns(&self) -> NsFile {
-        self.base.netns.clone()
+    #[cfg(target_os = "linux")]
+    pub fn netns(&self) -> &public::netns::NsFile {
+        &self.base.netns
     }
 
     pub(super) fn on_config_change(&mut self, config: &DispatcherConfig) {
@@ -323,6 +325,10 @@ impl LocalModeDispatcherListener {
         return self.base.id;
     }
 
+    pub fn local_dispatcher_count(&self) -> usize {
+        return self.base.local_dispatcher_count;
+    }
+
     pub fn flow_acl_change(&self) {
         // Start capturing traffic after resource information is distributed
         self.base.pause.store(false, Ordering::Relaxed);
@@ -331,7 +337,7 @@ impl LocalModeDispatcherListener {
 
     pub fn on_tap_interface_change(
         &self,
-        interfaces: &Vec<Link>,
+        interfaces: &[Link],
         if_mac_source: IfMacSource,
         trident_type: TridentType,
         blacklist: &Vec<u64>,
@@ -369,6 +375,7 @@ impl LocalModeDispatcherListener {
             &interfaces,
             if_mac_source,
             trident_type,
+            #[cfg(target_os = "linux")]
             &self.base.options.lock().unwrap().tap_mac_script,
         );
         self.base.on_vm_change(&keys, &macs);
@@ -381,15 +388,15 @@ impl LocalModeDispatcherListener {
         if_mac_source: IfMacSource,
         trident_type: TridentType,
         #[cfg(target_os = "linux")] tap_mac_script: &str,
-        #[cfg(target_os = "windows")] _: &str,
     ) -> Vec<MacAddr> {
         let mut macs = vec![];
 
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "android"))]
         let index_to_mac_map = Self::get_if_index_to_inner_mac_map();
         #[cfg(target_os = "linux")]
         let index_to_mac_map =
             Self::get_if_index_to_inner_mac_map(&self.base.platform_poller, &self.base.netns);
+
         #[cfg(target_os = "linux")]
         let name_to_mac_map = self.get_if_name_to_mac_map(tap_mac_script);
 
@@ -425,15 +432,17 @@ impl LocalModeDispatcherListener {
                 IfMacSource::IfLibvirtXml => {
                     *name_to_mac_map.get(&iface.name).unwrap_or(&iface.mac_addr)
                 }
-                #[cfg(target_os = "windows")]
+                #[cfg(any(target_os = "windows", target_os = "android"))]
                 IfMacSource::IfLibvirtXml => MacAddr::ZERO,
             });
         }
         macs
     }
-    #[cfg(target_os = "linux")]
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn get_if_name_to_mac_map(&self, tap_mac_script: &str) -> HashMap<String, MacAddr> {
         let mut result = HashMap::new();
+        #[cfg(target_os = "linux")]
         if let Some(entries) = self.extractor.get_entries() {
             debug!("Xml Mac:");
             for entry in entries {
@@ -450,7 +459,7 @@ impl LocalModeDispatcherListener {
         result
     }
 
-    fn parse_tap_mac_script_output(result: &mut HashMap<String, MacAddr>, bytes: &[u8]) {
+    pub fn parse_tap_mac_script_output(result: &mut HashMap<String, MacAddr>, bytes: &[u8]) {
         let mut iter = bytes.split(|x| *x == b'\n');
         while let Some(line) = iter.next() {
             let mut kvs = line.split(|x| *x == b',');
@@ -475,9 +484,9 @@ impl LocalModeDispatcherListener {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "android"))]
 impl LocalModeDispatcherListener {
-    fn get_if_index_to_inner_mac_map() -> HashMap<u32, MacAddr> {
+    pub fn get_if_index_to_inner_mac_map() -> HashMap<u32, MacAddr> {
         let mut result = HashMap::new();
 
         match public::utils::net::link_list() {
@@ -501,7 +510,10 @@ impl LocalModeDispatcherListener {
 
 #[cfg(target_os = "linux")]
 impl LocalModeDispatcherListener {
-    fn get_if_index_to_inner_mac_map(poller: &GenericPoller, ns: &NsFile) -> HashMap<u32, MacAddr> {
+    pub fn get_if_index_to_inner_mac_map(
+        poller: &GenericPoller,
+        ns: &public::netns::NsFile,
+    ) -> HashMap<u32, MacAddr> {
         let mut result = HashMap::new();
 
         match poller.get_interface_info_in(ns) {
@@ -538,7 +550,7 @@ impl LocalModeDispatcherListener {
 }
 
 #[derive(Clone)]
-struct MacRewriter {
+pub struct MacRewriter {
     contrail_regex: Regex,
     qing_cloud_vm_regex: Regex,
     qing_cloud_sriov_regex: Regex,

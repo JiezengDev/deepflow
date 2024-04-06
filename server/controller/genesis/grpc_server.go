@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -93,7 +93,7 @@ func NewGenesisSynchronizerServer(cfg config.GenesisConfig, genesisSyncQueue, k8
 func (g *SynchronizerServer) GetAgentStats(param string) []TridentStats {
 	result := []TridentStats{}
 	vtapID, err := strconv.Atoi(param)
-	if err != nil {
+	if err == nil {
 		s, ok := g.tridentStatsMap.Load(uint32(vtapID))
 		if !ok {
 			return result
@@ -195,6 +195,7 @@ func (g *SynchronizerServer) GenesisSync(ctx context.Context, request *trident.G
 		stats.SyncVersion = version
 		stats.SyncTridentType = tType
 		stats.SyncLastSeen = time.Now()
+		stats.K8sClusterID = k8sClusterID
 		stats.GenesisSyncProcessDataOperation = request.GetProcessData()
 		stats.GenesisSyncDataOperation = platformData
 		g.tridentStatsMap.Store(vtapID, stats)
@@ -375,9 +376,8 @@ func (g *SynchronizerServer) PrometheusAPISync(ctx context.Context, request *tri
 
 func (g *SynchronizerServer) GenesisSharingK8S(ctx context.Context, request *controller.GenesisSharingK8SRequest) (*controller.GenesisSharingK8SResponse, error) {
 	clusterID := request.GetClusterId()
-	k8sDatas := GenesisService.GetKubernetesData()
 
-	if k8sData, ok := k8sDatas[clusterID]; ok {
+	if k8sData, ok := GenesisService.GetKubernetesData(clusterID); ok {
 		epochStr := k8sData.Epoch.Format(controllercommon.GO_BIRTHDAY)
 		return &controller.GenesisSharingK8SResponse{
 			Epoch:    &epochStr,
@@ -391,9 +391,8 @@ func (g *SynchronizerServer) GenesisSharingK8S(ctx context.Context, request *con
 
 func (g *SynchronizerServer) GenesisSharingPrometheus(ctx context.Context, request *controller.GenesisSharingPrometheusRequest) (*controller.GenesisSharingPrometheusResponse, error) {
 	clusterID := request.GetClusterId()
-	prometheusDatas := GenesisService.GetPrometheusData()
 
-	if prometheusData, ok := prometheusDatas[clusterID]; ok {
+	if prometheusData, ok := GenesisService.GetPrometheusData(clusterID); ok {
 		epochStr := prometheusData.Epoch.Format(controllercommon.GO_BIRTHDAY)
 		entriesByte, _ := json.Marshal(prometheusData.Entries)
 		return &controller.GenesisSharingPrometheusResponse{
@@ -547,6 +546,7 @@ func (g *SynchronizerServer) GenesisSharingSync(ctx context.Context, request *co
 			DeviceLcuuid:        &vData.DeviceLcuuid,
 			DeviceName:          &vData.DeviceName,
 			DeviceType:          &vData.DeviceType,
+			IfType:              &vData.IFType,
 			HostIp:              &vData.HostIP,
 			KubernetesClusterId: &vData.KubernetesClusterID,
 			NodeIp:              &vData.NodeIP,

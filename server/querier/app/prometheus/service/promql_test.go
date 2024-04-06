@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ package service
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	. "github.com/smartystreets/goconvey/convey"
 
@@ -59,8 +60,52 @@ func TestParseMatchersParam(t *testing.T) {
 
 }
 
+func TestParsePromQL(t *testing.T) {
+	executor := NewPrometheusExecutor(5 * time.Minute)
+	Convey("TestCase_ParsePromQL_Success_1", t, func() {
+		res, err := executor.parsePromQL("max(kube_pod_info{job=\"kube-state-metrics\"} * on(node, cluster) group_left(role) kube_node_role{job=\"kube-state-metrics\", role=\"master\"} or on(pod, namespace, cluster) kube_pod_info{job=\"kube-state-metrics\"}) by (node, namespace, host_ip, role, pod, cluster)")
+		So(err, ShouldBeNil)
+		So(len(res.Data), ShouldBeGreaterThan, 0)
+		So(res.Data[0]["table"], ShouldEqual, "kube_pod_info,kube_node_role")
+		So(res.Data[0]["metric"], ShouldEqual, "kube_pod_info,kube_node_role")
+		So(res.Data[0]["aggFunc"], ShouldEqual, "max")
+	})
+
+	Convey("TestCase_ParsePromQL_Success_2", t, func() {
+		res, err := executor.parsePromQL("sum(node_cpu_seconds_total) - irate(node_cpu_seconds_total[5m])")
+		So(err, ShouldBeNil)
+		So(len(res.Data), ShouldBeGreaterThan, 0)
+		So(res.Data[0]["table"], ShouldEqual, "node_cpu_seconds_total")
+		So(res.Data[0]["metric"], ShouldEqual, "node_cpu_seconds_total")
+		So(res.Data[0]["aggFunc"], ShouldEqual, "sum,irate")
+	})
+
+	Convey("TestCase_ParsePromQL_Success_3", t, func() {
+		res, err := executor.parsePromQL("sum(node_cpu_seconds_total)")
+		So(err, ShouldBeNil)
+		So(len(res.Data), ShouldBeGreaterThan, 0)
+		So(res.Data[0]["table"], ShouldEqual, "node_cpu_seconds_total")
+		So(res.Data[0]["metric"], ShouldEqual, "node_cpu_seconds_total")
+		So(res.Data[0]["aggFunc"], ShouldEqual, "sum")
+	})
+
+	Convey("TestCase_ParsePromQL_Success_4_DeepFlow_Metrics", t, func() {
+		res, err := executor.parsePromQL("sum(flow_log__l7_flow_log__request)by(auto_instance_0)")
+		So(err, ShouldBeNil)
+		So(len(res.Data), ShouldBeGreaterThan, 0)
+		So(res.Data[0]["db"], ShouldEqual, "flow_log")
+		So(res.Data[0]["table"], ShouldEqual, "l7_flow_log")
+		So(res.Data[0]["metric"], ShouldEqual, "flow_log__l7_flow_log__request")
+		So(res.Data[0]["aggFunc"], ShouldEqual, "sum")
+	})
+
+	Convey("TestCase_ParsePromQL_Failed", t, func() {
+		_, err := executor.parsePromQL("")
+		So(err, ShouldNotBeNil)
+	})
+}
+
 func BenchmarkForMatchMetricName(b *testing.B) {
-	executor := &prometheusExecutor{}
 	matchers := [][]*labels.Matcher{
 		{
 			{Type: labels.MatchEqual, Name: "job", Value: "prometheus-demo-job"},
@@ -103,7 +148,7 @@ func BenchmarkForMatchMetricName(b *testing.B) {
 	for j := 0; j < len(matchers); j++ {
 		b.Run(fmt.Sprintf("BenchmarkTestFor[%d]", j), func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				executor.matchMetricName(&matchers[j])
+				extractMetricName(&matchers[j])
 			}
 		})
 	}

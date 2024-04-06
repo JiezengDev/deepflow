@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ use public::{
     bytes::{read_u32_be, read_u64_be},
     l7_protocol::L7Protocol,
 };
+
 use serde::Serialize;
 
 use crate::{
@@ -25,6 +26,7 @@ use crate::{
         flow::{L7PerfStats, PacketDirection},
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
         l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
+        meta_packet::EbpfFlags,
     },
     flow_generator::{
         protocol_logs::{
@@ -39,6 +41,8 @@ use super::{
     super::value_is_default,
     postgre_convert::{get_code_desc, get_request_str},
     sql_check::is_postgresql,
+    sql_obfuscate::attempt_obfuscation,
+    ObfuscateCache,
 };
 
 const SSL_REQ: u64 = 34440615471; // 00000008(len) 04d2162f(const 80877103)
@@ -95,17 +99,17 @@ impl L7ProtocolInfoInterface for PostgreInfo {
         None
     }
 
-    fn merge_log(&mut self, other: L7ProtocolInfo) -> Result<()> {
+    fn merge_log(&mut self, other: &mut L7ProtocolInfo) -> Result<()> {
         if let L7ProtocolInfo::PostgreInfo(pg) = other {
             match pg.msg_type {
                 LogMessageType::Request => {
                     self.req_type = pg.req_type;
-                    self.context = pg.context.clone();
+                    std::mem::swap(&mut self.context, &mut pg.context);
                 }
                 LogMessageType::Response => {
                     self.resp_type = pg.resp_type;
-                    self.result = pg.result;
-                    self.error_message = pg.error_message;
+                    std::mem::swap(&mut self.result, &mut pg.result);
+                    std::mem::swap(&mut self.error_message, &mut pg.error_message);
                     self.status = pg.status;
                     self.affected_rows = pg.affected_rows;
                 }
@@ -126,10 +130,19 @@ impl L7ProtocolInfoInterface for PostgreInfo {
     fn is_tls(&self) -> bool {
         self.is_tls
     }
+
+    fn get_request_resource_length(&self) -> usize {
+        self.context.len()
+    }
 }
 
 impl From<PostgreInfo> for L7ProtocolSendLog {
     fn from(p: PostgreInfo) -> L7ProtocolSendLog {
+        let flags = if p.is_tls {
+            EbpfFlags::TLS.bits()
+        } else {
+            EbpfFlags::NONE.bits()
+        };
         L7ProtocolSendLog {
             req_len: None,
             resp_len: None,
@@ -148,21 +161,16 @@ impl From<PostgreInfo> for L7ProtocolSendLog {
             ext_info: Some(ExtendedInfo {
                 ..Default::default()
             }),
+            flags,
             ..Default::default()
         }
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Default)]
 pub struct PostgresqlLog {
-    #[serde(skip)]
     perf_stats: Option<L7PerfStats>,
-}
-
-impl Default for PostgresqlLog {
-    fn default() -> Self {
-        Self { perf_stats: None }
-    }
+    obfuscate_cache: Option<ObfuscateCache>,
 }
 
 impl L7ProtocolParserInterface for PostgresqlLog {
@@ -208,6 +216,10 @@ impl L7ProtocolParserInterface for PostgresqlLog {
 
     fn perf_stats(&mut self) -> Option<L7PerfStats> {
         self.perf_stats.take()
+    }
+
+    fn set_obfuscate_cache(&mut self, obfuscate_cache: Option<ObfuscateCache>) {
+        self.obfuscate_cache = obfuscate_cache;
     }
 }
 
@@ -282,7 +294,11 @@ impl PostgresqlLog {
         match tag {
             'Q' => {
                 info.req_type = tag;
-                info.context = strip_string_end_with_zero(data)?;
+                let payload = strip_string_end_with_zero(data)?;
+                info.context = attempt_obfuscation(&self.obfuscate_cache, payload)
+                    .map_or(String::from_utf8_lossy(payload).to_string(), |m| {
+                        String::from_utf8_lossy(&m).to_string()
+                    });
                 info.ignore = false;
                 if !check {
                     self.perf_stats.as_mut().map(|p| p.inc_req());
@@ -302,8 +318,13 @@ impl PostgresqlLog {
 
                     // parse query
                     if let Some(idx) = data.iter().position(|x| *x == 0x0) {
-                        info.context = String::from_utf8_lossy(&data[..idx]).to_string();
-                        if is_postgresql(&info.context) {
+                        let payload = &data[..idx];
+                        let postgresql = is_postgresql(payload);
+                        info.context = attempt_obfuscation(&self.obfuscate_cache, payload)
+                            .map_or(String::from_utf8_lossy(payload).to_string(), |m| {
+                                String::from_utf8_lossy(&m).to_string()
+                            });
+                        if postgresql {
                             if !check {
                                 self.perf_stats.as_mut().map(|p| p.inc_req());
                             }
@@ -332,33 +353,38 @@ impl PostgresqlLog {
                 info.ignore = false;
                 info.resp_type = tag;
 
-                // INSERT xxx xxx0x0 where last xxx is row effect.
-                // DELETE xxx0x0
-                // UPDATE xxx0x0
-                // SELECT xxx0x0
+                // reference https://www.postgresql.org/docs/16/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-COMMANDCOMPLETE
+                // INSERT oid rows0x0, where rows is the number of rows inserted.
+                // DELETE | UPDATE | SELECT | MERGE | MOVE | FETCH | COPY rows0x0
+                // CREATE TABLE
                 if let Some(idx) = data.iter().position(|x| *x == 0x20) {
                     let op = &data[..idx];
                     data = &data[idx + 1..];
                     if op.eq("INSERT".as_bytes()) {
                         if let Some(idx) = data.iter().position(|x| *x == 0x20) {
                             data = &data[idx + 1..];
+                            if let Some(idx) = data.iter().position(|x| *x == 0x0) {
+                                let row_eff = String::from_utf8_lossy(&data[..idx]).to_string();
+                                info.affected_rows = row_eff.parse().unwrap_or(0);
+                            }
                         } else {
                             return Ok(true);
                         }
-                    } else {
-                        if !(op.eq("DELETE".as_bytes())
-                            || op.eq("UPDATE".as_bytes())
-                            || op.eq("SELECT".as_bytes()))
-                        {
-                            return Ok(true);
+                    } else if op.eq("DELETE".as_bytes())
+                        || op.eq("UPDATE".as_bytes())
+                        || op.eq("SELECT".as_bytes())
+                        || op.eq("MERGE".as_bytes())
+                        || op.eq("MOVE".as_bytes())
+                        || op.eq("FETCH".as_bytes())
+                        || op.eq("COPY".as_bytes())
+                    {
+                        if let Some(idx) = data.iter().position(|x| *x == 0x0) {
+                            let row_eff = String::from_utf8_lossy(&data[..idx]).to_string();
+                            info.affected_rows = row_eff.parse().unwrap_or(0);
                         }
                     }
                 }
 
-                if let Some(idx) = data.iter().position(|x| *x == 0x0) {
-                    let row_eff = String::from_utf8_lossy(&data[..idx]).to_string();
-                    info.affected_rows = row_eff.parse().unwrap_or(0);
-                }
                 if !check {
                     self.perf_stats.as_mut().map(|p| p.inc_resp());
                 }
@@ -436,9 +462,9 @@ fn read_block(payload: &[u8]) -> Option<(char, usize)> {
 
 // strip the latest 0x0 in string
 // if not end with 0x0, presume it is not pg protocol
-fn strip_string_end_with_zero(data: &[u8]) -> Result<String> {
+fn strip_string_end_with_zero(data: &[u8]) -> Result<&[u8]> {
     if data.ends_with(&[0]) {
-        return Ok(String::from_utf8_lossy(&data[..data.len() - 1]).to_string());
+        return Ok(&data[..data.len() - 1]);
     }
     Err(Error::L7ProtocolUnknown)
 }
@@ -480,6 +506,7 @@ mod test {
                 rrt_count: 1,
                 rrt_sum: 2224,
                 rrt_max: 2224,
+                ..Default::default()
             }
         );
     }
@@ -506,6 +533,7 @@ mod test {
                 rrt_count: 1,
                 rrt_sum: 477,
                 rrt_max: 477,
+                ..Default::default()
             }
         );
     }
@@ -530,6 +558,7 @@ mod test {
                 rrt_count: 1,
                 rrt_sum: 103,
                 rrt_max: 103,
+                ..Default::default()
             }
         );
     }
@@ -543,7 +572,15 @@ mod test {
         p[1].lookup_key.direction = PacketDirection::ServerToClient;
 
         let mut parser = PostgresqlLog::default();
-        let req_param = &mut ParseParam::new(&p[0], log_cache.clone(), true, true);
+        let req_param = &mut ParseParam::new(
+            &p[0],
+            log_cache.clone(),
+            Default::default(),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            Default::default(),
+            true,
+            true,
+        );
         let req_payload = p[0].get_l4_payload().unwrap();
         assert_eq!((&mut parser).check_payload(req_payload, req_param), true);
         let info = (&mut parser).parse_payload(req_payload, req_param).unwrap();
@@ -551,15 +588,23 @@ mod test {
 
         (&mut parser).reset();
 
-        let resp_param = &ParseParam::new(&p[1], log_cache.clone(), true, true);
+        let resp_param = &ParseParam::new(
+            &p[1],
+            log_cache.clone(),
+            Default::default(),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            Default::default(),
+            true,
+            true,
+        );
         let resp_payload = p[1].get_l4_payload().unwrap();
         assert_eq!((&mut parser).check_payload(resp_payload, resp_param), false);
-        let resp = (&mut parser)
+        let mut resp = (&mut parser)
             .parse_payload(resp_payload, resp_param)
             .unwrap()
             .unwrap_single();
 
-        req.merge_log(resp).unwrap();
+        req.merge_log(&mut resp).unwrap();
         if let L7ProtocolInfo::PostgreInfo(info) = req {
             return (info, parser.perf_stats.unwrap());
         }

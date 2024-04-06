@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,18 +23,16 @@ import (
 	"github.com/op/go-logging"
 	"gorm.io/gorm"
 
-	. "github.com/deepflowio/deepflow/server/controller/db/mysql/common"
-	. "github.com/deepflowio/deepflow/server/controller/db/mysql/config"
+	"github.com/deepflowio/deepflow/server/controller/db/mysql/common"
+	"github.com/deepflowio/deepflow/server/controller/db/mysql/config"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql/migration"
 )
 
 var log = logging.MustGetLogger("db.mysql")
 var Db *gorm.DB
-var DbConfig MySqlConfig
 
-func InitMySQL(cfg MySqlConfig) error {
-	DbConfig = cfg
-	Db = Gorm(cfg)
+func InitMySQL(cfg config.MySqlConfig) error {
+	Db, _ = common.GetSession(cfg)
 	if Db == nil {
 		return errors.New("connect mysql failed")
 	}
@@ -47,13 +45,4 @@ func InitMySQL(cfg MySqlConfig) error {
 		return errors.New(fmt.Sprintf("current db version: %s != expected db version: %s", version, migration.DB_VERSION_EXPECTED))
 	}
 	return nil
-}
-
-func Gorm(cfg MySqlConfig) *gorm.DB {
-	dsn := GetDSN(cfg, cfg.Database, cfg.TimeOut, false)
-	return GetGormDB(dsn)
-}
-
-func GetResultSetMax() int {
-	return int(DbConfig.ResultSetMax)
 }

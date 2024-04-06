@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,7 +21,6 @@ use std::fs::File;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 
 use flate2::read::GzDecoder;
@@ -34,25 +33,22 @@ use crate::common::l7_protocol_info::L7ProtocolInfo;
 use crate::common::l7_protocol_log::{EbpfParam, L7PerfCache};
 
 use crate::config::handler::LogParserConfig;
+use crate::config::OracleParseConfig;
 use crate::flow_generator::protocol_logs::pb_adapter::L7ProtocolSendLog;
 use crate::flow_generator::protocol_logs::{get_wasm_parser, L7ResponseStatus, WasmLog};
 use crate::{
     common::l7_protocol_log::{L7ProtocolParserInterface, ParseParam},
-    plugin::wasm::init_wasmtime,
     HttpLog,
 };
 
-use super::{
-    get_all_wasm_export_func_name, get_wasm_metric_counter_map_key, WasmCounter, WasmCounterMap,
-    WasmVm,
-};
+use super::WasmVm;
 
 fn get_req_param<'a>(
-    vm: Rc<RefCell<WasmVm>>,
+    vm: Rc<RefCell<Option<WasmVm>>>,
     rrt_cache: Rc<RefCell<L7PerfCache>>,
 ) -> ParseParam<'a> {
     ParseParam {
-        l4_protocol: IpProtocol::Tcp,
+        l4_protocol: IpProtocol::TCP,
         ip_src: IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
         ip_dst: IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
         port_src: 12345,
@@ -64,7 +60,7 @@ fn get_req_param<'a>(
             is_tls: false,
             is_req_end: false,
             is_resp_end: false,
-            process_kname: "test_wasm".to_string(),
+            process_kname: "test_wasm",
         }),
         packet_seq: 9999999,
         time: 12345678,
@@ -72,23 +68,22 @@ fn get_req_param<'a>(
         parse_log: true,
         parse_config: None,
         l7_perf_cache: rrt_cache.clone(),
-        wasm_vm: Some(vm.clone()),
-        #[cfg(target_os = "linux")]
-        so_func: None,
-        #[cfg(target_os = "linux")]
-        so_plugin_counter_map: None,
+        wasm_vm: vm,
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        so_func: Default::default(),
         stats_counter: None,
         rrt_timeout: Duration::from_secs(10).as_micros() as usize,
         buf_size: 999,
+        oracle_parse_conf: OracleParseConfig::default(),
     }
 }
 
 fn get_resq_param<'a>(
-    vm: Rc<RefCell<WasmVm>>,
+    vm: Rc<RefCell<Option<WasmVm>>>,
     rrt_cache: Rc<RefCell<L7PerfCache>>,
 ) -> ParseParam<'a> {
     ParseParam {
-        l4_protocol: IpProtocol::Tcp,
+        l4_protocol: IpProtocol::TCP,
         ip_src: IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
         ip_dst: IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
         port_src: 8080,
@@ -101,7 +96,7 @@ fn get_resq_param<'a>(
             is_tls: false,
             is_req_end: false,
             is_resp_end: false,
-            process_kname: "test_wasm".to_string(),
+            process_kname: "test_wasm",
         }),
         packet_seq: 9999999,
         time: 12345678,
@@ -109,14 +104,13 @@ fn get_resq_param<'a>(
         parse_log: true,
         parse_config: None,
         l7_perf_cache: rrt_cache.clone(),
-        wasm_vm: Some(vm.clone()),
-        #[cfg(target_os = "linux")]
-        so_func: None,
-        #[cfg(target_os = "linux")]
-        so_plugin_counter_map: None,
+        wasm_vm: vm,
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        so_func: Default::default(),
         stats_counter: None,
         rrt_timeout: Duration::from_secs(10).as_micros() as usize,
         buf_size: 999,
+        oracle_parse_conf: OracleParseConfig::default(),
     }
 }
 
@@ -129,26 +123,12 @@ fn load_module() -> WasmVm {
     let mut prog = vec![];
     d.read_to_end(&mut prog).unwrap();
 
-    let wasm_counter_map = Arc::new(WasmCounterMap {
-        wasm_mertic: {
-            let mut h = HashMap::new();
-            for func_name in get_all_wasm_export_func_name() {
-                let counter = Arc::new(WasmCounter::default());
-                h.insert(get_wasm_metric_counter_map_key("vm0", func_name), counter);
-            }
-            h
-        },
-    });
-
-    init_wasmtime(
-        vec![("vm0".to_string(), prog.as_slice())],
-        &wasm_counter_map,
-    )
+    WasmVm::new(&[("vm0", prog)])
 }
 
 #[test]
 fn test_wasm_http_req() {
-    let vm = Rc::new(RefCell::new(load_module()));
+    let vm = Rc::new(RefCell::new(Some(load_module())));
     let config = LogParserConfig::default();
     let rrt_cache = Rc::new(RefCell::new(L7PerfCache::new(100)));
 
@@ -185,6 +165,10 @@ fn test_wasm_http_req() {
             "bbb"
         );
 
+        assert_eq!(i.req.domain.as_str(), "rewrite domain");
+        assert_eq!(i.req.resource.as_str(), "rewrite resource");
+        assert_eq!(i.req.endpoint.as_str(), "/rewrite endpoint");
+
         let attr = i.ext_info.unwrap().attributes.unwrap();
 
         assert_eq!(attr.len(), kv.len());
@@ -203,7 +187,7 @@ fn test_wasm_http_req() {
 
 #[test]
 fn test_wasm_http_resp() {
-    let vm = Rc::new(RefCell::new(load_module()));
+    let vm = Rc::new(RefCell::new(Some(load_module())));
     let config = LogParserConfig::default();
     let rrt_cache = Rc::new(RefCell::new(L7PerfCache::new(100)));
 
@@ -239,6 +223,11 @@ fn test_wasm_http_resp() {
             ""
         );
 
+        assert_eq!(i.resp.code.unwrap(), 599);
+        assert_eq!(i.resp.status, L7ResponseStatus::ServerError);
+        assert_eq!(i.resp.exception.as_str(), "rewrite exception");
+        assert_eq!(i.resp.result, "rewrite result");
+
         let attr = i.ext_info.unwrap().attributes.unwrap();
         assert_eq!(attr.len(), kv.len());
         for i in attr {
@@ -256,7 +245,7 @@ fn test_wasm_http_resp() {
 
 #[test]
 fn test_check_payload() {
-    let vm = Rc::new(RefCell::new(load_module()));
+    let vm = Rc::new(RefCell::new(Some(load_module())));
     let rrt_cache = Rc::new(RefCell::new(L7PerfCache::new(100)));
 
     let param = get_req_param(vm.clone(), rrt_cache.clone());
@@ -275,7 +264,7 @@ fn test_check_payload() {
 
 #[test]
 fn test_wasm_parse_payload_req() {
-    let vm = Rc::new(RefCell::new(load_module()));
+    let vm = Rc::new(RefCell::new(Some(load_module())));
 
     let rrt_cache = Rc::new(RefCell::new(L7PerfCache::new(100)));
 
@@ -354,7 +343,7 @@ fn test_wasm_parse_payload_req() {
 
 #[test]
 fn test_wasm_parse_payload_resp() {
-    let vm = Rc::new(RefCell::new(load_module()));
+    let vm = Rc::new(RefCell::new(Some(load_module())));
     let rrt_cache = Rc::new(RefCell::new(L7PerfCache::new(100)));
 
     let param = get_resq_param(vm.clone(), rrt_cache.clone());
@@ -446,6 +435,7 @@ message Resp {
 
 // go wasm code, build cocmmand:
 // tinygo  build -o wasm.wasm  -target wasi -wasm-abi=generic -panic trap -scheduler=none -no-debug ./main.go
+
 /*
 package main
 
@@ -534,7 +524,7 @@ func checkEq(a, b interface{}) {
     }
 }
 
-func (p parser) OnHttpReq(ctx *sdk.HttpReqCtx) sdk.HttpAction {
+func (p parser) OnHttpReq(ctx *sdk.HttpReqCtx) sdk.Action {
     sdk.Warn("================ enter http req ==================")
     baseCtx := &ctx.BaseCtx
     payload, err := baseCtx.GetPayload()
@@ -591,10 +581,15 @@ func (p parser) OnHttpReq(ctx *sdk.HttpReqCtx) sdk.HttpAction {
         SpanID:       "bbb",
         ParentSpanID: "ccc",
     }
-    return sdk.HttpActionAbortWithResult(trace, attr)
+    return sdk.HttpReqActionAbortWithResult(&sdk.Request{
+        ReqType:  "rewrite req type",
+        Domain:   "rewrite domain",
+        Resource: "rewrite resource",
+        Endpoint: "rewrite endpoint",
+    }, trace, attr)
 }
 
-func (p parser) OnHttpResp(ctx *sdk.HttpRespCtx) sdk.HttpAction {
+func (p parser) OnHttpResp(ctx *sdk.HttpRespCtx) sdk.Action {
     sdk.Warn("================ enter http resp ==================")
     baseCtx := &ctx.BaseCtx
     payload, err := baseCtx.GetPayload()
@@ -609,6 +604,7 @@ func (p parser) OnHttpResp(ctx *sdk.HttpRespCtx) sdk.HttpAction {
 
     checkEq(0, int(baseCtx.L7))
     checkEq(uint16(200), ctx.Code)
+    checkEq(sdk.RespStatusOk, ctx.Status)
 
     r := bufio.NewReader(bytes.NewReader(payload))
     req, err := http.ReadResponse(r, nil)
@@ -626,7 +622,14 @@ func (p parser) OnHttpResp(ctx *sdk.HttpRespCtx) sdk.HttpAction {
 
     userID := fastjson.GetInt(body, "data", "user_id")
     userName := fastjson.GetString(body, "data", "name")
-    return sdk.HttpActionAbortWithResult(nil, []sdk.KeyVal{
+    var code int32 = 599
+    status := sdk.RespStatusServerErr
+    return sdk.HttpRespActionAbortWithResult(&sdk.Response{
+        Status:    &status,
+        Code:      &code,
+        Result:    "rewrite result",
+        Exception: "rewrite exception",
+    }, nil, []sdk.KeyVal{
         {
             Key: "user_id",
             Val: strconv.Itoa(userID),
@@ -664,7 +667,7 @@ func (p parser) OnCheckPayload(baseCtx *sdk.ParseCtx) (uint8, string) {
     return 1, "test"
 }
 
-func (p parser) OnParsePayload(baseCtx *sdk.ParseCtx) sdk.ParseAction {
+func (p parser) OnParsePayload(baseCtx *sdk.ParseCtx) sdk.Action {
     sdk.Warn("================ parse payload ==================")
     payload, err := baseCtx.GetPayload()
     if err != nil {
@@ -761,6 +764,7 @@ func (p parser) OnParsePayload(baseCtx *sdk.ParseCtx) sdk.ParseAction {
         respLen := 9999
         requestID := uint32(666)
         code := int32(999)
+        status := sdk.RespStatusOk
         return sdk.ParseActionAbortWithL7Info([]*sdk.L7ProtocolInfo{
             {
                 ReqLen:    &reqLen,
@@ -768,7 +772,7 @@ func (p parser) OnParsePayload(baseCtx *sdk.ParseCtx) sdk.ParseAction {
                 RequestID: &requestID,
                 Req:       nil,
                 Resp: &sdk.Response{
-                    Status:    sdk.RespStatusOk,
+                    Status:    &status,
                     Code:      &code,
                     Result:    "result",
                     Exception: "exception",
@@ -792,7 +796,7 @@ func (p parser) OnParsePayload(baseCtx *sdk.ParseCtx) sdk.ParseAction {
                 RequestID: &requestID,
                 Req:       nil,
                 Resp: &sdk.Response{
-                    Status:    sdk.RespStatusOk,
+                    Status:    &status,
                     Code:      &code,
                     Result:    "result",
                     Exception: "exception",
@@ -819,6 +823,5 @@ func (p parser) OnParsePayload(baseCtx *sdk.ParseCtx) sdk.ParseAction {
 func main() {
     sdk.Warn("wasm register parser")
     sdk.SetParser(parser{})
-
 }
 */

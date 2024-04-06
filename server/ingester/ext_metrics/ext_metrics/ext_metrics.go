@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -41,9 +41,10 @@ const (
 )
 
 type ExtMetrics struct {
-	Config        *config.Config
-	Telegraf      *Metricsor
-	MetaflowStats *Metricsor
+	Config              *config.Config
+	Telegraf            *Metricsor
+	DeepflowAgentStats  *Metricsor
+	DeepflowServerStats *Metricsor
 }
 
 type Metricsor struct {
@@ -61,27 +62,24 @@ func NewExtMetrics(config *config.Config, recv *receiver.Receiver, platformDataM
 	if err != nil {
 		return nil, err
 	}
-	deepflowStats, err := NewMetricsor(datatype.MESSAGE_TYPE_DFSTATS, dbwriter.DEEPFLOW_SYSTEM_DB, config, platformDataManager, manager, recv, false)
+	deepflowAgentStats, err := NewMetricsor(datatype.MESSAGE_TYPE_DFSTATS, dbwriter.DEEPFLOW_SYSTEM_AGENT_TABLE, config, platformDataManager, manager, recv, false)
+	if err != nil {
+		return nil, err
+	}
+	deepflowServerStats, err := NewMetricsor(datatype.MESSAGE_TYPE_SERVER_DFSTATS, dbwriter.DEEPFLOW_SYSTEM_SERVER_TABLE, config, platformDataManager, manager, recv, false)
 	if err != nil {
 		return nil, err
 	}
 	return &ExtMetrics{
-		Config:        config,
-		Telegraf:      telegraf,
-		MetaflowStats: deepflowStats,
+		Config:              config,
+		Telegraf:            telegraf,
+		DeepflowAgentStats:  deepflowAgentStats,
+		DeepflowServerStats: deepflowServerStats,
 	}, nil
 }
 
-func NewMetricsor(msgType datatype.MessageType, db string, config *config.Config, platformDataManager *grpc.PlatformDataManager, manager *dropletqueue.Manager, recv *receiver.Receiver, platformDataEnabled bool) (*Metricsor, error) {
+func NewMetricsor(msgType datatype.MessageType, flowTagTablePrefix string, config *config.Config, platformDataManager *grpc.PlatformDataManager, manager *dropletqueue.Manager, recv *receiver.Receiver, platformDataEnabled bool) (*Metricsor, error) {
 	queueCount := config.DecoderQueueCount
-	if msgType == datatype.MESSAGE_TYPE_DFSTATS {
-		// FIXME: At present, there are hundreds of tables in the deepflow_system database,
-		// and the amount of data is not large. Adjust the queue size to reduce memory consumption.
-		// In the future, it is necessary to merge the data tables in deepflow_system with
-		// reference to the ext_metrics database.
-		queueCount = 1
-	}
-
 	decodeQueues := manager.NewQueues(
 		"1-receive-to-decode-"+msgType.String(),
 		config.DecoderQueueSize,
@@ -104,7 +102,7 @@ func NewMetricsor(msgType datatype.MessageType, db string, config *config.Config
 				return nil, err
 			}
 		}
-		metricsWriter, err := dbwriter.NewExtMetricsWriter(i, msgType, db, config)
+		metricsWriter, err := dbwriter.NewExtMetricsWriter(i, msgType, flowTagTablePrefix, config)
 		if err != nil {
 			return nil, err
 		}
@@ -147,11 +145,13 @@ func (m *Metricsor) Close() {
 
 func (s *ExtMetrics) Start() {
 	s.Telegraf.Start()
-	s.MetaflowStats.Start()
+	s.DeepflowAgentStats.Start()
+	s.DeepflowServerStats.Start()
 }
 
 func (s *ExtMetrics) Close() error {
 	s.Telegraf.Close()
-	s.MetaflowStats.Close()
+	s.DeepflowAgentStats.Close()
+	s.DeepflowServerStats.Close()
 	return nil
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -166,10 +166,6 @@ impl PlatformSynchronizer {
         *self.thread.lock().unwrap() = Some(handle);
 
         info!("PlatformSynchronizer started");
-    }
-
-    pub fn reset_session(&self, controller_ips: Vec<String>) {
-        self.session.reset_server_ip(controller_ips);
     }
 
     fn query_platform(

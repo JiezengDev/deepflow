@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -67,18 +67,26 @@ const HANDLER_BATCH_SIZE: usize = 64;
 #[derive(Clone)]
 pub struct AnalyzerModeDispatcherListener {
     vm_mac_addrs: Arc<RwLock<HashMap<u32, MacAddr>>>,
+    gateway_vmac_addrs: Arc<RwLock<Vec<MacAddr>>>,
     base: BaseDispatcherListener,
 }
 
 impl AnalyzerModeDispatcherListener {
-    pub fn on_tap_interface_change(&self, _: &Vec<Link>, _: IfMacSource) {
+    #[cfg(target_os = "linux")]
+    pub fn netns(&self) -> &public::netns::NsFile {
+        &self.base.netns
+    }
+
+    pub fn on_tap_interface_change(&self, _: &[Link], _: IfMacSource) {
         self.base
             .on_tap_interface_change(vec![], IfMacSource::IfMac);
     }
 
-    pub fn on_vm_change(&self, vm_mac_addrs: &[MacAddr]) {
+    pub fn on_vm_change(&self, vm_mac_addrs: &[MacAddr], gateway_vmac_addrs: &[MacAddr]) {
         let old_vm_mac_addrs = self.vm_mac_addrs.read().unwrap();
-        if old_vm_mac_addrs.len() <= vm_mac_addrs.len()
+        let old_gateway_vmac_addrs = self.gateway_vmac_addrs.read().unwrap();
+        if old_gateway_vmac_addrs.as_slice() == gateway_vmac_addrs
+            && old_vm_mac_addrs.len() <= vm_mac_addrs.len()
             && vm_mac_addrs
                 .iter()
                 .all(|addr| old_vm_mac_addrs.contains_key(&addr.to_lower_32b()))
@@ -86,6 +94,7 @@ impl AnalyzerModeDispatcherListener {
             return;
         }
         drop(old_vm_mac_addrs);
+        drop(old_gateway_vmac_addrs);
 
         if vm_mac_addrs.len() <= 100 {
             info!(
@@ -101,10 +110,14 @@ impl AnalyzerModeDispatcherListener {
             );
         }
         let mut new_vm_mac_addrs = HashMap::with_capacity(vm_mac_addrs.len());
-        vm_mac_addrs.iter().for_each(|addr| {
-            new_vm_mac_addrs.insert(addr.to_lower_32b(), *addr);
-        });
+        vm_mac_addrs
+            .iter()
+            .zip(gateway_vmac_addrs)
+            .for_each(|(vm_mac, gw_vmac)| {
+                new_vm_mac_addrs.insert(vm_mac.to_lower_32b(), gw_vmac.clone());
+            });
         *self.vm_mac_addrs.write().unwrap() = new_vm_mac_addrs;
+        *self.gateway_vmac_addrs.write().unwrap() = gateway_vmac_addrs.to_vec();
     }
 
     pub(super) fn on_config_change(&mut self, config: &DispatcherConfig) {
@@ -152,6 +165,7 @@ impl AnalyzerModeDispatcher {
     pub(super) fn listener(&self) -> AnalyzerModeDispatcherListener {
         AnalyzerModeDispatcherListener {
             vm_mac_addrs: self.vm_mac_addrs.clone(),
+            gateway_vmac_addrs: Arc::new(RwLock::new(vec![])),
             base: self.base.listener(),
         }
     }
@@ -190,23 +204,33 @@ impl AnalyzerModeDispatcher {
                 (tunnel_info.mac_dst, tunnel_info.mac_src)
             };
         let vm_mac_addrs = vm_mac_addrs.read().unwrap();
-        let (dst_remote, src_remote) = (
-            vm_mac_addrs.contains_key(&da_key),
-            vm_mac_addrs.contains_key(&sa_key),
-        );
+        let (dst_remote, dst_gateway_vmac_addr) = match vm_mac_addrs.get(&da_key) {
+            Some(vmac) => (true, u64::from(*vmac) as u32),
+            None => (false, 0),
+        };
+        let (src_remote, src_gateway_vmac_addr) = match vm_mac_addrs.get(&sa_key) {
+            Some(vmac) => (true, u64::from(*vmac) as u32),
+            None => (false, 0),
+        };
         let mut tap_port = TapPort::from_id(tunnel_info.tunnel_type, id as u32);
-        let is_unicast = tunnel_info.tier > 0 || MacAddr::is_multicast(overlay_packet); // Consider unicast when there is a tunnel
+        let is_unicast = tunnel_info.tier > 0 || !MacAddr::is_multicast(overlay_packet); // Consider unicast when there is a tunnel
 
         if src_remote && dst_remote && is_unicast {
+            if cloud_gateway_traffic {
+                let gateway_vmac_addr = src_gateway_vmac_addr.max(dst_gateway_vmac_addr);
+                tap_port = TapPort::from_gateway_mac(tunnel_info.tunnel_type, gateway_vmac_addr);
+            }
             (tap_port, true, true)
         } else if src_remote {
             if cloud_gateway_traffic {
-                tap_port = TapPort::from_gateway_mac(tunnel_info.tunnel_type, sa_key);
+                tap_port =
+                    TapPort::from_gateway_mac(tunnel_info.tunnel_type, src_gateway_vmac_addr);
             }
             (tap_port, true, false)
         } else if dst_remote && is_unicast {
             if cloud_gateway_traffic {
-                tap_port = TapPort::from_gateway_mac(tunnel_info.tunnel_type, da_key);
+                tap_port =
+                    TapPort::from_gateway_mac(tunnel_info.tunnel_type, dst_gateway_vmac_addr);
             }
             (tap_port, false, true)
         } else {
@@ -264,7 +288,7 @@ impl AnalyzerModeDispatcher {
                         ntp_diff,
                         &flow_map_config.load(),
                         Some(packet_sequence_output_queue), // Enterprise Edition Feature: packet-sequence
-                        &stats,
+                        stats,
                         false, // !from_ebpf
                     );
 
@@ -273,7 +297,7 @@ impl AnalyzerModeDispatcher {
                             flow: &flow_map_config.load(),
                             log_parser: &log_parse_config.load(),
                             collector: &collector_config.load(),
-                            #[cfg(target_os = "linux")]
+                            #[cfg(any(target_os = "linux", target_os = "android"))]
                             ebpf: None,
                         };
 
@@ -390,7 +414,7 @@ impl AnalyzerModeDispatcher {
                             );
                             flow_map.inject_meta_packet(&config, &mut meta_packet);
                             let mini_packet =
-                                MiniPacket::new(meta_packet.raw.take().unwrap(), &meta_packet);
+                                MiniPacket::new(meta_packet.raw.take().unwrap(), &meta_packet, 0);
                             output_batch.push((tap_type, mini_packet));
                         }
                         if let Err(e) = sender.send_all(&mut output_batch) {

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,30 +18,55 @@ package updater
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
-	"github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type VMSecurityGroup struct {
-	UpdaterBase[cloudmodel.VMSecurityGroup, mysql.VMSecurityGroup, *cache.VMSecurityGroup]
+	UpdaterBase[
+		cloudmodel.VMSecurityGroup,
+		mysql.VMSecurityGroup,
+		*diffbase.VMSecurityGroup,
+		*message.VMSecurityGroupAdd,
+		message.VMSecurityGroupAdd,
+		*message.VMSecurityGroupUpdate,
+		message.VMSecurityGroupUpdate,
+		*message.VMSecurityGroupFieldsUpdate,
+		message.VMSecurityGroupFieldsUpdate,
+		*message.VMSecurityGroupDelete,
+		message.VMSecurityGroupDelete]
 }
 
 func NewVMSecurityGroup(wholeCache *cache.Cache, cloudData []cloudmodel.VMSecurityGroup) *VMSecurityGroup {
 	updater := &VMSecurityGroup{
-		UpdaterBase[cloudmodel.VMSecurityGroup, mysql.VMSecurityGroup, *cache.VMSecurityGroup]{
-			cache:        wholeCache,
-			dbOperator:   db.NewVMSecurityGroup(),
-			diffBaseData: wholeCache.VMSecurityGroups,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.VMSecurityGroup,
+			mysql.VMSecurityGroup,
+			*diffbase.VMSecurityGroup,
+			*message.VMSecurityGroupAdd,
+			message.VMSecurityGroupAdd,
+			*message.VMSecurityGroupUpdate,
+			message.VMSecurityGroupUpdate,
+			*message.VMSecurityGroupFieldsUpdate,
+			message.VMSecurityGroupFieldsUpdate,
+			*message.VMSecurityGroupDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_VM_SECURITY_GROUP_EN,
+			wholeCache,
+			db.NewVMSecurityGroup().SetORG(wholeCache.GetORG()),
+			wholeCache.DiffBaseDataSet.VMSecurityGroups,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
 }
 
-func (z *VMSecurityGroup) getDiffBaseByCloudItem(cloudItem *cloudmodel.VMSecurityGroup) (diffBase *cache.VMSecurityGroup, exists bool) {
+func (z *VMSecurityGroup) getDiffBaseByCloudItem(cloudItem *cloudmodel.VMSecurityGroup) (diffBase *diffbase.VMSecurityGroup, exists bool) {
 	diffBase, exists = z.diffBaseData[cloudItem.Lcuuid]
 	return
 }
@@ -49,18 +74,18 @@ func (z *VMSecurityGroup) getDiffBaseByCloudItem(cloudItem *cloudmodel.VMSecurit
 func (v *VMSecurityGroup) generateDBItemToAdd(cloudItem *cloudmodel.VMSecurityGroup) (*mysql.VMSecurityGroup, bool) {
 	securityGroupID, exists := v.cache.ToolDataSet.GetSecurityGroupIDByLcuuid(cloudItem.SecurityGroupLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
-			common.RESOURCE_TYPE_SECURITY_GROUP_EN, cloudItem.SecurityGroupLcuuid,
-			common.RESOURCE_TYPE_VM_SECURITY_GROUP_EN, cloudItem.Lcuuid,
-		))
+		log.Error(v.org.LogPre(resourceAForResourceBNotFound(
+			ctrlrcommon.RESOURCE_TYPE_SECURITY_GROUP_EN, cloudItem.SecurityGroupLcuuid,
+			ctrlrcommon.RESOURCE_TYPE_VM_SECURITY_GROUP_EN, cloudItem.Lcuuid,
+		)))
 		return nil, false
 	}
 	vmID, exists := v.cache.ToolDataSet.GetVMIDByLcuuid(cloudItem.VMLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
-			common.RESOURCE_TYPE_VM_EN, cloudItem.VMLcuuid,
-			common.RESOURCE_TYPE_VM_SECURITY_GROUP_EN, cloudItem.Lcuuid,
-		))
+		log.Error(v.org.LogPre(resourceAForResourceBNotFound(
+			ctrlrcommon.RESOURCE_TYPE_VM_EN, cloudItem.VMLcuuid,
+			ctrlrcommon.RESOURCE_TYPE_VM_SECURITY_GROUP_EN, cloudItem.Lcuuid,
+		)))
 		return nil, false
 	}
 
@@ -68,19 +93,19 @@ func (v *VMSecurityGroup) generateDBItemToAdd(cloudItem *cloudmodel.VMSecurityGr
 		VMID:            vmID,
 		SecurityGroupID: securityGroupID,
 		Priority:        cloudItem.Priority,
+		Domain:          v.cache.DomainLcuuid,
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true
 }
 
-func (v *VMSecurityGroup) generateUpdateInfo(diffBase *cache.VMSecurityGroup, cloudItem *cloudmodel.VMSecurityGroup) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (v *VMSecurityGroup) generateUpdateInfo(diffBase *diffbase.VMSecurityGroup, cloudItem *cloudmodel.VMSecurityGroup) (*message.VMSecurityGroupFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.VMSecurityGroupFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.Priority != cloudItem.Priority {
-		updateInfo["priority"] = cloudItem.Priority
+		mapInfo["priority"] = cloudItem.Priority
+		structInfo.Priority.Set(diffBase.Priority, cloudItem.Priority)
 	}
 
-	if len(updateInfo) > 0 {
-		return updateInfo, true
-	}
-	return nil, false
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

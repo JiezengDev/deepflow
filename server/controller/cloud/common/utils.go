@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,13 +30,12 @@ import (
 	"strconv"
 	"strings"
 
-	"inet.af/netaddr"
-
 	"github.com/bitly/go-simplejson"
 	mapset "github.com/deckarep/golang-set"
 	"github.com/mikioh/ipaddr"
 	logging "github.com/op/go-logging"
 	uuid "github.com/satori/go.uuid"
+	"inet.af/netaddr"
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/config"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
@@ -62,28 +61,29 @@ func StringInterfaceMapKeys(m map[string]interface{}) (keys []string) {
 	return
 }
 
-func StringInterfaceMapKVs(m map[string]interface{}, sep string, valueMaxLength int) (items []string) {
-	keys := []string{}
-	for key := range m {
-		value, ok := m[key].(string)
+func GenerateCustomTag(dataMap map[string]interface{}, keyRegex *regexp.Regexp, valueMaxLength int, sep string) []string {
+	var items, keys []string
+	constraintLengthMap := map[string]string{}
+	for key, v := range dataMap {
+		value, ok := v.(string)
 		if !ok {
-			value = ""
+			continue
 		}
 		if valueMaxLength != 0 && len(value) > valueMaxLength {
 			continue
 		}
+		if keyRegex != nil && !keyRegex.MatchString(key) {
+			continue
+		}
 		keys = append(keys, key)
+		constraintLengthMap[key] = value
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		v, ok := m[k].(string)
-		if !ok {
-			v = ""
-		}
-		newString := k + sep + v
+		newString := k + sep + constraintLengthMap[k]
 		items = append(items, newString)
 	}
-	return
+	return items
 }
 
 func StringSliceStringMapKeys(m map[string][]string) (keys []string) {
@@ -161,153 +161,6 @@ func ReadLineJSONFile(path string) (js []*simplejson.Json, err error) {
 	return
 }
 
-func GenerateIPMask(ip string) int {
-	netO, err := netaddr.ParseIPPrefix(ip)
-	if err == nil {
-		maskLen, _ := netO.IPNet().Mask.Size()
-		return maskLen
-	}
-	if strings.Contains(ip, ":") {
-		return common.IPV6_MAX_MASK
-	}
-	return common.IPV4_MAX_MASK
-}
-
-func IPAndMaskToCIDR(ip string, mask int) (string, error) {
-	ipO, err := netaddr.ParseIP(ip)
-	if err != nil {
-		return "", errors.New("ip and mask to cidr ip format error:" + err.Error())
-	}
-	IPString := ipO.String() + "/" + strconv.Itoa(mask)
-	netO, err := netaddr.ParseIPPrefix(IPString)
-	if err != nil {
-		return "", errors.New("ip and mask to cidr format error" + err.Error())
-	}
-	netRange, ok := netO.Range().Prefix()
-	if !ok {
-		return "", errors.New("ip and mask to cidr format not valid")
-	}
-	return netRange.String(), nil
-}
-
-func TidyIPString(ipsString []string) (v4Prefix, v6Prefix []netaddr.IPPrefix, err error) {
-	for _, ipS := range ipsString {
-		_, ignoreErr := netaddr.ParseIPPrefix(ipS)
-		if ignoreErr != nil {
-			switch {
-			case strings.Contains(ipS, "."):
-				ipS = ipS + "/32"
-			case strings.Contains(ipS, ":"):
-				ipS = ipS + "/128"
-			}
-		}
-		ipPrefix, prefixErr := netaddr.ParseIPPrefix(ipS)
-		if prefixErr != nil {
-			err = prefixErr
-			return
-		}
-		switch {
-		case ipPrefix.IP().Is4():
-			v4Prefix = append(v4Prefix, ipPrefix)
-		case ipPrefix.IP().Is6():
-			v6Prefix = append(v6Prefix, ipPrefix)
-		}
-	}
-	return
-}
-
-func AggregateCIDR(ips []netaddr.IPPrefix, maxMask int) (cirdsString []string) {
-	CIDRs := []*ipaddr.Prefix{}
-	for _, Prefix := range ips {
-		aggFlag := false
-		ipNet := ipaddr.NewPrefix(Prefix.IPNet())
-		for i, CIDR := range CIDRs {
-			pSlice := []ipaddr.Prefix{*ipNet, *CIDR}
-			aggCIDR := ipaddr.Supernet(pSlice)
-			if aggCIDR == nil {
-				continue
-			}
-			aggCIDRMask, _ := aggCIDR.IPNet.Mask.Size()
-			if aggCIDRMask >= maxMask {
-				CIDRs[i] = aggCIDR
-				aggFlag = true
-				break
-			} else {
-				continue
-			}
-		}
-		if !aggFlag {
-			CIDRs = append(CIDRs, ipNet)
-		}
-	}
-	for _, i := range CIDRs {
-		cirdsString = append(cirdsString, i.String())
-	}
-	return
-}
-
-func GenerateCIDR(ips []netaddr.IPPrefix, maxMask int) (cirds []netaddr.IPPrefix) {
-	CIDRs := []*ipaddr.Prefix{}
-	for _, Prefix := range ips {
-		aggFlag := false
-		ipNet := ipaddr.NewPrefix(Prefix.IPNet())
-		for i, CIDR := range CIDRs {
-			if CIDR.Contains(ipNet) {
-				aggFlag = true
-				break
-			}
-			pSlice := []ipaddr.Prefix{*ipNet, *CIDR}
-			aggCIDR := ipaddr.Supernet(pSlice)
-			if aggCIDR == nil {
-				continue
-			}
-			aggCIDRMask, _ := aggCIDR.IPNet.Mask.Size()
-			if aggCIDRMask >= maxMask {
-				CIDRs[i] = aggCIDR
-				aggFlag = true
-				break
-			} else {
-				continue
-			}
-		}
-		if !aggFlag {
-			CIDRs = append(CIDRs, ipNet)
-		}
-	}
-	for _, i := range CIDRs {
-		cirds = append(cirds, netaddr.MustParseIPPrefix(i.String()))
-	}
-	return
-}
-
-func IsIPInCIDR(ip, cidr string) bool {
-	if strings.Contains(cidr, "/") {
-		_, nCIDR, err := net.ParseCIDR(cidr)
-		if err != nil {
-			log.Errorf("parse cidr failed: %v", err)
-			return false
-		}
-		return nCIDR.Contains(net.ParseIP(ip))
-	} else {
-		if ip == cidr {
-			return true
-		}
-		return false
-	}
-}
-
-func ContainsIP(cidrs []string, ip string) bool {
-	if len(cidrs) == 0 {
-		return false
-	}
-	for _, cidr := range cidrs {
-		if IsIPInCIDR(ip, cidr) {
-			return true
-		}
-	}
-	return false
-}
-
 // 针对各私有云平台，每个区域生成一个基础VPC和子网
 // 宿主机及管理节点的接口和IP属于基础VPC和子网
 func GetBasicVPCLcuuid(uuidGenerate, regionLcuuid string) string {
@@ -332,7 +185,7 @@ func GetBasicVPCAndNetworks(regions []model.Region, regionLcuuid, domainName, uu
 
 	for _, region := range regions {
 		vpcLcuuid := GetBasicVPCLcuuid(uuidGenerate, region.Lcuuid)
-		vpcName := domainName + fmt.Sprintf("%s_基础VPC_%s", domainName, region.Name)
+		vpcName := fmt.Sprintf("%s_基础VPC_%s", domainName, region.Name)
 		retVPCs = append(retVPCs, model.VPC{
 			Lcuuid:       vpcLcuuid,
 			Name:         vpcName,
@@ -697,4 +550,171 @@ func GenerateWANVInterfaceMac(mac string) string {
 		return mac
 	}
 	return "ff" + mac[2:]
+}
+
+func DiffMap(base, newTags map[string]string) bool {
+	if len(base) != len(newTags) {
+		return true
+	}
+	for k, v := range newTags {
+		bValue, ok := base[k]
+		if !ok {
+			return true
+		}
+		if v != bValue {
+			return true
+		}
+	}
+	return false
+}
+
+func GetNodeHostNameByDomain(lcuuid string, isSubDomain bool) (map[string]string, error) {
+	podNodeLcuuidToHostName := map[string]string{}
+	var domain string
+	if isSubDomain {
+		var subDomain mysql.SubDomain
+		err := mysql.Db.Where("lcuuid = ?", lcuuid).Find(&subDomain).Error
+		if err != nil {
+			return map[string]string{}, err
+		}
+		domain = subDomain.Domain
+	} else {
+		domain = lcuuid
+	}
+
+	var azs []mysql.AZ
+	err := mysql.Db.Where("domain = ?", domain).Find(&azs).Error
+	if err != nil {
+		return map[string]string{}, err
+	}
+	azLcuuids := []string{}
+	for _, az := range azs {
+		azLcuuids = append(azLcuuids, az.Lcuuid)
+	}
+	var vtaps []mysql.VTap
+	err = mysql.Db.Where("az IN ?", azLcuuids).Find(&vtaps).Error
+	if err != nil {
+		return map[string]string{}, err
+	}
+	var podNodes []mysql.PodNode
+	if isSubDomain {
+		err = mysql.Db.Where("domain = ? AND sub_domain = ?", domain, lcuuid).Find(&podNodes).Error
+		if err != nil {
+			return map[string]string{}, err
+		}
+	} else {
+		err = mysql.Db.Where("domain = ?", domain).Find(&podNodes).Error
+		if err != nil {
+			return map[string]string{}, err
+		}
+	}
+
+	podNodeIDs := map[int]bool{}
+	for _, podNode := range podNodes {
+		podNodeIDs[podNode.ID] = false
+	}
+
+	for _, vtap := range vtaps {
+		if vtap.Type != common.VTAP_TYPE_POD_HOST && vtap.Type != common.VTAP_TYPE_POD_VM {
+			continue
+		}
+		if _, ok := podNodeIDs[vtap.LaunchServerID]; !ok {
+			continue
+		}
+		podNodeLcuuidToHostName[vtap.Lcuuid] = vtap.RawHostname
+	}
+	return podNodeLcuuidToHostName, nil
+}
+
+func GetHostAndVmHostNameByDomain(domain string) (map[string]string, map[string]string, error) {
+	hostIPToHostName := map[string]string{}
+	vmLcuuidToHostName := map[string]string{}
+
+	var azs []mysql.AZ
+	err := mysql.Db.Where("domain = ?", domain).Find(&azs).Error
+	if err != nil {
+		return map[string]string{}, map[string]string{}, err
+	}
+	azLcuuids := []string{}
+	for _, az := range azs {
+		azLcuuids = append(azLcuuids, az.Lcuuid)
+	}
+	var vtaps []mysql.VTap
+	err = mysql.Db.Where("az IN ?", azLcuuids).Find(&vtaps).Error
+	if err != nil {
+		return map[string]string{}, map[string]string{}, err
+	}
+	var podNodes []mysql.PodNode
+	err = mysql.Db.Where("domain = ?", domain).Find(&podNodes).Error
+	if err != nil {
+		return map[string]string{}, map[string]string{}, err
+	}
+	podNodeIDs := map[int]bool{}
+	for _, podNode := range podNodes {
+		podNodeIDs[podNode.ID] = false
+	}
+
+	for _, vtap := range vtaps {
+		switch vtap.Type {
+		case common.VTAP_TYPE_KVM, common.VTAP_TYPE_HYPER_V:
+			hostIPToHostName[vtap.CtrlIP] = vtap.RawHostname
+		case common.VTAP_TYPE_WORKLOAD_V, common.VTAP_TYPE_WORKLOAD_P:
+			vmLcuuidToHostName[vtap.Lcuuid] = vtap.RawHostname
+		}
+	}
+	return hostIPToHostName, vmLcuuidToHostName, nil
+}
+
+func GetVTapSubDomainMappingByDomain(domain string) (map[int]string, error) {
+	vtapIDToSubDomain := make(map[int]string)
+
+	var azs []mysql.AZ
+	err := mysql.Db.Where("domain = ?", domain).Find(&azs).Error
+	if err != nil {
+		return vtapIDToSubDomain, err
+	}
+	azLcuuids := []string{}
+	for _, az := range azs {
+		azLcuuids = append(azLcuuids, az.Lcuuid)
+	}
+
+	var podNodes []mysql.PodNode
+	err = mysql.Db.Where("domain = ?", domain).Find(&podNodes).Error
+	if err != nil {
+		return vtapIDToSubDomain, err
+	}
+	podNodeIDToSubDomain := make(map[int]string)
+	for _, podNode := range podNodes {
+		podNodeIDToSubDomain[podNode.ID] = podNode.SubDomain
+	}
+
+	var pods []mysql.Pod
+	err = mysql.Db.Where("domain = ?", domain).Find(&pods).Error
+	if err != nil {
+		return vtapIDToSubDomain, err
+	}
+	podIDToSubDomain := make(map[int]string)
+	for _, pod := range pods {
+		podIDToSubDomain[pod.ID] = pod.SubDomain
+	}
+
+	var vtaps []mysql.VTap
+	err = mysql.Db.Where("az IN ?", azLcuuids).Find(&vtaps).Error
+	if err != nil {
+		return vtapIDToSubDomain, err
+	}
+	for _, vtap := range vtaps {
+		vtapIDToSubDomain[vtap.ID] = ""
+		if vtap.Type == common.VTAP_TYPE_POD_HOST || vtap.Type == common.VTAP_TYPE_POD_VM {
+			if subDomain, ok := podNodeIDToSubDomain[vtap.LaunchServerID]; ok {
+				vtapIDToSubDomain[vtap.ID] = subDomain
+			}
+		} else if vtap.Type == common.VTAP_TYPE_K8S_SIDECAR {
+			if subDomain, ok := podIDToSubDomain[vtap.LaunchServerID]; ok {
+				vtapIDToSubDomain[vtap.ID] = subDomain
+			}
+		}
+	}
+
+	return vtapIDToSubDomain, nil
 }

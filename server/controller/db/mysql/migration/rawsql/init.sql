@@ -51,10 +51,15 @@ TRUNCATE TABLE domain_additional_resource;
 
 CREATE TABLE IF NOT EXISTS process (
     id                  INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    name                VARCHAR(256) DEFAULT '',
+    name                TEXT,
     vtap_id             INTEGER NOT NULL DEFAULT 0,
     pid                 INTEGER NOT NULL,
-    process_name        VARCHAR(256) DEFAULT '',
+    devicetype          INTEGER,
+    deviceid            INTEGER,
+    pod_node_id         INTEGER,
+    vm_id               INTEGER,
+    epc_id              INTEGER,
+    process_name        TEXT,
     command_line        TEXT,
     user_name           VARCHAR(256) DEFAULT '',
     start_time          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -77,8 +82,11 @@ CREATE TABLE IF NOT EXISTS prometheus_target (
     job                 VARCHAR(255) DEFAULT '',
     scrape_url          VARCHAR(2083) DEFAULT '',
     other_labels        TEXT COMMENT 'separated by ,',
+    epc_id              INTEGER NOT NULL DEFAULT 0,
     domain              CHAR(64) DEFAULT '',
     sub_domain          CHAR(64) DEFAULT '',
+    pod_cluster_id      INTEGER,
+    create_method       TINYINT(1) DEFAULT 1 COMMENT '1.recorder learning 2.prometheus learning',
     created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at          DATETIME NOT NULL ON UPDATE CURRENT_TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     deleted_at          DATETIME DEFAULT NULL
@@ -93,6 +101,7 @@ CREATE TABLE IF NOT EXISTS host_device (
     alias               CHAR(64) DEFAULT '',
     description         VARCHAR(256) DEFAULT '',
     ip                  CHAR(64) DEFAULT '',
+    hostname            CHAR(64) DEFAULT '',
     htype               INTEGER COMMENT '1. Xen host 2. VMware host 3. KVM host 4. Public cloud host 5. Hyper-V',
     create_method       INTEGER DEFAULT 0 COMMENT '0.learning 1.user_defined',
     user_name           VARCHAR(64) DEFAULT '',
@@ -195,6 +204,7 @@ CREATE TABLE IF NOT EXISTS routing_table (
     destination         TEXT,
     nexthop_type        TEXT,
     nexthop             TEXT,
+    domain              CHAR(64) DEFAULT '',
     lcuuid              CHAR(64)
 )engine=innodb AUTO_INCREMENT=1  DEFAULT CHARSET=utf8;
 TRUNCATE TABLE routing_table;
@@ -227,6 +237,7 @@ CREATE TABLE IF NOT EXISTS security_group_rule (
     remote              TEXT,
     priority            INTEGER NOT NULL,
     action              TINYINT(1) NOT NULL DEFAULT 0 COMMENT '0.Unknow 1.Accept 2.Drop',
+    domain              CHAR(64) DEFAULT '',
     lcuuid              CHAR(64) DEFAULT ''
 ) ENGINE=innodb DEFAULT CHARSET=utf8 AUTO_INCREMENT=1;
 TRUNCATE TABLE security_group_rule;
@@ -236,6 +247,7 @@ CREATE TABLE IF NOT EXISTS vm_security_group (
     sg_id               INTEGER NOT NULL,
     vm_id               INTEGER NOT NULL,
     priority            INTEGER NOT NULL,
+    domain              CHAR(64) DEFAULT '',
     lcuuid              CHAR(64) DEFAULT ''
 ) ENGINE=innodb DEFAULT CHARSET=utf8 AUTO_INCREMENT=1;
 TRUNCATE TABLE vm_security_group;
@@ -279,6 +291,7 @@ CREATE TABLE IF NOT EXISTS vl2_net (
     name                VARCHAR(256) DEFAULT '',
     label               VARCHAR(64) DEFAULT '',
     sub_domain          CHAR(64) DEFAULT '',
+    domain              CHAR(64) DEFAULT '',
     lcuuid              CHAR(64) DEFAULT '',
     PRIMARY KEY (id)
 ) ENGINE=innodb DEFAULT CHARSET=utf8 AUTO_INCREMENT=1;
@@ -290,9 +303,12 @@ CREATE TABLE IF NOT EXISTS vm (
     name                VARCHAR(256) DEFAULT '',
     alias               CHAR(64) DEFAULT '',
     label               CHAR(64) DEFAULT '',
+    ip                  CHAR(64) DEFAULT '',
+    hostname            CHAR(64) DEFAULT '',
     create_method       INTEGER DEFAULT 0 COMMENT '0.learning 1.user_defined',
     htype               INTEGER DEFAULT 1 COMMENT '1.vm-c 2.bm-c 3.vm-n 4.bm-n 5.vm-s 6.bm-s',
     launch_server       CHAR(64) DEFAULT '',
+    host_id             INTEGER DEFAULT 0,
     cloud_tags          TEXT COMMENT 'separated by ,',
     epc_id              INTEGER DEFAULT 0,
     domain              CHAR(64) DEFAULT '',
@@ -319,6 +335,7 @@ CREATE TABLE IF NOT EXISTS vinterface (
     create_method       INTEGER DEFAULT 0 COMMENT '0.learning 1.user_defined',
     iftype              INTEGER DEFAULT 0 COMMENT '0.Unknown 1.Control 2.Service 3.WAN 4.LAN 5.Trunk 6.Tap 7.Tool',
     mac                 CHAR(32) DEFAULT '',
+    vmac                CHAR(32) DEFAULT '',
     tap_mac             CHAR(32) DEFAULT '',
     subnetid            INTEGER DEFAULT 0 COMMENT 'vl2 id',
     vlantag             INTEGER DEFAULT 0,
@@ -431,6 +448,7 @@ INSERT INTO az (id, name, lcuuid, region, domain) values(1, '系统默认', 'fff
 
 CREATE TABLE IF NOT EXISTS domain (
     id                  INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    team_id             INTEGER DEFAULT 1,
     name                VARCHAR(64),
     icon_id             INTEGER,
     display_name        VARCHAR(64) DEFAULT '',
@@ -771,6 +789,7 @@ CREATE TABLE IF NOT EXISTS pod_node (
     server_type         INTEGER DEFAULT NULL COMMENT '1: Host 2: VM',
     state               INTEGER DEFAULT 1 COMMENT '0: Exception 1: Normal',
     ip                  CHAR(64) DEFAULT '',
+    hostname            CHAR(64) DEFAULT '',
     vcpu_num            INTEGER DEFAULT 0,
     mem_total           INTEGER DEFAULT 0 COMMENT 'unit: M',
     pod_cluster_id      INTEGER,
@@ -797,6 +816,7 @@ CREATE TABLE IF NOT EXISTS pod (
     state               INTEGER NOT NULL COMMENT '0.Exception 1.Running',
     pod_rs_id           INTEGER DEFAULT NULL,
     pod_group_id        INTEGER DEFAULT NULL,
+    pod_service_id      INTEGER DEFAULT 0,
     pod_namespace_id    INTEGER DEFAULT NULL,
     pod_node_id         INTEGER DEFAULT NULL,
     pod_cluster_id      INTEGER DEFAULT NULL,
@@ -902,6 +922,7 @@ CREATE TABLE IF NOT EXISTS pod_service_port (
     node_port           INTEGER,
     pod_service_id      INTEGER DEFAULT NULL,
     sub_domain          CHAR(64) DEFAULT '',
+    domain              CHAR(64) DEFAULT '',
     lcuuid              CHAR(64)
 ) ENGINE=innodb AUTO_INCREMENT=1 DEFAULT CHARSET=utf8;
 TRUNCATE TABLE pod_service_port;
@@ -914,6 +935,7 @@ CREATE TABLE IF NOT EXISTS pod_group_port (
     pod_group_id        INTEGER DEFAULT NULL,
     pod_service_id      INTEGER DEFAULT NULL,
     sub_domain          CHAR(64) DEFAULT '',
+    domain              CHAR(64) DEFAULT '',
     lcuuid              CHAR(64) DEFAULT ''
 ) ENGINE=innodb AUTO_INCREMENT=1 DEFAULT CHARSET=utf8;
 TRUNCATE TABLE pod_group_port;
@@ -942,6 +964,7 @@ CREATE TABLE IF NOT EXISTS pod_ingress_rule (
     host                TEXT,
     pod_ingress_id      INTEGER DEFAULT NULL,
     sub_domain          CHAR(64) DEFAULT '',
+    domain              CHAR(64) DEFAULT '',
     lcuuid              CHAR(64) DEFAULT ''
 ) ENGINE=innodb AUTO_INCREMENT=1 DEFAULT CHARSET=utf8;
 TRUNCATE TABLE pod_ingress_rule;
@@ -954,6 +977,7 @@ CREATE TABLE IF NOT EXISTS pod_ingress_rule_backend (
     pod_ingress_rule_id INTEGER DEFAULT NULL,
     pod_ingress_id      INTEGER DEFAULT NULL,
     sub_domain          CHAR(64) DEFAULT '',
+    domain              CHAR(64) DEFAULT '',
     lcuuid              CHAR(64) DEFAULT ''
 ) ENGINE=innodb AUTO_INCREMENT=1 DEFAULT CHARSET=utf8;
 TRUNCATE TABLE pod_ingress_rule_backend;
@@ -992,6 +1016,7 @@ CREATE TABLE IF NOT EXISTS `report` (
 CREATE TABLE IF NOT EXISTS vtap (
     id                      INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
     name                    VARCHAR(256) NOT NULL,
+    raw_hostname            VARCHAR(256),
     state                   INTEGER DEFAULT 1 COMMENT '0.not-connected 1.normal',
     enable                  INTEGER DEFAULT 1 COMMENT '0: stop 1: running',
     type                    INTEGER DEFAULT 0 COMMENT '1: process 2: vm 3: public cloud 4: analyzer 5: physical machine 6: dedicated physical machine 7: host pod 8: vm pod',
@@ -1104,6 +1129,7 @@ CREATE TABLE IF NOT EXISTS npb_policy (
     name                   CHAR(64),
     state                  INTEGER DEFAULT 1 COMMENT '0-disable; 1-enable',
     business_id            INTEGER NOT NULL,
+    direction              TINYINT(1) DEFAULT 1 COMMENT '1-all; 2-forward; 3-backward;',
     vni                    INTEGER,
     npb_tunnel_id          INTEGER,
     distribute             TINYINT(1) DEFAULT 1 COMMENT '0-drop, 1-distribute',
@@ -1184,6 +1210,10 @@ CREATE TABLE IF NOT EXISTS alarm_policy (
     query_params            TEXT,
     query_conditions        TEXT,
     tag_conditions          TEXT,
+    monitoring_frequency    CHAR(64) DEFAULT "1m",
+    monitoring_interval     CHAR(64) DEFAULT "1m",
+    trigger_info_event      INTEGER DEFAULT 0,
+    trigger_recovery_event  INTEGER DEFAULT 1,
     lcuuid                  CHAR(64)
 ) ENGINE=innodb DEFAULT CHARSET=utf8 AUTO_INCREMENT=1;
 TRUNCATE TABLE alarm_policy;
@@ -1248,6 +1278,8 @@ CREATE TABLE IF NOT EXISTS alarm_endpoint (
     push_level              TEXT,
     push_level_disable      TEXT,
     send_title              TEXT,
+    topic                   TEXT,
+    sasl                    TEXT,
     lcuuid                  CHAR(64),
     created_at              TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at              TIMESTAMP NOT NULL ON UPDATE CURRENT_TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -1262,289 +1294,289 @@ CREATE TABLE IF NOT EXISTS alarm_policy_endpoint_connection (
 TRUNCATE TABLE alarm_policy_endpoint_connection;
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_error, lcuuid)
-    values(1, "过滤项: N/A | 分组项: 采集器", "", "/v1/alarm/vtap-lost/", "{}", "[{\"OPERATOR\": {\"return_field\": \"sysalarm_value\", \"return_field_description\": \"最近 1 分钟失联次数\", \"return_field_unit\": \" 次\"}}]", "采集器失联",  1, 1, 1, 20, 1, "", "", "{\"displayName\":\"sysalarm_value\", \"unit\": \"次\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
+    values(1, 1, "过滤项: N/A | 分组项: 采集器", "", "/v1/alarm/vtap-lost/", "{}", "[{\"OPERATOR\": {\"return_field\": \"sysalarm_value\", \"return_field_description\": \"最近 1 分钟失联次数\", \"return_field_unit\": \" 次\"}}]", "采集器失联",  1, 1, 1, 20, 1, "", "", "{\"displayName\":\"sysalarm_value\", \"unit\": \"次\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host_ip", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_server.monitor\",\"include_history\":\"true\",\"interval\":60,\"fill\":0,\"window_size\":5,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Min(`metrics.load1`*100/`metrics.cpu_num`) AS `load`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host_ip`, `tag.host`\",\"METRICS\":[\"Min(`metrics.load1`*100/`metrics.cpu_num`) AS `load`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host_ip", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_server_monitor\",\"interval\":60,\"fill\": \"none\",\"window_size\":5,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Min(`metrics.load1`*100/`metrics.cpu_num`) AS `load`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host_ip`, `tag.host`\",\"METRICS\":[\"Min(`metrics.load1`*100/`metrics.cpu_num`) AS `load`\"]}]}",
     "[{\"METRIC_LABEL\":\"load\",\"return_field_description\":\"持续 5 分钟 (系统负载/CPU总数)\",\"unit\":\"%\"}]", "控制器系统负载高",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"load\", \"unit\": \"%\"}", "{\"OP\":\">=\",\"VALUE\":70}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host_ip", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_server.monitor\",\"include_history\":\"true\",\"interval\":60,\"fill\":0,\"window_size\":5,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Min(`metrics.load1`*100/`metrics.cpu_num`) AS `load`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host_ip`, `tag.host`\",\"METRICS\":[\"Min(`metrics.load1`*100/`metrics.cpu_num`) AS `load`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host_ip", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_server_monitor\",\"interval\":60,\"fill\": \"none\",\"window_size\":5,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Min(`metrics.load1`*100/`metrics.cpu_num`) AS `load`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host_ip`, `tag.host`\",\"METRICS\":[\"Min(`metrics.load1`*100/`metrics.cpu_num`) AS `load`\"]}]}",
     "[{\"METRIC_LABEL\":\"load\",\"return_field_description\":\"持续 5 分钟 (系统负载/CPU总数)\",\"unit\":\"%\"}]", "数据节点系统负载高",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"load\", \"unit\": \"%\"}", "{\"OP\":\">=\",\"VALUE\":70}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_critical, lcuuid)
-    values(1, "过滤项: N/A | 分组项: 采集器", "", "/v1/alarm/vtap-exception/", "{}", "[{\"OPERATOR\": {\"return_field\": \"sysalarm_value\", \"return_field_description\": \"最近 1 分钟异常状态个数\", \"return_field_unit\": \" 个\"}}]", "采集器异常",  1, 1, 1, 20, 1, "", "", "{\"displayName\":\"sysalarm_value\", \"unit\": \"个\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
+    values(1, 1, "过滤项: N/A | 分组项: 采集器", "", "/v1/alarm/vtap-exception/", "{}", "[{\"OPERATOR\": {\"return_field\": \"sysalarm_value\", \"return_field_description\": \"最近 1 分钟异常状态个数\", \"return_field_unit\": \" 个\"}}]", "采集器异常",  1, 1, 1, 20, 1, "", "", "{\"displayName\":\"sysalarm_value\", \"unit\": \"个\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_critical, lcuuid)
-    values(1, "过滤项: N/A | 分组项: 控制器", "", "/v1/alarm/controller-lost/", "{}", "[{\"OPERATOR\": {\"return_field\": \"sysalarm_value\", \"return_field_description\": \"最近 1 分钟失联次数\", \"return_field_unit\": \" 次\"}}]", "控制器失联",  2, 1, 1, 20, 1, "", "", "{\"displayName\":\"sysalarm_value\", \"unit\": \"次\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
+    values(1, 1, "过滤项: N/A | 分组项: 控制器", "", "/v1/alarm/controller-lost/", "{}", "[{\"OPERATOR\": {\"return_field\": \"sysalarm_value\", \"return_field_description\": \"最近 1 分钟失联次数\", \"return_field_unit\": \" 次\"}}]", "控制器失联",  2, 1, 1, 20, 1, "", "", "{\"displayName\":\"sysalarm_value\", \"unit\": \"次\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_error, lcuuid)
-    values(1, "过滤项: N/A | 分组项: 数据节点", "", "/v1/alarm/analyzer-lost/", "{}", "[{\"OPERATOR\": {\"return_field\": \"sysalarm_value\", \"return_field_description\": \"最近 1 分钟失联次数\", \"return_field_unit\": \" 次\"}}]", "数据节点失联",  2, 1, 1, 20, 1, "", "", "{\"displayName\":\"sysalarm_value\", \"unit\": \"次\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
+    values(1, 1, "过滤项: N/A | 分组项: 数据节点", "", "/v1/alarm/analyzer-lost/", "{}", "[{\"OPERATOR\": {\"return_field\": \"sysalarm_value\", \"return_field_description\": \"最近 1 分钟失联次数\", \"return_field_unit\": \" 次\"}}]", "数据节点失联",  2, 1, 1, 20, 1, "", "", "{\"displayName\":\"sysalarm_value\", \"unit\": \"次\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host_ip, tag.path", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"ext_metrics\",\"TABLE\":\"influxdb.disk\",\"include_history\":\"true\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Last(`metrics.used_percent`) AS `disk_used_percent`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host_ip`, `tag.path`, `tag.host`\",\"METRICS\":[\"Last(`metrics.used_percent`) AS `disk_used_percent`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host_ip, tag.path, tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_server_monitor_disk\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Last(`metrics.used_percent`) AS `disk_used_percent`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host_ip`, `tag.path`, `tag.host`\",\"METRICS\":[\"Last(`metrics.used_percent`) AS `disk_used_percent`\"]}]}",
     "[{\"METRIC_LABEL\":\"disk_used_percent\",\"return_field_description\":\"磁盘用量百分比\",\"unit\":\"%\"}]", "控制器磁盘空间不足",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"disk_used_percent\", \"unit\": \"%\"}", "{\"OP\":\">=\",\"VALUE\":70}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host_ip, tag.path, tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"ext_metrics\",\"TABLE\":\"influxdb.disk\",\"include_history\":\"true\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Last(`metrics.used_percent`) AS `disk_used_percent`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host_ip`, `tag.path`, `tag.host`\",\"METRICS\":[\"Last(`metrics.used_percent`) AS `disk_used_percent`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host_ip, tag.path, tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_server_monitor_disk\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Last(`metrics.used_percent`) AS `disk_used_percent`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host_ip`, `tag.path`, `tag.host`\",\"METRICS\":[\"Last(`metrics.used_percent`) AS `disk_used_percent`\"]}]}",
     "[{\"METRIC_LABEL\":\"disk_used_percent\",\"return_field_description\":\"磁盘用量百分比\",\"unit\":\"%\"}]", "数据节点磁盘空间不足",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"disk_used_percent\", \"unit\": \"%\"}", "{\"OP\":\">=\",\"VALUE\":70}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_monitor\",\"include_history\":\"true\",\"interval\":60,\"fill\":0,\"window_size\":5,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Min(`metrics.cpu_percent`/`metrics.max_cpus`) AS `cpu_usage`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Min(`metrics.cpu_percent`/`metrics.max_cpus`) AS `cpu_usage`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_monitor\",\"interval\":60,\"fill\": \"none\",\"window_size\":5,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Min(`metrics.cpu_percent`/`metrics.max_cpus`) AS `cpu_usage`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Min(`metrics.cpu_percent`/`metrics.max_cpus`) AS `cpu_usage`\"]}]}",
     "[{\"METRIC_LABEL\":\"cpu_usage\",\"return_field_description\":\"持续 5 分钟 (CPU用量/阈值)\",\"unit\":\"%\"}]", "采集器 CPU 超限",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"cpu_usage\", \"unit\": \"%\"}", "{\"OP\":\">=\",\"VALUE\":70}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_monitor\",\"include_history\":\"true\",\"interval\":60,\"fill\":0,\"window_size\":5,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Min(`metrics.memory`*100/`metrics.max_memory`) AS `used_bytes`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Min(`metrics.memory`*100/`metrics.max_memory`) AS `used_bytes`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_monitor\",\"interval\":60,\"fill\": \"none\",\"window_size\":5,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Min(`metrics.memory`*100/`metrics.max_memory`) AS `used_bytes`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Min(`metrics.memory`*100/`metrics.max_memory`) AS `used_bytes`\"]}]}",
     "[{\"METRIC_LABEL\":\"used_bytes\",\"return_field_description\":\"持续 5 分钟 (内存用量/阈值)\",\"unit\":\"%\"}]", "采集器内存超限",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"used_bytes\", \"unit\": \"%\"}", "{\"OP\":\">=\",\"VALUE\":70}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field, agg,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: host", "", "/v1/stats/querier/UniversalPromHistory", "{\"DATABASE\":\"\",\"include_history\":\"true\",\"PROM_SQL\":\"delta(min(deepflow_system__deepflow_agent_monitor__create_time)by(host)[1m:])\",\"interval\":60,\"metric\":\"process_start\",\"time_tag\":\"toi\"}",
+    values(1, 1, "过滤项: N/A | 分组项: host", "", "/v1/stats/querier/UniversalPromHistory", "{\"DATABASE\":\"\",\"PROM_SQL\":\"delta(min(deepflow_system__deepflow_agent_monitor__create_time)by(host)[1m:10s])\",\"interval\":60,\"metric\":\"process_start\",\"time_tag\":\"toi\"}",
     "[{\"METRIC_LABEL\":\"process_start\",\"return_field_description\":\"最近 1 分钟进程启动时间变化\",\"unit\":\" 毫秒\"}]", "进程启动",  0, 1, 1, 20, 1, "", "", "{\"displayName\":\"process_start\", \"unit\": \"毫秒\"}", 1, "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field, agg,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: 主机名, 进程", "", "/v1/alarm/process-end/", "{}", "[{\"OPERATOR\": {\"return_field\": \"sysalarm_value\", \"return_field_description\": \"最近 1 分钟进程停止次数\", \"return_field_unit\": \"次\"}}]", "进程停止",  0, 1, 1, 20, 1, "", "", "{\"displayName\":\"sysalarm_value\", \"unit\": \"次\"}", 1, "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
+    values(1, 1, "过滤项: N/A | 分组项: 主机名, 进程", "", "/v1/alarm/process-end/", "{}", "[{\"OPERATOR\": {\"return_field\": \"sysalarm_value\", \"return_field_description\": \"最近 1 分钟进程停止次数\", \"return_field_unit\": \"次\"}}]", "进程停止",  0, 1, 1, 20, 1, "", "", "{\"displayName\":\"sysalarm_value\", \"unit\": \"次\"}", 1, "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field, agg,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: *", "", "/v1/alarm/policy-event/", "{}", "[{\"OPERATOR\": {\"return_field\": \"sysalarm_value\", \"return_field_description\": \"最近 1 分钟无效策略自动删除条数\", \"return_field_unit\": \"次\"}}]", "无效策略自动删除",  0, 1, 1, 22, 1, "", "", "{\"displayName\":\"sysalarm_value\", \"unit\": \"次\"}", 1, "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
+    values(1, 1, "过滤项: N/A | 分组项: *", "", "/v1/alarm/policy-event/", "{}", "[{\"OPERATOR\": {\"return_field\": \"sysalarm_value\", \"return_field_description\": \"最近 1 分钟无效策略自动删除条数\", \"return_field_unit\": \"次\"}}]", "无效策略自动删除",  0, 1, 1, 22, 1, "", "", "{\"displayName\":\"sysalarm_value\", \"unit\": \"次\"}", 1, "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_error, lcuuid)
-    values(1, "过滤项: N/A | 分组项: *", "", "/v1/alarm/platform-event/", "{}", "[{\"OPERATOR\": {\"return_field\": \"sysalarm_value\", \"return_field_description\": \"最近 1 分钟云资源同步异常次数\", \"return_field_unit\": \"次\"}}]", "云资源同步异常",  1, 1, 1, 23, 1, "", "", "{\"displayName\":\"sysalarm_value\", \"unit\": \"次\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
+    values(1, 1, "过滤项: N/A | 分组项: *", "", "/v1/alarm/platform-event/", "{}", "[{\"OPERATOR\": {\"return_field\": \"sysalarm_value\", \"return_field_description\": \"最近 1 分钟云资源同步异常次数\", \"return_field_unit\": \"次\"}}]", "云资源同步异常",  1, 1, 1, 23, 1, "", "", "{\"displayName\":\"sysalarm_value\", \"unit\": \"次\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field, data_level, agg, delay,
     threshold_error, lcuuid)
-    values(1, "过滤项: N/A | 分组项: *", "", "/v1/alarm/voucher-30days/", "{}", "[{\"OPERATOR\": {\"return_field\": \"sysalarm_value\", \"return_field_description\": \"余额预估可用天数\", \"return_field_unit\": \"天\"}}]", "DeepFlow 服务即将停止",  1, 1, 1, 24, 1, "", "", "{\"displayName\":\"sysalarm_value\", \"unit\": \"天\"}", "1d", 1, 0, "{\"OP\":\"<=\",\"VALUE\":30}", @lcuuid);
+    values(1, 1, "过滤项: N/A | 分组项: *", "", "/v1/alarm/voucher-30days/", "{}", "[{\"OPERATOR\": {\"return_field\": \"sysalarm_value\", \"return_field_description\": \"余额预估可用天数\", \"return_field_unit\": \"天\"}}]", "DeepFlow 服务即将停止",  1, 1, 1, 24, 1, "", "", "{\"displayName\":\"sysalarm_value\", \"unit\": \"天\"}", "1d", 1, 0, "{\"OP\":\"<=\",\"VALUE\":30}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field, data_level, agg, delay,
     threshold_critical, lcuuid)
-    values(1, "过滤项: N/A | 分组项: *", "", "/v1/alarm/voucher-0days/", "{}", "[{\"OPERATOR\": {\"return_field\": \"sysalarm_value\", \"return_field_description\": \"余额可用天数\", \"return_field_unit\": \"天\"}}]", "DeepFlow 服务停止",  2, 1, 1, 24, 1, "", "", "{\"displayName\":\"sysalarm_value\", \"unit\": \"天\"}", "1d", 1, 0, "{\"OP\":\"<=\",\"VALUE\":0}", @lcuuid);
+    values(1, 1, "过滤项: N/A | 分组项: *", "", "/v1/alarm/voucher-0days/", "{}", "[{\"OPERATOR\": {\"return_field\": \"sysalarm_value\", \"return_field_description\": \"余额可用天数\", \"return_field_unit\": \"天\"}}]", "DeepFlow 服务停止",  2, 1, 1, 24, 1, "", "", "{\"displayName\":\"sysalarm_value\", \"unit\": \"天\"}", "1d", 1, 0, "{\"OP\":\"<=\",\"VALUE\":0}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field, data_level, agg, delay,
     threshold_error, lcuuid)
-    values(1, "过滤项: N/A | 分组项: *", "","/v1/alarm/license-30days/", "{}", "[{\"OPERATOR\": {\"return_field\": \"sysalarm_value\", \"return_field_description\": \"至少一个授权文件剩余有效期\", \"return_field_unit\": \"天\"}}]", "DeepFlow 授权即将过期",  1, 1, 1, 24, 1, "", "", "{\"displayName\":\"sysalarm_value\", \"unit\": \"天\"}", "1d", 1, 0, "{\"OP\":\"<=\",\"VALUE\":30}", @lcuuid);
+    values(1, 1, "过滤项: N/A | 分组项: *", "","/v1/alarm/license-30days/", "{}", "[{\"OPERATOR\": {\"return_field\": \"sysalarm_value\", \"return_field_description\": \"至少一个授权文件剩余有效期\", \"return_field_unit\": \"天\"}}]", "DeepFlow 授权即将过期",  1, 1, 1, 24, 1, "", "", "{\"displayName\":\"sysalarm_value\", \"unit\": \"天\"}", "1d", 1, 0, "{\"OP\":\"<=\",\"VALUE\":30}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field, data_level, agg, delay,
     threshold_critical, lcuuid)
-    values(1, "过滤项: N/A | 分组项: *", "", "/v1/alarm/license-0days/", "{}", "[{\"OPERATOR\": {\"return_field\": \"sysalarm_value\", \"return_field_description\": \"至少一个授权文件剩余有效期\", \"return_field_unit\": \"天\"}}]", "DeepFlow 授权过期",  2, 1, 1, 24, 1, "", "", "{\"displayName\":\"sysalarm_value\", \"unit\": \"天\"}", "1d", 1, 0, "{\"OP\":\"<=\",\"VALUE\":0}", @lcuuid);
+    values(1, 1, "过滤项: N/A | 分组项: *", "", "/v1/alarm/license-0days/", "{}", "[{\"OPERATOR\": {\"return_field\": \"sysalarm_value\", \"return_field_description\": \"至少一个授权文件剩余有效期\", \"return_field_unit\": \"天\"}}]", "DeepFlow 授权过期",  2, 1, 1, 24, 1, "", "", "{\"displayName\":\"sysalarm_value\", \"unit\": \"天\"}", "1d", 1, 0, "{\"OP\":\"<=\",\"VALUE\":0}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_monitor\",\"include_history\":\"true\",\"interval\":60,\"fill\":\"null\",\"window_size\":5,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Min(`metrics.sys_free_memory`*100/`metrics.system_free_memory_limit`) AS `used_bytes`\",\"WHERE\":\"`metrics.system_free_memory_limit`!=0\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Min(`metrics.sys_free_memory`*100/`metrics.system_free_memory_limit`) AS `used_bytes`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_monitor\",\"interval\":60,\"fill\": \"none\",\"window_size\":5,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Min(`metrics.sys_free_memory`*100/`metrics.system_free_memory_limit`) AS `used_bytes`\",\"WHERE\":\"`metrics.system_free_memory_limit`!=0\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Min(`metrics.sys_free_memory`*100/`metrics.system_free_memory_limit`) AS `used_bytes`\"]}]}",
     "[{\"METRIC_LABEL\":\"used_bytes\",\"return_field_description\":\"持续 5 分钟 (系统空闲内存百分比/阈值)\",\"unit\":\"%\"}]", "采集器所在系统空闲内存低",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"used_bytes\", \"unit\": \"%\"}", "{\"OP\":\"<=\",\"VALUE\":150}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_log_counter\",\"include_history\":\"true\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.warning`) AS `log_counter_warning`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.warning`) AS `log_counter_warning`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_log_counter\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.warning`) AS `log_counter_warning`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.warning`) AS `log_counter_warning`\"]}]}",
     "[{\"METRIC_LABEL\":\"log_counter_warning\",\"return_field_description\":\"最近 1 分钟 WARN 日志总条数\",\"unit\":\" 条\"}]", "采集器 WARN 日志过多",  0, 1, 1, 20, 1, "", "", "{\"displayName\":\"log_counter_warning\", \"unit\": \"条\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_error, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_log_counter\",\"include_history\":\"true\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.error`) AS `log_counter_error`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.error`) AS `log_counter_error`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_log_counter\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.error`) AS `log_counter_error`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.error`) AS `log_counter_error`\"]}]}",
     "[{\"METRIC_LABEL\":\"log_counter_error\",\"return_field_description\":\"最近 1 分钟 ERR 日志总条数\",\"unit\":\" 条\"}]", "采集器 ERR 日志过多",  1, 1, 1, 20, 1, "", "", "{\"displayName\":\"log_counter_error\", \"unit\": \"条\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_error, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.cluster_id", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_server_controller_genesis_k8sinfo_delay\",\"include_history\":\"true\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Last(`metrics.avg`) AS `delay`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.cluster_id`\",\"METRICS\":[\"Last(`metrics.avg`) AS `delay`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.cluster_id", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_server_controller_genesis_k8sinfo_delay\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Last(`metrics.avg`) AS `delay`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.cluster_id`\",\"METRICS\":[\"Last(`metrics.avg`) AS `delay`\"]}]}",
     "[{\"METRIC_LABEL\":\"delay\",\"return_field_description\":\"资源同步滞后时间\",\"unit\":\" 秒\"}]", "K8s 资源同步滞后",  1, 1, 1, 23, 1, "", "", "{\"displayName\":\"delay\", \"unit\": \"秒\"}", "{\"OP\":\">=\",\"VALUE\":600}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_dispatcher\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.kernel_drops`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.kernel_drops`) AS `drop_packets`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_dispatcher\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.kernel_drops`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.kernel_drops`) AS `drop_packets`\"]}]}",
      "[{\"METRIC_LABEL\":\"drop_packets\",\"return_field_description\":\"最近 1 分钟 dispatcher.metrics.kernel_drops\",\"unit\":\"\"}]",
      "采集器数据丢失 (dispatcher.metrics.kernel_drops)",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"drop_packets\", \"unit\": \"\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_queue\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.overwritten`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.overwritten`) AS `drop_packets`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_queue\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.overwritten`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.overwritten`) AS `drop_packets`\"]}]}",
      "[{\"METRIC_LABEL\":\"drop_packets\",\"return_field_description\":\"最近 1 分钟 queue.metrics.overwritten\",\"unit\":\"\"}]",
      "采集器数据丢失 (queue.metrics.overwritten)",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"drop_packets\", \"unit\": \"\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_l7_session_aggr\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.throttle-drop`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.throttle-drop`) AS `drop_packets`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_l7_session_aggr\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.throttle-drop`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.throttle-drop`) AS `drop_packets`\"]}]}",
      "[{\"METRIC_LABEL\":\"drop_packets\",\"return_field_description\":\"最近 1 分钟 l7_session_aggr.metrics.throttle-drop\",\"unit\":\"\"}]",
      "采集器数据丢失 (l7_session_aggr.metrics.throttle-drop)",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"drop_packets\", \"unit\": \"\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_flow_aggr\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.drop-in-throttle`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.drop-in-throttle`) AS `drop_packets`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_flow_aggr\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.drop-in-throttle`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.drop-in-throttle`) AS `drop_packets`\"]}]}",
     "[{\"METRIC_LABEL\":\"drop_packets\",\"return_field_description\":\"最近 1 分钟 flow_aggr.metrics.drop-in-throttle\",\"unit\":\"\"}]",
      "采集器数据丢失 (flow_aggr.metrics.drop-in-throttle)",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"drop_packets\", \"unit\": \"\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_ebpf_collector\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.kern_lost`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.kern_lost`) AS `drop_packets`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_ebpf_collector\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.kern_lost`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.kern_lost`) AS `drop_packets`\"]}]}",
     "[{\"METRIC_LABEL\":\"drop_packets\",\"return_field_description\":\"最近 1 分钟 ebpf_collector.metrics.kern_lost\",\"unit\":\"\"}]",
      "采集器数据丢失 (ebpf_collector.metrics.kern_lost)",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"drop_packets\", \"unit\": \"\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_ebpf_collector\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.user_enqueue_lost`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.kernuser_enqueue_lost_lost`) AS `drop_packets`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_ebpf_collector\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.user_enqueue_lost`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.kernuser_enqueue_lost_lost`) AS `drop_packets`\"]}]}",
     "[{\"METRIC_LABEL\":\"drop_packets\",\"return_field_description\":\"最近 1 分钟 ebpf_collector.metrics.user_enqueue_lost\",\"unit\":\"\"}]",
      "采集器数据丢失 (ebpf_collector.metrics.user_enqueue_lost)",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"drop_packets\", \"unit\": \"\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_dispatcher\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.invalid_packets`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.invalid_packets`) AS `drop_packets`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_dispatcher\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.invalid_packets`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.invalid_packets`) AS `drop_packets`\"]}]}",
     "[{\"METRIC_LABEL\":\"drop_packets\",\"return_field_description\":\"最近 1 分钟 dispatcher.metrics.invalid_packets\",\"unit\":\"\"}]",
      "采集器数据丢失 (dispatcher.metrics.invalid_packets)",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"drop_packets\", \"unit\": \"\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_dispatcher\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.err`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.err`) AS `drop_packets`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_dispatcher\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.err`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.err`) AS `drop_packets`\"]}]}",
     "[{\"METRIC_LABEL\":\"drop_packets\",\"return_field_description\":\"最近 1 分钟 dispatcher.metrics.err\",\"unit\":\"\"}]",
      "采集器数据丢失 (dispatcher.metrics.err)",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"drop_packets\", \"unit\": \"\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_flow_map\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.drop_before_window`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.drop_before_window`) AS `drop_packets`\"]}]}",
-    "[{\"METRIC_LABEL\":\"drop_packets\",\"return_field_description\":\"最近 1 分钟 flow_map.metrics.drop_before_window\",\"unit\":\"\"}]",
-     "采集器数据丢失 (flow_map.metrics.drop_before_window)",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"drop_packets\", \"unit\": \"\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_flow_map\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.drop_by_window`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.drop_by_window`) AS `drop_packets`\"]}]}",
+    "[{\"METRIC_LABEL\":\"drop_packets\",\"return_field_description\":\"最近 1 分钟 flow_map.metrics.drop_by_window\",\"unit\":\"\"}]",
+     "采集器数据丢失 (flow_map.metrics.drop_by_window)",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"drop_packets\", \"unit\": \"\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_flow_aggr\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.drop-before-window`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.drop-before-window`) AS `drop_packets`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_flow_aggr\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.drop-before-window`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.drop-before-window`) AS `drop_packets`\"]}]}",
     "[{\"METRIC_LABEL\":\"drop_packets\",\"return_field_description\":\"最近 1 分钟 flow_aggr.metrics.drop-before-window\",\"unit\":\"\"}]",
      "采集器数据丢失 (flow_aggr.metrics.drop-before-window)",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"drop_packets\", \"unit\": \"\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_quadruple_generator\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.drop-before-window`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.drop-before-window`) AS `drop_packets`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_quadruple_generator\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.drop-before-window`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.drop-before-window`) AS `drop_packets`\"]}]}",
     "[{\"METRIC_LABEL\":\"drop_packets\",\"return_field_description\":\"最近 1 分钟 quadruple_generator.metrics.drop_before_window\",\"unit\":\"\"}]",
      "采集器数据丢失 (quadruple_generator.metrics.drop-before-window)",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"drop_packets\", \"unit\": \"\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_collector\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.drop-before-window`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.drop-before-window`) AS `drop_packets`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_collector\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.drop-before-window`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.drop-before-window`) AS `drop_packets`\"]}]}",
     "[{\"METRIC_LABEL\":\"drop_packets\",\"return_field_description\":\"最近 1 分钟 collector.metrics.drop_before_window\",\"unit\":\"\"}]",
      "采集器数据丢失 (collector.metrics.drop-before-window)",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"drop_packets\", \"unit\": \"\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_collector\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.drop-inactive`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.drop-inactive`) AS `drop_packets`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_collector\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.drop-inactive`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.drop-inactive`) AS `drop_packets`\"]}]}",
     "[{\"METRIC_LABEL\":\"drop_packets\",\"return_field_description\":\"最近 1 分钟 collector.metrics.drop-inactive\",\"unit\":\"\"}]",
      "采集器数据丢失 (collector.metrics.drop-inactive)",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"drop_packets\", \"unit\": \"\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_collect_sender\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.dropped`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.dropped`) AS `drop_packets`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_agent_collect_sender\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.dropped`) AS `drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.dropped`) AS `drop_packets`\"]}]}",
     "[{\"METRIC_LABEL\":\"drop_packets\",\"return_field_description\":\"最近 1 分钟 collect_sender.metrics.dropped\",\"unit\":\"\"}]",
      "采集器数据丢失 (collect_sender.metrics.dropped)",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"drop_packets\", \"unit\": \"\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_server.ingester.recviver\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.invalid`) AS `rx_drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.invalid`) AS `rx_drop_packets`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_server_ingester_recviver\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.invalid`) AS `rx_drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.invalid`) AS `rx_drop_packets`\"]}]}",
     "[{\"METRIC_LABEL\":\"rx_drop_packets\",\"return_field_description\":\"最近 1 分钟 ingester.recviver.metrics.invalid\",\"unit\":\"\"}]",
     "数据节点数据丢失 (ingester.recviver.metrics.invalid)",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"rx_drop_packets\", \"unit\": \"\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_server.ingester.queue\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.overwritten`) AS `rx_drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.overwritten`) AS `rx_drop_packets`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_server_ingester_queue\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.overwritten`) AS `rx_drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.overwritten`) AS `rx_drop_packets`\"]}]}",
      "[{\"METRIC_LABEL\":\"rx_drop_packets\",\"return_field_description\":\"最近 1 分钟 ingester.queue.metrics.overwritten\",\"unit\":\"\"}]",
      "数据节点数据丢失 (ingester.queue.metrics.overwritten)",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"rx_drop_packets\", \"unit\": \"\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_server.ingester.decoder\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.drop_count`) AS `rx_drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.drop_count`) AS `rx_drop_packets`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_server_ingester_decoder\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.drop_count`) AS `rx_drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.drop_count`) AS `rx_drop_packets`\"]}]}",
      "[{\"METRIC_LABEL\":\"rx_drop_packets\",\"return_field_description\":\"最近 1 分钟 ingester.decoder.metrics.drop_count\",\"unit\":\"\"}]",
      "数据节点数据丢失 (ingester.decoder.metrics.drop_count)",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"rx_drop_packets\", \"unit\": \"\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
 set @lcuuid = (select uuid());
-INSERT INTO alarm_policy(sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
+INSERT INTO alarm_policy(user_id, sub_view_type, tag_conditions, query_conditions, query_url, query_params, sub_view_metrics, name, level, state,
     app_type, sub_type, contrast_type, target_line_uid, target_line_name, target_field,
     threshold_warning, lcuuid)
-    values(1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_server.ingester.ckwriter\",\"interval\":60,\"fill\":0,\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.write_failed_count`) AS `rx_drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.write_failed_count`) AS `rx_drop_packets`\"]}]}",
+    values(1, 1, "过滤项: N/A | 分组项: tag.host", "", "/v1/stats/querier/UniversalHistory", "{\"DATABASE\":\"deepflow_system\",\"TABLE\":\"deepflow_server_ingester_ckwriter\",\"interval\":60,\"fill\": \"none\",\"window_size\":1,\"QUERIES\":[{\"QUERY_ID\":\"R1\",\"SELECT\":\"Sum(`metrics.write_failed_count`) AS `rx_drop_packets`\",\"WHERE\":\"1=1\",\"GROUP_BY\":\"`tag.host`\",\"METRICS\":[\"Sum(`metrics.write_failed_count`) AS `rx_drop_packets`\"]}]}",
      "[{\"METRIC_LABEL\":\"rx_drop_packets\",\"return_field_description\":\"最近 1 分钟 ingester.ckwriter.metrics.write_failed_count\",\"unit\":\"\"}]",
      "数据节点数据丢失 (ingester.ckwriter.metrics.write_failed_count)",  0, 1, 1, 21, 1, "", "", "{\"displayName\":\"rx_drop_packets\", \"unit\": \"\"}", "{\"OP\":\">=\",\"VALUE\":1}", @lcuuid);
 
@@ -1575,72 +1607,78 @@ CREATE TABLE IF NOT EXISTS policy_acl_group (
 TRUNCATE TABLE policy_acl_group;
 
 CREATE TABLE IF NOT EXISTS vtap_group_configuration(
-    id                        INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    max_collect_pps           INTEGER DEFAULT NULL,
-    max_npb_bps               BIGINT DEFAULT NULL COMMENT 'unit: bps',
-    max_cpus                  INTEGER DEFAULT NULL,
-    max_memory                INTEGER DEFAULT NULL COMMENT 'unit: M',
-    sync_interval             INTEGER DEFAULT NULL,
-    stats_interval            INTEGER,
-    rsyslog_enabled           TINYINT(1) COMMENT '0: disabled 1:enabled',
-    max_tx_bandwidth          BIGINT COMMENT 'unit: bps',
-    bandwidth_probe_interval  INTEGER,
-    tap_interface_regex       TEXT,
-    max_escape_seconds        INTEGER,
-    mtu                       INTEGER,
-    output_vlan               INTEGER DEFAULT NULL,
-    collector_socket_type     CHAR(64),
-    compressor_socket_type    CHAR(64),
-    npb_socket_type           CHAR(64),
-    npb_vlan_mode             INTEGER,
-    collector_enabled         TINYINT(1) COMMENT '0: disabled 1:enabled',
-    vtap_flow_1s_enabled      TINYINT(1) COMMENT '0: disabled 1:enabled',
-    l4_log_tap_types          TEXT COMMENT 'tap type info, separate by ","',
-    npb_dedup_enabled         TINYINT(1) COMMENT '0: disabled 1:enabled',
-    platform_enabled          TINYINT(1) COMMENT '0: disabled 1:enabled',
-    if_mac_source             INTEGER COMMENT '0: 接口MAC 1: 接口名称 2: 虚拟机MAC解析',
-    vm_xml_path               TEXT,
-    extra_netns_regex         TEXT,
-    nat_ip_enabled            TINYINT(1) COMMENT '0: disabled 1:enabled',
-    capture_packet_size       INTEGER,
-    inactive_server_port_enabled   TINYINT(1) COMMENT '0: disabled 1:enabled',
-    inactive_ip_enabled       TINYINT(1) COMMENT '0: disabled 1:enabled',
-    vtap_group_lcuuid         CHAR(64) DEFAULT NULL,
-    log_threshold             INTEGER,
-    log_level                 CHAR(64),
-    log_retention             INTEGER,
-    http_log_proxy_client     CHAR(64),
-    http_log_trace_id         TEXT DEFAULT NULL,
-    l7_log_packet_size        INTEGER,
-    l4_log_collect_nps_threshold   INTEGER,
-    l7_log_collect_nps_threshold   INTEGER,
-    l7_metrics_enabled        TINYINT(1) COMMENT '0: disabled 1:enabled',
-    l7_log_store_tap_types    TEXT COMMENT 'l7 log store tap types, separate by ","',
-    l4_log_ignore_tap_sides   TEXT COMMENT 'separate by ","',
-    l7_log_ignore_tap_sides   TEXT COMMENT 'separate by ","',
-    decap_type                TEXT COMMENT 'separate by ","',
-    capture_socket_type       INTEGER,
-    capture_bpf               VARCHAR(512),
-    tap_mode                  INTEGER COMMENT '0: local 1: virtual mirror 2: physical mirror',
-    thread_threshold          INTEGER,
-    process_threshold         INTEGER,
-    ntp_enabled               TINYINT(1) COMMENT '0: disabled 1:enabled',
-    l4_performance_enabled    TINYINT(1) COMMENT '0: disabled 1:enabled',
-    pod_cluster_internal_ip   TINYINT(1) COMMENT '0: 所有集群 1:采集器所在集群',
-    domains                   TEXT COMMENT 'domains info, separate by ","',
-    http_log_span_id          TEXT DEFAULT NULL,
-    http_log_x_request_id     CHAR(64),
-    sys_free_memory_limit     INTEGER DEFAULT NULL COMMENT 'unit: %',
-    log_file_size             INTEGER DEFAULT NULL COMMENT 'unit: MB',
-    external_agent_http_proxy_enabled  TINYINT(1) COMMENT '0: disabled 1:enabled',
-    external_agent_http_proxy_port     INTEGER DEFAULT NULL,
-    prometheus_http_api_addresses      VARCHAR(1024),
-    proxy_controller_port     INTEGER DEFAULT NULL,
-    analyzer_port             INTEGER DEFAULT NULL,
-    proxy_controller_ip       VARCHAR(128),
-    analyzer_ip               VARCHAR(128),
-    yaml_config               TEXT,
-    lcuuid                    CHAR(64)
+    id                                      INTEGER        NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    max_collect_pps                         INTEGER        DEFAULT NULL,
+    max_npb_bps                             BIGINT         DEFAULT NULL     COMMENT 'unit: bps',
+    max_cpus                                INTEGER        DEFAULT NULL,
+    max_memory                              INTEGER        DEFAULT NULL     COMMENT 'unit: M',
+    platform_sync_interval                  INTEGER        DEFAULT NULL,
+    sync_interval                           INTEGER        DEFAULT NULL,
+    stats_interval                          INTEGER,
+    rsyslog_enabled                         TINYINT(1)     COMMENT '0: disabled 1: enabled',
+    system_load_circuit_breaker_threshold   FLOAT(8,2)     DEFAULT NULL,
+    system_load_circuit_breaker_recover     FLOAT(8,2)     DEFAULT NULL,
+    system_load_circuit_breaker_metric      CHAR(64)       DEFAULT NULL,
+    max_tx_bandwidth                        BIGINT         COMMENT 'unit: bps',
+    bandwidth_probe_interval                INTEGER,
+    tap_interface_regex                     TEXT,
+    max_escape_seconds                      INTEGER,
+    mtu                                     INTEGER,
+    output_vlan                             INTEGER        DEFAULT NULL,
+    collector_socket_type                   CHAR(64),
+    compressor_socket_type                  CHAR(64),
+    npb_socket_type                         CHAR(64),
+    npb_vlan_mode                           INTEGER,
+    collector_enabled                       TINYINT(1)     COMMENT '0: disabled 1: enabled',
+    vtap_flow_1s_enabled                    TINYINT(1)     COMMENT '0: disabled 1: enabled',
+    l4_log_tap_types                        TEXT           COMMENT 'tap type info, separate by ","',
+    npb_dedup_enabled                       TINYINT(1)     COMMENT '0: disabled 1: enabled',
+    platform_enabled                        TINYINT(1)     COMMENT '0: disabled 1: enabled',
+    if_mac_source                           INTEGER        COMMENT '0: 接口MAC 1: 接口名称 2: 虚拟机MAC解析',
+    vm_xml_path                             TEXT,
+    extra_netns_regex                       TEXT,
+    nat_ip_enabled                          TINYINT(1)     COMMENT '0: disabled 1: enabled',
+    capture_packet_size                     INTEGER,
+    inactive_server_port_enabled            TINYINT(1)     COMMENT '0: disabled 1: enabled',
+    inactive_ip_enabled                     TINYINT(1)     COMMENT '0: disabled 1: enabled',
+    vtap_group_lcuuid                       CHAR(64)       DEFAULT NULL,
+    log_threshold                           INTEGER,
+    log_level                               CHAR(64),
+    log_retention                           INTEGER,
+    http_log_proxy_client                   CHAR(64),
+    http_log_trace_id                       TEXT           DEFAULT NULL,
+    l7_log_packet_size                      INTEGER,
+    l4_log_collect_nps_threshold            INTEGER,
+    l7_log_collect_nps_threshold            INTEGER,
+    l7_metrics_enabled                      TINYINT(1)     COMMENT '0: disabled 1: enabled',
+    l7_log_store_tap_types                  TEXT           COMMENT 'l7 log store tap types, separate by ","',
+    l4_log_ignore_tap_sides                 TEXT           COMMENT 'separate by ","',
+    l7_log_ignore_tap_sides                 TEXT           COMMENT 'separate by ","',
+    decap_type                              TEXT           COMMENT 'separate by ","',
+    capture_socket_type                     INTEGER,
+    capture_bpf                             VARCHAR(512),
+    tap_mode                                INTEGER        COMMENT '0: local 1: virtual mirror 2: physical mirror',
+    thread_threshold                        INTEGER,
+    process_threshold                       INTEGER,
+    ntp_enabled                             TINYINT(1)     COMMENT '0: disabled 1: enabled',
+    l4_performance_enabled                  TINYINT(1)     COMMENT '0: disabled 1: enabled',
+    pod_cluster_internal_ip                 TINYINT(1)     COMMENT '0: 所有集群 1: 采集器所在集群',
+    domains                                 TEXT           COMMENT 'domains info, separate by ","',
+    http_log_span_id                        TEXT           DEFAULT NULL,
+    http_log_x_request_id                   CHAR(64),
+    sys_free_memory_limit                   INTEGER        DEFAULT NULL     COMMENT 'unit: %',
+    log_file_size                           INTEGER        DEFAULT NULL     COMMENT 'unit: MB',
+    external_agent_http_proxy_enabled       TINYINT(1)     COMMENT '0: disabled 1: enabled',
+    external_agent_http_proxy_port          INTEGER        DEFAULT NULL,
+    prometheus_http_api_addresses           VARCHAR(1024),
+    proxy_controller_port                   INTEGER        DEFAULT NULL,
+    analyzer_port                           INTEGER        DEFAULT NULL,
+    proxy_controller_ip                     VARCHAR(128),
+    analyzer_ip                             VARCHAR(128),
+    wasm_plugins                            TEXT           COMMENT 'wasm_plugin info, separate by ","',
+    so_plugins                              TEXT           COMMENT 'so_plugin info, separate by ","',
+    yaml_config                             TEXT,
+    lcuuid                                  CHAR(64)
 ) ENGINE=innodb DEFAULT CHARSET=utf8 AUTO_INCREMENT=1;
 TRUNCATE TABLE vtap_group_configuration;
 
@@ -1649,6 +1687,7 @@ CREATE TABLE IF NOT EXISTS npb_tunnel (
     name                CHAR(64) NOT NULL,
     ip                  CHAR(64),
     type                INTEGER COMMENT '(0-VXLAN；1-ERSPAN)',
+    vni_input_type      TINYINT(1) DEFAULT 1 COMMENT '1. entire one 2. two parts',
     created_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at          TIMESTAMP NOT NULL ON UPDATE CURRENT_TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     lcuuid              CHAR(64)
@@ -1672,108 +1711,19 @@ CREATE TABLE IF NOT EXISTS tap_type (
 TRUNCATE TABLE tap_type;
 
 set @lcuuid = (select uuid());
-INSERT INTO tap_type(name, value, vlan, description, lcuuid) values('虚拟网络', 3, 768, '', @lcuuid);
+INSERT INTO tap_type(name, value, vlan, description, lcuuid) values('云网络', 3, 768, '', @lcuuid);
 
 CREATE TABLE IF NOT EXISTS genesis_host (
-    id          INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    hostname    VARCHAR(256),
-    ip          CHAR(64)
-) ENGINE=innodb DEFAULT CHARSET=utf8mb4 AUTO_INCREMENT=1;
-TRUNCATE TABLE genesis_host;
-
-CREATE TABLE IF NOT EXISTS genesis_vm (
-    id              INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    uuid            CHAR(64),
-    name            VARCHAR(256),
-    label           CHAR(64),
-    vpc_uuid        CHAR(64),
-    launch_server   CHAR(64),
-    state           INTEGER
-) ENGINE=innodb DEFAULT CHARSET=utf8mb4 AUTO_INCREMENT=1;
-TRUNCATE TABLE genesis_vm;
-
-CREATE TABLE IF NOT EXISTS genesis_vpc (
-    id              INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    uuid            CHAR(64),
-    name            VARCHAR(256)
-) ENGINE=innodb DEFAULT CHARSET=utf8mb4 AUTO_INCREMENT=1;
-TRUNCATE TABLE genesis_vpc;
-
-CREATE TABLE IF NOT EXISTS genesis_network (
-    id              INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    name            VARCHAR(256),
-    uuid            CHAR(64),
-    segmentation_id INTEGER,
-    net_type        INTEGER,
-    external        TINYINT(1),
-    vpc_uuid        CHAR(64)
-) ENGINE=innodb DEFAULT CHARSET=utf8mb4 AUTO_INCREMENT=1;
-TRUNCATE TABLE genesis_network;
-
-CREATE TABLE IF NOT EXISTS genesis_port (
-    id              INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    uuid            CHAR(64),
-    type            INTEGER,
-    mac_address     CHAR(32),
-    device_uuid     CHAR(64),
-    network_uuid    CHAR(64),
-    vpc_uuid        CHAR(64)
-) ENGINE=innodb DEFAULT CHARSET=utf8mb4 AUTO_INCREMENT=1;
-TRUNCATE TABLE genesis_port;
-
-CREATE TABLE IF NOT EXISTS genesis_ip (
-    id              INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    uuid            CHAR(64),
-    ip              CHAR(64),
-    port_uuid       CHAR(64),
-    last_seen       INTEGER,
-    masklen         INTEGER DEFAULT 0
-) ENGINE=innodb DEFAULT CHARSET=utf8mb4 AUTO_INCREMENT=1;
-TRUNCATE TABLE genesis_ip;
-
-CREATE TABLE IF NOT EXISTS genesis_lldp (
-    id                 INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    uuid               CHAR(64),
-    host_ip            CHAR(48),
-    host_interface     CHAR(64),
-    system_name        VARCHAR(512),
-    management_address VARCHAR(512),
-    port_id            VARCHAR(512),
-    port_description   VARCHAR(512),
-    last_seen          INTEGER
-) ENGINE=innodb DEFAULT CHARSET=utf8mb4 AUTO_INCREMENT=1;
-TRUNCATE TABLE genesis_lldp;
-
-CREATE TABLE IF NOT EXISTS genesis_vinterface (
-    id                    INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    uuid                  CHAR(64),
-    name                  CHAR(64),
-    mac                   CHAR(32),
-    ips                   TEXT,
-    tap_name              CHAR(64),
-    tap_mac               CHAR(32),
-    device_uuid           CHAR(64),
-    device_name           VARCHAR(512),
-    device_type           CHAR(64),
-    host_ip               CHAR(48),
-    last_seen             INTEGER,
-    vtap_id               INTEGER,
-    kubernetes_cluster_id CHAR(64)
-) ENGINE=innodb DEFAULT CHARSET=utf8mb4 AUTO_INCREMENT=1;
-TRUNCATE TABLE genesis_vinterface;
-
-CREATE TABLE IF NOT EXISTS go_genesis_host (
-    id          INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
     lcuuid      CHAR(64),
     hostname    VARCHAR(256),
     ip          CHAR(64),
     vtap_id     INTEGER,
-    node_ip     CHAR(48)
-) ENGINE=innodb DEFAULT CHARSET=utf8mb4 AUTO_INCREMENT=1;
-TRUNCATE TABLE go_genesis_host;
+    node_ip     CHAR(48),
+    PRIMARY KEY (`lcuuid`,`vtap_id`, `node_ip`)
+) ENGINE=innodb DEFAULT CHARSET=utf8mb4;
+TRUNCATE TABLE genesis_host;
 
-CREATE TABLE IF NOT EXISTS go_genesis_vm (
-    id              INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS genesis_vm (
     lcuuid          CHAR(64),
     name            VARCHAR(256),
     label           CHAR(64),
@@ -1782,30 +1732,30 @@ CREATE TABLE IF NOT EXISTS go_genesis_vm (
     node_ip         CHAR(48),
     state           INTEGER,
     vtap_id         INTEGER,
-    created_at      DATETIME
-) ENGINE=innodb DEFAULT CHARSET=utf8mb4 AUTO_INCREMENT=1;
-TRUNCATE TABLE go_genesis_vm;
+    created_at      DATETIME,
+    PRIMARY KEY (`lcuuid`,`vtap_id`, `node_ip`)
+) ENGINE=innodb DEFAULT CHARSET=utf8mb4;
+TRUNCATE TABLE genesis_vm;
 
-CREATE TABLE IF NOT EXISTS go_genesis_vip (
-    id          INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS genesis_vip (
     lcuuid      CHAR(64),
     ip          CHAR(64),
     vtap_id     INTEGER,
-    node_ip     CHAR(48)
-) ENGINE=innodb DEFAULT CHARSET=utf8mb4 AUTO_INCREMENT=1;
-TRUNCATE TABLE go_genesis_vip;
+    node_ip     CHAR(48),
+    PRIMARY KEY (`lcuuid`,`vtap_id`, `node_ip`)
+) ENGINE=innodb DEFAULT CHARSET=utf8mb4;
+TRUNCATE TABLE genesis_vip;
 
-CREATE TABLE IF NOT EXISTS go_genesis_vpc (
-    id              INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS genesis_vpc (
     lcuuid          CHAR(64),
     node_ip         CHAR(48),
     vtap_id         INTEGER,
-    name            VARCHAR(256)
-) ENGINE=innodb DEFAULT CHARSET=utf8mb4 AUTO_INCREMENT=1;
-TRUNCATE TABLE go_genesis_vpc;
+    name            VARCHAR(256),
+    PRIMARY KEY (`lcuuid`,`vtap_id`, `node_ip`)
+) ENGINE=innodb DEFAULT CHARSET=utf8mb4;
+TRUNCATE TABLE genesis_vpc;
 
-CREATE TABLE IF NOT EXISTS go_genesis_network (
-    id              INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS genesis_network (
     name            VARCHAR(256),
     lcuuid          CHAR(64),
     segmentation_id INTEGER,
@@ -1813,12 +1763,12 @@ CREATE TABLE IF NOT EXISTS go_genesis_network (
     external        TINYINT(1),
     vpc_lcuuid      CHAR(64),
     vtap_id         INTEGER,
-    node_ip         CHAR(48)
-) ENGINE=innodb DEFAULT CHARSET=utf8mb4 AUTO_INCREMENT=1;
-TRUNCATE TABLE go_genesis_network;
+    node_ip         CHAR(48),
+    PRIMARY KEY (`lcuuid`,`vtap_id`, `node_ip`)
+) ENGINE=innodb DEFAULT CHARSET=utf8mb4;
+TRUNCATE TABLE genesis_network;
 
-CREATE TABLE IF NOT EXISTS go_genesis_port (
-    id              INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS genesis_port (
     lcuuid          CHAR(64),
     type            INTEGER,
     device_type     INTEGER,
@@ -1827,24 +1777,24 @@ CREATE TABLE IF NOT EXISTS go_genesis_port (
     network_lcuuid  CHAR(64),
     vpc_lcuuid      CHAR(64),
     vtap_id         INTEGER,
-    node_ip         CHAR(48)
-) ENGINE=innodb DEFAULT CHARSET=utf8mb4 AUTO_INCREMENT=1;
-TRUNCATE TABLE go_genesis_port;
+    node_ip         CHAR(48),
+    PRIMARY KEY (`lcuuid`,`vtap_id`, `node_ip`)
+) ENGINE=innodb DEFAULT CHARSET=utf8mb4;
+TRUNCATE TABLE genesis_port;
 
-CREATE TABLE IF NOT EXISTS go_genesis_ip (
-    id                  INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS genesis_ip (
     lcuuid              CHAR(64),
     ip                  CHAR(64),
     vinterface_lcuuid   CHAR(64),
     node_ip             CHAR(48),
     last_seen           DATETIME,
     vtap_id             INTEGER,
-    masklen             INTEGER DEFAULT 0
-) ENGINE=innodb DEFAULT CHARSET=utf8mb4 AUTO_INCREMENT=1;
-TRUNCATE TABLE go_genesis_ip;
+    masklen             INTEGER DEFAULT 0,
+    PRIMARY KEY (`lcuuid`,`vtap_id`, `node_ip`)
+) ENGINE=innodb DEFAULT CHARSET=utf8mb4;
+TRUNCATE TABLE genesis_ip;
 
-CREATE TABLE IF NOT EXISTS go_genesis_lldp (
-    id                      INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS genesis_lldp (
     lcuuid                  CHAR(64),
     host_ip                 CHAR(48),
     host_interface          CHAR(64),
@@ -1854,12 +1804,12 @@ CREATE TABLE IF NOT EXISTS go_genesis_lldp (
     vinterface_lcuuid       VARCHAR(512),
     vinterface_description  VARCHAR(512),
     vtap_id                 INTEGER,
-    last_seen               DATETIME
-) ENGINE=innodb DEFAULT CHARSET=utf8mb4 AUTO_INCREMENT=1;
-TRUNCATE TABLE go_genesis_lldp;
+    last_seen               DATETIME,
+    PRIMARY KEY (`lcuuid`,`vtap_id`, `node_ip`)
+) ENGINE=innodb DEFAULT CHARSET=utf8mb4;
+TRUNCATE TABLE genesis_lldp;
 
-CREATE TABLE IF NOT EXISTS go_genesis_vinterface (
-    id                    INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS genesis_vinterface (
     netns_id              INTEGER UNSIGNED DEFAULT 0,
     lcuuid                CHAR(64),
     name                  CHAR(64),
@@ -1870,37 +1820,38 @@ CREATE TABLE IF NOT EXISTS go_genesis_vinterface (
     device_lcuuid         CHAR(64),
     device_name           VARCHAR(512),
     device_type           CHAR(64),
+    if_type               CHAR(64) DEFAULT '',
     host_ip               CHAR(48),
     node_ip               CHAR(48),
     last_seen             DATETIME,
     vtap_id               INTEGER,
-    kubernetes_cluster_id CHAR(64)
-) ENGINE=innodb DEFAULT CHARSET=utf8mb4 AUTO_INCREMENT=1;
-TRUNCATE TABLE go_genesis_vinterface;
+    kubernetes_cluster_id CHAR(64),
+    PRIMARY KEY (`lcuuid`,`vtap_id`, `node_ip`)
+) ENGINE=innodb DEFAULT CHARSET=utf8mb4;
+TRUNCATE TABLE genesis_vinterface;
 
-CREATE TABLE IF NOT EXISTS go_genesis_process (
-    id                  INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS genesis_process (
     netns_id            INTEGER UNSIGNED DEFAULT 0,
     vtap_id             INTEGER NOT NULL DEFAULT 0,
     pid                 INTEGER NOT NULL,
     lcuuid              CHAR(64) DEFAULT '',
-    name                VARCHAR(256) DEFAULT '',
-    process_name        VARCHAR(256) DEFAULT '',
+    name                TEXT,
+    process_name        TEXT,
     cmd_line            TEXT,
     user                VARCHAR(256) DEFAULT '',
     container_id        CHAR(64) DEFAULT '',
     os_app_tags         TEXT COMMENT 'separated by ,',
     node_ip             CHAR(48) DEFAULT '',
-    start_time          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-) ENGINE=innodb DEFAULT CHARSET=utf8 AUTO_INCREMENT=1;
-TRUNCATE TABLE go_genesis_process;
+    start_time          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`lcuuid`,`vtap_id`, `node_ip`)
+) ENGINE=innodb DEFAULT CHARSET=utf8;
+TRUNCATE TABLE genesis_process;
 
-CREATE TABLE IF NOT EXISTS go_genesis_storage (
-    id          INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    vtap_id     INTEGER,
+CREATE TABLE IF NOT EXISTS genesis_storage (
+    vtap_id     INTEGER NOT NULL PRIMARY KEY,
     node_ip     CHAR(48)
-) ENGINE = innodb DEFAULT CHARSET = utf8mb4 AUTO_INCREMENT = 1;
-TRUNCATE TABLE go_genesis_storage;
+) ENGINE=innodb DEFAULT CHARSET = utf8mb4;
+TRUNCATE TABLE genesis_storage;
 
 CREATE TABLE IF NOT EXISTS controller (
     id                  INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -2034,6 +1985,7 @@ CREATE TABLE IF NOT EXISTS ch_pod_ns (
     id                      INTEGER NOT NULL PRIMARY KEY,
     name                    VARCHAR(256),
     icon_id                 INTEGER,
+    pod_cluster_id          INTEGER,
     updated_at              TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 )ENGINE=innodb DEFAULT CHARSET=utf8;
 TRUNCATE TABLE ch_pod_ns;
@@ -2041,7 +1993,10 @@ TRUNCATE TABLE ch_pod_ns;
 CREATE TABLE IF NOT EXISTS ch_pod_group (
     id                      INTEGER NOT NULL PRIMARY KEY,
     name                    VARCHAR(256),
+    pod_group_type          INTEGER DEFAULT NULL,
     icon_id                 INTEGER,
+    pod_cluster_id          INTEGER,
+    pod_ns_id               INTEGER,
     updated_at              TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 )ENGINE=innodb DEFAULT CHARSET=utf8;
 TRUNCATE TABLE ch_pod_group;
@@ -2050,6 +2005,11 @@ CREATE TABLE IF NOT EXISTS ch_pod (
     id                      INTEGER NOT NULL PRIMARY KEY,
     name                    VARCHAR(256),
     icon_id                 INTEGER,
+    pod_cluster_id          INTEGER,
+    pod_ns_id               INTEGER,
+    pod_node_id             INTEGER,
+    pod_service_id          INTEGER,
+    pod_group_id            INTEGER,
     updated_at              TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 )ENGINE=innodb DEFAULT CHARSET=utf8;
 TRUNCATE TABLE ch_pod;
@@ -2057,9 +2017,11 @@ TRUNCATE TABLE ch_pod;
 CREATE TABLE IF NOT EXISTS ch_device (
     devicetype              INTEGER NOT NULL,
     deviceid                INTEGER NOT NULL,
-    name                    VARCHAR(256),
+    name                    TEXT,
     uid                     CHAR(64),
     icon_id                 INTEGER,
+    ip                      CHAR(64),
+    hostname                VARCHAR(256),
     updated_at              TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (devicetype, deviceid)
 )ENGINE=innodb DEFAULT CHARSET=utf8;
@@ -2231,8 +2193,8 @@ CREATE TABLE IF NOT EXISTS ch_ip_resource (
     host_name           VARCHAR(256),
     chost_id            INTEGER,
     chost_name          VARCHAR(256),
-    vpc_id              INTEGER,
-    vpc_name            VARCHAR(256),
+    l3_epc_id           INTEGER,
+    l3_epc_name         VARCHAR(256),
     router_id           INTEGER,
     router_name         VARCHAR(256),
     dhcpgw_id           INTEGER,
@@ -2311,47 +2273,54 @@ CREATE TABLE IF NOT EXISTS data_source (
 TRUNCATE TABLE data_source;
 
 set @lcuuid = (select uuid());
-INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid) 
-                 VALUES (1, '网络-指标（秒级）', 'flow_metrics.vtap_flow*', 1, 1*24, @lcuuid);
+INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid)
+                 VALUES (1, '网络-指标（秒级）', 'flow_metrics.network*', 1, 1*24, @lcuuid);
 set @lcuuid = (select uuid());
-INSERT INTO data_source (id, display_name, data_table_collection, base_data_source_id, `interval`, retention_time, summable_metrics_operator, unsummable_metrics_operator, lcuuid) 
-                 VALUES (3, '网络-指标（分钟级）', 'flow_metrics.vtap_flow*', 1, 60, 7*24, 'Sum', 'Avg', @lcuuid);
+INSERT INTO data_source (id, display_name, data_table_collection, base_data_source_id, `interval`, retention_time, summable_metrics_operator, unsummable_metrics_operator, lcuuid)
+                 VALUES (3, '网络-指标（分钟级）', 'flow_metrics.network*', 1, 60, 7*24, 'Sum', 'Avg', @lcuuid);
 set @lcuuid = (select uuid());
-INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid) 
+INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid)
                  VALUES (6, '网络-流日志', 'flow_log.l4_flow_log', 0, 3*24, @lcuuid);
 set @lcuuid = (select uuid());
-INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid) 
-                 VALUES (7, '应用-指标（秒级）', 'flow_metrics.vtap_app*', 1, 1*24, @lcuuid);
+INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid)
+                 VALUES (7, '应用-指标（秒级）', 'flow_metrics.application*', 1, 1*24, @lcuuid);
 set @lcuuid = (select uuid());
-INSERT INTO data_source (id, display_name, data_table_collection, base_data_source_id, `interval`, retention_time, summable_metrics_operator, unsummable_metrics_operator, lcuuid) 
-                 VALUES (8, '应用-指标（分钟级）', 'flow_metrics.vtap_app*', 7, 60, 7*24, 'Sum', 'Avg', @lcuuid);
+INSERT INTO data_source (id, display_name, data_table_collection, base_data_source_id, `interval`, retention_time, summable_metrics_operator, unsummable_metrics_operator, lcuuid)
+                 VALUES (8, '应用-指标（分钟级）', 'flow_metrics.application*', 7, 60, 7*24, 'Sum', 'Avg', @lcuuid);
 set @lcuuid = (select uuid());
-INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid) 
+INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid)
                  VALUES (9, '应用-调用日志', 'flow_log.l7_flow_log', 0, 3*24, @lcuuid);
 set @lcuuid = (select uuid());
-INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid) 
+INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid)
                  VALUES (10, '网络-TCP 时序数据', 'flow_log.l4_packet', 0, 3*24, @lcuuid);
 set @lcuuid = (select uuid());
-INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid) 
+INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid)
                  VALUES (11, '网络-PCAP 数据', 'flow_log.l7_packet', 0, 3*24, @lcuuid);
 set @lcuuid = (select uuid());
-INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid) 
-                 VALUES (12, '系统监控数据', 'deepflow_system.*', 0, 3*24, @lcuuid);
+INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid)
+                 VALUES (12, '系统监控数据', 'deepflow_system.*', 0, 7*24, @lcuuid);
 set @lcuuid = (select uuid());
-INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid) 
+INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid)
                  VALUES (13, '外部指标数据', 'ext_metrics.*', 0, 7*24, @lcuuid);
 set @lcuuid = (select uuid());
-INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid) 
+INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid)
                  VALUES (14, 'Prometheus 数据', 'prometheus.*', 0, 7*24, @lcuuid);
 set @lcuuid = (select uuid());
-INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid) 
-                 VALUES (15, '事件-资源变更事件', 'event.event', 0, 3*24, @lcuuid);
+INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid)
+                 VALUES (15, '事件-资源变更事件', 'event.event', 0, 30*24, @lcuuid);
 set @lcuuid = (select uuid());
-INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid) 
-                 VALUES (16, '事件-IO 事件', 'event.perf_event', 0, 3*24, @lcuuid);
+INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid)
+                 VALUES (16, '事件-IO 事件', 'event.perf_event', 0, 7*24, @lcuuid);
 set @lcuuid = (select uuid());
-INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid) 
-                 VALUES (17, '事件-告警事件', 'event.alarm_event', 0, 3*24, @lcuuid);
+INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid)
+                 VALUES (17, '事件-告警事件', 'event.alarm_event', 0, 30*24, @lcuuid);
+set @lcuuid = (select uuid());
+INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid)
+                 VALUES (18, '应用-性能剖析', 'profile.in_process', 0, 3*24, @lcuuid);
+set @lcuuid = (select uuid());
+INSERT INTO data_source (id, display_name, data_table_collection, `interval`, retention_time, lcuuid)
+                 VALUES (19, '网络-网络策略', 'flow_metrics.traffic_policy', 60, 3*24, @lcuuid);
+
 
 CREATE TABLE IF NOT EXISTS license (
     id                  INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -2411,6 +2380,22 @@ CREATE TABLE IF NOT EXISTS kubernetes_cluster (
     unique (cluster_id)
 )ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8;
 TRUNCATE TABLE kubernetes_cluster;
+
+CREATE TABLE IF NOT EXISTS mail_server (
+    id                      INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    status                  int NOT NULL ,
+    host                    TEXT NOT NULL,
+    port                    int Not NULL,
+    user                    TEXT NOT NULL,
+    password                TEXT NOT NULL,
+    security                TEXT Not NULL,
+    ntlm_enabled            int,
+    ntlm_name               TEXT,
+    ntlm_password           TEXT,
+    lcuuid                  CHAR(64) DEFAULT ''
+)ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8;
+TRUNCATE TABLE mail_server;
+
 
 CREATE TABLE IF NOT EXISTS ch_string_enum (
     tag_name                VARCHAR(256) NOT NULL ,
@@ -2498,8 +2483,10 @@ TRUNCATE TABLE ch_os_app_tags;
 
 CREATE TABLE IF NOT EXISTS ch_gprocess (
     id                      INTEGER NOT NULL PRIMARY KEY,
-    name                    VARCHAR(256),
+    name                    TEXT,
     icon_id                 INTEGER,
+    chost_id                INTEGER,
+    l3_epc_id               INTEGER,
     updated_at              TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 )ENGINE=innodb DEFAULT CHARSET=utf8;
 TRUNCATE TABLE ch_gprocess;
@@ -2567,6 +2554,7 @@ TRUNCATE TABLE ch_pod_k8s_annotations;
 CREATE TABLE IF NOT EXISTS prometheus_metric_name (
     `id`            INT(10) NOT NULL PRIMARY KEY,
     `name`          VARCHAR(256) NOT NULL UNIQUE,
+    `synced_at`     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     `created_at`    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 )ENGINE=innodb DEFAULT CHARSET=utf8 COLLATE=utf8_bin;
 TRUNCATE TABLE prometheus_metric_name;
@@ -2574,23 +2562,25 @@ TRUNCATE TABLE prometheus_metric_name;
 CREATE TABLE IF NOT EXISTS prometheus_label_name (
     `id`            INT(10) NOT NULL PRIMARY KEY,
     `name`          VARCHAR(256) NOT NULL UNIQUE,
+    `synced_at`     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     `created_at`    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 )ENGINE=innodb DEFAULT CHARSET=utf8 COLLATE=utf8_bin;
 TRUNCATE TABLE prometheus_label_name;
 
 CREATE TABLE IF NOT EXISTS prometheus_label_value (
-    `id`            INT(10) NOT NULL PRIMARY KEY,
-    `value`         VARCHAR(256) NOT NULL UNIQUE,
+    `id`            INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    `value`         TEXT,
+    `synced_at`     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     `created_at`    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-)ENGINE=innodb DEFAULT CHARSET=utf8 COLLATE=utf8_bin;
+)ENGINE=innodb AUTO_INCREMENT=1 DEFAULT CHARSET=utf8 COLLATE=utf8_bin;
 TRUNCATE TABLE prometheus_label_value;
 
 CREATE TABLE IF NOT EXISTS prometheus_label (
     `id`            INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
     `name`          VARCHAR(256) NOT NULL,
-    `value`         VARCHAR(256) NOT NULL,
-    `created_at`    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE INDEX label(name, value)
+    `value`         TEXT,
+    `synced_at`     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `created_at`    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 )ENGINE=innodb AUTO_INCREMENT=1 DEFAULT CHARSET=utf8 COLLATE=utf8_bin;
 TRUNCATE TABLE prometheus_label;
 
@@ -2599,24 +2589,27 @@ CREATE TABLE IF NOT EXISTS prometheus_metric_app_label_layout (
     `metric_name`               VARCHAR(256) NOT NULL,
     `app_label_name`            VARCHAR(256) NOT NULL,
     `app_label_column_index`    TINYINT(3) UNSIGNED NOT NULL,
-    `created_at`    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `synced_at`                 DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `created_at`                DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE INDEX metric_label_index(metric_name, app_label_name)
 )ENGINE=innodb AUTO_INCREMENT=1 DEFAULT CHARSET=utf8 COLLATE=utf8_bin;
 TRUNCATE TABLE prometheus_metric_app_label_layout;
 
-CREATE TABLE IF NOT EXISTS prometheus_metric_label (
-    `id`            INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    `metric_name`   VARCHAR(256) NOT NULL,
-    `label_id`      INT NOT NULL,
-    `created_at`    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE INDEX metric_label_index(metric_name, label_id)
+CREATE TABLE IF NOT EXISTS prometheus_metric_label_name (
+    `id`                INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    `metric_name`       VARCHAR(256) NOT NULL,
+    `label_name_id`     INT NOT NULL,
+    `synced_at`         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `created_at`        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE INDEX metric_label_name_index(metric_name, label_name_id)
 )ENGINE=innodb AUTO_INCREMENT=1 DEFAULT CHARSET=utf8 COLLATE=utf8_bin;
-TRUNCATE TABLE prometheus_metric_label;
+TRUNCATE TABLE prometheus_metric_label_name;
 
 CREATE TABLE IF NOT EXISTS prometheus_metric_target (
     `id`            INT(10) NOT NULL AUTO_INCREMENT PRIMARY KEY,
     `metric_name`   VARCHAR(256) NOT NULL,
     `target_id`     INT(10) NOT NULL,
+    `synced_at`     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     `created_at`    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE INDEX metric_target_index(metric_name, target_id)
 )ENGINE=innodb AUTO_INCREMENT=1 DEFAULT CHARSET=utf8 COLLATE=utf8_bin;
@@ -2645,7 +2638,7 @@ TRUNCATE TABLE ch_pod_k8s_envs;
 CREATE TABLE IF NOT EXISTS ch_app_label (
     `label_name_id`      INT(10) NOT NULL,
     `label_value_id`     INT(10) NOT NULL,
-    `label_value`        VARCHAR(256) NOT NULL,
+    `label_value`        TEXT,
     `updated_at`         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (label_name_id, label_value_id)
 )ENGINE=innodb DEFAULT CHARSET=utf8;
@@ -2692,8 +2685,47 @@ CREATE TABLE IF NOT EXISTS ch_prometheus_target_label_layout (
 )ENGINE=innodb DEFAULT CHARSET=utf8;
 TRUNCATE TABLE ch_prometheus_target_label_layout;
 
-CREATE TABLE IF NOT EXISTS ch_view_change (
-    `updated_at`          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+CREATE TABLE IF NOT EXISTS ch_pod_service (
+    `id`              INTEGER NOT NULL PRIMARY KEY,
+    `name`            VARCHAR(256),
+    `pod_cluster_id`  INTEGER,
+    `pod_ns_id`       INTEGER,
+    `updated_at`      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 )ENGINE=innodb DEFAULT CHARSET=utf8;
-TRUNCATE TABLE ch_view_change;
-INSERT INTO ch_view_change () VALUES ();
+TRUNCATE TABLE ch_pod_service;
+
+CREATE TABLE IF NOT EXISTS ch_chost (
+    `id`              INTEGER NOT NULL PRIMARY KEY,
+    `name`            VARCHAR(256),
+    `host_id`         INTEGER,
+    `l3_epc_id`       INTEGER,
+    `ip`              CHAR(64),
+    `hostname`        VARCHAR(256),
+    `updated_at`      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)ENGINE=innodb DEFAULT CHARSET=utf8;
+TRUNCATE TABLE ch_chost;
+
+CREATE TABLE IF NOT EXISTS ch_policy (
+    `tunnel_type`     INTEGER NOT NULL,
+    `acl_gid`         INTEGER NOT NULL,
+    `id`              INTEGER,
+    `name`            VARCHAR(256),
+    `updated_at`      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`tunnel_type`, `acl_gid`)
+)ENGINE=innodb DEFAULT CHARSET=utf8;
+TRUNCATE TABLE ch_policy;
+
+CREATE TABLE IF NOT EXISTS ch_npb_tunnel (
+    `id`              INTEGER NOT NULL PRIMARY KEY,
+    `name`            VARCHAR(256),
+    `updated_at`      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)ENGINE=innodb DEFAULT CHARSET=utf8;
+TRUNCATE TABLE ch_npb_tunnel;
+
+CREATE TABLE IF NOT EXISTS ch_alarm_policy (
+    `id`              INTEGER NOT NULL PRIMARY KEY,
+    `name`            VARCHAR(256),
+    `user_id`         INTEGER,
+    `updated_at`      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)ENGINE=innodb DEFAULT CHARSET=utf8;
+TRUNCATE TABLE ch_alarm_policy;

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -152,6 +152,9 @@ func (t *Tencent) getSecurityGroups(region tencentRegion) ([]model.SecurityGroup
 			action := common.SECURITY_GROUP_RULE_ACCEPT
 			if cidrBlock, ok := rule.rule.CheckGet("CidrBlock"); ok && cidrBlock.MustString() != "" {
 				addressSet.Add(cidrBlock.MustString())
+			}
+			if cidrBlockV6, ok := rule.rule.CheckGet("Ipv6CidrBlock"); ok && cidrBlockV6.MustString() != "" {
+				addressSet.Add(cidrBlockV6.MustString())
 			}
 
 			if rSGID, ok := rule.rule.CheckGet("SecurityGroupId"); ok && rSGID.MustString() != "" {

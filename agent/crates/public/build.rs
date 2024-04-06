@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,7 +28,7 @@ fn generate_protobuf() -> Result<(), Box<dyn Error>> {
                 "../../../message/metric.proto",
                 "../../../message/flow_log.proto",
                 "../../../message/stats.proto",
-                "../../../message/protobuf_rpcs.proto",
+                "../../../message/k8s_event.proto",
             ],
             &["../../../message"],
         )?;

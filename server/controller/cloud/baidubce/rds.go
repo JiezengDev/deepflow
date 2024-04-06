@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,10 +25,7 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/common"
 )
 
-func (b *BaiduBce) getRDSInstances(
-	region model.Region, vpcIdToLcuuid map[string]string, networkIdToLcuuid map[string]string,
-	zoneNameToAZLcuuid map[string]string,
-) ([]model.RDSInstance, []model.VInterface, []model.IP, error) {
+func (b *BaiduBce) getRDSInstances(region model.Region, vpcIdToLcuuid, networkIdToLcuuid, zoneNameToAZLcuuid map[string]string) ([]model.RDSInstance, []model.VInterface, []model.IP, error) {
 	var retRDSInstances []model.RDSInstance
 	var retVInterfaces []model.VInterface
 	var retIPs []model.IP
@@ -60,8 +57,7 @@ func (b *BaiduBce) getRDSInstances(
 			log.Error(err)
 			return nil, nil, nil, err
 		}
-		b.cloudStatsd.APICost["ListRds"] = append(b.cloudStatsd.APICost["ListRds"], int(time.Now().Sub(startTime).Milliseconds()))
-		b.cloudStatsd.APICount["ListRds"] = append(b.cloudStatsd.APICount["ListRds"], len(result.Instances))
+		b.cloudStatsd.RefreshAPIMoniter("ListRds", len(result.Instances), startTime)
 		results = append(results, result)
 		if !result.IsTruncated {
 			break

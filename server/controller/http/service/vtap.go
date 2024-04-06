@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,8 +31,11 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	httpcommon "github.com/deepflowio/deepflow/server/controller/http/common"
 	. "github.com/deepflowio/deepflow/server/controller/http/service/common"
+	"github.com/deepflowio/deepflow/server/controller/http/service/rebalance"
 	"github.com/deepflowio/deepflow/server/controller/model"
+	"github.com/deepflowio/deepflow/server/controller/monitor/config"
 	"github.com/deepflowio/deepflow/server/controller/monitor/license"
+	"github.com/deepflowio/deepflow/server/controller/trisolaris/refresh"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/utils"
 	vtapop "github.com/deepflowio/deepflow/server/controller/trisolaris/vtap"
 )
@@ -47,6 +50,7 @@ func GetVtaps(filter map[string]interface{}) (resp []model.Vtap, err error) {
 	var vtapGroups []mysql.VTapGroup
 	var regions []mysql.Region
 	var azs []mysql.AZ
+	var vtapRepos []mysql.VTapRepo
 
 	Db := mysql.Db
 	for _, param := range []string{
@@ -62,10 +66,21 @@ func GetVtaps(filter map[string]interface{}) (resp []model.Vtap, err error) {
 			Db = Db.Where("name IN (?)", filter["names"].([]string))
 		}
 	}
-	Db.Find(&vtaps)
-	mysql.Db.Find(&vtapGroups)
-	mysql.Db.Find(&regions)
-	mysql.Db.Find(&azs)
+	if err := Db.Find(&vtaps).Error; err != nil {
+		return nil, err
+	}
+	if err := mysql.Db.Find(&vtapGroups).Error; err != nil {
+		return nil, err
+	}
+	if err := mysql.Db.Find(&regions).Error; err != nil {
+		return nil, err
+	}
+	if err := mysql.Db.Find(&azs).Error; err != nil {
+		return nil, err
+	}
+	if err := mysql.Db.Select("name", "branch", "rev_count").Find(&vtapRepos).Error; err != nil {
+		return nil, err
+	}
 
 	lcuuidToRegion := make(map[string]string)
 	for _, region := range regions {
@@ -82,6 +97,11 @@ func GetVtaps(filter map[string]interface{}) (resp []model.Vtap, err error) {
 	lcuuidToGroup := make(map[string]string)
 	for _, group := range vtapGroups {
 		lcuuidToGroup[group.Lcuuid] = group.Name
+	}
+
+	vtapRepoNameToRevision := make(map[string]string, len(vtapRepos))
+	for _, item := range vtapRepos {
+		vtapRepoNameToRevision[item.Name] = item.Branch + " " + item.RevCount
 	}
 
 	for _, vtap := range vtaps {
@@ -127,6 +147,13 @@ func GetVtaps(filter map[string]interface{}) (resp []model.Vtap, err error) {
 		}
 		vtapResp.Revision = revision
 		vtapResp.CompleteRevision = completeRevision
+		if vtap.UpgradePackage != "" {
+			if upgradeRevision, ok := vtapRepoNameToRevision[vtap.UpgradePackage]; ok {
+				vtapResp.UpgradeRevision = upgradeRevision
+			} else {
+				log.Errorf("vtap upgrade package(%v) cannot assoicated with vtap repo", vtap.UpgradePackage)
+			}
+		}
 		// exceptions
 		exceptions := vtap.Exceptions
 		bitNum := 0
@@ -278,6 +305,7 @@ func UpdateVtap(lcuuid, name string, vtapUpdate map[string]interface{}) (resp mo
 	}
 
 	response, _ := GetVtaps(map[string]interface{}{"lcuuid": vtap.Lcuuid})
+	refresh.RefreshCache([]common.DataChanged{common.DATA_CHANGED_VTAP})
 	return response[0], nil
 }
 
@@ -558,7 +586,7 @@ func execAZRebalance(
 	}
 
 	for _, hostRebalanceResult := range hostIPToRebalanceResult {
-		response.Details = append(response.Details, *hostRebalanceResult)
+		response.Details = append(response.Details, hostRebalanceResult)
 	}
 	return response
 }
@@ -567,7 +595,7 @@ func vtapControllerRebalance(azs []mysql.AZ, ifCheck bool) (*model.VTapRebalance
 	var controllers []mysql.Controller
 	var azControllerConns []mysql.AZControllerConnection
 	var vtaps []mysql.VTap
-	var response model.VTapRebalanceResult
+	response := &model.VTapRebalanceResult{}
 
 	mysql.Db.Find(&controllers)
 	mysql.Db.Find(&azControllerConns)
@@ -657,14 +685,14 @@ func vtapControllerRebalance(azs []mysql.AZ, ifCheck bool) (*model.VTapRebalance
 		response.TotalSwitchVTapNum += azVTapRebalanceResult.TotalSwitchVTapNum
 		response.Details = append(response.Details, azVTapRebalanceResult.Details...)
 	}
-	return &response, nil
+	return response, nil
 }
 
 func vtapAnalyzerRebalance(azs []mysql.AZ, ifCheck bool) (*model.VTapRebalanceResult, error) {
 	var analyzers []mysql.Analyzer
 	var azAnalyzerConns []mysql.AZAnalyzerConnection
 	var vtaps []mysql.VTap
-	var response model.VTapRebalanceResult
+	response := &model.VTapRebalanceResult{}
 
 	mysql.Db.Find(&analyzers)
 	mysql.Db.Find(&azAnalyzerConns)
@@ -693,24 +721,7 @@ func vtapAnalyzerRebalance(azs []mysql.AZ, ifCheck bool) (*model.VTapRebalanceRe
 		return nil, NewError(httpcommon.SERVER_ERROR, errMsg)
 	}
 
-	azToAnalyzers := make(map[string][]*mysql.Analyzer)
-	for _, conn := range azAnalyzerConns {
-		if conn.AZ == "ALL" {
-			if azLcuuids, ok := regionToAZLcuuids[conn.Region]; ok {
-				for _, azLcuuid := range azLcuuids {
-					if analyzer, ok := ipToAnalyzer[conn.AnalyzerIP]; ok {
-						azToAnalyzers[azLcuuid] = append(
-							azToAnalyzers[azLcuuid], analyzer,
-						)
-					}
-				}
-			}
-		} else {
-			if analyzer, ok := ipToAnalyzer[conn.AnalyzerIP]; ok {
-				azToAnalyzers[conn.AZ] = append(azToAnalyzers[conn.AZ], analyzer)
-			}
-		}
-	}
+	azToAnalyzers := rebalance.GetAZToAnalyzers(azAnalyzerConns, regionToAZLcuuids, ipToAnalyzer)
 
 	// 遍历可用区，进行数据节点均衡
 	for _, az := range azs {
@@ -752,10 +763,10 @@ func vtapAnalyzerRebalance(azs []mysql.AZ, ifCheck bool) (*model.VTapRebalanceRe
 		response.TotalSwitchVTapNum += azVTapRebalanceResult.TotalSwitchVTapNum
 		response.Details = append(response.Details, azVTapRebalanceResult.Details...)
 	}
-	return &response, nil
+	return response, nil
 }
 
-func VTapRebalance(args map[string]interface{}) (*model.VTapRebalanceResult, error) {
+func VTapRebalance(args map[string]interface{}, cfg config.IngesterLoadBalancingStrategy) (*model.VTapRebalanceResult, error) {
 	var azs []mysql.AZ
 
 	hostType := "controller"
@@ -772,7 +783,22 @@ func VTapRebalance(args map[string]interface{}) (*model.VTapRebalanceResult, err
 	if hostType == "controller" {
 		return vtapControllerRebalance(azs, ifCheck)
 	} else {
-		return vtapAnalyzerRebalance(azs, ifCheck)
+		if cfg.Algorithm == common.ANALYZER_ALLOC_BY_INGESTED_DATA {
+			return rebalance.NewAnalyzerInfo().RebalanceAnalyzerByTraffic(ifCheck, cfg.DataDuration)
+		} else if cfg.Algorithm == common.ANALYZER_ALLOC_BY_AGENT_COUNT {
+			result, err := vtapAnalyzerRebalance(azs, ifCheck)
+			if err != nil {
+				return nil, err
+			}
+			for _, detail := range result.Details {
+				detail.BeforeVTapWeights = 1
+				detail.AfterVTapWeights = 1
+			}
+			return result, nil
+		} else {
+			return nil, fmt.Errorf("algorithm(%s) is not supported, only supports: %s, %s", cfg.Algorithm,
+				common.ANALYZER_ALLOC_BY_INGESTED_DATA, common.ANALYZER_ALLOC_BY_AGENT_COUNT)
+		}
 	}
 }
 

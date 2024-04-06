@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -54,6 +54,7 @@ use serde::ser::Serialize;
 use tokio::{runtime::Handle, sync::Mutex, task::JoinHandle, time};
 
 use super::crd::{
+    calico::IpPool,
     kruise::{CloneSet, StatefulSet as KruiseStatefulSet},
     pingan::ServiceRule,
 };
@@ -98,6 +99,7 @@ pub enum GenericResourceWatcher {
     ServiceRule(ResourceWatcher<ServiceRule>),
     CloneSet(ResourceWatcher<CloneSet>),
     KruiseStatefulSet(ResourceWatcher<KruiseStatefulSet>),
+    IpPool(ResourceWatcher<IpPool>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -371,6 +373,15 @@ pub fn supported_resources() -> Vec<Resource> {
             }],
             selected_gv: None,
         },
+        Resource {
+            name: "ippools",
+            pb_name: "*v1.IPPool",
+            group_versions: vec![GroupVersion {
+                group: "crd.projectcalico.org",
+                version: "v1",
+            }],
+            selected_gv: None,
+        },
     ]
 }
 
@@ -624,11 +635,15 @@ where
         loop {
             let need_relist = Self::watch(&mut ctx, &mut encoder).await;
             time::sleep(SLEEP_INTERVAL).await;
+            let now = SystemTime::now();
             // list and rewatch
-            if need_relist || last_update.elapsed().unwrap() >= ctx.config.list_interval {
+            if need_relist
+                || now < last_update
+                || last_update.elapsed().unwrap() >= ctx.config.list_interval
+            {
                 debug!("{} watcher relisting", ctx.kind);
                 Self::full_sync(&mut ctx, &mut encoder).await;
-                last_update = SystemTime::now();
+                last_update = now;
             }
         }
     }
@@ -666,6 +681,7 @@ where
         );
         let mut all_entries = HashMap::new();
         let mut total_count = 0;
+        let mut estimated_total = None;
         let mut total_bytes = 0;
         let mut params = ListParams::default().limit(ctx.config.list_limit);
         loop {
@@ -691,6 +707,9 @@ where
                             .remaining_item_count
                             .unwrap_or_default()
                     );
+                    if let Some(r) = object_list.metadata.remaining_item_count {
+                        estimated_total = Some(total_count + r as usize);
+                    }
 
                     for object in object_list.items {
                         if object.meta().uid.as_ref().is_none() {
@@ -753,7 +772,31 @@ where
                 }
                 Err(err) => {
                     ctx.stats_counter.list_error.fetch_add(1, Ordering::Relaxed);
-                    let msg = format!("{} watcher list failed: {}", ctx.kind, err);
+                    let msg = if matches!(
+                        err,
+                        ClientErr::Api(ErrorResponse {
+                            code: HTTP_GONE,
+                            ..
+                        })
+                    ) {
+                        // kubernetes api pagination token expires after a certain timeout (default 5min)
+                        // Should an api have high RTT or large quantity of resources, it may not
+                        // be able to return all resources before token expires. Notice the user to
+                        // increase page size if this happens.
+                        format!(
+                            "{} watcher list HTTP Gone failed when {}/{} entries returned, \
+                            try increasing 'kubernetes-api-list-limit' in agent config: {}",
+                            ctx.kind,
+                            total_count,
+                            match estimated_total {
+                                Some(total) => total.to_string(),
+                                None => "unknown".to_owned(),
+                            },
+                            err
+                        )
+                    } else {
+                        format!("{} watcher list failed: {}", ctx.kind, err)
+                    };
                     warn!("{}", msg);
                     ctx.err_msg.lock().await.replace(msg);
                     return false;
@@ -1303,6 +1346,12 @@ impl ResourceWatcherFactory {
                 config,
             )),
             "clonesets" => GenericResourceWatcher::CloneSet(self.new_watcher_inner(
+                resource,
+                stats_collector,
+                namespace,
+                config,
+            )),
+            "ippools" => GenericResourceWatcher::IpPool(self.new_watcher_inner(
                 resource,
                 stats_collector,
                 namespace,

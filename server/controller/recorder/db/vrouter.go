@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@
 package db
 
 import (
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/recorder/common"
 )
 
 type VRouter struct {
@@ -28,7 +28,7 @@ type VRouter struct {
 func NewVRouter() *VRouter {
 	operater := &VRouter{
 		OperatorBase[mysql.VRouter]{
-			resourceTypeName: common.RESOURCE_TYPE_VROUTER_EN,
+			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_VROUTER_EN,
 			softDelete:       true,
 			allocateID:       true,
 		},

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,20 +31,23 @@ use super::l7_protocol_info::L7ProtocolInfo;
 use super::MetaPacket;
 
 use crate::config::handler::LogParserConfig;
+use crate::config::OracleParseConfig;
 use crate::flow_generator::flow_map::FlowMapCounter;
+use crate::flow_generator::protocol_logs::fastcgi::FastCGILog;
 use crate::flow_generator::protocol_logs::plugin::custom_wrap::CustomWrapLog;
 use crate::flow_generator::protocol_logs::plugin::get_custom_log_parser;
+use crate::flow_generator::protocol_logs::sql::ObfuscateCache;
 use crate::flow_generator::protocol_logs::{
-    get_protobuf_rpc_parser, DnsLog, DubboLog, HttpLog, KafkaLog, MqttLog, MysqlLog, PostgresqlLog,
-    ProtobufRpcWrapLog, RedisLog, SofaRpcLog,
+    AmqpLog, BrpcLog, DnsLog, DubboLog, HttpLog, KafkaLog, MongoDBLog, MqttLog, MysqlLog, NatsLog,
+    OpenWireLog, OracleLog, PostgresqlLog, PulsarLog, RedisLog, SofaRpcLog, TlsLog, ZmtpLog,
 };
 use crate::flow_generator::{LogMessageType, Result};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use crate::plugin::c_ffi::SoPluginFunc;
 use crate::plugin::wasm::WasmVm;
-#[cfg(target_os = "linux")]
-use crate::plugin::{c_ffi::SoPluginFunc, shared_obj::SoPluginCounterMap};
 
 use public::enums::IpProtocol;
-use public::l7_protocol::{CustomProtocol, L7Protocol, L7ProtocolEnum, ProtobufRpcProtocol};
+use public::l7_protocol::{CustomProtocol, L7Protocol, L7ProtocolEnum};
 
 /*
  所有协议都需要实现L7ProtocolLogInterface这个接口.
@@ -117,11 +120,11 @@ macro_rules! impl_protocol_parser {
         pub fn get_parser(p: L7ProtocolEnum) -> Option<L7ProtocolParser> {
             match p {
                 L7ProtocolEnum::L7Protocol(p) => match p {
-                    L7Protocol::Http1 | L7Protocol::Http1TLS => Some(L7ProtocolParser::Http(HttpLog::new_v1())),
-                    L7Protocol::Http2 | L7Protocol::Http2TLS => Some(L7ProtocolParser::Http(HttpLog::new_v2(false))),
+                    L7Protocol::Http1 => Some(L7ProtocolParser::Http(HttpLog::new_v1())),
+                    L7Protocol::Http2 => Some(L7ProtocolParser::Http(HttpLog::new_v2(false))),
                     L7Protocol::Grpc => Some(L7ProtocolParser::Http(HttpLog::new_v2(true))),
 
-                    // in check_payload, need to get the default Custom and ProtobufRpc parser by L7Protocol.
+                    // in check_payload, need to get the default Custom by L7Protocol.
                     // due to Custom not in macro, need to define explicit
                     L7Protocol::Custom => Some(L7ProtocolParser::Custom(CustomWrapLog::default())),
                     $(
@@ -129,7 +132,6 @@ macro_rules! impl_protocol_parser {
                     )+
                     _ => None,
                 },
-                L7ProtocolEnum::ProtobufRpc(p) => Some(get_protobuf_rpc_parser(p)),
                 L7ProtocolEnum::Custom(p) => Some(get_custom_log_parser(p)),
             }
         }
@@ -159,16 +161,25 @@ macro_rules! impl_protocol_parser {
 impl_protocol_parser! {
     pub enum L7ProtocolParser {
         // http have two version but one parser, can not place in macro param.
-        // custom must in frist so can not place in macro
+        // custom must in first so can not place in macro
         DNS(DnsLog),
-        ProtobufRPC(ProtobufRpcWrapLog),
         SofaRPC(SofaRpcLog),
         MySQL(MysqlLog),
         Kafka(KafkaLog),
         Redis(RedisLog),
+        MongoDB(MongoDBLog),
         PostgreSQL(PostgresqlLog),
         Dubbo(DubboLog),
+        FastCGI(FastCGILog),
+        Brpc(BrpcLog),
+        Oracle(OracleLog),
         MQTT(MqttLog),
+        AMQP(AmqpLog),
+        NATS(NatsLog),
+        Pulsar(PulsarLog),
+        TLS(TlsLog),
+        OpenWire(OpenWireLog),
+        ZMTP(ZmtpLog),
         // add protocol below
     }
 }
@@ -215,10 +226,6 @@ pub trait L7ProtocolParserInterface {
     // return protocol number and protocol string. because of bitmap use u128, so the max protocol number can not exceed 128
     // crates/public/src/l7_protocol.rs, pub const L7_PROTOCOL_xxx is the implemented protocol.
     fn protocol(&self) -> L7Protocol;
-    // return protobuf protocol, only when L7Protocol is ProtobufRPC will not None
-    fn protobuf_rpc_protocol(&self) -> Option<ProtobufRpcProtocol> {
-        None
-    }
 
     // return inner proto of Custom, only when L7Protocol is Custom will not None
     fn custom_protocol(&self) -> Option<CustomProtocol> {
@@ -229,9 +236,6 @@ pub trait L7ProtocolParserInterface {
     fn l7_protocol_enum(&self) -> L7ProtocolEnum {
         let proto = self.protocol();
         match proto {
-            L7Protocol::ProtobufRPC => {
-                L7ProtocolEnum::ProtobufRpc(self.protobuf_rpc_protocol().unwrap())
-            }
             L7Protocol::Custom => L7ProtocolEnum::Custom(self.custom_protocol().unwrap()),
             _ => L7ProtocolEnum::L7Protocol(proto),
         }
@@ -258,17 +262,19 @@ pub trait L7ProtocolParserInterface {
 
     // return perf data
     fn perf_stats(&mut self) -> Option<L7PerfStats>;
+
+    fn set_obfuscate_cache(&mut self, _: Option<ObfuscateCache>) {}
 }
 
 #[derive(Clone)]
-pub struct EbpfParam {
+pub struct EbpfParam<'a> {
     pub is_tls: bool,
     // 目前仅 http2 uprobe 有意义
     // ==========================
     // now only http2 uprobe uses
     pub is_req_end: bool,
     pub is_resp_end: bool,
-    pub process_kname: String,
+    pub process_kname: &'a str,
 }
 
 pub struct KafkaInfoCache {
@@ -346,7 +352,7 @@ pub struct ParseParam<'a> {
     // ebpf_type 不为 EBPF_TYPE_NONE 会有值
     // ===================================
     // not None when payload from ebpf
-    pub ebpf_param: Option<EbpfParam>,
+    pub ebpf_param: Option<EbpfParam<'a>>,
     // calculate from cap_seq, req and correspond resp may have same packet seq, non ebpf always 0
     pub packet_seq: u64,
     pub time: u64, // micro second
@@ -358,11 +364,9 @@ pub struct ParseParam<'a> {
     pub l7_perf_cache: Rc<RefCell<L7PerfCache>>,
 
     // plugins
-    pub wasm_vm: Option<Rc<RefCell<WasmVm>>>,
-    #[cfg(target_os = "linux")]
-    pub so_func: Option<Rc<Vec<SoPluginFunc>>>,
-    #[cfg(target_os = "linux")]
-    pub so_plugin_counter_map: Option<Rc<SoPluginCounterMap>>,
+    pub wasm_vm: Rc<RefCell<Option<WasmVm>>>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub so_func: Rc<RefCell<Option<Vec<SoPluginFunc>>>>,
 
     pub stats_counter: Option<Arc<FlowMapCounter>>,
 
@@ -371,16 +375,22 @@ pub struct ParseParam<'a> {
 
     // the config of `l7_log_packet_size`, must set in parse_payload and check_payload
     pub buf_size: u16,
+
+    pub oracle_parse_conf: OracleParseConfig,
 }
 
-impl ParseParam<'_> {
+impl<'a> ParseParam<'a> {
     pub fn is_from_ebpf(&self) -> bool {
         self.ebpf_type != EbpfType::None
     }
 
     pub fn new(
-        packet: &MetaPacket<'_>,
+        packet: &'a MetaPacket<'a>,
         cache: Rc<RefCell<L7PerfCache>>,
+        wasm_vm: Rc<RefCell<Option<WasmVm>>>,
+        #[cfg(any(target_os = "linux", target_os = "android"))] so_func: Rc<
+            RefCell<Option<Vec<SoPluginFunc>>>,
+        >,
         parse_perf: bool,
         parse_log: bool,
     ) -> Self {
@@ -403,11 +413,9 @@ impl ParseParam<'_> {
 
             l7_perf_cache: cache,
 
-            wasm_vm: None,
-            #[cfg(target_os = "linux")]
-            so_func: None,
-            #[cfg(target_os = "linux")]
-            so_plugin_counter_map: None,
+            wasm_vm,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            so_func,
 
             stats_counter: None,
 
@@ -415,23 +423,18 @@ impl ParseParam<'_> {
             rrt_timeout: Duration::from_secs(10).as_micros() as usize,
 
             buf_size: 0,
+
+            oracle_parse_conf: OracleParseConfig::default(),
         };
         if packet.ebpf_type != EbpfType::None {
-            let is_tls = match packet.ebpf_type {
-                EbpfType::TlsUprobe => true,
-                _ => match packet.l7_protocol_from_ebpf {
-                    L7Protocol::Http1TLS | L7Protocol::Http2TLS => true,
-                    _ => false,
-                },
-            };
             param.ebpf_param = Some(EbpfParam {
-                is_tls,
+                is_tls: packet.is_tls(),
                 is_req_end: packet.is_request_end,
                 is_resp_end: packet.is_response_end,
-                #[cfg(target_os = "linux")]
-                process_kname: String::from_utf8_lossy(&packet.process_kname[..]).to_string(),
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                process_kname: std::str::from_utf8(&packet.process_kname[..]).unwrap_or(""),
                 #[cfg(target_os = "windows")]
-                process_kname: "".into(),
+                process_kname: "",
             });
         }
 
@@ -447,25 +450,8 @@ impl<'a> ParseParam<'a> {
         false
     }
 
-    pub fn set_wasm_vm(&mut self, vm: Rc<RefCell<WasmVm>>) {
-        self.wasm_vm = Some(vm);
-    }
-
-    #[cfg(target_os = "linux")]
-    pub fn set_so_func(&mut self, so_func: Rc<Vec<SoPluginFunc>>) {
-        self.so_func = Some(so_func);
-    }
-
-    pub fn set_counter(
-        &mut self,
-        stat: Arc<FlowMapCounter>,
-        #[cfg(target_os = "linux")] so_counter: Option<Rc<SoPluginCounterMap>>,
-    ) {
+    pub fn set_counter(&mut self, stat: Arc<FlowMapCounter>) {
         self.stats_counter = Some(stat);
-        #[cfg(target_os = "linux")]
-        {
-            self.so_plugin_counter_map = so_counter;
-        }
     }
 
     pub fn set_buf_size(&mut self, buf_size: usize) {
@@ -478,6 +464,10 @@ impl<'a> ParseParam<'a> {
 
     pub fn set_log_parse_config(&mut self, conf: &'a LogParserConfig) {
         self.parse_config = Some(conf);
+    }
+
+    pub fn set_oracle_conf(&mut self, conf: OracleParseConfig) {
+        self.oracle_parse_conf = conf;
     }
 }
 
@@ -496,10 +486,10 @@ pub fn get_parse_bitmap(protocol: IpProtocol, l7_enabled: L7ProtocolBitmap) -> L
     for i in get_all_protocol().iter() {
         if l7_enabled.is_enabled(i.protocol()) {
             match protocol {
-                IpProtocol::Tcp if i.parsable_on_tcp() => {
+                IpProtocol::TCP if i.parsable_on_tcp() => {
                     bitmap.set_enabled(i.protocol());
                 }
-                IpProtocol::Udp if i.parsable_on_udp() => {
+                IpProtocol::UDP if i.parsable_on_udp() => {
                     bitmap.set_enabled(i.protocol());
                 }
                 _ => {}
@@ -515,7 +505,7 @@ pub fn get_parse_bitmap(protocol: IpProtocol, l7_enabled: L7ProtocolBitmap) -> L
     when bit set 0 should skip the protocol check.
     so the protocol number can not exceed 127.
 */
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct L7ProtocolBitmap(u128);
 
 impl L7ProtocolBitmap {

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -176,7 +176,7 @@ impl NpbBuilder {
             packet_size += VLAN_HEADER_SIZE;
         }
 
-        vec![u8::from(IpProtocol::Tcp); packet_size]
+        vec![u8::from(IpProtocol::TCP); packet_size]
     }
 
     pub fn on_config_change(&mut self, config: &NpbConfig, queue_debugger: &QueueDebugger) {
@@ -288,7 +288,7 @@ impl NpbBuilder {
             self.mtu,
             self.pseudo_tunnel_header.clone(),
             underlay_vlan_header_size,
-            self.overlay_vlan_mode != VlanMode::None,
+            self.overlay_vlan_mode,
             self.bps_limit.clone(),
             counter,
             self.sender.clone(),

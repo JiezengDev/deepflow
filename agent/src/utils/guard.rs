@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ use std::io::Read;
 use std::path::Path;
 use std::{
     fs::{self, File},
-    process::exit,
     string::String,
     sync::{Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
@@ -43,9 +42,93 @@ use crate::common::{
 };
 use crate::config::handler::EnvironmentAccess;
 use crate::exception::ExceptionHandler;
+use crate::rpc::get_timestamp;
 use crate::utils::{cgroups::is_kernel_available_for_cgroups, environment::running_in_container};
 
-use public::proto::trident::{Exception, TapMode};
+use public::proto::trident::{Exception, SystemLoadMetric, TapMode};
+
+struct SystemLoadGuard {
+    system: Arc<Mutex<System>>,
+
+    exception_handler: ExceptionHandler,
+
+    last_exceeded: Duration,
+    last_exceeded_metric: SystemLoadMetric,
+}
+
+impl SystemLoadGuard {
+    const CONTINUOUS_SAFETY_TIME: Duration = Duration::from_secs(300);
+
+    fn new(system: Arc<Mutex<System>>, exception_handler: ExceptionHandler) -> Self {
+        Self {
+            system,
+            exception_handler,
+            last_exceeded: Duration::ZERO,
+            last_exceeded_metric: SystemLoadMetric::Load15,
+        }
+    }
+
+    fn check(
+        &mut self,
+        system_load_circuit_breaker_threshold: f32,
+        system_load_circuit_breaker_recover: f32,
+        system_load_circuit_breaker_metric: SystemLoadMetric,
+    ) {
+        if system_load_circuit_breaker_threshold == 0.0
+            || system_load_circuit_breaker_recover == 0.0
+        {
+            self.last_exceeded = Duration::ZERO;
+            self.exception_handler
+                .clear(Exception::SystemLoadCircuitBreaker);
+            return;
+        }
+        if system_load_circuit_breaker_metric != self.last_exceeded_metric {
+            self.last_exceeded_metric = system_load_circuit_breaker_metric;
+            self.last_exceeded = Duration::ZERO;
+        }
+
+        let mut system = self.system.lock().unwrap();
+        system.refresh_cpu();
+
+        let cpu_count = system.cpus().len() as f32;
+        let system_load = match system_load_circuit_breaker_metric {
+            SystemLoadMetric::Load1 => system.load_average().one,
+            SystemLoadMetric::Load5 => system.load_average().five,
+            SystemLoadMetric::Load15 => system.load_average().fifteen,
+        } as f32;
+
+        if self
+            .exception_handler
+            .has(Exception::SystemLoadCircuitBreaker)
+        {
+            let has_exceeded = system_load / cpu_count >= system_load_circuit_breaker_recover;
+            if has_exceeded {
+                self.last_exceeded = get_timestamp(0);
+            } else {
+                let now = get_timestamp(0);
+                if now > self.last_exceeded + Self::CONTINUOUS_SAFETY_TIME {
+                    info!(
+                        "Current load {:?} is below the recover threshold({:?}), set the agent to enabled.",
+                        system_load_circuit_breaker_metric, system_load_circuit_breaker_recover
+                    );
+                    self.exception_handler
+                        .clear(Exception::SystemLoadCircuitBreaker);
+                }
+            }
+        } else {
+            let has_exceeded = system_load / cpu_count >= system_load_circuit_breaker_threshold;
+            if has_exceeded {
+                error!(
+                    "Current load {:?} exceeds the threshold({:?}), set the agent to disabled.",
+                    system_load_circuit_breaker_metric, system_load_circuit_breaker_threshold
+                );
+                self.last_exceeded = get_timestamp(0);
+                self.exception_handler
+                    .set(Exception::SystemLoadCircuitBreaker);
+            }
+        }
+    }
+}
 
 pub struct Guard {
     config: EnvironmentAccess,
@@ -70,19 +153,11 @@ impl Guard {
         cgroup_mount_path: String,
         is_cgroup_v2: bool,
         memory_trim_disabled: bool,
-    ) -> Self {
-        let pid = match get_current_pid() {
-            Ok(p) => p,
-            Err(e) => {
-                error!(
-                    "get the process' pid failed: {}, deepflow-agent restart...",
-                    e
-                );
-                thread::sleep(Duration::from_secs(1));
-                exit(-1);
-            }
+    ) -> Result<Self, &'static str> {
+        let Ok(pid) = get_current_pid() else {
+            return Err("get the process' pid failed: {}, deepflow-agent restart...");
         };
-        Self {
+        Ok(Self {
             config,
             log_dir,
             interval,
@@ -94,7 +169,7 @@ impl Guard {
             memory_trim_disabled,
             system: Arc::new(Mutex::new(System::new())),
             pid,
-        }
+        })
     }
 
     fn release_log_files(file_and_size_sum: FileAndSizeSum, log_file_size: u64) {
@@ -225,14 +300,16 @@ impl Guard {
         let in_container = running_in_container();
 
         let thread = thread::Builder::new().name("guard".to_owned()).spawn(move || {
+            let mut system_load = SystemLoadGuard::new(system.clone(), exception_handler.clone());
             loop {
                 let config = config.load();
                 let tap_mode = config.tap_mode;
                 let cpu_limit = config.max_cpus;
-                match get_file_and_size_sum(log_dir.clone()) {
+                system_load.check(config.system_load_circuit_breaker_threshold, config.system_load_circuit_breaker_recover, config.system_load_circuit_breaker_metric);
+                match get_file_and_size_sum(&log_dir) {
                     Ok(file_and_size_sum) => {
                         let log_file_size = config.log_file_size; // Log file size limit (unit: M)
-                        let file_sizes_sum = file_and_size_sum.file_sizes_sum.clone(); // Total size of current log files (unit: B)
+                        let file_sizes_sum = file_and_size_sum.file_sizes_sum; // Total size of current log files (unit: B)
                         debug!(
                             "current log files' size: {}B, log_file_size_limit: {}B",
                             file_sizes_sum,
@@ -257,15 +334,15 @@ impl Guard {
                         if check_cgroup_result {
                             check_cgroup_result = Self::check_cgroups(cgroup_mount_path.clone(), is_cgroup_v2);
                             if !check_cgroup_result {
-                                error!("check cgroups failed, limit cpu or memory without cgroups");
+                                warn!("check cgroups failed, limit cpu or memory without cgroups");
                             }
                         }
                         if !check_cgroup_result {
                             if !Self::check_cpu(system.clone(), pid.clone(), cpu_limit) {
                                 if over_cpu_limit {
                                     error!("cpu usage over cpu limit twice, deepflow-agent restart...");
-                                    thread::sleep(Duration::from_secs(1));
-                                    exit(-1);
+                                    crate::utils::notify_exit(-1);
+                                    break;
                                 } else {
                                     warn!("cpu usage over cpu limit");
                                     over_cpu_limit = true;
@@ -278,8 +355,8 @@ impl Guard {
                         if !Self::check_cpu(system.clone(), pid.clone(), cpu_limit) {
                             if over_cpu_limit {
                                 error!("cpu usage over cpu limit twice, deepflow-agent restart...");
-                                thread::sleep(Duration::from_secs(1));
-                                exit(-1);
+                                crate::utils::notify_exit(-1);
+                                break;
                             } else {
                                 warn!("cpu usage over cpu limit");
                                 over_cpu_limit = true;
@@ -311,8 +388,8 @@ impl Guard {
                                     "memory usage over memory limit twice, current={}, memory_limit={}, deepflow-agent restart...",
                                     ByteSize::b(memory_usage).to_string_as(true), ByteSize::b(memory_limit).to_string_as(true)
                                     );
-                                        thread::sleep(Duration::from_secs(1));
-                                        exit(-1);
+                                        crate::utils::notify_exit(-1);
+                                        break;
                                     } else {
                                         warn!(
                                     "memory usage over memory limit, current={}, memory_limit={}",
@@ -342,8 +419,8 @@ impl Guard {
                                     "current system free memory percentage is less than sys_free_memory_limit twice, current system free memory percentage={}%, sys_free_memory_limit={}%, deepflow-agent restart...",
                                     current_sys_free_memory_percentage, sys_free_memory_limit
                                     );
-                            thread::sleep(Duration::from_secs(1));
-                            exit(-1);
+                            crate::utils::notify_exit(-1);
+                            break;
                         } else {
                             warn!(
                                     "current system free memory percentage is less than sys_free_memory_limit, current system free memory percentage={}%, sys_free_memory_limit={}%",
@@ -364,8 +441,8 @@ impl Guard {
                             );
                             if thread_num > thread_limit * 2 {
                                 error!("the number of thread exceeds the limit by 2 times, deepflow-agent restart...");
-                                thread::sleep(Duration::from_secs(1));
-                                exit(NORMAL_EXIT_WITH_RESTART);
+                                crate::utils::notify_exit(NORMAL_EXIT_WITH_RESTART);
+                                break;
                             }
                             exception_handler.set(Exception::ThreadThresholdExceeded);
                         } else {

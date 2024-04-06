@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -42,6 +42,8 @@ func executeQuery() gin.HandlerFunc {
 		args := common.QuerierParams{}
 		args.Context = c.Request.Context()
 		args.Debug = c.Query("debug")
+		args.UseQueryCache, _ = strconv.ParseBool(c.DefaultQuery("use_query_cache", "false"))
+		args.QueryCacheTTL = c.Query("query_cache_ttl")
 		args.QueryUUID = c.Query("query_uuid")
 		args.NoPreWhere, _ = strconv.ParseBool(c.DefaultQuery("no_prewhere", "false"))
 		if args.QueryUUID == "" {

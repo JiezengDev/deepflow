@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -45,6 +45,10 @@ func newControllerDiscovery(masterIP string, nodeType string, regionDomainPrefix
 }
 
 func (c *ControllerDiscovery) GetControllerData() *models.Controller {
+	if c.ctrlIP == "" {
+		log.Errorf("get env(%s) data failed", NODE_IP_KEY)
+		return nil
+	}
 	envData := utils.GetRuntimeEnv()
 	name := GetNodeName()
 	if name == "" {

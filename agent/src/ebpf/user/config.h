@@ -31,17 +31,19 @@
 #define MAP_PROTO_FILTER_NAME		"__protocol_filter"
 #define MAP_KPROBE_PORT_BITMAP_NAME	"__kprobe_port_bitmap"
 #define MAP_ADAPT_KERN_UID_NAME		"__adapt_kern_uid_map"
+#define MAP_PROTO_PORTS_BITMAPS_NAME	"__proto_ports_bitmap"
 
 //Program jmp tables
 #define MAP_PROGS_JMP_KP_NAME		"__progs_jmp_kp_map"
 #define MAP_PROGS_JMP_TP_NAME		"__progs_jmp_tp_map"
 
-// This prog is designed to handle data transfer
-#define PROG_DATA_SUBMIT_NAME_FOR_KP   "bpf_prog_kp__data_submit"
-#define PROG_DATA_SUBMIT_NAME_FOR_TP   "bpf_prog_tp__data_submit"
+#define PROG_DATA_SUBMIT_NAME_FOR_KP	"bpf_prog_kp__data_submit"
+#define PROG_DATA_SUBMIT_NAME_FOR_TP	"bpf_prog_tp__data_submit"
 #define PROG_OUTPUT_DATA_NAME_FOR_KP	"bpf_prog_kp__output_data"
 #define PROG_OUTPUT_DATA_NAME_FOR_TP	"bpf_prog_tp__output_data"
 #define PROG_IO_EVENT_NAME_FOR_TP	"bpf_prog_tp__io_event"
+#define PROG_PROTO_INFER_FOR_KP		"bpf_prog_kp__proto_infer_2"
+#define PROG_PROTO_INFER_FOR_TP		"bpf_prog_tp__proto_infer_2"
 
 // perf profiler
 #define MAP_PERF_PROFILER_BUF_A_NAME	"__profiler_output_a"
@@ -49,6 +51,7 @@
 #define PROFILE_PG_CNT_DEF		16	// perf ring-buffer page count
 
 enum {
+	PROG_PROTO_INFER_TP_IDX,
 	PROG_DATA_SUBMIT_TP_IDX,
 	PROG_OUTPUT_DATA_TP_IDX,
 	PROG_IO_EVENT_TP_IDX,
@@ -56,6 +59,7 @@ enum {
 };
 
 enum {
+	PROG_PROTO_INFER_KP_IDX,
 	PROG_DATA_SUBMIT_KP_IDX,
 	PROG_OUTPUT_DATA_KP_IDX,
 	PROG_KP_NUM
@@ -64,8 +68,7 @@ enum {
 //thread index for bihash
 enum {
 	THREAD_PROFILER_READER_IDX = 0,
-	THREAD_PROC_ACT_IDX,
-	THREAD_NUM
+	THREAD_PROC_ACT_IDX_BASE
 };
 
 /*
@@ -141,4 +144,125 @@ enum {
 
 #define PROFILER_READER_EPOLL_TIMEOUT		500 //msecs
 #define EPOLL_SHORT_TIMEOUT			100  //mescs
+
+/*
+ * Process information recalibration time, this time is the number of seconds
+ * lost from the process startup time to the current time.
+ * For Java :
+ *   The Java process will delay obtaining the symbol table by
+ *   'PROC_INFO_VERIFY_TIME' seconds after it starts running.
+ */
+#define PROC_INFO_VERIFY_TIME  60 // 60 seconds
+
+/*
+ * This value is used to determine which type of Java agent's so library to
+ * attach JVM (GNU or musl libc agent.so).
+ */
+#define JAVA_AGENT_LIBS_TEST_FUN_RET_VAL 3302
+
+/*
+ * Java symbol table update delay time.
+ * When an unknown Frame is encountered during the symbolization process of
+ * the Java process, it will be delayed for a fixed time (if the unknown f-
+ * rame is encountered again during this period, it will be ignored) to up-
+ * date the Java symbol table. This is done The purpose is to avoid freque-
+ * nt updates of the java symbol table.
+ */
+#define JAVA_SYMS_UPDATE_DELAY_DEF 60 // 60 seconds
+#define JAVA_SYMS_UPDATE_DELAY_MIN 5 // 5 seconds
+#define JAVA_SYMS_UPDATE_DELAY_MAX 3600 // 3600 seconds
+
+/* Profiler - maximum data push interval time (in nanosecond). */
+#define MAX_PUSH_MSG_TIME_INTERVAL 1000000000ULL	/* 1 seconds */ 
+
+/*
+ * timer config
+ */
+
+/*
+ * tick every 10 millisecond
+ *
+ * unit: microseconds
+ */
+#define EVENT_TIMER_TICK_US    10000
+
+/*
+ * The kernel uses bundled burst to send data to the user.
+ * The implementation method is that all CPUs trigger timeout checks and send
+ * the data resident in the eBPF buffer. This value is the periodic time, unit
+ * is milliseconds.
+ */
+#define KICK_KERN_PERIOD 10 // 10 ticks(100 milliseconds)
+
+/*
+ * System boot time update cycle time, unit is milliseconds.
+ */
+#define SYS_TIME_UPDATE_PERIOD 1000  // 1000 ticks(10 seconds)
+
+/*
+ * Check whether the eBPF Map exceeds the maximum value and use it to release
+ * stale data (unit is milliseconds).
+ */
+#define CHECK_MAP_EXCEEDED_PERIOD 100 // 100 ticks(1 seconds)
+
+/* 
+ * Used to check whether the kernel adaptation is successful, here is the
+ * check cycle time (unit is milliseconds).
+ */
+#define CHECK_KERN_ADAPT_PERIOD 100 // 100 ticks(1 seconds)
+
+/*
+ * The maximum space occupied by the Java symbol files in the target POD.
+ * Its valid range is [2, 100], which means it falls within the interval
+ * of 2Mi to 100Mi. If the configuration value is outside this range, the
+ * default value of 10(10Mi), will be used.
+ */
+#define JAVA_POD_WRITE_FILES_SPACE_MIN 2097152 // 2Mi
+#define JAVA_POD_WRITE_FILES_SPACE_MAX 104857600 // 100Mi
+#define JAVA_POD_WRITE_FILES_SPACE_DEF 10485760 // 10Mi
+/*
+ * The `df_java_agent_musl.so` and `df_java_agent.so` files will also be
+ * placed in the target POD for loading operations. They occupy less than
+ * 300Ki of space.
+ */
+#define JAVA_POD_EXTRA_SPACE_MMA 307200 // 300Ki
+
+/*
+ * The perf profiler utilizes a perf buffer (per CPUs) for transporting stack data,
+ * which may lead to out-of-order behavior in a multi-core environment, as illustrated
+ * below:
+ *
+ * User-received  eBPF (Kernel) Data  Description
+ * Order          recv-time (ns)	     
+ * ---------------------------------------------------------
+ * 0	       1043099273143475	   First stack data with stack ID 'A'
+ * 1	       1043099276726460    Successfully removed 'A' from the stack map
+ * 2	       1043099169934151	   Second stack data with stack ID also 'A'
+ *                                 (failed lookup in stack map for 'A')
+ * 3	       1043099314811542	   Attempted duplicate removal of 'A' from the
+ *                                 stack map, failed
+ * ---------------------------------------------------------
+ *
+ * We have introduced a threshold to delay the removal of 'A' from the stack map to
+ * avoid the aforementioned out-of-order scenario. After each iteration, stack map
+ * cleanup is performed only if the number of entries in the stack map exceeds this
+ * threshold.
+ */
+#define STACKMAP_CLEANUP_THRESHOLD 50
+
+/*
+ * When the deepflow-agent is started, to avoid the sudden generation of Java symbol
+ * tables:
+ * - Introduce an additional random value for each process's delay, on top of
+ *   the configuration specified above, to prevent the abrupt generation of symbol file
+ *   for a large number of processes.
+ *
+ * For non-Java programs, symbol loading will also be randomly delayed
+ * (time range: 0 to PROFILER_DEFER_RANDOM_MAX).
+ *
+ * The random value has a maximum limit specified above(measured in seconds). 
+ */
+
+#define PROFILER_DEFER_RANDOM_MAX 60 // 60 seconds
+
 #endif /* DF_EBPF_CONFIG_H */

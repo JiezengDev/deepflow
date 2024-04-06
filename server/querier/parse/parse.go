@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,6 +44,14 @@ func (p *Parser) ParseSQL(sql string) error {
 		fromErr := p.Engine.TransFrom(pStmt.From)
 		if fromErr != nil {
 			return fromErr
+		}
+	}
+
+	// DerivativeGroupBy解析
+	if pStmt.GroupBy != nil {
+		groupErr := p.Engine.TransDerivativeGroupBy(pStmt.GroupBy)
+		if groupErr != nil {
+			return groupErr
 		}
 	}
 

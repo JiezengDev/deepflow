@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,17 +26,18 @@ import (
 	"time"
 
 	"github.com/deepflowio/deepflow/server/ingester/common"
+	profile_common "github.com/deepflowio/deepflow/server/ingester/profile/common"
 	"github.com/deepflowio/deepflow/server/ingester/profile/dbwriter"
 	"github.com/deepflowio/deepflow/server/libs/codec"
 	"github.com/deepflowio/deepflow/server/libs/datatype"
+	"github.com/deepflowio/deepflow/server/libs/flow-metrics/pb"
 	"github.com/deepflowio/deepflow/server/libs/grpc"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 	"github.com/deepflowio/deepflow/server/libs/receiver"
 	"github.com/deepflowio/deepflow/server/libs/stats"
 	"github.com/deepflowio/deepflow/server/libs/utils"
-	"github.com/deepflowio/deepflow/server/libs/zerodoc/pb"
 	"github.com/google/uuid"
-	"github.com/op/go-logging"
+	logging "github.com/op/go-logging"
 	"github.com/pyroscope-io/pyroscope/pkg/convert/jfr"
 	"github.com/pyroscope-io/pyroscope/pkg/convert/pprof"
 	pprofile "github.com/pyroscope-io/pyroscope/pkg/convert/profile"
@@ -84,27 +85,29 @@ var eBPFEventType = map[pb.ProfileEventType]string{
 }
 
 type Decoder struct {
-	index         int
-	msgType       datatype.MessageType
-	platformData  *grpc.PlatformInfoTable
-	inQueue       queue.QueueReader
-	profileWriter *dbwriter.ProfileWriter
+	index           int
+	msgType         datatype.MessageType
+	platformData    *grpc.PlatformInfoTable
+	inQueue         queue.QueueReader
+	profileWriter   *dbwriter.ProfileWriter
+	compressionAlgo string
 
 	counter *Counter
 	utils.Closable
 }
 
-func NewDecoder(index int, msgType datatype.MessageType,
+func NewDecoder(index int, msgType datatype.MessageType, compressionAlgo string,
 	platformData *grpc.PlatformInfoTable,
 	inQueue queue.QueueReader,
 	profileWriter *dbwriter.ProfileWriter) *Decoder {
 	return &Decoder{
-		index:         index,
-		msgType:       msgType,
-		platformData:  platformData,
-		inQueue:       inQueue,
-		profileWriter: profileWriter,
-		counter:       &Counter{},
+		index:           index,
+		msgType:         msgType,
+		platformData:    platformData,
+		inQueue:         inQueue,
+		profileWriter:   profileWriter,
+		compressionAlgo: compressionAlgo,
+		counter:         &Counter{},
 	}
 }
 
@@ -156,13 +159,15 @@ func (d *Decoder) handleProfileData(vtapID uint16, decoder *codec.SimpleDecoder)
 		}
 
 		parser := &Parser{
-			vtapID:       vtapID,
-			inTimestamp:  time.Now(),
-			callBack:     d.profileWriter.Write,
-			platformData: d.platformData,
-			IP:           make([]byte, len(profile.Ip)),
-			observer:     &observer{},
-			Counter:      d.counter,
+			vtapID:          vtapID,
+			inTimestamp:     time.Now(),
+			callBack:        d.profileWriter.Write,
+			platformData:    d.platformData,
+			IP:              make([]byte, len(profile.Ip)),
+			podID:           profile.PodId,
+			compressionAlgo: d.compressionAlgo,
+			observer:        &observer{},
+			Counter:         d.counter,
 		}
 		copy(parser.IP, profile.Ip[:len(profile.Ip)])
 
@@ -171,13 +176,18 @@ func (d *Decoder) handleProfileData(vtapID uint16, decoder *codec.SimpleDecoder)
 			atomic.AddInt64(&d.counter.JavaProfileCount, 1)
 			metadata := d.buildMetaData(profile)
 			parser.profileName = metadata.Key.AppName()
-			err := d.sendProfileData(&jfr.RawProfile{
+			decompressJfr, err := profile_common.GzipDecompress(profile.Data)
+			if err != nil {
+				log.Errorf("decompress java profile data failed, offset=%d, len=%d, err=%s", decoder.Offset(), len(decoder.Bytes()), err)
+				return
+			}
+			err = d.sendProfileData(&jfr.RawProfile{
 				FormDataContentType: string(profile.ContentType),
-				RawData:             profile.Data,
+				RawData:             decompressJfr,
 			}, profile.Format, parser, metadata)
 
 			if err != nil {
-				log.Errorf("decode java profile data failed, offset=%d len=%d", decoder.Offset(), len(decoder.Bytes()))
+				log.Errorf("decode java profile data failed, offset=%d, len=%d, err=%s", decoder.Offset(), len(decoder.Bytes()), err)
 				return
 			}
 		case "pprof":
@@ -189,7 +199,7 @@ func (d *Decoder) handleProfileData(vtapID uint16, decoder *codec.SimpleDecoder)
 				RawData:             profile.Data,
 			}, profile.Format, parser, metadata)
 			if err != nil {
-				log.Errorf("decode golang profile data failed, offset=%d len=%d", decoder.Offset(), len(decoder.Bytes()))
+				log.Errorf("decode golang profile data failed, offset=%d, len=%d, err=%s", decoder.Offset(), len(decoder.Bytes()), err)
 				return
 			}
 		case "":
@@ -206,7 +216,7 @@ func (d *Decoder) handleProfileData(vtapID uint16, decoder *codec.SimpleDecoder)
 					PoolStreamingParser: true,
 				}, profile.Format, parser, metadata)
 				if err != nil {
-					log.Errorf("decode golang profile data failed, offset=%d len=%d", decoder.Offset(), len(decoder.Bytes()))
+					log.Errorf("decode golang profile data failed, offset=%d, len=%d, err=%s", decoder.Offset(), len(decoder.Bytes()), err)
 					return
 				}
 			} else {
@@ -220,7 +230,7 @@ func (d *Decoder) handleProfileData(vtapID uint16, decoder *codec.SimpleDecoder)
 					RawData: profile.Data,
 				}, profile.Format, parser, metadata)
 				if err != nil {
-					log.Errorf("decode golang profile data failed, offset=%d len=%d", decoder.Offset(), len(decoder.Bytes()))
+					log.Errorf("decode ebpf profile data failed, offset=%d, len=%d, err=%s", decoder.Offset(), len(decoder.Bytes()), err)
 					return
 				}
 			}
@@ -253,7 +263,7 @@ func (d *Decoder) buildMetaData(profile *pb.Profile) ingestion.Metadata {
 	} else {
 		profileName, err = url.QueryUnescape(profile.Name)
 		if err != nil {
-			log.Warning("decode profile.name wrong, got %s, will use as profilename", profile.Name)
+			log.Debugf("decode profile.name wrong, got %s, will use as profilename", profile.Name)
 			profileName = profile.Name
 		}
 	}
@@ -264,10 +274,15 @@ func (d *Decoder) buildMetaData(profile *pb.Profile) ingestion.Metadata {
 		labelKey := make(map[string]string, 1)
 		labels = segment.NewKey(labelKey)
 		labels.Add("__name__", profileName)
-		log.Warningf("parse profile labels wrong, got %s", profileName)
+	}
+	// use app-profile with `from` params
+	startTime := time.Unix(int64(profile.From), 0)
+	// using ebpf-profile with `timestamp` nanoseconds parse
+	if profile.Timestamp > 0 {
+		startTime = time.Unix(0, int64(profile.Timestamp))
 	}
 	return ingestion.Metadata{
-		StartTime:       time.Unix(int64(profile.From), 0),
+		StartTime:       startTime,
 		EndTime:         time.Unix(int64(profile.Until), 0),
 		SpyName:         profile.SpyName,
 		Key:             labels,

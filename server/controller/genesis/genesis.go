@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,8 +17,6 @@
 package genesis
 
 import (
-	"bytes"
-	"compress/zlib"
 	"context"
 	"encoding/json"
 	"errors"
@@ -37,6 +35,7 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/config"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	genesiscommon "github.com/deepflowio/deepflow/server/controller/genesis/common"
 	gconfig "github.com/deepflowio/deepflow/server/controller/genesis/config"
 	"github.com/deepflowio/deepflow/server/controller/model"
 	"github.com/deepflowio/deepflow/server/controller/statsd"
@@ -51,30 +50,30 @@ type Genesis struct {
 	mutex            sync.RWMutex
 	grpcPort         string
 	grpcMaxMSGLength int
+	listenPort       int
+	listenNodePort   int
 	cfg              gconfig.GenesisConfig
 	genesisSyncData  atomic.Value
-	kubernetesData   atomic.Value
-	prometheusData   atomic.Value
+	kubernetesData   sync.Map
+	prometheusData   sync.Map
 	genesisStatsd    statsd.GenesisStatsd
 }
 
 func NewGenesis(cfg *config.ControllerConfig) *Genesis {
 	var sData atomic.Value
 	sData.Store(GenesisSyncData{})
-	var kData atomic.Value
-	kData.Store(map[string]KubernetesInfo{})
-	var pData atomic.Value
-	pData.Store(map[string]PrometheusInfo{})
 	GenesisService = &Genesis{
 		mutex:            sync.RWMutex{},
 		grpcPort:         cfg.GrpcPort,
 		grpcMaxMSGLength: cfg.GrpcMaxMessageLength,
+		listenPort:       cfg.ListenPort,
+		listenNodePort:   cfg.ListenNodePort,
 		cfg:              cfg.GenesisCfg,
 		genesisSyncData:  sData,
-		kubernetesData:   kData,
-		prometheusData:   pData,
+		kubernetesData:   sync.Map{},
+		prometheusData:   sync.Map{},
 		genesisStatsd: statsd.GenesisStatsd{
-			K8SInfoDelay: make(map[string][]int),
+			K8SInfoDelay: make(map[string][]float64),
 		},
 	}
 	return GenesisService
@@ -102,7 +101,7 @@ func (g *Genesis) Start() {
 		vUpdater := NewGenesisSyncRpcUpdater(vStorage, sQueue, g.cfg, ctx)
 		vUpdater.Start()
 
-		kStorage := NewKubernetesStorage(g.cfg, kubernetesDataChan, ctx)
+		kStorage := NewKubernetesStorage(g.listenPort, g.listenNodePort, g.cfg, kubernetesDataChan, ctx)
 		kStorage.Start()
 		kUpdater := NewKubernetesRpcUpdater(kStorage, kQueue, ctx)
 		kUpdater.Start()
@@ -151,6 +150,16 @@ func (g *Genesis) GetGenesisSyncResponse() (GenesisSyncData, error) {
 		controllerIPToRegion[conn.ControllerIP] = conn.Region
 	}
 
+	syncIPLcuuidSet := map[string]bool{}
+	syncVIPLcuuidSet := map[string]bool{}
+	syncHostLcuuidSet := map[string]bool{}
+	syncLLDPLcuuidSet := map[string]bool{}
+	syncNetworkLcuuidSet := map[string]bool{}
+	syncPortLcuuidSet := map[string]bool{}
+	syncVMLcuuidSet := map[string]bool{}
+	syncVPCLcuuidSet := map[string]bool{}
+	syncVinterfaceLcuuidSet := map[string]bool{}
+	syncProcessLcuuidSet := map[string]bool{}
 	for _, controller := range controllers {
 		// skip other region controller
 		if region, ok := controllerIPToRegion[controller.IP]; !ok || region != currentRegion {
@@ -193,17 +202,21 @@ func (g *Genesis) GetGenesisSyncResponse() (GenesisSyncData, error) {
 			if _, ok := vtapIDMap[ip.GetVtapId()]; !ok {
 				continue
 			}
+			sIPLcuuid := ip.GetLcuuid()
+			if _, ok := syncIPLcuuidSet[sIPLcuuid]; ok {
+				continue
+			}
+			syncIPLcuuidSet[sIPLcuuid] = false
 			ipLastSeenStr := ip.GetLastSeen()
 			ipLastSeen, _ := time.ParseInLocation(common.GO_BIRTHDAY, ipLastSeenStr, time.Local)
-			gIP := model.GenesisIP{
+			retGenesisSyncData.IPLastSeens = append(retGenesisSyncData.IPLastSeens, model.GenesisIP{
 				Masklen:          ip.GetMasklen(),
 				IP:               ip.GetIp(),
-				Lcuuid:           ip.GetLcuuid(),
+				Lcuuid:           sIPLcuuid,
 				VinterfaceLcuuid: ip.GetVinterfaceLcuuid(),
 				NodeIP:           ip.GetNodeIp(),
 				LastSeen:         ipLastSeen,
-			}
-			retGenesisSyncData.IPLastSeens = append(retGenesisSyncData.IPLastSeens, gIP)
+			})
 		}
 
 		genesisSyncVIPs := genesisSyncData.GetVip()
@@ -212,13 +225,17 @@ func (g *Genesis) GetGenesisSyncResponse() (GenesisSyncData, error) {
 			if _, ok := vtapIDMap[vtapID]; !ok {
 				continue
 			}
-			gVIP := model.GenesisVIP{
+			sVIPLcuuid := vip.GetLcuuid()
+			if _, ok := syncVIPLcuuidSet[sVIPLcuuid]; ok {
+				continue
+			}
+			syncVIPLcuuidSet[sVIPLcuuid] = false
+			retGenesisSyncData.VIPs = append(retGenesisSyncData.VIPs, model.GenesisVIP{
 				VtapID: vtapID,
 				IP:     vip.GetIp(),
-				Lcuuid: vip.GetLcuuid(),
+				Lcuuid: sVIPLcuuid,
 				NodeIP: vip.GetNodeIp(),
-			}
-			retGenesisSyncData.VIPs = append(retGenesisSyncData.VIPs, gVIP)
+			})
 		}
 
 		genesisSyncHosts := genesisSyncData.GetHost()
@@ -226,13 +243,17 @@ func (g *Genesis) GetGenesisSyncResponse() (GenesisSyncData, error) {
 			if _, ok := vtapIDMap[host.GetVtapId()]; !ok {
 				continue
 			}
-			gHost := model.GenesisHost{
-				Lcuuid:   host.GetLcuuid(),
+			sHostLcuuid := host.GetLcuuid()
+			if _, ok := syncHostLcuuidSet[sHostLcuuid]; ok {
+				continue
+			}
+			syncHostLcuuidSet[sHostLcuuid] = false
+			retGenesisSyncData.Hosts = append(retGenesisSyncData.Hosts, model.GenesisHost{
+				Lcuuid:   sHostLcuuid,
 				Hostname: host.GetHostname(),
 				IP:       host.GetIp(),
 				NodeIP:   host.GetNodeIp(),
-			}
-			retGenesisSyncData.Hosts = append(retGenesisSyncData.Hosts, gHost)
+			})
 		}
 
 		genesisSyncLldps := genesisSyncData.GetLldp()
@@ -240,10 +261,15 @@ func (g *Genesis) GetGenesisSyncResponse() (GenesisSyncData, error) {
 			if _, ok := vtapIDMap[l.GetVtapId()]; !ok {
 				continue
 			}
+			sLLDPLcuuid := l.GetLcuuid()
+			if _, ok := syncLLDPLcuuidSet[sLLDPLcuuid]; ok {
+				continue
+			}
+			syncLLDPLcuuidSet[sLLDPLcuuid] = false
 			lLastSeenStr := l.GetLastSeen()
 			lLastSeen, _ := time.ParseInLocation(common.GO_BIRTHDAY, lLastSeenStr, time.Local)
-			gLldp := model.GenesisLldp{
-				Lcuuid:                l.GetLcuuid(),
+			retGenesisSyncData.Lldps = append(retGenesisSyncData.Lldps, model.GenesisLldp{
+				Lcuuid:                sLLDPLcuuid,
 				HostIP:                l.GetHostIp(),
 				HostInterface:         l.GetHostInterface(),
 				SystemName:            l.GetSystemName(),
@@ -252,8 +278,7 @@ func (g *Genesis) GetGenesisSyncResponse() (GenesisSyncData, error) {
 				VinterfaceDescription: l.GetVinterfaceDescription(),
 				NodeIP:                l.GetNodeIp(),
 				LastSeen:              lLastSeen,
-			}
-			retGenesisSyncData.Lldps = append(retGenesisSyncData.Lldps, gLldp)
+			})
 		}
 
 		genesisSyncNetworks := genesisSyncData.GetNetwork()
@@ -261,16 +286,20 @@ func (g *Genesis) GetGenesisSyncResponse() (GenesisSyncData, error) {
 			if _, ok := vtapIDMap[network.GetVtapId()]; !ok {
 				continue
 			}
-			gNetwork := model.GenesisNetwork{
+			sNetworkLcuuid := network.GetLcuuid()
+			if _, ok := syncNetworkLcuuidSet[sNetworkLcuuid]; ok {
+				continue
+			}
+			syncNetworkLcuuidSet[sNetworkLcuuid] = false
+			retGenesisSyncData.Networks = append(retGenesisSyncData.Networks, model.GenesisNetwork{
 				SegmentationID: network.GetSegmentationId(),
 				NetType:        network.GetNetType(),
 				External:       network.GetExternal(),
 				Name:           network.GetName(),
-				Lcuuid:         network.GetLcuuid(),
+				Lcuuid:         sNetworkLcuuid,
 				VPCLcuuid:      network.GetVpcLcuuid(),
 				NodeIP:         network.GetNodeIp(),
-			}
-			retGenesisSyncData.Networks = append(retGenesisSyncData.Networks, gNetwork)
+			})
 		}
 
 		genesisSyncPorts := genesisSyncData.GetPort()
@@ -278,17 +307,21 @@ func (g *Genesis) GetGenesisSyncResponse() (GenesisSyncData, error) {
 			if _, ok := vtapIDMap[port.GetVtapId()]; !ok {
 				continue
 			}
-			gPort := model.GenesisPort{
+			sPortLcuuid := port.GetLcuuid()
+			if _, ok := syncPortLcuuidSet[sPortLcuuid]; ok {
+				continue
+			}
+			syncPortLcuuidSet[sPortLcuuid] = false
+			retGenesisSyncData.Ports = append(retGenesisSyncData.Ports, model.GenesisPort{
 				Type:          port.GetType(),
 				DeviceType:    port.GetDeviceType(),
-				Lcuuid:        port.GetLcuuid(),
+				Lcuuid:        sPortLcuuid,
 				Mac:           port.GetMac(),
 				DeviceLcuuid:  port.GetDeviceLcuuid(),
 				NetworkLcuuid: port.GetNetworkLcuuid(),
 				VPCLcuuid:     port.GetVpcLcuuid(),
 				NodeIP:        port.GetNodeIp(),
-			}
-			retGenesisSyncData.Ports = append(retGenesisSyncData.Ports, gPort)
+			})
 		}
 
 		genesisSyncVms := genesisSyncData.GetVm()
@@ -296,19 +329,23 @@ func (g *Genesis) GetGenesisSyncResponse() (GenesisSyncData, error) {
 			if _, ok := vtapIDMap[vm.GetVtapId()]; !ok {
 				continue
 			}
+			sVMLcuuid := vm.GetLcuuid()
+			if _, ok := syncVMLcuuidSet[sVMLcuuid]; ok {
+				continue
+			}
+			syncVMLcuuidSet[sVMLcuuid] = false
 			vCreatedAtStr := vm.GetCreatedAt()
 			vCreatedAt, _ := time.ParseInLocation(common.GO_BIRTHDAY, vCreatedAtStr, time.Local)
-			gVm := model.GenesisVM{
+			retGenesisSyncData.VMs = append(retGenesisSyncData.VMs, model.GenesisVM{
 				State:        vm.GetState(),
-				Lcuuid:       vm.GetLcuuid(),
+				Lcuuid:       sVMLcuuid,
 				Name:         vm.GetName(),
 				Label:        vm.GetLabel(),
 				VPCLcuuid:    vm.GetVpcLcuuid(),
 				LaunchServer: vm.GetLaunchServer(),
 				NodeIP:       vm.GetNodeIp(),
 				CreatedAt:    vCreatedAt,
-			}
-			retGenesisSyncData.VMs = append(retGenesisSyncData.VMs, gVm)
+			})
 		}
 
 		genesisSyncVpcs := genesisSyncData.GetVpc()
@@ -316,12 +353,16 @@ func (g *Genesis) GetGenesisSyncResponse() (GenesisSyncData, error) {
 			if _, ok := vtapIDMap[vpc.GetVtapId()]; !ok {
 				continue
 			}
-			gVpc := model.GenesisVpc{
-				Lcuuid: vpc.GetLcuuid(),
+			sVPCLcuuid := vpc.GetLcuuid()
+			if _, ok := syncVPCLcuuidSet[sVPCLcuuid]; ok {
+				continue
+			}
+			syncVPCLcuuidSet[sVPCLcuuid] = false
+			retGenesisSyncData.VPCs = append(retGenesisSyncData.VPCs, model.GenesisVpc{
+				Lcuuid: sVPCLcuuid,
 				Name:   vpc.GetName(),
 				NodeIP: vpc.GetNodeIp(),
-			}
-			retGenesisSyncData.VPCs = append(retGenesisSyncData.VPCs, gVpc)
+			})
 		}
 
 		genesisSyncVinterfaces := genesisSyncData.GetVinterface()
@@ -329,11 +370,16 @@ func (g *Genesis) GetGenesisSyncResponse() (GenesisSyncData, error) {
 			if _, ok := vtapIDMap[v.GetVtapId()]; !ok {
 				continue
 			}
+			sVinterfaceLcuuid := v.GetLcuuid()
+			if _, ok := syncVinterfaceLcuuidSet[sVinterfaceLcuuid]; ok {
+				continue
+			}
+			syncVinterfaceLcuuidSet[sVinterfaceLcuuid] = false
 			vLastSeenStr := v.GetLastSeen()
 			vpLastSeen, _ := time.ParseInLocation(common.GO_BIRTHDAY, vLastSeenStr, time.Local)
-			gVinterface := model.GenesisVinterface{
+			retGenesisSyncData.Vinterfaces = append(retGenesisSyncData.Vinterfaces, model.GenesisVinterface{
 				VtapID:              v.GetVtapId(),
-				Lcuuid:              v.GetLcuuid(),
+				Lcuuid:              sVinterfaceLcuuid,
 				NetnsID:             v.GetNetnsId(),
 				Name:                v.GetName(),
 				IPs:                 v.GetIps(),
@@ -343,12 +389,12 @@ func (g *Genesis) GetGenesisSyncResponse() (GenesisSyncData, error) {
 				DeviceLcuuid:        v.GetDeviceLcuuid(),
 				DeviceName:          v.GetDeviceName(),
 				DeviceType:          v.GetDeviceType(),
+				IFType:              v.GetIfType(),
 				HostIP:              v.GetHostIp(),
 				KubernetesClusterID: v.GetKubernetesClusterId(),
 				NodeIP:              v.GetNodeIp(),
 				LastSeen:            vpLastSeen,
-			}
-			retGenesisSyncData.Vinterfaces = append(retGenesisSyncData.Vinterfaces, gVinterface)
+			})
 		}
 
 		genesisSyncProcesses := genesisSyncData.GetProcess()
@@ -356,12 +402,17 @@ func (g *Genesis) GetGenesisSyncResponse() (GenesisSyncData, error) {
 			if _, ok := vtapIDMap[p.GetVtapId()]; !ok {
 				continue
 			}
+			sProcessLcuuid := p.GetLcuuid()
+			if _, ok := syncProcessLcuuidSet[sProcessLcuuid]; ok {
+				continue
+			}
+			syncProcessLcuuidSet[sProcessLcuuid] = false
 			pStartTimeStr := p.GetStartTime()
 			pStartTime, _ := time.ParseInLocation(common.GO_BIRTHDAY, pStartTimeStr, time.Local)
-			gProcess := model.GenesisProcess{
+			retGenesisSyncData.Processes = append(retGenesisSyncData.Processes, model.GenesisProcess{
 				VtapID:      p.GetVtapId(),
 				PID:         p.GetPid(),
-				Lcuuid:      p.GetLcuuid(),
+				Lcuuid:      sProcessLcuuid,
 				NetnsID:     p.GetNetnsId(),
 				Name:        p.GetName(),
 				ProcessName: p.GetProcessName(),
@@ -371,14 +422,13 @@ func (g *Genesis) GetGenesisSyncResponse() (GenesisSyncData, error) {
 				OSAPPTags:   p.GetOsAppTags(),
 				NodeIP:      p.GetNodeIp(),
 				StartTime:   pStartTime,
-			}
-			retGenesisSyncData.Processes = append(retGenesisSyncData.Processes, gProcess)
+			})
 		}
 	}
 	return retGenesisSyncData, nil
 }
 
-func (g *Genesis) GetServerIPs() ([]string, error) {
+func (g *Genesis) getServerIPs() ([]string, error) {
 	var serverIPs []string
 	var controllers []mysql.Controller
 	var azControllerConns []mysql.AZControllerConnection
@@ -424,22 +474,33 @@ func (g *Genesis) receiveKubernetesData(kChan chan map[string]KubernetesInfo) {
 	for {
 		select {
 		case k := <-kChan:
-			g.kubernetesData.Store(k)
+			for key, value := range k {
+				g.kubernetesData.Store(key, value)
+			}
 		}
 	}
 }
 
-func (g *Genesis) GetKubernetesData() map[string]KubernetesInfo {
-	return g.kubernetesData.Load().(map[string]KubernetesInfo)
+func (g *Genesis) GetKubernetesData(clusterID string) (KubernetesInfo, bool) {
+	k8sInterface, ok := g.kubernetesData.Load(clusterID)
+	if !ok {
+		log.Warningf("kubernetes data not found cluster id (%s)", clusterID)
+		return KubernetesInfo{}, false
+	}
+	k8sData, ok := k8sInterface.(KubernetesInfo)
+	if !ok {
+		log.Warning("kubernetes data interface assert failed")
+		return KubernetesInfo{}, false
+	}
+	return k8sData, true
 }
 
 func (g *Genesis) GetKubernetesResponse(clusterID string) (map[string][]string, error) {
 	k8sResp := map[string][]string{}
 
-	localK8sDatas := g.GetKubernetesData()
-	k8sInfo, ok := localK8sDatas[clusterID]
+	k8sInfo, ok := g.GetKubernetesData(clusterID)
 
-	serverIPs, err := g.GetServerIPs()
+	serverIPs, err := g.getServerIPs()
 	if err != nil {
 		return k8sResp, err
 	}
@@ -487,39 +548,30 @@ func (g *Genesis) GetKubernetesResponse(clusterID string) (map[string][]string, 
 		}
 	}
 	if !ok && !retFlag {
-		return k8sResp, errors.New("no vtap k8s report cluster id:" + clusterID)
+		return k8sResp, errors.New("no vtap report cluster id:" + clusterID)
 	}
 	if k8sInfo.ErrorMSG != "" {
 		log.Errorf("cluster id (%s) k8s info grpc Error: %s", clusterID, k8sInfo.ErrorMSG)
 		return k8sResp, errors.New(k8sInfo.ErrorMSG)
 	}
+	if len(k8sInfo.Entries) == 0 {
+		return k8sResp, errors.New("not found k8s entries")
+	}
 
 	g.mutex.Lock()
-	g.genesisStatsd.K8SInfoDelay = map[string][]int{}
-	g.genesisStatsd.K8SInfoDelay[clusterID] = []int{int(time.Now().Sub(k8sInfo.Epoch).Seconds())}
+	g.genesisStatsd.K8SInfoDelay = map[string][]float64{}
+	g.genesisStatsd.K8SInfoDelay[clusterID] = []float64{time.Now().Sub(k8sInfo.Epoch).Seconds()}
 	statsd.MetaStatsd.RegisterStatsdTable(g)
 	g.mutex.Unlock()
 
 	for _, e := range k8sInfo.Entries {
 		eType := e.GetType()
-		eInfo := e.GetCompressedInfo()
-		reader := bytes.NewReader(eInfo)
-		var out bytes.Buffer
-		r, err := zlib.NewReader(reader)
+		out, err := genesiscommon.ParseCompressedInfo(e.GetCompressedInfo())
 		if err != nil {
-			log.Warningf("zlib decompress error: %s", err.Error())
-			return k8sResp, err
+			log.Warningf("decode decompress error: %s", err.Error())
+			return map[string][]string{}, err
 		}
-		_, err = out.ReadFrom(r)
-		if err != nil {
-			log.Warningf("read decompress error: %s", err.Error())
-			return k8sResp, err
-		}
-		if _, ok := k8sResp[eType]; ok {
-			k8sResp[eType] = append(k8sResp[eType], string(out.Bytes()))
-		} else {
-			k8sResp[eType] = []string{string(out.Bytes())}
-		}
+		k8sResp[eType] = append(k8sResp[eType], string(out.Bytes()))
 	}
 	return k8sResp, nil
 }
@@ -528,26 +580,36 @@ func (g *Genesis) receivePrometheusData(pChan chan map[string]PrometheusInfo) {
 	for {
 		select {
 		case p := <-pChan:
-			g.prometheusData.Store(p)
+			for k, v := range p {
+				g.prometheusData.Store(k, v)
+			}
 		}
 	}
 }
 
-func (g *Genesis) GetPrometheusData() map[string]PrometheusInfo {
-	return g.prometheusData.Load().(map[string]PrometheusInfo)
+func (g *Genesis) GetPrometheusData(clusterID string) (PrometheusInfo, bool) {
+	prometheusInterface, ok := g.prometheusData.Load(clusterID)
+	if !ok {
+		log.Warningf("prometheus data not found cluster id (%s)", clusterID)
+		return PrometheusInfo{}, false
+	}
+	prometheusData, ok := prometheusInterface.(PrometheusInfo)
+	if !ok {
+		log.Warning("prometheus data interface assert failed")
+		return PrometheusInfo{}, false
+	}
+	return prometheusData, true
 }
 
 func (g *Genesis) GetPrometheusResponse(clusterID string) ([]cloudmodel.PrometheusTarget, error) {
 	prometheusEntries := []cloudmodel.PrometheusTarget{}
 
-	localPrometheusDatas := g.GetPrometheusData()
-	prometheusInfo, ok := localPrometheusDatas[clusterID]
+	prometheusInfo, _ := g.GetPrometheusData(clusterID)
 
-	serverIPs, err := g.GetServerIPs()
+	serverIPs, err := g.getServerIPs()
 	if err != nil {
 		return []cloudmodel.PrometheusTarget{}, err
 	}
-	retFlag := false
 	for _, serverIP := range serverIPs {
 		grpcServer := net.JoinHostPort(serverIP, g.grpcPort)
 		conn, err := grpc.Dial(grpcServer, grpc.WithInsecure(), grpc.WithMaxMsgSize(g.grpcMaxMSGLength))
@@ -589,21 +651,19 @@ func (g *Genesis) GetPrometheusResponse(clusterID string) ([]cloudmodel.Promethe
 
 		err = json.Unmarshal(entriesByte, &prometheusEntries)
 		if err != nil {
-			if err != nil {
-				log.Error("genesis api sharing prometheus unmarshal json faild:" + err.Error())
-				return []cloudmodel.PrometheusTarget{}, err
-			}
+			log.Error("genesis api sharing prometheus unmarshal json faild:" + err.Error())
+			return []cloudmodel.PrometheusTarget{}, err
 		}
 
-		retFlag = true
 		prometheusInfo = PrometheusInfo{
 			Epoch:    epoch,
 			ErrorMSG: errorMsg,
 			Entries:  prometheusEntries,
 		}
 	}
-	if !ok && !retFlag {
-		return []cloudmodel.PrometheusTarget{}, errors.New("no vtap prometheus report cluster id:" + clusterID)
+
+	if prometheusInfo.ErrorMSG != "" {
+		return []cloudmodel.PrometheusTarget{}, errors.New(prometheusInfo.ErrorMSG)
 	}
 
 	return prometheusInfo.Entries, nil

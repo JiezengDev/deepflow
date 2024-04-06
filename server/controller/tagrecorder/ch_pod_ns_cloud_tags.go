@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,72 +18,65 @@ package tagrecorder
 
 import (
 	"encoding/json"
-	"strings"
 
+	"github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type ChPodNSCloudTags struct {
-	UpdaterBase[mysql.ChPodNSCloudTags, CloudTagsKey]
+	SubscriberComponent[*message.PodNamespaceFieldsUpdate, message.PodNamespaceFieldsUpdate, mysql.PodNamespace, mysql.ChPodNSCloudTags, CloudTagsKey]
 }
 
 func NewChPodNSCloudTags() *ChPodNSCloudTags {
-	updater := &ChPodNSCloudTags{
-		UpdaterBase[mysql.ChPodNSCloudTags, CloudTagsKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_POD_NS_CLOUD_TAGS,
-		},
+	mng := &ChPodNSCloudTags{
+		newSubscriberComponent[*message.PodNamespaceFieldsUpdate, message.PodNamespaceFieldsUpdate, mysql.PodNamespace, mysql.ChPodNSCloudTags, CloudTagsKey](
+			common.RESOURCE_TYPE_POD_NAMESPACE_EN, RESOURCE_TYPE_CH_POD_NS_CLOUD_TAGS,
+		),
 	}
-	updater.dataGenerator = updater
-	return updater
+	mng.subscriberDG = mng
+	return mng
 }
 
-func (p *ChPodNSCloudTags) generateNewData() (map[CloudTagsKey]mysql.ChPodNSCloudTags, bool) {
-	var podNamespaces []mysql.PodNamespace
-	err := mysql.Db.Unscoped().Find(&podNamespaces).Error
-	if err != nil {
-		log.Errorf(dbQueryResourceFailed(p.resourceTypeName, err))
-		return nil, false
-	}
-
-	keyToItem := make(map[CloudTagsKey]mysql.ChPodNSCloudTags)
-	for _, podNamespace := range podNamespaces {
-		cloudTagsMap := map[string]string{}
-		splitCloudTags := strings.Split(podNamespace.CloudTags, ", ")
-		for _, singleCloudTag := range splitCloudTags {
-			splitSingleLabel := strings.Split(singleCloudTag, ":")
-			if len(splitSingleLabel) == 2 {
-				cloudTagsMap[splitSingleLabel[0]] = splitSingleLabel[1]
-			}
-		}
-		if len(cloudTagsMap) > 0 {
-			cloudTagsStr, err := json.Marshal(cloudTagsMap)
-			if err != nil {
-				log.Error(err)
-				return nil, false
-			}
-			key := CloudTagsKey{
-				ID: podNamespace.ID,
-			}
-			keyToItem[key] = mysql.ChPodNSCloudTags{
-				ID:        podNamespace.ID,
-				CloudTags: string(cloudTagsStr),
-			}
-		}
-	}
-	return keyToItem, true
-}
-
-func (p *ChPodNSCloudTags) generateKey(dbItem mysql.ChPodNSCloudTags) CloudTagsKey {
-	return CloudTagsKey{ID: dbItem.ID}
-}
-
-func (p *ChPodNSCloudTags) generateUpdateInfo(oldItem, newItem mysql.ChPodNSCloudTags) (map[string]interface{}, bool) {
+// onResourceUpdated implements SubscriberDataGenerator
+func (c *ChPodNSCloudTags) onResourceUpdated(sourceID int, fieldsUpdate *message.PodNamespaceFieldsUpdate) {
 	updateInfo := make(map[string]interface{})
-	if oldItem.CloudTags != newItem.CloudTags {
-		updateInfo["cloud_tags"] = newItem.CloudTags
+	if fieldsUpdate.CloudTags.IsDifferent() {
+		bytes, err := json.Marshal(fieldsUpdate.CloudTags.GetNew())
+		if err != nil {
+			log.Error(err)
+			return
+		}
+		updateInfo["cloud_tags"] = string(bytes)
 	}
 	if len(updateInfo) > 0 {
-		return updateInfo, true
+		var chItem mysql.ChPodNSCloudTags
+		mysql.Db.Where("id = ?", sourceID).First(&chItem)
+		if chItem.ID == 0 {
+			c.SubscriberComponent.dbOperator.add(
+				[]CloudTagsKey{{ID: sourceID}},
+				[]mysql.ChPodNSCloudTags{{ID: sourceID, CloudTags: updateInfo["cloud_tags"].(string)}},
+			)
+		} else {
+			c.SubscriberComponent.dbOperator.update(chItem, updateInfo, CloudTagsKey{ID: sourceID})
+		}
 	}
-	return nil, false
+}
+
+// onResourceUpdated implements SubscriberDataGenerator
+func (c *ChPodNSCloudTags) sourceToTarget(item *mysql.PodNamespace) (keys []CloudTagsKey, targets []mysql.ChPodNSCloudTags) {
+	if len(item.CloudTags) == 0 {
+		return
+	}
+	bytes, err := json.Marshal(item.CloudTags)
+	if err != nil {
+		log.Error(err)
+		return
+	}
+	return []CloudTagsKey{{ID: item.ID}}, []mysql.ChPodNSCloudTags{{ID: item.ID, CloudTags: string(bytes)}}
+}
+
+// softDeletedTargetsUpdated implements SubscriberDataGenerator
+func (c *ChPodNSCloudTags) softDeletedTargetsUpdated(targets []mysql.ChPodNSCloudTags) {
+
 }

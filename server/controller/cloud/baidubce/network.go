@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -47,8 +47,7 @@ func (b *BaiduBce) getNetworks(
 			log.Error(err)
 			return nil, nil, nil, err
 		}
-		b.cloudStatsd.APICost["ListSubnets"] = append(b.cloudStatsd.APICost["ListSubnets"], int(time.Now().Sub(startTime).Milliseconds()))
-		b.cloudStatsd.APICount["ListSubnets"] = append(b.cloudStatsd.APICount["ListSubnets"], len(result.Subnets))
+		b.cloudStatsd.RefreshAPIMoniter("ListSubnets", len(result.Subnets), startTime)
 		results = append(results, result)
 		if !result.IsTruncated {
 			break

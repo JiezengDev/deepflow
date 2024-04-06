@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -468,6 +468,79 @@ impl ServiceTable {
 
         (flow_src_score, flow_dst_score)
     }
+
+    pub fn get_ebpf_tcp_score(
+        &mut self,
+        socket_role: u8,
+        l2_end_0: bool,
+        l2_end_1: bool,
+        flow_src_key: ServiceKey,
+        flow_dst_key: ServiceKey,
+    ) -> (u8, bool) {
+        let mut score = Self::MIN_SCORE;
+        let mut need_reverse = false;
+        match (flow_src_key, flow_dst_key) {
+            (ServiceKey::V4(flow_src_key), ServiceKey::V4(flow_dst_key)) => {
+                // socket_role: 0:unkonwn 1:client(connect) 2:server(accept)
+                // if socket_role > 0, indicating that socket was established by connect
+                // or accept, and we can determine the direction by l2_end_0 and l2_end_1
+                if socket_role == 1 && l2_end_0 {
+                    self.ipv4.put(flow_dst_key, Self::MAX_SCORE);
+                    self.ipv4.pop(&flow_src_key);
+                    score = Self::MAX_SCORE;
+                } else if socket_role == 1 && l2_end_1 {
+                    self.ipv4.put(flow_src_key, Self::MAX_SCORE);
+                    self.ipv4.pop(&flow_dst_key);
+                    score = Self::MAX_SCORE;
+                    need_reverse = true;
+                } else if socket_role == 2 && l2_end_1 {
+                    self.ipv4.put(flow_dst_key, Self::MAX_SCORE);
+                    self.ipv4.pop(&flow_src_key);
+                    score = Self::MAX_SCORE;
+                } else if socket_role == 2 && l2_end_0 {
+                    self.ipv4.put(flow_src_key, Self::MAX_SCORE);
+                    self.ipv4.pop(&flow_dst_key);
+                    score = Self::MAX_SCORE;
+                    need_reverse = true;
+                } else if let Some(s) = self.ipv4.get(&flow_dst_key) {
+                    score = *s;
+                } else if let Some(s) = self.ipv4.get(&flow_src_key) {
+                    // if get score from flow_src_key, it indicate that the packet maybe disorder, the flow should be reversed
+                    score = *s;
+                    need_reverse = score == Self::MAX_SCORE;
+                }
+            }
+            (ServiceKey::V6(flow_src_key), ServiceKey::V6(flow_dst_key)) => {
+                if socket_role == 1 && l2_end_0 {
+                    self.ipv6.put(flow_dst_key, Self::MAX_SCORE);
+                    self.ipv6.pop(&flow_src_key);
+                    score = Self::MAX_SCORE;
+                } else if socket_role == 1 && l2_end_1 {
+                    self.ipv6.put(flow_src_key, Self::MAX_SCORE);
+                    self.ipv6.pop(&flow_dst_key);
+                    score = Self::MAX_SCORE;
+                    need_reverse = true;
+                } else if socket_role == 2 && l2_end_1 {
+                    self.ipv6.put(flow_dst_key, Self::MAX_SCORE);
+                    self.ipv6.pop(&flow_src_key);
+                    score = Self::MAX_SCORE;
+                } else if socket_role == 2 && l2_end_0 {
+                    self.ipv6.put(flow_src_key, Self::MAX_SCORE);
+                    self.ipv6.pop(&flow_dst_key);
+                    score = Self::MAX_SCORE;
+                    need_reverse = true;
+                } else if let Some(s) = self.ipv6.get(&flow_dst_key) {
+                    score = *s;
+                } else if let Some(s) = self.ipv6.get(&flow_src_key) {
+                    // if get score from flow_src_key, it indicate that the packet maybe disorder, the flow should be reversed
+                    score = *s;
+                    need_reverse = score == Self::MAX_SCORE;
+                }
+            }
+            _ => unimplemented!(),
+        }
+        (score, need_reverse)
+    }
 }
 
 #[cfg(test)]
@@ -478,25 +551,21 @@ mod tests {
     };
 
     use super::*;
-    use crate::common::endpoint::EPC_FROM_DEEPFLOW;
+    use crate::common::endpoint::EPC_DEEPFLOW;
 
     #[test]
     fn service_key() {
-        let key1 = Ipv4Key::new(Ipv4Addr::new(192, 168, 1, 1), EPC_FROM_DEEPFLOW as i16, 80);
-        let key2 = Ipv4Key::new(
-            Ipv4Addr::new(192, 168, 1, 1),
-            EPC_FROM_DEEPFLOW as i16,
-            8080,
-        );
+        let key1 = Ipv4Key::new(Ipv4Addr::new(192, 168, 1, 1), EPC_DEEPFLOW as i16, 80);
+        let key2 = Ipv4Key::new(Ipv4Addr::new(192, 168, 1, 1), EPC_DEEPFLOW as i16, 8080);
         assert_ne!(key1, key2);
         let key1 = Ipv6Key::new(
             Ipv6Addr::from_str("1002:1003:4421:5566:7788:99aa:bbcc:ddee").unwrap(),
-            EPC_FROM_DEEPFLOW as i16,
+            EPC_DEEPFLOW as i16,
             80,
         );
         let key2 = Ipv6Key::new(
             Ipv6Addr::from_str("1002:1003:4421:5566:7788:99aa:bbcc:ddee").unwrap(),
-            EPC_FROM_DEEPFLOW as i16,
+            EPC_DEEPFLOW as i16,
             8080,
         );
         assert_ne!(key1, key2);
@@ -510,26 +579,26 @@ mod tests {
                     Ipv6Addr::from_str("1002:1003:4421:5566:7788:99aa:bbcc:ddee")
                         .unwrap()
                         .into(),
-                    EPC_FROM_DEEPFLOW as i16,
+                    EPC_DEEPFLOW as i16,
                     1234,
                 ),
                 ServiceKey::new(
                     Ipv6Addr::from_str("1002:1003:4421:5566:7788:99aa:bbcc:ddee")
                         .unwrap()
                         .into(),
-                    EPC_FROM_DEEPFLOW as i16,
+                    EPC_DEEPFLOW as i16,
                     80,
                 ),
             ),
             (
                 ServiceKey::new(
                     Ipv4Addr::new(192, 168, 1, 1).into(),
-                    EPC_FROM_DEEPFLOW as i16,
+                    EPC_DEEPFLOW as i16,
                     1234,
                 ),
                 ServiceKey::new(
                     Ipv4Addr::new(192, 168, 1, 10).into(),
-                    EPC_FROM_DEEPFLOW as i16,
+                    EPC_DEEPFLOW as i16,
                     80,
                 ),
             ),
@@ -665,26 +734,26 @@ mod tests {
                     Ipv6Addr::from_str("1002:1003:4421:5566:7788:99aa:bbcc:ddee")
                         .unwrap()
                         .into(),
-                    EPC_FROM_DEEPFLOW as i16,
+                    EPC_DEEPFLOW as i16,
                     1234,
                 ),
                 ServiceKey::new(
                     Ipv6Addr::from_str("1002:1003:4421:5566:7788:99aa:bbcc:ddee")
                         .unwrap()
                         .into(),
-                    EPC_FROM_DEEPFLOW as i16,
+                    EPC_DEEPFLOW as i16,
                     53,
                 ),
             ),
             (
                 ServiceKey::new(
                     Ipv4Addr::new(192, 168, 1, 1).into(),
-                    EPC_FROM_DEEPFLOW as i16,
+                    EPC_DEEPFLOW as i16,
                     1234,
                 ),
                 ServiceKey::new(
                     Ipv4Addr::new(192, 168, 1, 10).into(),
-                    EPC_FROM_DEEPFLOW as i16,
+                    EPC_DEEPFLOW as i16,
                     53,
                 ),
             ),

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,7 +31,7 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/refresh"
 )
 
-func convertStrToIntList(convertStr string) ([]int, error) {
+func ConvertStrToIntList(convertStr string) ([]int, error) {
 	if len(convertStr) == 0 {
 		return []int{}, nil
 	}
@@ -44,6 +44,26 @@ func convertStrToIntList(convertStr string) ([]int, error) {
 		} else {
 			result[index] = target
 		}
+	}
+
+	return result, nil
+}
+
+func ConvertStrToIntListWithIgnore(convertStr string, ignoreFields []int) ([]int, error) {
+	if len(convertStr) == 0 {
+		return []int{}, nil
+	}
+	splitStr := strings.Split(convertStr, ",")
+	var result []int
+	for _, src := range splitStr {
+		target, err := strconv.Atoi(src)
+		if err != nil {
+			return []int{}, err
+		}
+		if common.Contains[int](ignoreFields, target) {
+			continue
+		}
+		result = append(result, target)
 	}
 
 	return result, nil
@@ -71,7 +91,13 @@ func copyStruct(from, to interface{}, ignoreName []string) {
 	toElem := toValue.Elem()
 	for i := 0; i < toElem.NumField(); i++ {
 		toField := toElem.Type().Field(i)
-		if common.Contains(ignoreName, toField.Name) == true {
+		if common.Contains(ignoreName, toField.Name) {
+			// set value to avoid return nil
+			if toField.Type.Kind() == reflect.Slice {
+				sliceType := reflect.SliceOf(toField.Type.Elem())
+				emptySlice := reflect.MakeSlice(sliceType, 0, 0)
+				toElem.Field(i).Set(emptySlice)
+			}
 			continue
 		}
 		fromFieldName, ok := fromElem.Type().FieldByName(toField.Name)
@@ -127,10 +153,12 @@ var tapSideIDToName = map[int]string{
 	34: "网关到服务端",    // ServerGateway
 	41: "客户端进程",     // ClientProcess
 	42: "服务端进程",     // ServerProcess
-	48: "应用",        // App
-	49: "客户端应用",     // ClientApp
-	50: "服务端应用",     // ServerApp
+	// 48: "应用",        // App
+	// 49: "客户端应用",     // ClientApp
+	// 50: "服务端应用",     // ServerApp
 }
+
+var DeprecatedTapSideID = []int{48, 49, 50}
 
 func convertDBToJson(
 	sData *mysql.VTapGroupConfiguration,
@@ -138,15 +166,12 @@ func convertDBToJson(
 	idToTapTypeName map[int]string,
 	lcuuidToDomain map[string]string) {
 
-	ignoreName := []string{"ID", "YamlConfig", "L4LogTapTypes", "L4LogIgnoreTapSides", "L7LogIgnoreTapSides",
-		"L7LogStoreTapTypes", "DecapType", "Domains", "MaxCollectPps", "MaxNpbBps", "MaxTxBandwidth"}
+	ignoreName := []string{"ID", "YamlConfig", "L4LogTapTypes", "L4LogIgnoreTapSides",
+		"L7LogIgnoreTapSides", "L7LogStoreTapTypes", "DecapType", "Domains", "MaxCollectPps",
+		"MaxNpbBps", "MaxTxBandwidth", "WasmPlugins", "SoPlugins"}
 	copyStruct(sData, tData, ignoreName)
-	tData.L4LogTapTypes = []*model.TypeInfo{}
-	tData.L7LogStoreTapTypes = []*model.TypeInfo{}
-	tData.DecapType = []*model.TypeInfo{}
-	tData.Domains = []*model.DomainInfo{}
 	if sData.L4LogTapTypes != nil {
-		cL4LogTapTypes, err := convertStrToIntList(*sData.L4LogTapTypes)
+		cL4LogTapTypes, err := ConvertStrToIntList(*sData.L4LogTapTypes)
 		if err == nil {
 			for _, tapTypeValue := range cL4LogTapTypes {
 				tData.L4LogTapTypes = append(tData.L4LogTapTypes,
@@ -157,35 +182,40 @@ func convertDBToJson(
 		}
 	}
 	if sData.L4LogIgnoreTapSides != nil {
-		tapSides, err := convertStrToIntList(*sData.L4LogIgnoreTapSides)
+		tapSides, err := ConvertStrToIntListWithIgnore(*sData.L4LogIgnoreTapSides, DeprecatedTapSideID)
 		if err != nil {
 			log.Error(err)
 		} else {
 			for _, tapSideValue := range tapSides {
-				tData.L4LogIgnoreTapSides = append(tData.L4LogIgnoreTapSides,
-					&model.TapSideInfo{
-						ID:   tapSideValue,
-						Name: tapSideIDToName[tapSideValue],
-					})
+				if name, ok := tapSideIDToName[tapSideValue]; ok {
+					tData.L4LogIgnoreTapSides = append(tData.L4LogIgnoreTapSides,
+						&model.TapSideInfo{
+							ID:   tapSideValue,
+							Name: name,
+						})
+				}
 			}
 		}
 	}
 	if sData.L7LogIgnoreTapSides != nil {
-		tapSides, err := convertStrToIntList(*sData.L7LogIgnoreTapSides)
+		tapSides, err := ConvertStrToIntListWithIgnore(*sData.L7LogIgnoreTapSides, DeprecatedTapSideID)
 		if err == nil {
 			for _, tapSideValue := range tapSides {
-				tData.L7LogIgnoreTapSides = append(tData.L7LogIgnoreTapSides,
-					&model.TapSideInfo{
-						ID:   tapSideValue,
-						Name: tapSideIDToName[tapSideValue],
-					})
+				if name, ok := tapSideIDToName[tapSideValue]; ok {
+					tData.L7LogIgnoreTapSides = append(tData.L7LogIgnoreTapSides,
+						&model.TapSideInfo{
+							ID:   tapSideValue,
+							Name: name,
+						})
+				}
+
 			}
 		} else {
 			log.Error(err)
 		}
 	}
 	if sData.L7LogStoreTapTypes != nil {
-		cL7LogStoreTapTypes, err := convertStrToIntList(*sData.L7LogStoreTapTypes)
+		cL7LogStoreTapTypes, err := ConvertStrToIntList(*sData.L7LogStoreTapTypes)
 		if err == nil {
 			for _, tapTypeValue := range cL7LogStoreTapTypes {
 				tData.L7LogStoreTapTypes = append(tData.L7LogStoreTapTypes,
@@ -196,7 +226,7 @@ func convertDBToJson(
 		}
 	}
 	if sData.DecapType != nil {
-		cDecapType, err := convertStrToIntList(*sData.DecapType)
+		cDecapType, err := ConvertStrToIntList(*sData.DecapType)
 		if err == nil {
 			for _, decapType := range cDecapType {
 				typeInfo := &model.TypeInfo{
@@ -243,13 +273,26 @@ func convertDBToJson(
 		cMaxTxBandwidth := *sData.MaxTxBandwidth / 1000000
 		tData.MaxTxBandwidth = &cMaxTxBandwidth
 	}
+
+	if sData.WasmPlugins != nil && len(*sData.WasmPlugins) > 0 {
+		cWasmPlugins := strings.Split(*sData.WasmPlugins, ",")
+		for _, wasmPlugin := range cWasmPlugins {
+			tData.WasmPlugins = append(tData.WasmPlugins, wasmPlugin)
+		}
+	}
+	if sData.SoPlugins != nil && len(*sData.SoPlugins) > 0 {
+		cSoPlugins := strings.Split(*sData.SoPlugins, ",")
+		for _, soPlugin := range cSoPlugins {
+			tData.SoPlugins = append(tData.SoPlugins, soPlugin)
+		}
+	}
 }
 
 func convertDBToYaml(sData *mysql.VTapGroupConfiguration, tData *model.VTapGroupConfiguration) {
 	ignoreName := []string{"ID", "VTapGroupLcuuid", "VTapGroupID", "Lcuuid", "YamlConfig",
 		"L4LogTapTypes", "L4LogIgnoreTapSides", "L7LogIgnoreTapSides",
 		"L7LogStoreTapTypes", "DecapType", "Domains", "MaxCollectPps", "MaxNpbBps", "MaxTxBandwidth",
-		"PrometheusHttpAPIAddresses",
+		"PrometheusHttpAPIAddresses", "WasmPlugins", "SoPlugins",
 	}
 	copyStruct(sData, tData, ignoreName)
 	if sData.YamlConfig != nil {
@@ -262,7 +305,7 @@ func convertDBToYaml(sData *mysql.VTapGroupConfiguration, tData *model.VTapGroup
 	}
 
 	if sData.L4LogTapTypes != nil {
-		cL4LogTapTypes, err := convertStrToIntList(*sData.L4LogTapTypes)
+		cL4LogTapTypes, err := ConvertStrToIntList(*sData.L4LogTapTypes)
 		if err == nil {
 			for _, tapTypeValue := range cL4LogTapTypes {
 				tData.L4LogTapTypes = append(tData.L4LogTapTypes, tapTypeValue)
@@ -272,7 +315,7 @@ func convertDBToYaml(sData *mysql.VTapGroupConfiguration, tData *model.VTapGroup
 		}
 	}
 	if sData.L4LogIgnoreTapSides != nil {
-		tapSides, err := convertStrToIntList(*sData.L4LogIgnoreTapSides)
+		tapSides, err := ConvertStrToIntListWithIgnore(*sData.L4LogIgnoreTapSides, DeprecatedTapSideID)
 		if err == nil {
 			for _, tapSide := range tapSides {
 				tData.L4LogIgnoreTapSides = append(tData.L4LogIgnoreTapSides, tapSide)
@@ -282,7 +325,7 @@ func convertDBToYaml(sData *mysql.VTapGroupConfiguration, tData *model.VTapGroup
 		}
 	}
 	if sData.L7LogIgnoreTapSides != nil {
-		tapSides, err := convertStrToIntList(*sData.L7LogIgnoreTapSides)
+		tapSides, err := ConvertStrToIntListWithIgnore(*sData.L7LogIgnoreTapSides, DeprecatedTapSideID)
 		if err == nil {
 			for _, tapSide := range tapSides {
 				tData.L7LogIgnoreTapSides = append(tData.L7LogIgnoreTapSides, tapSide)
@@ -292,7 +335,7 @@ func convertDBToYaml(sData *mysql.VTapGroupConfiguration, tData *model.VTapGroup
 		}
 	}
 	if sData.L7LogStoreTapTypes != nil {
-		cL7LogStoreTapTypes, err := convertStrToIntList(*sData.L7LogStoreTapTypes)
+		cL7LogStoreTapTypes, err := ConvertStrToIntList(*sData.L7LogStoreTapTypes)
 		if err == nil {
 			for _, tapTypeValue := range cL7LogStoreTapTypes {
 				tData.L7LogStoreTapTypes = append(tData.L7LogStoreTapTypes, tapTypeValue)
@@ -302,7 +345,7 @@ func convertDBToYaml(sData *mysql.VTapGroupConfiguration, tData *model.VTapGroup
 		}
 	}
 	if sData.DecapType != nil {
-		cDecapType, err := convertStrToIntList(*sData.DecapType)
+		cDecapType, err := ConvertStrToIntList(*sData.DecapType)
 		if err == nil {
 			for _, decapType := range cDecapType {
 				tData.DecapType = append(tData.DecapType, decapType)
@@ -334,6 +377,23 @@ func convertDBToYaml(sData *mysql.VTapGroupConfiguration, tData *model.VTapGroup
 		cMaxTxBandwidth := *sData.MaxTxBandwidth / 1000000
 		tData.MaxTxBandwidth = &cMaxTxBandwidth
 	}
+
+	if sData.WasmPlugins != nil {
+		cWasmPlugins := strings.Split(*sData.WasmPlugins, ",")
+		for _, wasmPlugin := range cWasmPlugins {
+			if wasmPlugin != "" {
+				tData.WasmPlugins = append(tData.WasmPlugins, wasmPlugin)
+			}
+		}
+	}
+	if sData.SoPlugins != nil {
+		cSoPlugins := strings.Split(*sData.SoPlugins, ",")
+		for _, soPlugin := range cSoPlugins {
+			if soPlugin != "" {
+				tData.SoPlugins = append(tData.SoPlugins, soPlugin)
+			}
+		}
+	}
 }
 
 func convertJsonToDb(sData *model.VTapGroupConfiguration, tData *mysql.VTapGroupConfiguration) {
@@ -360,7 +420,7 @@ func convertToDb(sData *model.VTapGroupConfiguration, tData *mysql.VTapGroupConf
 	ignoreName := []string{"ID", "YamlConfig", "Lcuuid", "VTapGroupLcuuid", "VTapGroupID",
 		"L4LogTapTypes", "L4LogIgnoreTapSides", "L7LogIgnoreTapSides",
 		"L7LogStoreTapTypes", "DecapType", "Domains", "MaxCollectPps", "MaxNpbBps", "MaxTxBandwidth",
-		"PrometheusHttpAPIAddresses",
+		"PrometheusHttpAPIAddresses", "WasmPlugins", "SoPlugins",
 	}
 	copyStruct(sData, tData, ignoreName)
 	if len(sData.L4LogTapTypes) > 0 {
@@ -422,6 +482,18 @@ func convertToDb(sData *model.VTapGroupConfiguration, tData *mysql.VTapGroupConf
 		tData.MaxTxBandwidth = &cMaxTxBandwidth
 	} else {
 		tData.MaxTxBandwidth = nil
+	}
+	if len(sData.WasmPlugins) > 0 {
+		cWasmPlugins := strings.Join(sData.WasmPlugins, ",")
+		tData.WasmPlugins = &cWasmPlugins
+	} else {
+		tData.WasmPlugins = nil
+	}
+	if len(sData.SoPlugins) > 0 {
+		cSoPlugins := strings.Join(sData.SoPlugins, ",")
+		tData.SoPlugins = &cSoPlugins
+	} else {
+		tData.SoPlugins = nil
 	}
 }
 

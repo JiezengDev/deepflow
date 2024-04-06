@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package ctl
 
 import (
 	"fmt"
+	"html/template"
 	"io/ioutil"
 	"os"
 
@@ -25,7 +26,6 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/deepflowio/deepflow/cli/ctl/common"
-	"github.com/deepflowio/deepflow/cli/ctl/example"
 )
 
 func RegisterDomainAdditionalResourceCommand() *cobra.Command {
@@ -57,7 +57,24 @@ func RegisterDomainAdditionalResourceCommand() *cobra.Command {
 		},
 	}
 
+	var resourceType, resourceName string
+	list := &cobra.Command{
+		Use:     "list",
+		Short:   "list domain additional resource",
+		Example: "deepflow-ctl domain additional-resource list",
+		Run: func(cmd *cobra.Command, args []string) {
+			if resourceName != "" && resourceType == "" {
+				fmt.Printf("please enter resource type, resource name(%v)\n", resourceName)
+				return
+			}
+			listDomainAdditionalResource(cmd, resourceType, resourceName)
+		},
+	}
+	list.Flags().StringVarP(&resourceType, "type", "", "", "resource type, support: az, vpc, subnet, host, chost, lb, cloud-tag, peer-connection")
+	list.Flags().StringVarP(&resourceName, "name", "", "", "resource name, need to set the type value first")
+
 	DomainAdditionalResource.AddCommand(apply)
+	DomainAdditionalResource.AddCommand(list)
 	DomainAdditionalResource.AddCommand(exampleCmd)
 	return DomainAdditionalResource
 }
@@ -71,14 +88,176 @@ func applyDomainAdditionalResource(cmd *cobra.Command, args []string, filename s
 
 	server := common.GetServerInfo(cmd)
 	url := fmt.Sprintf("http://%s:%d/v1/domain-additional-resources/", server.IP, server.Port)
-	_, err = common.CURLPerform("PUT", url, body, "")
+	_, err = common.CURLPerform("PUT", url, body, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 	}
 }
 
+var additionalListTemplate = `{{- if .AZS }}
+azs:{{ range .AZS }}
+- name: {{ .NAME }}
+  uuid: {{ .UUID }}
+  domain_uuid: {{ .DOMAIN_UUID }}
+{{- end }}{{ end }}
+
+{{- if .VPCS }}
+vpcs:{{ range .VPCS }}
+- name: {{ .NAME }}
+  uuid: {{ .UUID }}
+  domain_uuid: {{ .DOMAIN_UUID }}
+{{- end }}{{ end }}
+
+{{- if .SUBNETS }}
+subnets:{{ range .SUBNETS }}
+- name: {{ .NAME }}
+  uuid: {{ .UUID }}
+  type: {{ .TYPE }}
+  is_vip: {{ .IS_VIP }}
+  vpc_uuid: {{ .VPC_UUID }}
+  {{- if .AZ_UUID }}az_uuid: {{ .AZ_UUID }}{{ end }}
+  domain_uuid: {{ .DOMAIN_UUID }}
+  cidrs:{{ range .CIDRS }} 
+  - {{ . }}
+  {{- end }}
+{{- end }}{{ end }}
+
+{{- if .HOSTS }}
+hosts:{{ range .HOSTS }}
+- name: {{ .NAME }}
+  uuid: {{ .UUID }}
+  ip: {{ .IP }}
+  type: {{ .TYPE }}
+  az_uuid: {{ .AZ_UUID }}
+  domain_uuid: {{ .DOMAIN_UUID }}
+  {{-  if .VINTERFACES }}
+  vinterfaces: {{ range .VINTERFACES }}
+  - mac: {{ .MAC }}
+    name: {{ .NAME }}
+    subnet_uuid: {{ .SUBNET_UUID }}
+    {{- if .IPS }}
+    ips:{{ range .IPS }}
+    - {{ . }}
+    {{- end }}
+    {{- end }}
+  {{- end }}
+  {{- end }}
+{{- end }}{{- end }}
+
+{{- if .CHOSTS }}
+chosts:{{ range .CHOSTS }}
+- name: {{ .NAME }}
+  uuid: {{ .UUID }}
+  host_ip: {{ .HOST_IP }}
+  type: {{ .TYPE }}
+  vpc_uuid: {{ .VPC_UUID }}
+  az_uuid: {{ .AZ_UUID }}
+  domain_uuid: {{ .DOMAIN_UUID }}
+  {{-  if .VINTERFACES }}
+  vinterfaces: {{ range .VINTERFACES }}
+  - mac: {{ .MAC }}
+    subnet_uuid: {{ .SUBNET_UUID }}
+    {{- if .IPS }}
+    ips:{{ range .IPS }}
+    - {{ . }}
+    {{- end }}
+    {{- end }}
+  {{- end }}
+  {{- end }}
+{{- end }}{{- end }}
+
+{{- if .LBS }}
+lbs:{{ range .LBS }}
+- name: {{ .NAME }}
+  model: {{ .MODEL }}
+  vpc_uuid: {{ .VPC_UUID }}
+  domain_uuid: {{ .DOMAIN_UUID }}
+  region_uuid: {{ .REGION_UUID }}
+  {{-  if .VINTERFACES }}
+  vinterfaces: {{ range .VINTERFACES }}
+  - mac: {{ .MAC }}
+    subnet_uuid: {{ .SUBNET_UUID }}
+    {{- if .IPS }}
+    ips:{{ range .IPS}} 
+    - {{ . }}
+    {{- end }}
+    {{- end }}
+  {{- end }}
+  {{- end }}
+  {{- if .LB_LISTENERS }}
+  lb_listeners:{{ range .LB_LISTENERS }}
+  - {{ if .NAME }}name: {{ .NAME }}{{ end }} 
+    protocol: {{ .PROTOCOL }}
+    ip: {{ .IP }}
+    port: {{ .PORT }}
+    {{ if .LB_TARGET_SERVERS }}lb_target_servers:{{range  .LB_TARGET_SERVERS }}
+    - ip: {{ .IP }}
+      port: {{ .PORT }}
+      {{ end }}
+	{{- end }}
+  {{- end }}
+  {{- end }}
+{{- end }}{{ end }}
+
+{{- if .CLOUD_TAGS }}
+cloud_tags:{{ range .CLOUD_TAGS }}
+- resource_type: {{ .RESOURCE_TYPE }}
+  resource_name: {{ .RESOURCE_NAME }}
+  domain_uuid: {{ .DOMAIN_UUID }}
+  {{- if .SUBDOMAIN_UUID }}
+  subdomain_uuid: {{ .SUBDOMAIN_UUID }}{{ end }}
+  tags: {{ range .TAGS }}
+  - key: {{ .KEY }}
+    value: {{ .VALUE }}
+  {{- end }}
+{{- end }}{{ end }}
+
+{{- if .PEER_CONNECTIONS }}
+peer_connections:{{ range .PEER_CONNECTIONS }}
+- name: {{ .NAME }}
+  uuid: {{ .UUID }}
+  domain_uuid: {{ .DOMAIN_UUID }}
+  local_vpc_uuid: {{ .LOCAL_VPC_UUID }}
+  local_region_uuid: {{ .LOCAL_REGION_UUID }}
+  remote_vpc_uuid: {{ .REMOTE_VPC_UUID }}
+  remote_region_uuid: {{ .REMOTE_REGION_UUID }}
+{{- end }}{{ end }}
+`
+
+func listDomainAdditionalResource(cmd *cobra.Command, resourceType, resourceName string) {
+	server := common.GetServerInfo(cmd)
+	url := fmt.Sprintf("http://%s:%d/v1/domain-additional-resources/?type=%s&name=%s", server.IP, server.Port, resourceType, resourceName)
+	response, err := common.CURLPerform("GET", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return
+	}
+
+	data, err := response.Get("DATA").Map()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return
+	}
+
+	t := template.Must(template.New("domain_additional_list").Parse(additionalListTemplate))
+	t.Execute(os.Stdout, data)
+}
+
 func exampleDomainAdditionalResourceConfig(cmd *cobra.Command) {
-	fmt.Printf(string(example.YamlDomainAdditionalResourceReader))
+	server := common.GetServerInfo(cmd)
+	url := fmt.Sprintf("http://%s:%d/v1/domain-additional-resources/example/", server.IP, server.Port)
+	response, err := common.CURLPerform("GET", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return
+	}
+
+	data, err := response.Get("DATA").String()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return
+	}
+	fmt.Println(data)
 }
 
 func loadBodyFromFile(filename string) (map[string]interface{}, error) {

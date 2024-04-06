@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,8 +15,6 @@
  */
 
 package mysql
-
-import "time"
 
 type ChRegion struct {
 	ID     int    `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
@@ -44,9 +42,11 @@ func (ChVPC) TableName() string {
 type ChDevice struct {
 	DeviceType int    `gorm:"primaryKey;column:devicetype;type:int;not null" json:"DEVICETYPE"`
 	DeviceID   int    `gorm:"primaryKey;column:deviceid;type:int;not null" json:"DEVICEID"`
-	Name       string `gorm:"column:name;type:varchar(64);default:null" json:"NAME"`
+	Name       string `gorm:"column:name;type:text;default:null" json:"NAME"`
 	IconID     int    `gorm:"column:icon_id;type:int;default:null" json:"ICON_ID"`
 	UID        string `gorm:"column:uid;type:char(64);default:null" json:"UID"`
+	Hostname   string `gorm:"column:hostname;type:varchar(256)" json:"HOSTNAME"`
+	IP         string `gorm:"column:ip;type:varchar(64)" json:"IP"`
 }
 
 type ChVTapPort struct {
@@ -134,7 +134,7 @@ type ChServerPort struct {
 }
 
 type ChIPRelation struct {
-	VPCID          int    `gorm:"primaryKey;column:l3_epc_id;type:int;not null" json:"VPC_ID"`
+	L3EPCID        int    `gorm:"primaryKey;column:l3_epc_id;type:int;not null" json:"L3_EPC_ID"`
 	IP             string `gorm:"primaryKey;column:ip;type:varchar(64);not null" json:"IP"`
 	NATGWID        int    `gorm:"column:natgw_id;type:int;default:null" json:"NATGW_ID"`
 	NATGWName      string `gorm:"column:natgw_name;type:varchar(256);default:null" json:"NATGW_NAME"`
@@ -164,8 +164,8 @@ type ChIPResource struct {
 	HostName       string `gorm:"column:host_name;type:varchar(256);default:null" json:"HOST_NAME"`
 	CHostID        int    `gorm:"column:chost_id;type:int;not null" json:"CHOST_ID"`
 	CHostName      string `gorm:"column:chost_name;type:varchar(256);default:null" json:"CHOST_NAME"`
-	VPCID          int    `gorm:"column:vpc_id;type:int;not null" json:"VPC_ID"`
-	VPCName        string `gorm:"column:vpc_name;type:varchar(256);default:null" json:"VPC_NAME"`
+	L3EPCID        int    `gorm:"column:l3_epc_id;type:int;not null" json:"L3_EPC_ID"`
+	L3EPCName      string `gorm:"column:l3_epc_name;type:varchar(256);default:null" json:"L3_EPC_NAME"`
 	RouterID       int    `gorm:"column:router_id;type:int;not null" json:"ROUTER_ID"`
 	RouterName     string `gorm:"column:router_name;type:varchar(256);default:null" json:"ROUTER_NAME"`
 	DHCPGWID       int    `gorm:"column:dhcpgw_id;type:int;not null" json:"DHCPGW_ID"`
@@ -212,9 +212,14 @@ func (ChNetwork) TableName() string {
 }
 
 type ChPod struct {
-	ID     int    `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
-	Name   string `gorm:"column:name;type:varchar(256);not null" json:"NAME"`
-	IconID int    `gorm:"column:icon_id;type:int;default:null" json:"ICON_ID"`
+	ID           int    `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
+	Name         string `gorm:"column:name;type:varchar(256);not null" json:"NAME"`
+	IconID       int    `gorm:"column:icon_id;type:int;default:null" json:"ICON_ID"`
+	PodClusterID int    `gorm:"column:pod_cluster_id;type:int;not null" json:"POD_CLUSTER_ID"`
+	PodNsID      int    `gorm:"column:pod_ns_id;type:int;not null" json:"POD_NS_ID"`
+	PodNodeID    int    `gorm:"column:pod_node_id;type:int;not null" json:"POD_NODE_ID"`
+	PodServiceID int    `gorm:"column:pod_service_id;type:int;default:null" json:"POD_SERVICE_ID"`
+	PodGroupID   int    `gorm:"column:pod_group_id;type:int;default:null" json:"POD_GROUP_ID"`
 }
 
 type ChPodCluster struct {
@@ -224,15 +229,19 @@ type ChPodCluster struct {
 }
 
 type ChPodGroup struct {
-	ID     int    `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
-	Name   string `gorm:"column:name;type:varchar(256);not null" json:"NAME"`
-	IconID int    `gorm:"column:icon_id;type:int;default:null" json:"ICON_ID"`
+	ID           int    `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
+	Name         string `gorm:"column:name;type:varchar(256);not null" json:"NAME"`
+	PodGroupType int    `gorm:"column:pod_group_type;type:int;default:null" json:"POD_GROUP_TYPE"`
+	IconID       int    `gorm:"column:icon_id;type:int;default:null" json:"ICON_ID"`
+	PodClusterID int    `gorm:"column:pod_cluster_id;type:int;not null" json:"POD_CLUSTER_ID"`
+	PodNsID      int    `gorm:"column:pod_ns_id;type:int;not null" json:"POD_NS_ID"`
 }
 
 type ChPodNamespace struct {
-	ID     int    `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
-	Name   string `gorm:"column:name;type:varchar(256);not null" json:"NAME"`
-	IconID int    `gorm:"column:icon_id;type:int;default:null" json:"ICON_ID"`
+	ID           int    `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
+	Name         string `gorm:"column:name;type:varchar(256);not null" json:"NAME"`
+	IconID       int    `gorm:"column:icon_id;type:int;default:null" json:"ICON_ID"`
+	PodClusterID int    `gorm:"column:pod_cluster_id;type:int;not null" json:"POD_CLUSTER_ID"`
 }
 
 func (ChPodNamespace) TableName() string {
@@ -374,9 +383,11 @@ func (ChOSAppTags) TableName() string {
 }
 
 type ChGProcess struct {
-	ID     int    `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
-	Name   string `gorm:"column:name;type:varchar(256);not null" json:"NAME"`
-	IconID int    `gorm:"column:icon_id;type:int;default:null" json:"ICON_ID"`
+	ID      int    `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
+	Name    string `gorm:"column:name;type:text;default:null" json:"NAME"`
+	IconID  int    `gorm:"column:icon_id;type:int;default:null" json:"ICON_ID"`
+	CHostID int    `gorm:"column:chost_id;type:int;not null" json:"CHOST_ID"`
+	L3EPCID int    `gorm:"column:l3_epc_id;type:int" json:"L3_EPC_ID"`
 }
 
 func (ChGProcess) TableName() string {
@@ -448,7 +459,7 @@ type ChPrometheusMetricAPPLabelLayout struct {
 type ChAPPLabel struct {
 	LabelNameID  int    `gorm:"primaryKey;column:label_name_id;type:int;not null" json:"LABEL_NAME_ID"`
 	LabelValueID int    `gorm:"primaryKey;column:label_value_id;type:int unsigned;not null" json:"LABEL_VALUE_ID"`
-	LabelValue   string `gorm:"column:label_value;type:varchar(256);not null" json:"LABEL_VALUE"`
+	LabelValue   string `gorm:"column:label_value;type:text;not null" json:"LABEL_VALUE"`
 }
 
 func (ChAPPLabel) TableName() string {
@@ -467,7 +478,40 @@ type ChPrometheusTargetLabelLayout struct {
 	TargetLabelNames  string `gorm:"column:target_label_names;type:text;not null" json:"TARGET_LABEL_NAMES"`
 	TargetLabelValues string `gorm:"column:target_label_values;type:text;not null" json:"TARGET_LABEL_VALUES"`
 }
+type ChPodService struct {
+	ID           int    `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
+	Name         string `gorm:"column:name;type:varchar(256)" json:"NAME"`
+	PodClusterID int    `gorm:"column:pod_cluster_id;type:int" json:"POD_CLUSTER_ID"`
+	PodNsID      int    `gorm:"column:pod_ns_id;type:int" json:"POD_NS_ID"`
+}
 
-type ChViewChange struct {
-	UpdatedAt time.Time `gorm:"column:updated_at;type:timestamp;not null;default:CURRENT_TIMESTAMP" json:"UPDATED_AT"`
+type ChChost struct {
+	ID       int    `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
+	Name     string `gorm:"column:name;type:varchar(256)" json:"NAME"`
+	L3EPCID  int    `gorm:"column:l3_epc_id;type:int" json:"L3_EPC_ID"`
+	HostID   int    `gorm:"column:host_id;type:int" json:"HOST_ID"`
+	Hostname string `gorm:"column:hostname;type:varchar(256)" json:"HOSTNAME"`
+	IP       string `gorm:"column:ip;type:varchar(64)" json:"IP"`
+}
+
+type ChPolicy struct {
+	ACLGID     int    `gorm:"primaryKey;column:acl_gid;type:int;not null" json:"ACL_GID"`
+	TunnelType int    `gorm:"primaryKey;column:tunnel_type;type:int;not null" json:"TUNNEL_TYPE"`
+	ID         int    `gorm:"column:id;type:int;not null" json:"ID"`
+	Name       string `gorm:"column:name;type:varchar(256)" json:"NAME"`
+}
+
+type ChNpbTunnel struct {
+	ID   int    `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
+	Name string `gorm:"column:name;type:varchar(256)" json:"NAME"`
+}
+
+type ChAlarmPolicy struct {
+	ID     int    `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
+	Name   string `gorm:"column:name;type:char(128)" json:"NAME"`
+	UserID int    `gorm:"column:user_id;type:int" json:"USER_ID"`
+}
+
+func (ChAlarmPolicy) TableName() string {
+	return "ch_alarm_policy"
 }

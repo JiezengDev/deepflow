@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -75,9 +75,11 @@ func (h *HuaWei) CheckAuth() error {
 func (h *HuaWei) GetCloudData() (model.Resource, error) {
 	h.cloudStatsd = statsd.NewCloudStatsd()
 	h.toolDataSet = NewToolDataSet()
-	h.refreshTokenMap()
-
 	var resource model.Resource
+	err := h.refreshTokenMap()
+	if err != nil {
+		return resource, err
+	}
 
 	regions, err := h.getRegions()
 	if err != nil {
@@ -156,12 +158,28 @@ func (h *HuaWei) GetCloudData() (model.Resource, error) {
 	resource.VInterfaces = append(resource.VInterfaces, vifs...)
 	resource.IPs = append(resource.IPs, ips...)
 
+	rds, vifs, ips, err := h.getRDSInstances()
+	if err != nil {
+		return resource, err
+	}
+	resource.RDSInstances = append(resource.RDSInstances, rds...)
+	resource.VInterfaces = append(resource.VInterfaces, vifs...)
+	resource.IPs = append(resource.IPs, ips...)
+
+	redis, vifs, ips, err := h.getRedisInstances()
+	if err != nil {
+		return resource, err
+	}
+	resource.RedisInstances = append(resource.RedisInstances, redis...)
+	resource.VInterfaces = append(resource.VInterfaces, vifs...)
+	resource.IPs = append(resource.IPs, ips...)
+
 	log.Debugf("region resource num info: %v", h.toolDataSet.regionLcuuidToResourceNum)
 	log.Debugf("az resource num info: %v", h.toolDataSet.azLcuuidToResourceNum)
 	resource.Regions = cloudcommon.EliminateEmptyRegions(regions, h.toolDataSet.regionLcuuidToResourceNum)
 	resource.AZs = cloudcommon.EliminateEmptyAZs(azs, h.toolDataSet.azLcuuidToResourceNum)
 
-	h.cloudStatsd.RefreshResCount(resource)
+	h.cloudStatsd.ResCount = statsd.GetResCount(resource)
 	statsd.MetaStatsd.RegisterStatsdTable(h)
 
 	h.debugger.Refresh()
@@ -181,36 +199,35 @@ func (h *HuaWei) GetStatter() statsd.StatsdStatter {
 	}
 }
 
-func (h *HuaWei) getRawData(url, token, resultKey string) (jsonList []*simplejson.Json, err error) {
+func (h *HuaWei) getRawData(ctx rawDataGetContext) (jsonList []*simplejson.Json, err error) {
 	statsdAPIStartTime := time.Now()
 	statsdAPIDataCount := 0
 
-	noLimitKeys := []string{"projects", "regions", "availabilityZoneInfo"}
-	if common.Contains(noLimitKeys, resultKey) {
-		resp, err := cloudcommon.RequestGet(url, token, time.Duration(h.httpTimeout))
+	if ctx.pageQueryMethod == pageQueryMethodNotPage {
+		resp, err := RequestGet(ctx.url, ctx.token, time.Duration(h.httpTimeout), ctx.additionalHeaders)
 		if err != nil {
 			return []*simplejson.Json{}, err
 		}
-		jData := resp.Get(resultKey)
+		jData := resp.Get(ctx.resultKey)
 		for i := range jData.MustArray() {
 			jsonList = append(jsonList, jData.GetIndex(i))
 		}
-	} else {
+	} else if ctx.pageQueryMethod == pageQueryMethodMarker {
 		var marker string
 		limit := 50
-		baseURL := url
+		baseURL := ctx.url
 		for {
 			if marker == "" {
-				url = fmt.Sprintf("%s?limit=%d", baseURL, limit)
+				ctx.url = fmt.Sprintf("%s?limit=%d", baseURL, limit)
 			} else {
-				url = fmt.Sprintf("%s?limit=%d&marker=%s", baseURL, limit, marker)
+				ctx.url = fmt.Sprintf("%s?limit=%d&marker=%s", baseURL, limit, marker)
 			}
-			resp, err := cloudcommon.RequestGet(url, token, time.Duration(h.httpTimeout))
+			resp, err := RequestGet(ctx.url, ctx.token, time.Duration(h.httpTimeout), ctx.additionalHeaders)
 			if err != nil {
 				return []*simplejson.Json{}, err
 			}
 
-			jData := resp.Get(resultKey)
+			jData := resp.Get(ctx.resultKey)
 			curCount := len(jData.MustArray())
 			for i := range jData.MustArray() {
 				jsonList = append(jsonList, jData.GetIndex(i))
@@ -226,11 +243,60 @@ func (h *HuaWei) getRawData(url, token, resultKey string) (jsonList []*simplejso
 				break
 			}
 		}
+	} else if ctx.pageQueryMethod == pageQueryMethodOffset {
+		offset := 0
+		limit := 50
+		baseURL := ctx.url
+		for {
+			ctx.url = fmt.Sprintf("%s?limit=%d&offset=%d", baseURL, limit, offset)
+			resp, err := RequestGet(ctx.url, ctx.token, time.Duration(h.httpTimeout), ctx.additionalHeaders)
+			if err != nil {
+				return []*simplejson.Json{}, err
+			}
+
+			jData := resp.Get(ctx.resultKey)
+			curCount := len(jData.MustArray())
+			for i := range jData.MustArray() {
+				jsonList = append(jsonList, jData.GetIndex(i))
+			}
+			statsdAPIDataCount += curCount
+			if curCount < limit {
+				break
+			}
+			offset += curCount
+		}
 	}
+	h.cloudStatsd.RefreshAPIMoniter(ctx.resultKey, statsdAPIDataCount, statsdAPIStartTime)
 
-	h.cloudStatsd.RefreshAPICost(resultKey, statsdAPIStartTime)
-	h.cloudStatsd.RefreshAPICount(resultKey, statsdAPIDataCount)
-
-	h.debugger.WriteJson(resultKey, url, jsonList)
+	h.debugger.WriteJson(ctx.resultKey, ctx.url, jsonList)
 	return
+}
+
+const (
+	pageQueryMethodNotPage = iota
+	pageQueryMethodMarker
+	pageQueryMethodOffset
+)
+
+type rawDataGetContext struct {
+	url               string
+	token             string
+	pageQueryMethod   int
+	resultKey         string
+	additionalHeaders map[string]string
+}
+
+func newRawDataGetContext(url, token, resultKey string, pageQuery int) rawDataGetContext {
+	return rawDataGetContext{
+		url:               url,
+		token:             token,
+		resultKey:         resultKey,
+		pageQueryMethod:   pageQuery,
+		additionalHeaders: make(map[string]string),
+	}
+}
+
+func (c rawDataGetContext) addHeader(key, value string) rawDataGetContext {
+	c.additionalHeaders[key] = value
+	return c
 }

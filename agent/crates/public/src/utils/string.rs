@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,9 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 
 pub fn get_string_from_chars(chars: &[u8]) -> String {
     let mut end_index = chars.len();
@@ -32,16 +29,5 @@ pub fn get_string_from_chars(chars: &[u8]) -> String {
     unsafe {
         // safe because it has been checked that every character is ascii
         String::from_utf8_unchecked(result)
-    }
-}
-
-pub fn hash_endpoint(endpoint: &Option<String>) -> u64 {
-    match endpoint {
-        Some(s) => {
-            let mut hasher = DefaultHasher::new();
-            s.hash(&mut hasher);
-            hasher.finish()
-        }
-        None => 0,
     }
 }

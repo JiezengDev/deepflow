@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,12 +24,14 @@ pub mod enums;
 pub mod error;
 pub mod l7_protocol;
 pub mod leaky_bucket;
-pub mod netns;
 pub mod packet;
 pub mod proto;
 pub mod pwd;
 pub mod queue;
 pub mod sender;
 pub mod utils;
+
+#[cfg(target_os = "linux")]
+pub mod netns;
 
 pub use leaky_bucket::LeakyBucket;

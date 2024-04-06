@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,8 +17,9 @@
 package common
 
 const (
-	CLOUD_SYNC_TIMER_MIN = 60
-	CLOUD_SYNC_TIMER_MAX = 86400
+	CLOUD_SYNC_TIMER_DEFAULT = 60
+	CLOUD_SYNC_TIMER_MIN     = 1
+	CLOUD_SYNC_TIMER_MAX     = 86400
 )
 
 const (

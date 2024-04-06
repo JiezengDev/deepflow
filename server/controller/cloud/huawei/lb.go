@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan NATGateways
+ * Copyright (c) 2024 Yunshan NATGateways
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,11 +30,10 @@ func (h *HuaWei) getLBs() (
 ) {
 	requiredAttrs := []string{"id", "name", "vip_port_id", "vip_subnet_id", "vip_address"}
 	for project, token := range h.projectTokenMap {
-		jLBs, err := h.getRawData(
-			fmt.Sprintf("https://vpc.%s.%s/v2.0/lbaas/loadbalancers", project.name, h.config.Domain), token.token, "loadbalancers",
-		)
+		jLBs, err := h.getRawData(newRawDataGetContext(
+			fmt.Sprintf("https://vpc.%s.%s/v2.0/lbaas/loadbalancers", project.name, h.config.Domain), token.token, "loadbalancers", pageQueryMethodMarker,
+		))
 		if err != nil {
-			log.Errorf("request failed: %v", err)
 			return nil, nil, nil, nil, nil, err
 		}
 
@@ -92,13 +91,20 @@ func (h *HuaWei) getLBs() (
 					RegionLcuuid:  lb.RegionLcuuid,
 				},
 			)
+			var subnetLcuuid string
+			for _, subnet := range h.toolDataSet.networkLcuuidToSubnets[networkLcuuid] {
+				if cloudcommon.IsIPInCIDR(ip, subnet.CIDR) {
+					subnetLcuuid = subnet.Lcuuid
+					break
+				}
+			}
 			ips = append(
 				ips,
 				model.IP{
 					Lcuuid:           common.GenerateUUID(vifLcuuid + ip),
 					VInterfaceLcuuid: vifLcuuid,
 					IP:               ip,
-					SubnetLcuuid:     h.toolDataSet.networkLcuuidToSubnetLcuuid[networkLcuuid],
+					SubnetLcuuid:     subnetLcuuid,
 					RegionLcuuid:     lb.RegionLcuuid,
 				},
 			)
@@ -118,11 +124,10 @@ func (h *HuaWei) getLBs() (
 }
 
 func (h *HuaWei) formatListenersAndTargetServers(projectName, token string) (lbListeners []model.LBListener, lbTargetSevers []model.LBTargetServer, err error) {
-	jLs, err := h.getRawData(
-		fmt.Sprintf("https://vpc.%s.%s/v2.0/lbaas/listeners", projectName, h.config.Domain), token, "listeners",
-	)
+	jLs, err := h.getRawData(newRawDataGetContext(
+		fmt.Sprintf("https://vpc.%s.%s/v2.0/lbaas/listeners", projectName, h.config.Domain), token, "listeners", pageQueryMethodMarker,
+	))
 	if err != nil {
-		log.Errorf("request failed: %v", err)
 		return nil, nil, err
 	}
 
@@ -172,11 +177,10 @@ func (h *HuaWei) formatListenersAndTargetServers(projectName, token string) (lbL
 
 		poolID, ok := jL.CheckGet("default_pool_id")
 		if ok && poolID.MustString() != "" {
-			jTSs, err := h.getRawData(
-				fmt.Sprintf("https://vpc.%s.%s/v2.0/lbaas/pools/%s/members", projectName, h.config.Domain, poolID.MustString()), token, "members",
-			)
+			jTSs, err := h.getRawData(newRawDataGetContext(
+				fmt.Sprintf("https://vpc.%s.%s/v2.0/lbaas/pools/%s/members", projectName, h.config.Domain, poolID.MustString()), token, "members", pageQueryMethodMarker,
+			))
 			if err != nil {
-				log.Errorf("request failed: %v", err)
 				return nil, nil, err
 			}
 			for i := range jTSs {

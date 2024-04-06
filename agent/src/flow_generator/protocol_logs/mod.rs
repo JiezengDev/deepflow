@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 pub mod consts;
 pub(crate) mod dns;
+pub(crate) mod fastcgi;
 pub(crate) mod http;
 pub(crate) mod mq;
 mod parser;
@@ -23,46 +24,48 @@ pub mod pb_adapter;
 pub(crate) mod plugin;
 pub(crate) mod rpc;
 pub(crate) mod sql;
-pub use self::http::{
-    check_http_method, get_http_request_info, get_http_request_version, get_http_resp_info,
-    is_http_v1_payload, parse_v1_headers, HttpInfo, HttpLog, Httpv2Headers,
-};
+pub(crate) mod tls;
+pub use self::http::{check_http_method, parse_v1_headers, HttpInfo, HttpLog};
 use self::pb_adapter::L7ProtocolSendLog;
-pub use self::plugin::custom_wrap::CustomWrapLog;
-pub use self::plugin::wasm::{get_wasm_parser, WasmLog};
+
 pub use dns::{DnsInfo, DnsLog};
-pub use mq::{mqtt, KafkaInfo, KafkaLog, MqttInfo, MqttLog};
+pub use mq::{
+    AmqpInfo, AmqpLog, KafkaInfo, KafkaLog, MqttInfo, MqttLog, NatsInfo, NatsLog, OpenWireInfo,
+    OpenWireLog, PulsarInfo, PulsarLog, ZmtpInfo, ZmtpLog,
+};
 use num_enum::TryFromPrimitive;
-pub use parser::{MetaAppProto, SessionAggregator, SLOT_WIDTH};
+pub use parser::{AppProto, MetaAppProto, PseudoAppProto, SessionAggregator, SLOT_WIDTH};
 pub use rpc::{
-    decode_new_rpc_trace_context, decode_new_rpc_trace_context_with_type, get_protobuf_rpc_parser,
-    DubboHeader, DubboInfo, DubboLog, ProtobufRpcInfo, ProtobufRpcWrapLog, SofaRpcInfo, SofaRpcLog,
-    SOFA_NEW_RPC_TRACE_CTX_KEY,
+    decode_new_rpc_trace_context_with_type, BrpcInfo, BrpcLog, DubboInfo, DubboLog, SofaRpcInfo,
+    SofaRpcLog, SOFA_NEW_RPC_TRACE_CTX_KEY,
 };
 pub use sql::{
-    decode, MysqlHeader, MysqlInfo, MysqlLog, PostgreInfo, PostgresqlLog, RedisInfo, RedisLog,
+    MongoDBInfo, MongoDBLog, MysqlInfo, MysqlLog, OracleInfo, OracleLog, PostgreInfo,
+    PostgresqlLog, RedisInfo, RedisLog,
 };
+pub use tls::{TlsInfo, TlsLog};
+
+#[cfg(test)]
+pub use self::plugin::wasm::{get_wasm_parser, WasmLog};
 
 use std::{
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     str,
-    time::Duration,
 };
 
+use base64::{prelude::BASE64_STANDARD, Engine};
 use prost::Message;
 use serde::{Serialize, Serializer};
 
-use crate::common::l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface};
 use crate::{
     common::{
         ebpf::EbpfType,
         enums::{IpProtocol, TapType},
         flow::{L7Protocol, PacketDirection, SignalSource},
         tap_port::TapPort,
+        Timestamp,
     },
-    flow_generator::error::Error,
-    flow_generator::error::Result,
     metric::document::TapSide,
 };
 use public::proto::flow_log;
@@ -151,19 +154,18 @@ impl From<AppProtoHead> for flow_log::AppProtoHead {
 
 #[derive(Serialize, Debug, Clone)]
 pub struct AppProtoLogsBaseInfo {
-    #[serde(serialize_with = "duration_to_micros")]
-    pub start_time: Duration,
-    #[serde(serialize_with = "duration_to_micros")]
-    pub end_time: Duration,
+    #[serde(serialize_with = "timestamp_to_micros")]
+    pub start_time: Timestamp,
+    #[serde(serialize_with = "timestamp_to_micros")]
+    pub end_time: Timestamp,
     pub flow_id: u64,
     #[serde(serialize_with = "to_string_format")]
     pub tap_port: TapPort,
     pub signal_source: SignalSource,
     pub vtap_id: u16,
     pub tap_type: TapType,
-    #[serde(skip)]
-    pub is_ipv6: bool,
     pub tap_side: TapSide,
+    pub biz_type: u8,
     #[serde(flatten)]
     pub head: AppProtoHead,
 
@@ -214,9 +216,13 @@ pub struct AppProtoLogsBaseInfo {
     #[serde(rename = "syscall_thread_1", skip_serializing_if = "value_is_default")]
     pub syscall_trace_id_thread_1: u32,
     #[serde(skip_serializing_if = "value_is_default")]
-    pub syscall_cap_seq_0: u64,
+    pub syscall_coroutine_0: u64,
     #[serde(skip_serializing_if = "value_is_default")]
-    pub syscall_cap_seq_1: u64,
+    pub syscall_coroutine_1: u64,
+    #[serde(skip_serializing_if = "value_is_default")]
+    pub syscall_cap_seq_0: u32,
+    #[serde(skip_serializing_if = "value_is_default")]
+    pub syscall_cap_seq_1: u32,
 
     pub protocol: IpProtocol,
     #[serde(skip)]
@@ -224,12 +230,12 @@ pub struct AppProtoLogsBaseInfo {
     #[serde(skip)]
     pub is_vip_interface_dst: bool,
     #[serde(skip)]
-    pub netns_id_0: u32,
+    pub pod_id_0: u32,
     #[serde(skip)]
-    pub netns_id_1: u32,
+    pub pod_id_1: u32,
 }
 
-pub fn duration_to_micros<S>(d: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+pub fn timestamp_to_micros<S>(d: &Timestamp, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -276,7 +282,7 @@ impl From<AppProtoLogsBaseInfo> for flow_log::AppProtoLogsBaseInfo {
             tap_port: f.tap_port.0,
             vtap_id: f.vtap_id as u32,
             tap_type: u16::from(f.tap_type) as u32,
-            is_ipv6: f.is_ipv6 as u32,
+            is_ipv6: f.ip_src.is_ipv6() as u32,
             tap_side: f.tap_side as u32,
             head: Some(f.head.into()),
             mac_src: f.mac_src.into(),
@@ -302,33 +308,59 @@ impl From<AppProtoLogsBaseInfo> for flow_log::AppProtoLogsBaseInfo {
             syscall_trace_id_response: f.syscall_trace_id_response,
             syscall_trace_id_thread_0: f.syscall_trace_id_thread_0,
             syscall_trace_id_thread_1: f.syscall_trace_id_thread_1,
-            syscall_cap_seq_0: f.syscall_cap_seq_0 as u32,
-            syscall_cap_seq_1: f.syscall_cap_seq_1 as u32,
+            syscall_cap_seq_0: f.syscall_cap_seq_0,
+            syscall_cap_seq_1: f.syscall_cap_seq_1,
+            syscall_coroutine_0: f.syscall_coroutine_0,
+            syscall_coroutine_1: f.syscall_coroutine_1,
             gpid_0: f.gpid_0,
             gpid_1: f.gpid_1,
-            netns_id_0: f.netns_id_0,
-            netns_id_1: f.netns_id_1,
+            pod_id_0: f.pod_id_0,
+            pod_id_1: f.pod_id_1,
+            biz_type: f.biz_type as u32,
         }
     }
 }
 
 impl AppProtoLogsBaseInfo {
     // 请求调用回应来合并
-    fn merge(&mut self, log: AppProtoLogsBaseInfo) {
+    fn merge(&mut self, log: &mut AppProtoLogsBaseInfo) {
         // adjust protocol when change, now only use for http2 change to grpc.
         if self.head.proto != log.head.proto {
             self.head.proto = log.head.proto;
         }
         if log.process_id_0 > 0 {
             self.process_id_0 = log.process_id_0;
-            self.process_kname_0 = log.process_kname_0;
+            std::mem::swap(&mut self.process_kname_0, &mut log.process_kname_0);
         }
         if log.process_id_1 > 0 {
             self.process_id_1 = log.process_id_1;
-            self.process_kname_1 = log.process_kname_1;
+            std::mem::swap(&mut self.process_kname_1, &mut log.process_kname_1);
         }
-        self.syscall_trace_id_thread_1 = log.syscall_trace_id_thread_1;
-        self.syscall_cap_seq_1 = log.syscall_cap_seq_1;
+        if log.syscall_coroutine_0 > 0 {
+            self.syscall_coroutine_0 = log.syscall_coroutine_0;
+        }
+        if log.syscall_coroutine_1 > 0 {
+            self.syscall_coroutine_1 = log.syscall_coroutine_1;
+        }
+        if log.syscall_trace_id_thread_0 > 0 {
+            self.syscall_trace_id_thread_0 = log.syscall_trace_id_thread_0;
+        }
+        if log.syscall_trace_id_thread_1 > 0 {
+            self.syscall_trace_id_thread_1 = log.syscall_trace_id_thread_1;
+        }
+        if log.syscall_cap_seq_0 > 0 {
+            self.syscall_cap_seq_0 = log.syscall_cap_seq_0;
+        }
+        if log.syscall_cap_seq_1 > 0 {
+            self.syscall_cap_seq_1 = log.syscall_cap_seq_1;
+        }
+
+        if log.syscall_trace_id_request > 0 {
+            self.syscall_trace_id_request = log.syscall_trace_id_request;
+        }
+        if log.syscall_trace_id_response > 0 {
+            self.syscall_trace_id_response = log.syscall_trace_id_response;
+        }
 
         self.start_time = log.start_time.min(self.start_time);
         self.end_time = log.end_time.max(self.end_time);
@@ -342,7 +374,6 @@ impl AppProtoLogsBaseInfo {
             _ => {}
         }
 
-        self.syscall_trace_id_response = log.syscall_trace_id_response;
         // go http2 uprobe  may merge multi times, if not req and resp merge can not set to session
         if self.head.msg_type != log.head.msg_type {
             self.head.msg_type = LogMessageType::Session;
@@ -356,114 +387,8 @@ impl AppProtoLogsBaseInfo {
     }
 }
 
-#[derive(Serialize, Debug, Clone)]
-pub struct AppProtoLogsData {
-    #[serde(flatten)]
-    pub base_info: AppProtoLogsBaseInfo,
-    #[serde(flatten)]
-    pub special_info: L7ProtocolInfo,
-    pub direction_score: u8,
-}
-
-impl fmt::Display for AppProtoLogsData {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} direction_score: {}\n",
-            self.base_info, self.direction_score
-        )?;
-        write!(f, "\t{:?}", self.special_info)
-    }
-}
-
-impl AppProtoLogsData {
-    pub fn new(
-        base_info: AppProtoLogsBaseInfo,
-        special_info: L7ProtocolInfo,
-        direction_score: u8,
-    ) -> Self {
-        Self {
-            base_info,
-            special_info,
-            direction_score,
-        }
-    }
-
-    pub fn is_request(&self) -> bool {
-        self.base_info.head.msg_type == LogMessageType::Request
-    }
-
-    pub fn is_response(&self) -> bool {
-        return self.base_info.head.msg_type == LogMessageType::Response;
-    }
-
-    pub fn ebpf_flow_session_id(&self) -> u64 {
-        // 取flow_id(即ebpf底层的socket id)的高8位(cpu id)+低24位(socket id的变化增量), 作为聚合id的高32位
-        // |flow_id 高8位| flow_id 低24位|proto 8 位|session 低24位|
-
-        // due to grpc is init by http2 and modify during parse, it must reset to http2 when the protocol is grpc.
-        let proto = if self.base_info.head.proto == L7Protocol::Grpc {
-            if let L7ProtocolInfo::HttpInfo(http) = &self.special_info {
-                if http.is_tls() {
-                    L7Protocol::Http2TLS
-                } else {
-                    L7Protocol::Http2
-                }
-            } else {
-                unreachable!()
-            }
-        } else {
-            self.base_info.head.proto
-        };
-
-        let flow_id_part =
-            (self.base_info.flow_id >> 56 << 56) | (self.base_info.flow_id << 40 >> 8);
-        if let Some(session_id) = self.special_info.session_id() {
-            flow_id_part | (proto as u64) << 24 | ((session_id as u64) & 0xffffff)
-        } else {
-            let mut cap_seq = self
-                .base_info
-                .syscall_cap_seq_0
-                .max(self.base_info.syscall_cap_seq_1);
-            if self.base_info.head.msg_type == LogMessageType::Request {
-                cap_seq += 1;
-            };
-            flow_id_part | ((proto as u64) << 24) | (cap_seq & 0xffffff)
-        }
-    }
-
-    pub fn session_merge(&mut self, log: Self) -> Result<()> {
-        if let Err(err) = self.protocol_merge(log.special_info) {
-            /*
-                if can not merge, return log which can not merge to self.
-                the follow circumstance can not merge:
-                    when ebpf disorder, http1 can not match req/resp.
-            */
-            if let Error::L7ProtocolCanNotMerge(special_info) = err {
-                return Err(Error::L7LogCanNotMerge(Self {
-                    special_info,
-                    ..log
-                }));
-            }
-            return Err(err);
-        };
-        self.base_info.merge(log.base_info);
-        Ok(())
-    }
-
-    fn protocol_merge(&mut self, log: L7ProtocolInfo) -> Result<()> {
-        self.special_info.merge_log(log)
-    }
-
-    // 是否需要进一步聚合
-    // 目前仅http2 uprobe 需要聚合多个请求
-    pub fn need_protocol_merge(&self) -> bool {
-        self.special_info.need_merge()
-    }
-}
-
 #[derive(Debug)]
-pub struct BoxAppProtoLogsData(pub Box<AppProtoLogsData>);
+pub struct BoxAppProtoLogsData(pub Box<MetaAppProto>);
 
 impl Sendable for BoxAppProtoLogsData {
     fn encode(self, buf: &mut Vec<u8>) -> Result<usize, prost::EncodeError> {
@@ -473,7 +398,7 @@ impl Sendable for BoxAppProtoLogsData {
             ..Default::default()
         };
 
-        let log: L7ProtocolSendLog = self.0.special_info.into();
+        let log: L7ProtocolSendLog = self.0.l7_info.into();
         log.fill_app_proto_log(&mut pb_proto_logs_data);
         pb_proto_logs_data
             .encode(buf)
@@ -544,7 +469,7 @@ impl fmt::Display for AppProtoLogsBaseInfo {
 }
 
 fn decode_base64_to_string(value: &str) -> String {
-    let bytes = match base64::decode(value) {
+    let bytes = match BASE64_STANDARD.decode(value) {
         Ok(v) => v,
         Err(_) => return value.to_string(),
     };
@@ -553,3 +478,18 @@ fn decode_base64_to_string(value: &str) -> String {
         Err(_) => value.to_string(),
     }
 }
+
+macro_rules! swap_if {
+    ($this:expr, $field:ident, is_none, $other:expr) => {
+        if $this.$field.is_none() {
+            std::mem::swap(&mut $this.$field, &mut $other.$field);
+        }
+    };
+    ($this:expr, $field:ident, is_empty, $other:expr) => {
+        if $this.$field.is_empty() {
+            std::mem::swap(&mut $this.$field, &mut $other.$field);
+        }
+    };
+}
+
+pub(crate) use swap_if;

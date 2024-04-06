@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -39,11 +39,15 @@ type ProfileTreeNode struct {
 }
 
 type Debug struct {
-	IP         string
-	Sql        string `json:"sql"`
-	SqlCH      string `json:"sql_CH"`
-	QueryTime  string `json:"query_time"`
-	FormatTime string `json:"format_time"`
-	QueryUUID  string `json:"query_uuid"`
-	Error      string `json:"error"`
+	IP        string `json:"ip"`
+	Sql       string `json:"sql"`
+	SqlCH     string `json:"sql_CH"`
+	QueryTime string `json:"query_time"`
+	QueryUUID string `json:"query_uuid"`
+	Error     string `json:"error"`
+}
+
+type ProfileDebug struct {
+	QuerierDebug []Debug `json:"querier_debug"`
+	FormatTime   string  `json:"format_time"`
 }

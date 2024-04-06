@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -83,12 +83,15 @@ func (n *Group) ToString() string {
 }
 
 func (n *Group) WriteTo(buf *bytes.Buffer) {
+
 	if n.Alias != "" {
 		buf.WriteString(n.Value)
 		buf.WriteString(" AS ")
 		buf.WriteString("`")
 		buf.WriteString(strings.Trim(n.Alias, "`"))
 		buf.WriteString("`")
+	} else if strings.Contains(n.Value, ",") {
+		buf.WriteString(n.Value)
 	} else {
 		buf.WriteString("`")
 		buf.WriteString(strings.Trim(n.Value, "`"))

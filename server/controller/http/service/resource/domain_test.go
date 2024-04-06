@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -192,7 +192,7 @@ func (t *SuiteTest) TestDeleteDomain() {
 	r = t.db.Create(&mysql.Pod{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
 
-	DeleteDomain(domain.Lcuuid)
+	DeleteDomainByNameOrUUID(domain.Lcuuid, t.db)
 
 	var azs []mysql.AZ
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&azs)
@@ -356,7 +356,7 @@ func (t *SuiteTest) TestDeleteSubDomain() {
 	r = t.db.Create(&mysql.Pod{Base: mysql.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
 
-	DeleteSubDomain(lcuuid)
+	DeleteSubDomain(lcuuid, t.db)
 
 	var networks []mysql.Network
 	t.db.Unscoped().Where("sub_domain = ?", lcuuid).Find(&networks)

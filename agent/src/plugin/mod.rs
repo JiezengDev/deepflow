@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,22 +14,25 @@
  * limitations under the License.
  */
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod c_ffi;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod shared_obj;
 pub mod wasm;
 
-use public::{bytes::read_u32_be, l7_protocol::L7Protocol};
+use public::{bytes::read_u32_be, counter::Countable, l7_protocol::L7Protocol};
 use serde::Serialize;
 
 use crate::{
     common::flow::PacketDirection,
     common::l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
     flow_generator::{
-        protocol_logs::pb_adapter::{
-            ExtendedInfo, KeyVal, L7ProtocolSendLog, L7Request, L7Response, TraceInfo,
+        protocol_logs::{
+            pb_adapter::{
+                ExtendedInfo, KeyVal, L7ProtocolSendLog, L7Request, L7Response, TraceInfo,
+            },
+            swap_if, L7ResponseStatus, LogMessageType,
         },
-        protocol_logs::{L7ResponseStatus, LogMessageType},
         AppProtoHead, Error,
     },
 };
@@ -85,6 +88,8 @@ pub struct CustomInfo {
 
     #[serde(skip)]
     pub attributes: Vec<KeyVal>,
+
+    pub biz_type: u8,
 }
 
 impl TryFrom<(&[u8], PacketDirection)> for CustomInfo {
@@ -154,6 +159,8 @@ impl TryFrom<(&[u8], PacketDirection)> for CustomInfo {
                 val:     $(val len) bytes
 
             ) x len(kv)
+
+        biz type: 1 byte
     */
 
     type Error = Error;
@@ -230,6 +237,7 @@ impl TryFrom<(&[u8], PacketDirection)> for CustomInfo {
                 let status = buf[off];
                 match status {
                     0 => info.resp.status = L7ResponseStatus::Ok,
+                    2 => info.resp.status = L7ResponseStatus::NotExist,
                     3 => info.resp.status = L7ResponseStatus::ServerError,
                     4 => info.resp.status = L7ResponseStatus::ClientError,
                     _ => {
@@ -359,6 +367,15 @@ impl TryFrom<(&[u8], PacketDirection)> for CustomInfo {
                 ))
             }
         }
+
+        // biz type
+        if off + 1 > buf.len() {
+            return Err(Error::WasmSerializeFail(
+                "buf len too short when parse biz_type".to_string(),
+            ));
+        }
+        info.biz_type = buf[off];
+
         Ok(info)
     }
 }
@@ -368,23 +385,13 @@ impl L7ProtocolInfoInterface for CustomInfo {
         self.request_id
     }
 
-    fn merge_log(&mut self, other: L7ProtocolInfo) -> crate::flow_generator::Result<()> {
+    fn merge_log(&mut self, other: &mut L7ProtocolInfo) -> crate::flow_generator::Result<()> {
         if let L7ProtocolInfo::CustomInfo(w) = other {
             // req merge
-            if self.req.domain.is_empty() {
-                self.req.domain = w.req.domain;
-            }
-            if self.req.endpoint.is_empty() {
-                self.req.endpoint = w.req.endpoint;
-            }
-
-            if self.req.req_type.is_empty() {
-                self.req.req_type = w.req.req_type;
-            }
-
-            if self.req.resource.is_empty() {
-                self.req.resource = w.req.resource;
-            }
+            swap_if!(self.req, req_type, is_empty, w.req);
+            swap_if!(self.req, domain, is_empty, w.req);
+            swap_if!(self.req, resource, is_empty, w.req);
+            swap_if!(self.req, endpoint, is_empty, w.req);
 
             if self.req_len.is_none() {
                 self.req_len = w.req_len;
@@ -395,10 +402,6 @@ impl L7ProtocolInfoInterface for CustomInfo {
             }
 
             // resp merge
-            if self.resp.exception.is_empty() {
-                self.resp.exception = w.resp.exception;
-            }
-
             if self.resp.status == L7ResponseStatus::default() {
                 self.resp.status = w.resp.status;
             }
@@ -407,9 +410,8 @@ impl L7ProtocolInfoInterface for CustomInfo {
                 self.resp.code = w.resp.code;
             }
 
-            if self.resp.result.is_empty() {
-                self.resp.result = w.resp.result;
-            }
+            swap_if!(self.resp, exception, is_empty, w.resp);
+            swap_if!(self.resp, result, is_empty, w.resp);
 
             if self.resp_len.is_none() {
                 self.resp_len = w.resp_len;
@@ -420,17 +422,10 @@ impl L7ProtocolInfoInterface for CustomInfo {
             }
 
             // trace merge
-            if self.trace.trace_id.is_none() {
-                self.trace.trace_id = w.trace.trace_id;
-            }
-
-            if self.trace.span_id.is_none() {
-                self.trace.span_id = w.trace.span_id;
-            }
-            if self.trace.parent_span_id.is_none() {
-                self.trace.parent_span_id = w.trace.parent_span_id;
-            }
-            self.attributes.extend(w.attributes);
+            swap_if!(self.trace, trace_id, is_none, w.trace);
+            swap_if!(self.trace, span_id, is_none, w.trace);
+            swap_if!(self.trace, parent_span_id, is_none, w.trace);
+            self.attributes.append(&mut w.attributes);
         }
         Ok(())
     }
@@ -457,6 +452,10 @@ impl L7ProtocolInfoInterface for CustomInfo {
 
     fn get_endpoint(&self) -> Option<String> {
         None
+    }
+
+    fn get_biz_type(&self) -> u8 {
+        self.biz_type
     }
 }
 
@@ -499,4 +498,11 @@ impl From<CustomInfo> for L7ProtocolSendLog {
             ..Default::default()
         }
     }
+}
+
+pub struct PluginCounterInfo<'a> {
+    pub plugin_name: &'a str,
+    pub plugin_type: &'static str,
+    pub function_name: &'static str,
+    pub counter: Countable,
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -50,7 +50,8 @@ const (
 	CMD_PROMETHEUS_LABEL
 	CMD_L7_FLOW_LOG
 	CMD_OTLP_EXPORTER
-	CMD_OTLP_PLATFORMDATA
+	CMD_EXPORTER_PLATFORMDATA
+	CMD_PLATFORMDATA_PROFILE
 )
 
 const (

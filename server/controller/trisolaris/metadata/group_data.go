@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,7 +23,6 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	mapset "github.com/deckarep/golang-set"
 	"github.com/deepflowio/deepflow/message/trident"
@@ -58,6 +57,7 @@ type GroupProto struct {
 	groupVersion uint64
 	groups       *atomic.Value // []byte
 	groupHash    uint64
+	startTime    int64
 }
 
 func newGroupProto() *GroupProto {
@@ -79,7 +79,7 @@ func (g *GroupProto) checkVersion(groupHash uint64) {
 	if g.groupHash != groupHash {
 		g.groupHash = groupHash
 		if g.groupVersion == 0 {
-			g.groupVersion = uint64(time.Now().Unix())
+			g.groupVersion = uint64(g.startTime)
 		} else {
 			atomic.AddUint64(&g.groupVersion, 1)
 		}
@@ -138,6 +138,11 @@ var tridentGroup = []int{NPB_BUSINESS_ID, PCAP_BUSINESS_ID}
 type GroupIP struct {
 	cidrs    []string
 	ipRanges []string
+}
+
+func (g *GroupDataOP) SetStartTime(startTime int64) {
+	g.tridentGroupProto.startTime = startTime
+	g.dropletGroupProto.startTime = startTime
 }
 
 func (g *GroupDataOP) GetIDToGroup() map[int]*models.ResourceGroup {
@@ -365,7 +370,10 @@ func (g *GroupDataOP) generateGroupRawData() {
 						log.Error(err)
 						continue
 					}
-					if vpcData, ok := rawData.vpcIDToDeviceIPs[resourceGroup.VPCID]; ok {
+					if resourceGroup.VPCID == nil {
+						continue
+					}
+					if vpcData, ok := rawData.vpcIDToDeviceIPs[*resourceGroup.VPCID]; ok {
 						typeIDKey := TypeIDKey{
 							Type: VIF_DEVICE_TYPE_VM,
 							ID:   id,
@@ -378,7 +386,7 @@ func (g *GroupDataOP) generateGroupRawData() {
 						// Keep data in order
 						sort.Strings(ips)
 					}
-					if vpcData, ok := rawData.vpcIDToVmidFips[resourceGroup.VPCID]; ok {
+					if vpcData, ok := rawData.vpcIDToVmidFips[*resourceGroup.VPCID]; ok {
 						if vpcIPs, ok := vpcData[id]; ok {
 							for _, ip := range vpcIPs {
 								ips = append(ips, ip)
@@ -514,9 +522,13 @@ func (g *GroupDataOP) generateResourceGroupData(groups []*models.ResourceGroup) 
 
 			groupType = anonymous
 		}
+		vpcID := ANY_EPC_ID_UINT32
+		if group.VPCID != nil {
+			vpcID = *group.VPCID
+		}
 		rg := &trident.Group{
 			Id:       proto.Uint32(uint32(group.ID)),
-			EpcId:    proto.Uint32(uint32(group.VPCID)),
+			EpcId:    proto.Uint32(uint32(vpcID)),
 			Type:     &groupType,
 			IpRanges: groupIP.ipRanges,
 			Ips:      groupIP.cidrs,

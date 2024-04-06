@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,8 +26,13 @@ const GO_BIRTHDAY = "2006-01-02 15:04:05"
 const K8S_CA_CRT_PATH = "/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
 const (
+	DEFAULT_ORG_ID  = 1
+	DEFAULT_TEAM_ID = 1
+)
+
+const (
 	REMOTE_API_TIMEOUT = 30
-	ROZE_PORT          = 30106
+	INGESTER_API_PORT  = 30106
 )
 
 const (
@@ -84,6 +89,7 @@ const (
 	OS_UBUNTU  = 3
 	OS_SUSE    = 4
 	OS_WINDOWS = 5
+	OS_ANDROID = 6
 )
 
 const (
@@ -202,7 +208,11 @@ const (
 	VTAP_LICENSE_FUNCTION_NONE = iota
 	VTAP_LICENSE_FUNCTION_TRAFFIC_DISTRIBUTION
 	VTAP_LICENSE_FUNCTION_NETWORK_MONITORING
+	VTAP_LICENSE_FUNCTION_CALL_MONITORING
+	VTAP_LICENSE_FUNCTION_FUNCTION_MONITORING
 	VTAP_LICENSE_FUNCTION_APPLICATION_MONITORING
+	VTAP_LICENSE_FUNCTION_INDICATOR_MONITORING
+	VTAP_LICENSE_FUNCTION_DATABASE_MONITORING
 	VTAP_LICENSE_FUNCTION_MAX
 )
 
@@ -246,7 +256,9 @@ const (
 
 const (
 	DEFAULT_ENCRYPTION_PASSWORD = "******"
-	DEFAULT_PORT_NAME_REGEX     = "^(cni|flannel|cali|vxlan.calico|tunl|en[ospx])"
+	DEFAULT_ALL_MATCH_REGEX     = ".*"
+	DEFAULT_NOT_MATCH_REGEX     = "^$"
+	DEFAULT_PORT_NAME_REGEX     = "^(cni|flannel|vxlan.calico|tunl|en[ospx])"
 
 	OPENSTACK         = 1
 	VSPHERE           = 2
@@ -273,6 +285,8 @@ const (
 	MICROSOFT_ACS     = 24
 	BAIDU_BCE         = 25
 	ESHORE            = 26
+	CLOUD_TOWER       = 27
+	NFVO              = 28
 
 	OPENSTACK_EN         = "openstack"
 	VSPHERE_EN           = "vsphere"
@@ -300,6 +314,8 @@ const (
 	AGENT_SYNC_EN        = "genesis"
 	MICROSOFT_ACS_EN     = "microsoft_acs"
 	BAIDU_BCE_EN         = "baidu_bce"
+	CLOUD_TOWER_EN       = "cloudtower"
+	NFVO_EN              = "nfvo"
 
 	TENCENT_CH          = "腾讯云"
 	PINGAN_CH           = "平安云"
@@ -310,13 +326,15 @@ const (
 	MICROSOFT_CH        = "微软云"
 	BAIDU_BCE_CH        = "百度云"
 	ESHORE_CH           = "亿迅云"
+	NFVO_CH             = "华为NFVO+"
 
-	OPENSTACK_CH  = "OpenStack"
-	VSPHERE_CH    = "vSphere"
-	NSP_CH        = "NSP"
-	AWS_CH        = "AWS"
-	ZSTACK_CH     = "ZStack"
-	KUBERNETES_CH = "Kubernetes"
+	OPENSTACK_CH   = "OpenStack"
+	VSPHERE_CH     = "vSphere"
+	NSP_CH         = "NSP"
+	AWS_CH         = "AWS"
+	ZSTACK_CH      = "ZStack"
+	KUBERNETES_CH  = "Kubernetes"
+	CLOUD_TOWER_CH = "CloudTower"
 )
 
 var DomainTypeToIconID = map[int]int{
@@ -380,11 +398,17 @@ const (
 	VIF_DEVICE_TYPE_LB             = 15
 	VIF_DEVICE_TYPE_NAT_GATEWAY    = 16
 
-	VIF_DEVICE_TYPE_INTERNET  = 0
-	VIF_DEVICE_TYPE_POD_GROUP = 101
-	VIF_DEVICE_TYPE_SERVICE   = 102
-	VIF_DEVICE_TYPE_GPROCESS  = 120
-	VIF_DEVICE_TYPE_IP        = 255
+	VIF_DEVICE_TYPE_INTERNET                        = 0
+	VIF_DEVICE_TYPE_POD_GROUP                       = 101
+	VIF_DEVICE_TYPE_SERVICE                         = 102
+	VIF_DEVICE_TYPE_GPROCESS                        = 120
+	VIF_DEVICE_TYPE_POD_GROUP_DEPLOYMENT            = 130
+	VIF_DEVICE_TYPE_POD_GROUP_STATEFULSET           = 131
+	VIF_DEVICE_TYPE_POD_GROUP_RC                    = 132
+	VIF_DEVICE_TYPE_POD_GROUP_DAEMON_SET            = 133
+	VIF_DEVICE_TYPE_POD_GROUP_REPLICASET_CONTROLLER = 134
+	VIF_DEVICE_TYPE_POD_GROUP_CLONESET              = 135
+	VIF_DEVICE_TYPE_IP                              = 255
 )
 
 const (
@@ -433,7 +457,7 @@ const (
 	RDS_TYPE_MYSQL      = 1
 	RDS_TYPE_SQL_SERVER = 2
 	RDS_TYPE_PPAS       = 3
-	RDS_TYPE_PSQL       = 4
+	RDS_TYPE_PSQL       = 4 // PostgreSQL
 	RDS_TYPE_MARIADB    = 5
 
 	RDS_STATE_RUNNING   = 1
@@ -450,6 +474,10 @@ const (
 )
 
 const (
+	REDIS_STATE_RUNNING = 1
+)
+
+const (
 	INTERVAL_1MINUTE = 60
 	INTERVAL_1HOUR   = 3600
 	INTERVAL_1DAY    = 86400
@@ -459,8 +487,9 @@ const (
 )
 
 const (
-	DATA_SOURCE_FLOW = "flow_metrics.vtap_flow*"
-	DATA_SOURCE_APP  = "flow_metrics.vtap_app*"
+	DATA_SOURCE_NETWORK        = "flow_metrics.network*"
+	DATA_SOURCE_APPLICATION    = "flow_metrics.application*"
+	DATA_SOURCE_TRAFFIC_POLICY = "flow_metrics.traffic_policy"
 
 	DATA_SOURCE_STATE_EXCEPTION = 0
 	DATA_SOURCE_STATE_NORMAL    = 1
@@ -521,11 +550,12 @@ const (
 )
 
 const (
-	NODE_NAME_KEY  = "K8S_NODE_NAME_FOR_DEEPFLOW"
-	NODE_IP_KEY    = "K8S_NODE_IP_FOR_DEEPFLOW"
-	POD_NAME_KEY   = "K8S_POD_NAME_FOR_DEEPFLOW"
-	POD_IP_KEY     = "K8S_POD_IP_FOR_DEEPFLOW"
-	NAME_SPACE_KEY = "K8S_NAMESPACE_FOR_DEEPFLOW"
+	NODE_NAME_KEY    = "K8S_NODE_NAME_FOR_DEEPFLOW"
+	NODE_IP_KEY      = "K8S_NODE_IP_FOR_DEEPFLOW"
+	POD_NAME_KEY     = "K8S_POD_NAME_FOR_DEEPFLOW"
+	POD_IP_KEY       = "K8S_POD_IP_FOR_DEEPFLOW"
+	NAME_SPACE_KEY   = "K8S_NAMESPACE_FOR_DEEPFLOW"
+	RUNNING_MODE_KEY = "DEEPFLOW_SERVER_RUNNING_MODE"
 )
 
 const (
@@ -566,6 +596,11 @@ const (
 	TAPMODE_MIRROR   = 1
 	TAPMODE_ANALYZER = 2
 	TAPMODE_DECAP    = 3
+)
+
+const (
+	AGENT_IDENTIFIE_IP_AND_MAC = 1
+	AGENT_IDENTIFIE_IP         = 2
 )
 
 var VtapTapModeName = map[int]string{
@@ -612,10 +647,35 @@ const (
 // plugin
 const (
 	PLUGIN_TYPE_WASM = 1
+	PLUGIN_TYPE_SO   = 2
 )
 
 var (
 	PluginTypeName = map[int]string{
 		PLUGIN_TYPE_WASM: "wasm",
+		PLUGIN_TYPE_SO:   "so",
 	}
+)
+
+const (
+	PROMETHEUS_TARGET_CREATE_METHOD_RECORDER   = 1
+	PROMETHEUS_TARGET_CREATE_METHOD_PROMETHEUS = 2
+)
+
+const (
+	ANALYZER_ALLOC_BY_INGESTED_DATA = "by-ingested-data"
+	ANALYZER_ALLOC_BY_AGENT_COUNT   = "by-agent-count"
+)
+
+const (
+	DATA_SOURCE_DEEPFLOW_SYSTEM_INTERVAL = 10
+)
+
+const (
+	RUNNING_MODE_STANDALONE = "STANDALONE"
+)
+
+const (
+	HEADER_KEY_X_ORG_ID  = "X-Org-Id"
+	INGESTER_BODY_ORG_ID = "org-id"
 )

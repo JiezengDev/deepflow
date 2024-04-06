@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,6 +37,7 @@ type Host struct {
 	Lcuuid       string `json:"lcuuid" binding:"required"`
 	Name         string `json:"name" binding:"required"`
 	IP           string `json:"ip" binding:"required"`
+	Hostname     string `json:"hostname"`
 	Type         int    `json:"type" binding:"required"`
 	HType        int    `json:"htype" binding:"required"`
 	VCPUNum      int    `json:"vcpu_num"`
@@ -47,17 +48,19 @@ type Host struct {
 }
 
 type VM struct {
-	Lcuuid       string    `json:"lcuuid" binding:"required"`
-	Name         string    `json:"name" binding:"required"`
-	Label        string    `json:"label"`
-	HType        int       `json:"htype" binding:"required"`
-	State        int       `json:"state" binding:"required"`
-	LaunchServer string    `json:"launch_server" binding:"required"`
-	CloudTags    string    `json:"cloud_tags"`
-	CreatedAt    time.Time `json:"created_at"`
-	VPCLcuuid    string    `json:"vpc_lcuuid" binding:"required"`
-	AZLcuuid     string    `json:"az_lcuuid" binding:"required"`
-	RegionLcuuid string    `json:"region_lcuuid" binding:"required"`
+	Lcuuid       string            `json:"lcuuid" binding:"required"`
+	Name         string            `json:"name" binding:"required"`
+	Label        string            `json:"label"`
+	IP           string            `json:"ip"`
+	Hostname     string            `json:"hostname"`
+	HType        int               `json:"htype" binding:"required"`
+	State        int               `json:"state" binding:"required"`
+	LaunchServer string            `json:"launch_server" binding:"required"`
+	CreatedAt    time.Time         `json:"created_at"`
+	VPCLcuuid    string            `json:"vpc_lcuuid" binding:"required"`
+	AZLcuuid     string            `json:"az_lcuuid" binding:"required"`
+	RegionLcuuid string            `json:"region_lcuuid" binding:"required"`
+	CloudTags    map[string]string `json:"cloud_tags"`
 }
 
 type VMPodNodeConnection struct {
@@ -343,6 +346,7 @@ type PodNode struct {
 	ServerType       int    `json:"server_type" binding:"required"`
 	State            int    `json:"state" binding:"required"`
 	IP               string `json:"ip" binding:"required"`
+	Hostname         string `json:"hostname"`
 	VCPUNum          int    `json:"vcpu_num"`
 	MemTotal         int    `json:"memory_total"`
 	PodClusterLcuuid string `json:"pod_cluster_lcuuid" binding:"required"`
@@ -353,13 +357,13 @@ type PodNode struct {
 }
 
 type PodNamespace struct {
-	Lcuuid           string `json:"lcuuid" binding:"required"`
-	Name             string `json:"name" binding:"required"`
-	CloudTags        string `json:"cloud_tags"`
-	PodClusterLcuuid string `json:"pod_cluster_lcuuid" binding:"required"`
-	AZLcuuid         string `json:"az_lcuuid" binding:"required"`
-	RegionLcuuid     string `json:"region_lcuuid" binding:"required"`
-	SubDomainLcuuid  string `json:"sub_domain_lcuuid" binding:"required"`
+	Lcuuid           string            `json:"lcuuid" binding:"required"`
+	Name             string            `json:"name" binding:"required"`
+	PodClusterLcuuid string            `json:"pod_cluster_lcuuid" binding:"required"`
+	AZLcuuid         string            `json:"az_lcuuid" binding:"required"`
+	RegionLcuuid     string            `json:"region_lcuuid" binding:"required"`
+	SubDomainLcuuid  string            `json:"sub_domain_lcuuid" binding:"required"`
+	CloudTags        map[string]string `json:"cloud_tags"`
 }
 
 type PodService struct {
@@ -467,6 +471,7 @@ type Pod struct {
 	PodReplicaSetLcuuid string    `json:"pod_replica_set_lcuuid"`
 	PodNodeLcuuid       string    `json:"pod_node_lcuuid" binding:"required"`
 	PodGroupLcuuid      string    `json:"pod_group_lcuuid" binding:"required"`
+	PodServiceLcuuid    string    `json:"pod_service_lcuuid" binding:"required"`
 	PodNamespaceLcuuid  string    `json:"pod_namespace_lcuuid" binding:"required"`
 	PodClusterLcuuid    string    `json:"pod_cluster_lcuuid" binding:"required"`
 	VPCLcuuid           string    `json:"vpc_lcuuid" binding:"required"`
@@ -491,12 +496,15 @@ type Process struct {
 }
 
 type PrometheusTarget struct {
-	Lcuuid          string `json:"lcuuid" binding:"required"`
-	ScrapeURL       string `json:"scrape_url" binding:"required"`
-	Instance        string `json:"instance" binding:"required"`
-	Job             string `json:"job" binding:"required"`
-	OtherLabels     string `json:"other_labels" binding:"required"`
-	SubDomainLcuuid string `json:"sub_domain_lcuuid"`
+	Lcuuid            string `json:"lcuuid,omitempty" binding:"required"`
+	ScrapeURL         string `json:"scrape_url" binding:"required"`
+	Instance          string `json:"instance" binding:"required"`
+	Job               string `json:"job" binding:"required"`
+	OtherLabels       string `json:"other_labels" binding:"required"`
+	SubDomainLcuuid   string `json:"sub_domain_lcuuid,omitempty"`
+	PodClusterLcuuid  string `json:"pod_cluster_lcuuid" binding:"required"`
+	VPCLcuuid         string `json:"vpc_lcuuid,omitempty"`
+	HonorLabelsConfig bool   `json:"honor_labels_config" binding:"required"`
 }
 
 type SubDomainResource struct {
@@ -592,10 +600,11 @@ type AdditionalResource struct {
 	LB                    []LB
 	LBListeners           []LBListener
 	LBTargetServers       []LBTargetServer
+	PeerConnections       []PeerConnection
 	SubDomainResources    map[string]*AdditionalSubdomainResource
 }
 
-type UUIDToCloudTags map[string]string
+type UUIDToCloudTags map[string]map[string]string
 
 type AdditionalSubdomainResource struct {
 	PodNamespaceCloudTags UUIDToCloudTags

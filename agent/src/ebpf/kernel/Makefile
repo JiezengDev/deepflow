@@ -17,7 +17,7 @@ CLANG ?= /usr/bin/clang
 LLVM_STRIP ?= /usr/bin/llvm-strip
 LLVM_OBJDUMP ?= /usr/bin/llvm-objdump
 CC ?= gcc
-TAEGET_KERN_SRC = socket_trace.c perf_profiler.c
+TAEGET_KERN_SRC = socket_trace.bpf.c perf_profiler.bpf.c
 TAEGET_KERN_LL = $(TAEGET_KERN_SRC:c=ll)
 TAEGET_KERN_ELF = $(TAEGET_KERN_SRC:c=elf)
 ifeq ($(V),1)
@@ -32,11 +32,11 @@ else
 endif
 ARCH := $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/' | sed 's/ppc64le/powerpc/' | sed 's/mips.*/mips/')
 
-ifeq ($(LINUX_VER_5_2_PLUS),1)
+ifeq ($(LINUX_VER_3_10_0),1)
+	EXTRA_EBPF_CLAGS = -DLINUX_VER_3_10_0
+else ifeq ($(LINUX_VER_5_2_PLUS),1)
 	EXTRA_EBPF_CLAGS = -DLINUX_VER_5_2_PLUS
-endif
-
-ifeq ($(LINUX_VER_KYLIN),1)
+else ifeq ($(LINUX_VER_KYLIN),1)
 	EXTRA_EBPF_CLAGS = -DLINUX_VER_KYLIN
 endif
 

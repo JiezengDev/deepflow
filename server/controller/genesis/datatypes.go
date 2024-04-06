@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -56,7 +56,6 @@ type KubernetesInfo struct {
 	ClusterID string
 	ErrorMSG  string
 	Version   uint64
-	VtapID    uint32
 	Epoch     time.Time
 	Entries   []*messagecommon.KubernetesAPIInfo
 }
@@ -64,8 +63,6 @@ type KubernetesInfo struct {
 type PrometheusInfo struct {
 	ClusterID string
 	ErrorMSG  string
-	Version   uint64
-	VtapID    uint32
 	Epoch     time.Time
 	Entries   []cloudmodel.PrometheusTarget
 }
@@ -208,9 +205,6 @@ func (g *GenesisSyncTypeOperation[T]) Save() {
 		tData := reflect.ValueOf(&data).Elem()
 		vtapID := tData.FieldByName("VtapID").Uint()
 		if _, ok := vtapIDMap[uint32(vtapID)]; !ok {
-			continue
-		}
-		if tData.Type().String() == "model.GenesisProcess" && vtapID == 0 {
 			continue
 		}
 		nodeIP := tData.FieldByName("NodeIP")

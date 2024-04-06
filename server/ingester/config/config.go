@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,7 +35,7 @@ import (
 var log = logging.MustGetLogger("config")
 
 const (
-	DefaultControllerIP             = "127.0.0.1"
+	DefaultLocalIP                  = "127.0.0.1"
 	DefaultControllerPort           = 20035
 	DefaultCheckInterval            = 300 // clickhouse是异步删除
 	DefaultDiskUsedPercent          = 80
@@ -54,6 +54,12 @@ const (
 	DefaultStatsInterval            = 10      // s
 	DefaultFlowTagCacheFlushTimeout = 1800    // s
 	DefaultFlowTagCacheMaxSize      = 1 << 18 // 256k
+	IndexTypeHash                   = "hash"
+	IndexTypeIncremetalIdLocation   = "incremental-id"
+	FormatHex                       = "hex"
+	FormatDecimal                   = "decimal"
+	EnvRunningMode                  = "DEEPFLOW_SERVER_RUNNING_MODE"
+	RunningModeStandalone           = "STANDALONE"
 )
 
 type DatabaseTable struct {
@@ -121,6 +127,7 @@ type CKDB struct {
 }
 
 type Config struct {
+	IsRunningModeStandalone  bool
 	StorageDisabled          bool            `yaml:"storage-disabled"`
 	ListenPort               uint16          `yaml:"listen-port"`
 	CKDB                     CKDB            `yaml:"ckdb"`
@@ -131,8 +138,6 @@ type Config struct {
 	UDPReadBuffer            int             `yaml:"udp-read-buffer"`
 	TCPReadBuffer            int             `yaml:"tcp-read-buffer"`
 	TCPReaderBuffer          int             `yaml:"tcp-reader-buffer"`
-	Profiler                 bool            `yaml:"profiler"`
-	MaxCPUs                  int             `yaml:"max-cpus"`
 	CKDiskMonitor            CKDiskMonitor   `yaml:"ck-disk-monitor"`
 	ColdStorage              CKDBColdStorage `yaml:"ckdb-cold-storage"`
 	ckdbColdStorages         map[string]*ckdb.ColdStorage
@@ -145,20 +150,62 @@ type Config struct {
 	LogFile                  string
 	LogLevel                 string
 	MyNodeName               string
+	TraceIdWithIndex         TraceIdWithIndex
+}
+
+type Location struct {
+	Start  int    `yaml:"start"`
+	Length int    `yaml:"length"`
+	Format string `yaml:"format"`
+}
+
+type TraceIdWithIndex struct {
+	Enabled               bool     `yaml:"enabled"`
+	Type                  string   `yaml:"type"`
+	IncrementalIdLocation Location `yaml:"incremental-id-location"`
+	FormatIsHex           bool
+	TypeIsIncrementalId   bool
 }
 
 type BaseConfig struct {
-	LogFile  string `yaml:"log-file"`
-	LogLevel string `yaml:"log-level"`
-	Base     Config `yaml:"ingester"`
+	LogFile          string           `yaml:"log-file"`
+	LogLevel         string           `yaml:"log-level"`
+	TraceIdWithIndex TraceIdWithIndex `yaml:"trace-id-with-index"`
+	Base             Config           `yaml:"ingester"`
 }
 
 func sleepAndExit() {
-	time.Sleep(time.Second)
+	time.Sleep(time.Microsecond)
 	os.Exit(1)
 }
 
 func (c *Config) Validate() error {
+	runningMode, _ := os.LookupEnv(EnvRunningMode)
+	// in standalone mode, only supports single node and does not support horizontal expansion
+	c.IsRunningModeStandalone = runningMode == RunningModeStandalone
+
+	if c.TraceIdWithIndex.Enabled {
+		if c.TraceIdWithIndex.Type != IndexTypeIncremetalIdLocation && c.TraceIdWithIndex.Type != IndexTypeHash {
+			log.Errorf("invalid 'type'(%s) of 'trace-id-with-index', must be '%s' or '%s'", c.TraceIdWithIndex.Type, IndexTypeIncremetalIdLocation, IndexTypeHash)
+			sleepAndExit()
+		}
+		c.TraceIdWithIndex.TypeIsIncrementalId = false
+		if c.TraceIdWithIndex.Type == IndexTypeIncremetalIdLocation {
+			c.TraceIdWithIndex.TypeIsIncrementalId = true
+			location := c.TraceIdWithIndex.IncrementalIdLocation
+			if location.Format != FormatHex && location.Format != FormatDecimal {
+				log.Errorf("invalid 'format'(%s) of 'trace-id-with-index:incremetal-id-location', must be '%s' or '%s'", location.Format, FormatHex, FormatDecimal)
+				sleepAndExit()
+			}
+			if location.Length == 0 || (location.Length > 20 && location.Format == FormatDecimal) || (location.Length > 16 && location.Format == FormatHex) {
+				log.Errorf("invalid 'length'(%d) of 'trace-id-with-index:incremetal-id-location' out of range. when 'format' is '%s' range is (0, 20], 'format' is '%s' range is (0, 16]", location.Length, FormatDecimal, FormatHex)
+
+				sleepAndExit()
+			}
+			c.TraceIdWithIndex.FormatIsHex = c.TraceIdWithIndex.IncrementalIdLocation.Format == FormatHex
+		}
+	}
+
 	if len(c.ControllerIPs) == 0 {
 		log.Warning("controller-ips is empty")
 	} else {
@@ -196,36 +243,55 @@ func (c *Config) Validate() error {
 		c.StatsInterval = DefaultStatsInterval
 	}
 
-	// should get node ip from ENV
-	if c.NodeIP == "" && c.ControllerIPs[0] == DefaultControllerIP {
-		nodeIP, exist := os.LookupEnv(EnvK8sNodeIP)
-		if !exist {
-			log.Errorf("Can't get env %s", EnvK8sNodeIP)
-			sleepAndExit()
+	var myNodeName, myPodName, myNamespace string
+	// in standalone mode, no 'EnvK8sNodeName', 'EnvK8sPodName', 'EnvK8sNamespace' environment variables
+	if c.IsRunningModeStandalone {
+		// in standalone mode, also can get NodeIP from 'EnvK8sNodeIP'
+		nodeIP, _ := os.LookupEnv(EnvK8sNodeIP)
+		if nodeIP == "" {
+			nodeIP = DefaultLocalIP
 		}
 		c.NodeIP = nodeIP
-	}
+		c.MyNodeName, _ = os.Hostname()
+		if c.CKDB.Host == "" {
+			c.CKDB.Host = DefaultLocalIP
+		}
+		if c.CKDB.Port == 0 {
+			c.CKDB.Port = DefaultCKDBServicePort
+		}
+		// in standalone mode, only supports one ClickHouse node
+		c.CKDB.ActualAddrs = append(c.CKDB.ActualAddrs, fmt.Sprintf("%s:%d", c.CKDB.Host, c.CKDB.Port))
+	} else {
+		if c.NodeIP == "" && c.ControllerIPs[0] == DefaultLocalIP {
+			nodeIP, exist := os.LookupEnv(EnvK8sNodeIP)
+			if !exist {
+				log.Errorf("Can't get env %s", EnvK8sNodeIP)
+				sleepAndExit()
+			}
+			c.NodeIP = nodeIP
+		}
+		var exist bool
+		myNodeName, exist = os.LookupEnv(EnvK8sNodeName)
+		if !exist {
+			log.Errorf("Can't get node name env %s", EnvK8sNodeName)
+			sleepAndExit()
+		}
+		c.MyNodeName = myNodeName
 
-	myNodeName, exist := os.LookupEnv(EnvK8sNodeName)
-	if !exist {
-		log.Errorf("Can't get node name env %s", EnvK8sNodeName)
-		sleepAndExit()
+		myPodName, exist = os.LookupEnv(EnvK8sPodName)
+		if !exist {
+			log.Errorf("Can't get pod name env %s", EnvK8sPodName)
+			sleepAndExit()
+		}
+		myNamespace, exist = os.LookupEnv(EnvK8sNamespace)
+		if !exist {
+			log.Errorf("Can't get pod namespace env %s", EnvK8sNamespace)
+			sleepAndExit()
+		}
 	}
-	c.MyNodeName = myNodeName
 
 	if c.StorageDisabled {
 		return nil
-	}
-
-	myPodName, exist := os.LookupEnv(EnvK8sPodName)
-	if !exist {
-		log.Errorf("Can't get pod name env %s", EnvK8sPodName)
-		sleepAndExit()
-	}
-	myNamespace, exist := os.LookupEnv(EnvK8sNamespace)
-	if !exist {
-		log.Errorf("Can't get pod namespace env %s", EnvK8sNamespace)
-		sleepAndExit()
 	}
 
 	if c.CKDB.Host == "" {
@@ -258,6 +324,11 @@ func (c *Config) Validate() error {
 	var watcher *Watcher
 	var err error
 	for retryTimes := 0; ; retryTimes++ {
+		if c.IsRunningModeStandalone {
+			// in standalone mode, only supports one ClickHouse endpoint. no watcher required
+			break
+		}
+
 		if retryTimes > 0 {
 			time.Sleep(time.Second * 30)
 		}
@@ -274,6 +345,7 @@ func (c *Config) Validate() error {
 			log.Warningf("get clickhouse endpoints(%s) failed, err: %s", c.CKDB.Host, err)
 			continue
 		}
+		c.CKDB.ActualAddrs = c.CKDB.ActualAddrs[:0]
 		for _, endpoint := range endpoints {
 			// if it is an IPv6 address, it needs to be enclosed in []
 			if strings.Contains(endpoint.Host, ":") {
@@ -363,7 +435,7 @@ func Load(path string) *Config {
 		LogFile:  "/var/log/deepflow/server.log",
 		LogLevel: "info",
 		Base: Config{
-			ControllerIPs:   []string{DefaultControllerIP},
+			ControllerIPs:   []string{DefaultLocalIP},
 			ControllerPort:  DefaultControllerPort,
 			CKDBAuth:        Auth{"default", ""},
 			IngesterEnabled: true,
@@ -399,6 +471,7 @@ func Load(path string) *Config {
 		sleepAndExit()
 	}
 
+	config.Base.TraceIdWithIndex = config.TraceIdWithIndex
 	if err = config.Base.Validate(); err != nil {
 		log.Error(err)
 		sleepAndExit()

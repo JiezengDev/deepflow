@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,9 +17,8 @@
 package genesis
 
 import (
-	"bytes"
-	"compress/zlib"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"regexp"
@@ -52,7 +51,7 @@ type GenesisSyncRpcUpdater struct {
 	vCancel               context.CancelFunc
 	storage               *SyncStorage
 	outputQueue           queue.QueueReader
-	hostIPsMap            map[string]int
+	hostIPsRanges         []netaddr.IPPrefix
 	localIPRanges         []netaddr.IPPrefix
 	excludeIPRanges       []netaddr.IPPrefix
 	multiNSMode           bool
@@ -62,14 +61,36 @@ type GenesisSyncRpcUpdater struct {
 }
 
 func NewGenesisSyncRpcUpdater(storage *SyncStorage, queue queue.QueueReader, cfg config.GenesisConfig, ctx context.Context) *GenesisSyncRpcUpdater {
-	hostIPsMap := map[string]int{}
+	hostIPRanges := []netaddr.IPPrefix{}
 	for _, h := range cfg.HostIPs {
-		_, err := netaddr.ParseIP(h)
-		if err != nil {
-			log.Error("parse host ips error: " + err.Error())
-			continue
+		ipObj, err := netaddr.ParseIP(h)
+		if err == nil {
+			var bit uint8
+			switch {
+			case ipObj.Is4():
+				bit = 32
+			case ipObj.Is6():
+				bit = 128
+			}
+			ipPrefix, err := ipObj.Prefix(bit)
+			if err != nil {
+				log.Error("host ip convert to ip prefix error: " + err.Error())
+				continue
+			}
+			hostIPRanges = append(hostIPRanges, ipPrefix)
+		} else {
+			hostIPRange, err := netaddr.ParseIPPrefix(h)
+			if err == nil {
+				hostIPRanges = append(hostIPRanges, hostIPRange)
+			} else {
+				hostIPRangeSlice, err := netaddr.ParseIPRange(h)
+				if err != nil {
+					log.Error("parse host ip ranges error: " + err.Error())
+					continue
+				}
+				hostIPRanges = append(hostIPRanges, hostIPRangeSlice.Prefixes()...)
+			}
 		}
-		hostIPsMap[h] = 0
 	}
 
 	localIPRanges := []netaddr.IPPrefix{}
@@ -116,7 +137,7 @@ func NewGenesisSyncRpcUpdater(storage *SyncStorage, queue queue.QueueReader, cfg
 		vCancel:               vCancel,
 		storage:               storage,
 		outputQueue:           queue,
-		hostIPsMap:            hostIPsMap,
+		hostIPsRanges:         hostIPRanges,
 		localIPRanges:         localIPRanges,
 		excludeIPRanges:       excludeIPRanges,
 		multiNSMode:           cfg.MultiNSMode,
@@ -172,7 +193,7 @@ func (v *GenesisSyncRpcUpdater) ParseVinterfaceInfo(info VIFRPCMessage, peer str
 			if i == 0 {
 				rootNSMacs[item.MAC] = false
 			}
-			ifIndexToInterface[nsName+string(item.Index)] = item
+			ifIndexToInterface[fmt.Sprintf("%v%v", nsName, item.Index)] = item
 			ifNameToInterface[nsName+item.Name] = item
 			vIF := model.GenesisVinterface{
 				Name:    item.Name,
@@ -225,15 +246,27 @@ func (v *GenesisSyncRpcUpdater) ParseVinterfaceInfo(info VIFRPCMessage, peer str
 			Name: iface.GetName(),
 			Mac:  genesiscommon.Uint64ToMac(iface.GetMac()).String(),
 		}
-		hasNetMask := false
+		var hasNetMask bool
+		var validIPs []string
 		for _, addr := range iface.Ip {
 			hasNetMask = strings.Contains(addr, `/`)
-			sIP := strings.Split(addr, `/`)[0]
-			netIP, err := netaddr.ParseIP(sIP)
-			if err != nil {
-				log.Errorf(err.Error())
-				return []model.GenesisVinterface{}
+			var netIP netaddr.IP
+			if hasNetMask {
+				ipPrefix, err := netaddr.ParseIPPrefix(addr)
+				if err != nil {
+					log.Error(err.Error())
+					continue
+				}
+				netIP = ipPrefix.IP()
+			} else {
+				ipAddr, err := netaddr.ParseIP(addr)
+				if err != nil {
+					log.Error(err.Error())
+					continue
+				}
+				netIP = ipAddr
 			}
+
 			excludeFlag := false
 			for _, ipRange := range v.excludeIPRanges {
 				if ipRange.Contains(netIP) {
@@ -244,15 +277,12 @@ func (v *GenesisSyncRpcUpdater) ParseVinterfaceInfo(info VIFRPCMessage, peer str
 			if excludeFlag {
 				continue
 			}
-			if vIF.IPs == "" {
-				vIF.IPs = netIP.String()
-			} else {
-				vIF.IPs += ("," + netIP.String())
-			}
+			validIPs = append(validIPs, addr)
 		}
+		vIF.IPs = strings.Join(validIPs, ",")
 		vIF.Lcuuid = common.GetUUID(vIF.Name+vIF.Mac+vIF.IPs+strconv.Itoa(int(vtapID)), uuid.Nil)
 		ifaceNSName := iface.GetNetns()
-		if gIF, ok := ifIndexToInterface[ifaceNSName+string(iface.GetTapIndex())]; ok && isContainer {
+		if gIF, ok := ifIndexToInterface[fmt.Sprintf("%v%v", ifaceNSName, iface.GetTapIndex())]; ok && isContainer {
 			vIF.TapName = gIF.Name
 			vIF.TapMac = gIF.MAC
 		} else if gIF, ok := ifNameToInterface[ifaceNSName+iface.GetName()]; ok && !isContainer {
@@ -278,6 +308,7 @@ func (v *GenesisSyncRpcUpdater) ParseVinterfaceInfo(info VIFRPCMessage, peer str
 			continue
 		}
 		vIF.NetnsID = iface.GetNetnsId()
+		vIF.IFType = iface.GetIfType()
 		vIF.HostIP = peer
 		vIF.LastSeen = epoch
 		vIF.VtapID = vtapID
@@ -340,6 +371,7 @@ func (v *GenesisSyncRpcUpdater) ParseHostAsVmPlatformInfo(info VIFRPCMessage, pe
 	}
 	// check if vm is behind NAT
 	behindNat := peer != natIP
+	log.Infof("host (%s) nat ip is (%s) peer ip is (%s), behind nat: (%t), single vpc mode: (%t)", hostName, natIP, peer, behindNat, v.singleVPCMode)
 	vpc := model.GenesisVpc{
 		Name:   "default-public-cloud-vpc",
 		Lcuuid: common.GetUUID("default-public-cloud-vpc", uuid.Nil),
@@ -474,6 +506,10 @@ func (v *GenesisSyncRpcUpdater) ParseHostAsVmPlatformInfo(info VIFRPCMessage, pe
 
 func (v *GenesisSyncRpcUpdater) ParseProcessInfo(info VIFRPCMessage, vtapID uint32) []model.GenesisProcess {
 	processes := []model.GenesisProcess{}
+	if vtapID == 0 {
+		return processes
+	}
+
 	for _, p := range info.message.GetProcessData().GetProcessEntries() {
 		var osAppTagSlice []string
 		for _, tag := range p.GetOsAppTags() {
@@ -781,7 +817,7 @@ func (v *GenesisSyncRpcUpdater) UnmarshalProtobuf(info VIFRPCMessage) GenesisSyn
 	pProcess := v.ParseProcessInfo(info, info.vtapID)
 	processes := NewProcessPlatformDataOperation(pProcess)
 
-	if _, ok := v.hostIPsMap[info.peer]; ok && info.message.GetPlatformData().GetPlatformEnabled() {
+	if genesiscommon.IPInRanges(info.peer, v.hostIPsRanges...) && info.message.GetPlatformData().GetPlatformEnabled() {
 		genesisSyncDataOper = v.ParseKVMPlatformInfo(info, info.peer, info.vtapID)
 	}
 
@@ -897,20 +933,18 @@ func (k *KubernetesRpcUpdater) run() {
 	for {
 		info := k.outputQueue.Get().(K8SRPCMessage)
 		if info.msgType == genesiscommon.TYPE_EXIT {
-			log.Warningf("k8s from (%s) vtap_id (%v) type (%v)", info.peer, info.vtapID, info.msgType)
+			log.Warningf("k8s from (%s) vtap_id (%v) type (%v) exit", info.peer, info.vtapID, info.msgType)
 			break
 		}
-		log.Debugf("k8s from %s vtap_id %v received cluster_id %s version %s", info.peer, info.vtapID, info.message.GetClusterId(), info.message.GetVersion())
+		log.Debugf("k8s from %s vtap_id %v received cluster_id %s version %v", info.peer, info.vtapID, info.message.GetClusterId(), info.message.GetVersion())
 		// 更新和保存内存数据
-		k8sInfo := KubernetesInfo{
+		k.storage.Add(KubernetesInfo{
 			Epoch:     time.Now(),
 			ClusterID: info.message.GetClusterId(),
 			ErrorMSG:  info.message.GetErrorMsg(),
-			VtapID:    info.message.GetVtapId(),
 			Version:   info.message.GetVersion(),
 			Entries:   info.message.GetEntries(),
-		}
-		k.storage.Add(k8sInfo)
+		})
 	}
 }
 
@@ -944,58 +978,88 @@ func NewPrometheuspInfoRpcUpdater(storage *PrometheusStorage, queue queue.QueueR
 func (p *PrometheusRpcUpdater) ParsePrometheusEntries(info PrometheusMessage) ([]cloudmodel.PrometheusTarget, error) {
 	result := []cloudmodel.PrometheusTarget{}
 	entries := info.message.GetEntries()
-	for _, e := range entries {
-		eInfo := e.GetCompressedInfo()
-		reader := bytes.NewReader(eInfo)
-		var out bytes.Buffer
-		r, err := zlib.NewReader(reader)
+	for index, e := range entries {
+		pJobNameToHonorLabelsConfig := map[string]bool{}
+		configOut, err := genesiscommon.ParseCompressedInfo(e.GetConfigCompressedInfo())
 		if err != nil {
-			log.Warningf("zlib decompress error: %s", err.Error())
+			log.Warningf("index (%d): config decompress error: %s", index+1, err.Error())
 			return []cloudmodel.PrometheusTarget{}, err
 		}
-		_, err = out.ReadFrom(r)
+		cEntryJson, err := simplejson.NewJson(configOut.Bytes())
 		if err != nil {
-			log.Warningf("read decompress error: %s", err.Error())
+			log.Warningf("index (%d): config marshal json error: %s", index+1, err.Error())
 			return []cloudmodel.PrometheusTarget{}, err
 		}
-		entryJson, err := simplejson.NewJson(out.Bytes())
+		cStatus := cEntryJson.Get("status").MustString()
+		if cStatus != "success" {
+			errMSG := fmt.Sprintf("index (%d): config api status (%s)", index+1, cStatus)
+			log.Warning(errMSG)
+			return []cloudmodel.PrometheusTarget{}, errors.New(errMSG)
+		}
+		prometheusConfig, err := genesiscommon.ParseYMAL(cEntryJson.GetPath("data", "yaml").MustString())
 		if err != nil {
-			log.Warningf("marshal json error: %s", err.Error())
+			log.Warningf("index (%d): config parse yaml error: %s", index+1, err.Error())
 			return []cloudmodel.PrometheusTarget{}, err
 		}
-		status := entryJson.Get("status").MustString()
-		if status != "success" {
-			log.Warningf("prometheus target api status (%s)", status)
+		for _, scrapeConfig := range prometheusConfig.ScrapeConfigs {
+			pJobNameToHonorLabelsConfig[scrapeConfig.JobName] = scrapeConfig.HonorLabels
+		}
+
+		targetOut, err := genesiscommon.ParseCompressedInfo(e.GetTargetCompressedInfo())
+		if err != nil {
+			log.Warningf("index (%d): target decompress error: %s", index+1, err.Error())
 			return []cloudmodel.PrometheusTarget{}, err
 		}
-		targets := entryJson.GetPath("data", "activeTargets")
+		tEntryJson, err := simplejson.NewJson(targetOut.Bytes())
+		if err != nil {
+			log.Warningf("index (%d): target marshal json error: %s", index+1, err.Error())
+			return []cloudmodel.PrometheusTarget{}, err
+		}
+		tStatus := tEntryJson.Get("status").MustString()
+		if tStatus != "success" {
+			errMSG := fmt.Sprintf("index (%d): target api status (%s)", index+1, tStatus)
+			log.Warning(errMSG)
+			return []cloudmodel.PrometheusTarget{}, errors.New(errMSG)
+		}
+		targets := tEntryJson.GetPath("data", "activeTargets")
 		for t := range targets.MustArray() {
 			target := targets.GetIndex(t)
 			scrapeUrl := target.Get("scrapeUrl").MustString()
 			labels := target.Get("labels")
 			job := labels.Get("job").MustString()
 			instance := labels.Get("instance").MustString()
+
+			labelsSlice := []string{}
+			honorLabelsConfig, ok := pJobNameToHonorLabelsConfig[job]
+			if !ok {
+				honorLabelsConfig = true
+			}
 			labelsMap := labels.MustMap()
 			delete(labelsMap, "job")
 			delete(labelsMap, "instance")
 			keys := []string{}
-			labelsSlice := []string{}
 			for key := range labelsMap {
 				keys = append(keys, key)
 			}
 			sort.Strings(keys)
 			for _, k := range keys {
-				newString := k + ":" + labelsMap[k].(string)
+				v := labelsMap[k]
+				vString, ok := v.(string)
+				if !ok {
+					vString = ""
+				}
+				newString := k + ":" + vString
 				labelsSlice = append(labelsSlice, newString)
 			}
+
 			otherLabelsString := strings.Join(labelsSlice, ", ")
 
 			result = append(result, cloudmodel.PrometheusTarget{
-				Lcuuid:      common.GetUUID(instance+job+otherLabelsString, uuid.Nil),
-				ScrapeURL:   scrapeUrl,
-				Job:         job,
-				Instance:    instance,
-				OtherLabels: otherLabelsString,
+				ScrapeURL:         scrapeUrl,
+				Job:               job,
+				Instance:          instance,
+				OtherLabels:       otherLabelsString,
+				HonorLabelsConfig: honorLabelsConfig,
 			})
 		}
 	}
@@ -1004,32 +1068,37 @@ func (p *PrometheusRpcUpdater) ParsePrometheusEntries(info PrometheusMessage) ([
 }
 
 func (p *PrometheusRpcUpdater) run() {
+	currentVersion := map[string]uint64{}
 	for {
 		info := p.outputQueue.Get().(PrometheusMessage)
 		if info.msgType == genesiscommon.TYPE_EXIT {
-			log.Warningf("prometheus from (%s) vtap_id (%v) type (%v)", info.peer, info.vtapID, info.msgType)
+			log.Warningf("prometheus from (%s) vtap_id (%v) type (%v) exit", info.peer, info.vtapID, info.msgType)
 			break
 		}
 		// 更新和保存内存数据
+		var err error
+		var entries []cloudmodel.PrometheusTarget
 		clusterID := info.message.GetClusterId()
 		version := info.message.GetVersion()
-		entries, err := p.ParsePrometheusEntries(info)
-		if err != nil {
-			log.Warningf("prometheus from vtap_id %v received cluster_id %s version %s parse failed (%s)", info.vtapID, clusterID, version, err.Error())
-			continue
+		errMSG := info.message.GetErrorMsg()
+		cVersion := currentVersion[clusterID]
+		parseFlag := version != cVersion
+		if errMSG == "" && parseFlag {
+			entries, err = p.ParsePrometheusEntries(info)
+			if err != nil {
+				errMSG = err.Error()
+			}
+			currentVersion[clusterID] = version
 		}
 
-		log.Debugf("prometheus from %s vtap_id %v received cluster_id %s version %s", info.peer, info.vtapID, clusterID, version)
+		log.Debugf("prometheus from %s vtap_id %v received cluster_id %s version %v,  error message (%s)", info.peer, info.vtapID, clusterID, version, errMSG)
 
-		prometheusInfo := PrometheusInfo{
+		p.storage.Add(parseFlag, PrometheusInfo{
 			ClusterID: clusterID,
-			Version:   version,
 			Entries:   entries,
 			Epoch:     time.Now(),
-			ErrorMSG:  info.message.GetErrorMsg(),
-			VtapID:    info.message.GetVtapId(),
-		}
-		p.storage.Add(prometheusInfo)
+			ErrorMSG:  errMSG,
+		})
 	}
 }
 

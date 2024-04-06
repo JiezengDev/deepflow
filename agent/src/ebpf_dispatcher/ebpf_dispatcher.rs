@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,12 +15,14 @@
  */
 
 use std::ffi::{CStr, CString};
+use std::ptr::{self, null_mut};
 use std::slice;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use ahash::HashSet;
 use arc_swap::access::Access;
 use libc::{c_int, c_ulonglong};
 use log::{debug, error, info, warn};
@@ -32,56 +34,44 @@ use crate::common::l7_protocol_log::{
 };
 use crate::common::meta_packet::MetaPacket;
 use crate::common::proc_event::{BoxedProcEvents, EventType, ProcEvent};
-use crate::common::TaggedFlow;
+use crate::common::{FlowAclListener, FlowAclListenerId, TaggedFlow};
 use crate::config::handler::{CollectorAccess, EbpfAccess, EbpfConfig, LogParserAccess};
 use crate::config::FlowAccess;
 use crate::ebpf::{
     self, set_allow_port_bitmap, set_bypass_port_bitmap, set_profiler_cpu_aggregation,
-    set_profiler_regex, start_continuous_profiler,
+    set_profiler_regex, set_protocol_ports_bitmap, start_continuous_profiler,
 };
-use crate::flow_generator::{flow_map::Config, FlowMap, MetaAppProto};
+use crate::flow_generator::{flow_map::Config, AppProto, FlowMap};
 use crate::integration_collector::Profile;
-use crate::platform::PlatformSynchronizer;
 use crate::policy::PolicyGetter;
 use crate::utils::stats;
 use public::{
     buffer::BatchedBox,
     counter::{Counter, CounterType, CounterValue, OwnedCountable},
     debug::QueueDebugger,
-    proto::metric,
+    l7_protocol::L7Protocol,
+    proto::{common::TridentType, metric},
     queue::{bounded_with_debug, DebugSender, Receiver},
     utils::bitmap::parse_u16_range_list_to_bitmap,
 };
 
 pub struct EbpfCounter {
-    rx: u64,
+    rx: AtomicU64,
 }
 
 impl EbpfCounter {
-    fn reset(&mut self) {
-        self.rx = 0;
+    fn get_rx(&self) -> u64 {
+        self.rx.swap(0, Ordering::Relaxed)
     }
 }
 
-#[derive(Clone, Copy)]
 pub struct SyncEbpfCounter {
-    counter: *mut EbpfCounter,
+    counter: Arc<EbpfCounter>,
 }
-
-impl SyncEbpfCounter {
-    fn counter(&self) -> &mut EbpfCounter {
-        unsafe { &mut *self.counter }
-    }
-}
-
-unsafe impl Send for SyncEbpfCounter {}
-unsafe impl Sync for SyncEbpfCounter {}
 
 impl OwnedCountable for SyncEbpfCounter {
     fn get_counters(&self) -> Vec<Counter> {
-        let rx = self.counter().rx;
-        self.counter().reset();
-
+        let rx = self.counter.get_rx();
         let ebpf_counter = unsafe { ebpf::socket_tracer_stats() };
 
         vec![
@@ -183,11 +173,14 @@ impl OwnedCountable for SyncEbpfCounter {
     }
 }
 
+#[derive(Clone)]
 struct EbpfDispatcher {
     dispatcher_id: usize,
     time_diff: Arc<AtomicI64>,
 
-    receiver: Receiver<Box<MetaPacket<'static>>>,
+    receiver: Arc<Receiver<Box<MetaPacket<'static>>>>,
+
+    pause: Arc<AtomicBool>,
 
     // 策略查询
     policy_getter: PolicyGetter,
@@ -198,7 +191,7 @@ struct EbpfDispatcher {
     collector_config: CollectorAccess,
 
     config: EbpfAccess,
-    output: DebugSender<Box<MetaAppProto>>, // Send MetaAppProtos to the AppProtoLogsParser
+    output: DebugSender<Box<AppProto>>, // Send AppProtos to the AppProtoLogsParser
     flow_output: DebugSender<Arc<BatchedBox<TaggedFlow>>>, // Send TaggedFlows to the QuadrupleGenerator
     l7_stats_output: DebugSender<BatchedBox<L7Stats>>,     // Send L7Stats to the QuadrupleGenerator
     stats_collector: Arc<stats::Collector>,
@@ -207,7 +200,7 @@ struct EbpfDispatcher {
 impl EbpfDispatcher {
     const FLOW_MAP_SIZE: usize = 1 << 14;
 
-    fn run(&mut self, sync_counter: SyncEbpfCounter) {
+    fn run(&self, counter: Arc<EbpfCounter>) {
         let mut flow_map = FlowMap::new(
             self.dispatcher_id as u32,
             self.flow_output.clone(),
@@ -217,7 +210,7 @@ impl EbpfDispatcher {
             self.time_diff.clone(),
             &self.flow_map_config.load(),
             None, // Enterprise Edition Feature: packet-sequence
-            &self.stats_collector,
+            self.stats_collector.clone(),
             true, // from_ebpf
         );
         let ebpf_config = self.config.load();
@@ -240,8 +233,12 @@ impl EbpfDispatcher {
                 continue;
             }
 
+            if self.pause.load(Ordering::Relaxed) {
+                continue;
+            }
+
             for mut packet in batch.drain(..) {
-                sync_counter.counter().rx += 1;
+                counter.rx.fetch_add(1, Ordering::Relaxed);
 
                 packet.timestamp_adjust(self.time_diff.load(Ordering::Relaxed));
                 packet.set_loopback_mac(ebpf_config.ctrl_mac);
@@ -251,16 +248,27 @@ impl EbpfDispatcher {
     }
 }
 
-struct SyncEbpfDispatcher {
-    dispatcher: *mut EbpfDispatcher,
+pub struct SyncEbpfDispatcher {
+    pause: Arc<AtomicBool>,
 }
 
-unsafe impl Sync for SyncEbpfDispatcher {}
-unsafe impl Send for SyncEbpfDispatcher {}
+impl FlowAclListener for SyncEbpfDispatcher {
+    fn flow_acl_change(
+        &mut self,
+        _: TridentType,
+        _: i32,
+        _: &Vec<Arc<crate::_IpGroupData>>,
+        _: &Vec<Arc<crate::_PlatformData>>,
+        _: &Vec<Arc<crate::common::policy::PeerConnection>>,
+        _: &Vec<Arc<crate::_Cidr>>,
+        _: &Vec<Arc<crate::_Acl>>,
+    ) -> Result<(), String> {
+        self.pause.store(false, Ordering::Relaxed);
+        Ok(())
+    }
 
-impl SyncEbpfDispatcher {
-    fn dispatcher(&self) -> &mut EbpfDispatcher {
-        unsafe { &mut *self.dispatcher }
+    fn id(&self) -> usize {
+        u16::from(FlowAclListenerId::EbpfDispatcher) as usize
     }
 }
 
@@ -268,23 +276,39 @@ pub struct EbpfCollector {
     thread_dispatcher: EbpfDispatcher,
     thread_handle: Option<JoinHandle<()>>,
 
-    counter: EbpfCounter,
+    counter: Arc<EbpfCounter>,
 }
 
 static mut SWITCH: bool = false;
 static mut SENDER: Option<DebugSender<Box<MetaPacket>>> = None;
 static mut PROC_EVENT_SENDER: Option<DebugSender<BoxedProcEvents>> = None;
 static mut EBPF_PROFILE_SENDER: Option<DebugSender<Profile>> = None;
-static mut PLATFORM_SYNC: Option<Arc<PlatformSynchronizer>> = None;
+static mut POLICY_GETTER: Option<PolicyGetter> = None;
 static mut ON_CPU_PROFILE_FREQUENCY: u32 = 0;
+static mut TIME_DIFF: Option<Arc<AtomicI64>> = None;
 
 impl EbpfCollector {
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn convert_to_string(ptr: *const u8) -> String {
+        CStr::from_ptr(ptr as *const i8)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn convert_to_string(ptr: *const u8) -> String {
+        CStr::from_ptr(ptr).to_string_lossy().into_owned()
+    }
+
     extern "C" fn ebpf_l7_callback(sd: *mut ebpf::SK_BPF_DATA) {
         unsafe {
             if !SWITCH || SENDER.is_none() {
                 return;
             }
-            let event_type = EventType::from((*sd).source);
+
+            let container_id =
+                Self::convert_to_string(ptr::addr_of!((*sd).container_id) as *const u8);
+            let event_type = EventType::from(ptr::addr_of!((*sd).source).read_unaligned());
             if event_type != EventType::OtherEvent {
                 // EbpfType like TracePoint, TlsUprobe, GoHttp2Uprobe belong to other events
                 let event = ProcEvent::from_ebpf(sd, event_type);
@@ -293,8 +317,8 @@ impl EbpfCollector {
                     return;
                 }
                 let mut event = event.unwrap();
-                if let Some(m) = PLATFORM_SYNC.as_ref() {
-                    event.0.netns_id = m.get_netns_id_by_pid(event.0.pid).unwrap_or_default();
+                if let Some(policy) = POLICY_GETTER.as_ref() {
+                    event.0.pod_id = policy.lookup_pod_id(&container_id);
                 }
                 if let Err(e) = PROC_EVENT_SENDER.as_mut().unwrap().send(event) {
                     warn!("event send ebpf error: {:?}", e);
@@ -307,8 +331,8 @@ impl EbpfCollector {
                 return;
             }
             let mut packet = packet.unwrap();
-            if let Some(m) = PLATFORM_SYNC.as_ref() {
-                packet.netns_id = m.get_netns_id_by_pid(packet.process_id).unwrap_or_default();
+            if let Some(policy) = POLICY_GETTER.as_ref() {
+                packet.pod_id = policy.lookup_pod_id(&container_id);
             }
             if let Err(e) = SENDER.as_mut().unwrap().send(Box::new(packet)) {
                 warn!("meta packet send ebpf error: {:?}", e);
@@ -316,7 +340,6 @@ impl EbpfCollector {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
     extern "C" fn ebpf_on_cpu_callback(data: *mut ebpf::stack_profile_data) {
         unsafe {
             if !SWITCH || EBPF_PROFILE_SENDER.is_none() {
@@ -330,12 +353,8 @@ impl EbpfCollector {
             profile.stime = data.stime;
             profile.pid = data.pid;
             profile.tid = data.tid;
-            profile.thread_name = CStr::from_ptr(data.comm.as_ptr() as *const i8)
-                .to_string_lossy()
-                .into_owned();
-            profile.process_name = CStr::from_ptr(data.process_name.as_ptr() as *const i8)
-                .to_string_lossy()
-                .into_owned();
+            profile.thread_name = Self::convert_to_string(data.comm.as_ptr());
+            profile.process_name = Self::convert_to_string(data.process_name.as_ptr());
             profile.u_stack_id = data.u_stack_id;
             profile.k_stack_id = data.k_stack_id;
             profile.cpu = data.cpu;
@@ -343,41 +362,10 @@ impl EbpfCollector {
             profile.data =
                 slice::from_raw_parts(data.stack_data as *mut u8, data.stack_data_len as usize)
                     .to_vec();
-
-            if let Err(e) = EBPF_PROFILE_SENDER.as_mut().unwrap().send(Profile(profile)) {
-                warn!("ebpf profile send error: {:?}", e);
+            let container_id = Self::convert_to_string(data.container_id.as_ptr());
+            if let Some(policy_getter) = POLICY_GETTER.as_ref() {
+                profile.pod_id = policy_getter.lookup_pod_id(&container_id);
             }
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    extern "C" fn ebpf_on_cpu_callback(data: *mut ebpf::stack_profile_data) {
-        unsafe {
-            if !SWITCH || EBPF_PROFILE_SENDER.is_none() {
-                return;
-            }
-            let mut profile = metric::Profile::default();
-            let data = &mut *data;
-            profile.sample_rate = ON_CPU_PROFILE_FREQUENCY;
-            profile.timestamp = data.timestamp;
-            profile.event_type = metric::ProfileEventType::EbpfOnCpu.into();
-            profile.stime = data.stime;
-            profile.pid = data.pid;
-            profile.tid = data.tid;
-            profile.thread_name = CStr::from_ptr(data.comm.as_ptr() as *const u8)
-                .to_string_lossy()
-                .into_owned();
-            profile.process_name = CStr::from_ptr(data.process_name.as_ptr() as *const u8)
-                .to_string_lossy()
-                .into_owned();
-            profile.u_stack_id = data.u_stack_id;
-            profile.k_stack_id = data.k_stack_id;
-            profile.cpu = data.cpu;
-            profile.count = data.count;
-            profile.data =
-                slice::from_raw_parts(data.stack_data as *mut u8, data.stack_data_len as usize)
-                    .to_vec();
-
             if let Err(e) = EBPF_PROFILE_SENDER.as_mut().unwrap().send(Profile(profile)) {
                 warn!("ebpf profile send error: {:?}", e);
             }
@@ -390,20 +378,11 @@ impl EbpfCollector {
         proc_event_sender: DebugSender<BoxedProcEvents>,
         ebpf_profile_sender: DebugSender<Profile>,
         l7_protocol_enabled_bitmap: L7ProtocolBitmap,
-        platform_sync: Arc<PlatformSynchronizer>,
+        policy_getter: PolicyGetter,
+        time_diff: Arc<AtomicI64>,
     ) -> Result<()> {
         // ebpf内核模块初始化
         unsafe {
-            let log_file = config.ebpf.log_file.clone();
-            let log_file = if !log_file.is_empty() {
-                CString::new(log_file.as_bytes())
-                    .unwrap()
-                    .as_c_str()
-                    .as_ptr()
-            } else {
-                std::ptr::null()
-            };
-
             if !config.ebpf.uprobe_proc_regexp.golang.is_empty() {
                 info!(
                     "ebpf set golang uprobe proc regexp: {}",
@@ -480,16 +459,13 @@ impl EbpfCollector {
                 }
             }
 
-            if ebpf::bpf_tracer_init(log_file, true) != 0 {
-                info!("ebpf bpf_tracer_init error: {}", config.ebpf.log_file);
+            if ebpf::bpf_tracer_init(null_mut(), true) != 0 {
+                info!("ebpf bpf_tracer_init error.");
                 return Err(Error::EbpfInitError);
             }
 
             if ebpf::set_go_tracing_timeout(config.ebpf.go_tracing_timeout as c_int) != 0 {
-                info!(
-                    "ebpf set_go_tracing_timeout error: {}",
-                    config.ebpf.log_file
-                );
+                info!("ebpf set_go_tracing_timeout error.",);
                 return Err(Error::EbpfInitError);
             }
 
@@ -512,6 +488,35 @@ impl EbpfCollector {
                 return Err(Error::EbpfInitError);
             }
 
+            let mut all_proto_map = get_all_protocol()
+                .iter()
+                .map(|p| p.as_str().to_lowercase())
+                .collect::<HashSet<String>>();
+            for (protocol, port_range) in &config.l7_protocol_ports {
+                all_proto_map.remove(&protocol.to_lowercase());
+                let l7_protocol = L7Protocol::from(protocol.clone());
+                let ports = CString::new(port_range.as_str()).unwrap();
+                if set_protocol_ports_bitmap(u8::from(l7_protocol) as i32, ports.as_ptr()) != 0 {
+                    warn!(
+                        "Ebpf set_protocol_ports_bitmap error: {} {}",
+                        protocol, port_range
+                    );
+                }
+            }
+
+            // if not config the port range, default is parse in all port
+            let all_port = "1-65535".to_string();
+            for protocol in all_proto_map.iter() {
+                let l7_protocol = L7Protocol::from(protocol.clone());
+                let ports = CString::new(all_port.as_str()).unwrap();
+                if set_protocol_ports_bitmap(u8::from(l7_protocol) as i32, ports.as_ptr()) != 0 {
+                    warn!(
+                        "Ebpf set_protocol_ports_bitmap error: {} {}",
+                        protocol, all_port
+                    );
+                }
+            }
+
             if ebpf::running_socket_tracer(
                 Self::ebpf_l7_callback,                    /* 回调接口 rust -> C */
                 config.ebpf.thread_num as i32, /* 工作线程数，是指用户态有多少线程参与数据处理 */
@@ -529,6 +534,10 @@ impl EbpfCollector {
             if !on_cpu_profile_config.disabled {
                 if start_continuous_profiler(
                     on_cpu_profile_config.frequency as i32,
+                    on_cpu_profile_config.java_symbol_file_max_space_limit as i32,
+                    on_cpu_profile_config
+                        .java_symbol_file_refresh_defer_interval
+                        .as_secs() as i32,
                     Self::ebpf_on_cpu_callback,
                 ) != 0
                 {
@@ -555,8 +564,9 @@ impl EbpfCollector {
             SENDER = Some(sender);
             PROC_EVENT_SENDER = Some(proc_event_sender);
             EBPF_PROFILE_SENDER = Some(ebpf_profile_sender);
-            PLATFORM_SYNC = Some(platform_sync);
+            POLICY_GETTER = Some(policy_getter);
             ON_CPU_PROFILE_FREQUENCY = config.ebpf.on_cpu_profile.frequency as u32;
+            TIME_DIFF = Some(time_diff);
         }
 
         Ok(())
@@ -625,14 +635,13 @@ impl EbpfCollector {
         flow_map_config: FlowAccess,
         collector_config: CollectorAccess,
         policy_getter: PolicyGetter,
-        output: DebugSender<Box<MetaAppProto>>,
+        output: DebugSender<Box<AppProto>>,
         flow_output: DebugSender<Arc<BatchedBox<TaggedFlow>>>,
         l7_stats_output: DebugSender<BatchedBox<L7Stats>>,
         proc_event_output: DebugSender<BoxedProcEvents>,
         ebpf_profile_sender: DebugSender<Profile>,
         queue_debugger: &QueueDebugger,
         stats_collector: Arc<stats::Collector>,
-        platform_sync: Arc<PlatformSynchronizer>,
     ) -> Result<Box<Self>> {
         let ebpf_config = config.load();
         if ebpf_config.ebpf.disabled {
@@ -649,7 +658,8 @@ impl EbpfCollector {
             proc_event_output,
             ebpf_profile_sender,
             ebpf_config.l7_protocol_enabled_bitmap,
-            platform_sync,
+            policy_getter,
+            time_diff.clone(),
         )?;
         Self::ebpf_on_config_change(ebpf::CAP_LEN_MAX);
 
@@ -658,7 +668,7 @@ impl EbpfCollector {
             thread_dispatcher: EbpfDispatcher {
                 dispatcher_id,
                 time_diff,
-                receiver,
+                receiver: Arc::new(receiver),
                 policy_getter,
                 config,
                 log_parser_config,
@@ -668,21 +678,24 @@ impl EbpfCollector {
                 flow_map_config,
                 stats_collector,
                 collector_config,
+                pause: Arc::new(AtomicBool::new(true)),
             },
             thread_handle: None,
-            counter: EbpfCounter { rx: 0 },
+            counter: Arc::new(EbpfCounter {
+                rx: AtomicU64::new(0),
+            }),
         }))
     }
 
     pub fn get_sync_counter(&self) -> SyncEbpfCounter {
         SyncEbpfCounter {
-            counter: &self.counter as *const EbpfCounter as *mut EbpfCounter,
+            counter: self.counter.clone(),
         }
     }
 
-    fn get_sync_dispatcher(&self) -> SyncEbpfDispatcher {
+    pub fn get_sync_dispatcher(&self) -> SyncEbpfDispatcher {
         SyncEbpfDispatcher {
-            dispatcher: &self.thread_dispatcher as *const EbpfDispatcher as *mut EbpfDispatcher,
+            pause: self.thread_dispatcher.pause.clone(),
         }
     }
 
@@ -709,12 +722,12 @@ impl EbpfCollector {
             SWITCH = true;
         }
 
-        let sync_dispatcher = self.get_sync_dispatcher();
-        let sync_counter = self.get_sync_counter();
+        let sync_counter = self.counter.clone();
+        let dispatcher = self.thread_dispatcher.clone();
         self.thread_handle = Some(
             thread::Builder::new()
                 .name("ebpf-collector".to_owned())
-                .spawn(move || sync_dispatcher.dispatcher().run(sync_counter))
+                .spawn(move || dispatcher.run(sync_counter))
                 .unwrap(),
         );
 

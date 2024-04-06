@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,10 +18,10 @@ package event
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/common"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
-	. "github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 	"github.com/deepflowio/deepflow/server/libs/eventapi"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 )
@@ -29,16 +29,18 @@ import (
 type PodNode struct {
 	EventManagerBase
 	deviceType int
+	tool       *IPTool
 }
 
-func NewPodNode(toolDS *cache.ToolDataSet, eq *queue.OverwriteQueue) *PodNode {
+func NewPodNode(toolDS *tool.DataSet, eq *queue.OverwriteQueue) *PodNode {
 	mng := &PodNode{
-		EventManagerBase{
-			resourceType: RESOURCE_TYPE_POD_NODE_EN,
-			ToolDataSet:  toolDS,
-			Queue:        eq,
-		},
-		common.VIF_DEVICE_TYPE_POD_NODE,
+		newEventManagerBase(
+			ctrlrcommon.RESOURCE_TYPE_POD_NODE_EN,
+			toolDS,
+			eq,
+		),
+		ctrlrcommon.VIF_DEVICE_TYPE_POD_NODE,
+		newTool(toolDS),
 	}
 	return mng
 }
@@ -63,7 +65,7 @@ func (p *PodNode) ProduceByAdd(items []*mysql.PodNode) {
 			eventapi.TagPodClusterID(item.PodClusterID),
 		}...)
 
-		l3DeviceOpts, ok := getL3DeviceOptionsByPodNodeID(p.ToolDataSet, item.ID)
+		l3DeviceOpts, ok := p.tool.getL3DeviceOptionsByPodNodeID(item.ID)
 		if ok {
 			opts = append(opts, l3DeviceOpts...)
 			p.createAndEnqueue(
@@ -88,7 +90,7 @@ func (p *PodNode) ProduceByAdd(items []*mysql.PodNode) {
 	}
 }
 
-func (p *PodNode) ProduceByUpdate(cloudItem *cloudmodel.PodNode, diffBase *cache.PodNode) {
+func (p *PodNode) ProduceByUpdate(cloudItem *cloudmodel.PodNode, diffBase *diffbase.PodNode) {
 }
 
 func (p *PodNode) ProduceByDelete(lcuuids []string) {
@@ -99,7 +101,7 @@ func (p *PodNode) ProduceByDelete(lcuuids []string) {
 			var err error
 			name, err = p.ToolDataSet.GetPodNodeNameByID(id)
 			if err != nil {
-				log.Errorf("%v, %v", idByLcuuidNotFound(p.resourceType, lcuuid), err)
+				log.Error(p.org.LogPre("%v, %v", idByLcuuidNotFound(p.resourceType, lcuuid), err))
 			}
 		}
 

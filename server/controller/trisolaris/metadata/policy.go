@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,7 +23,6 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	mapset "github.com/deckarep/golang-set"
 	"github.com/deepflowio/deepflow/message/trident"
@@ -591,14 +590,20 @@ func (op *PolicyDataOP) generateProtoActions(acl *models.ACL) (map[int][]*triden
 			} else {
 				payloadSlice = *npbPolicy.PayloadSlice
 			}
+			direction := trident.Direction(npbPolicy.Direction)
+			var tunnelID *uint32
+			if npbPolicy.Vni != nil {
+				tunnelID = proto.Uint32(uint32(*npbPolicy.Vni))
+			}
 			npbAction := &trident.NpbAction{
-				TunnelId:      proto.Uint32(uint32(npbPolicy.Vni)),
+				TunnelId:      tunnelID,
 				TunnelIp:      proto.String(npbTunnel.IP),
 				TapSide:       &tapSideSRC,
 				TunnelType:    &tunnelType,
 				PayloadSlice:  proto.Uint32(uint32(payloadSlice)),
 				TunnelIpId:    proto.Uint32(uint32(npbTunnel.ID)),
 				NpbAclGroupId: proto.Uint32(uint32(npbPolicy.PolicyACLGroupID)),
+				Direction:     &direction,
 			}
 			if len(npbPolicy.VtapIDs) == 0 {
 				allVTapNpbActions = append(allVTapNpbActions, npbAction)
@@ -770,7 +775,7 @@ func getSortKey(vtapIDToPolicy map[int]*Policy) []int {
 
 func (op *PolicyDataOP) checkNewPolicies(vtapIDToPolicy map[int]*Policy,
 	allVTapSharePolicy *Policy, dropletPolicy *Policy) {
-	version := uint64(time.Now().Unix())
+	version := uint64(op.metaData.GetStartTime())
 	allVTapSharePolicy.toSerializeString()
 	dropletPolicy.toSerializeString()
 	vtapIDs := getSortKey(vtapIDToPolicy)

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,30 +18,55 @@ package updater
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
-	"github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type PodServicePort struct {
-	UpdaterBase[cloudmodel.PodServicePort, mysql.PodServicePort, *cache.PodServicePort]
+	UpdaterBase[
+		cloudmodel.PodServicePort,
+		mysql.PodServicePort,
+		*diffbase.PodServicePort,
+		*message.PodServicePortAdd,
+		message.PodServicePortAdd,
+		*message.PodServicePortUpdate,
+		message.PodServicePortUpdate,
+		*message.PodServicePortFieldsUpdate,
+		message.PodServicePortFieldsUpdate,
+		*message.PodServicePortDelete,
+		message.PodServicePortDelete]
 }
 
 func NewPodServicePort(wholeCache *cache.Cache, cloudData []cloudmodel.PodServicePort) *PodServicePort {
 	updater := &PodServicePort{
-		UpdaterBase[cloudmodel.PodServicePort, mysql.PodServicePort, *cache.PodServicePort]{
-			cache:        wholeCache,
-			dbOperator:   db.NewPodServicePort(),
-			diffBaseData: wholeCache.PodServicePorts,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.PodServicePort,
+			mysql.PodServicePort,
+			*diffbase.PodServicePort,
+			*message.PodServicePortAdd,
+			message.PodServicePortAdd,
+			*message.PodServicePortUpdate,
+			message.PodServicePortUpdate,
+			*message.PodServicePortFieldsUpdate,
+			message.PodServicePortFieldsUpdate,
+			*message.PodServicePortDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_PORT_EN,
+			wholeCache,
+			db.NewPodServicePort().SetORG(wholeCache.GetORG()),
+			wholeCache.DiffBaseDataSet.PodServicePorts,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
 }
 
-func (s *PodServicePort) getDiffBaseByCloudItem(cloudItem *cloudmodel.PodServicePort) (diffBase *cache.PodServicePort, exists bool) {
+func (s *PodServicePort) getDiffBaseByCloudItem(cloudItem *cloudmodel.PodServicePort) (diffBase *diffbase.PodServicePort, exists bool) {
 	diffBase, exists = s.diffBaseData[cloudItem.Lcuuid]
 	return
 }
@@ -49,10 +74,10 @@ func (s *PodServicePort) getDiffBaseByCloudItem(cloudItem *cloudmodel.PodService
 func (p *PodServicePort) generateDBItemToAdd(cloudItem *cloudmodel.PodServicePort) (*mysql.PodServicePort, bool) {
 	podServiceID, exists := p.cache.ToolDataSet.GetPodServiceIDByLcuuid(cloudItem.PodServiceLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
-			common.RESOURCE_TYPE_POD_SERVICE_EN, cloudItem.PodServiceLcuuid,
-			common.RESOURCE_TYPE_POD_SERVICE_PORT_EN, cloudItem.Lcuuid,
-		))
+		log.Error(p.org.LogPre(resourceAForResourceBNotFound(
+			ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN, cloudItem.PodServiceLcuuid,
+			ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_PORT_EN, cloudItem.Lcuuid,
+		)))
 		return nil, false
 	}
 
@@ -64,19 +89,19 @@ func (p *PodServicePort) generateDBItemToAdd(cloudItem *cloudmodel.PodServicePor
 		NodePort:     cloudItem.NodePort,
 		PodServiceID: podServiceID,
 		SubDomain:    cloudItem.SubDomainLcuuid,
+		Domain:       p.cache.DomainLcuuid,
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true
 }
 
-func (p *PodServicePort) generateUpdateInfo(diffBase *cache.PodServicePort, cloudItem *cloudmodel.PodServicePort) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (p *PodServicePort) generateUpdateInfo(diffBase *diffbase.PodServicePort, cloudItem *cloudmodel.PodServicePort) (*message.PodServicePortFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.PodServicePortFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
-		updateInfo["name"] = cloudItem.Name
+		mapInfo["name"] = cloudItem.Name
+		structInfo.Name.Set(diffBase.Name, cloudItem.Name)
 	}
 
-	if len(updateInfo) > 0 {
-		return updateInfo, true
-	}
-	return nil, false
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

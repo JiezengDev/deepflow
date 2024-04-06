@@ -29,6 +29,13 @@
 #define CACHE_LINE_ROUNDUP(size) \
   (CACHE_LINE_SIZE * ((size + CACHE_LINE_SIZE - 1) / CACHE_LINE_SIZE))
 
+enum linux_kernel_type {
+	K_TYPE_COMM,
+	K_TYPE_KYLIN,
+	K_TYPE_VER_5_2_PLUS,
+	K_TYPE_VER_3_10
+};
+
 enum probes_act_type {
 	ACT_NONE,
 	ACT_ATTACH,
@@ -42,6 +49,7 @@ struct socket_bpf_data {
 	uint64_t coroutine_id;	// CoroutineID, i.e., golang goroutine id
 	uint8_t source;		// syscall,go_tls_uprobe,go_http2_uprobe
 	uint8_t process_kname[TASK_COMM_LEN];	// comm in task_struct
+	uint8_t container_id[CONTAINER_ID_SIZE]; // container id
 
 	struct __tuple_t tuple;	// Socket五元组信息
 	uint64_t socket_id;	// Socket的唯一标识，从启动时的时钟开始自增1
@@ -49,6 +57,7 @@ struct socket_bpf_data {
 	// 存在一定误判性（例如标识为A协议但实际上是未知协议，或标识为多种协议），上层应用应继续深入判断
 	uint8_t msg_type;	// 信息类型，值为MSG_UNKNOWN(0), MSG_REQUEST(1), MSG_RESPONSE(2)
 	bool need_reconfirm;	// 是否需要上层再确认 
+	bool is_tls;
 
 	/* trace info */
 	uint64_t tcp_seq;	// 收发cap_data数据时TCP协议栈将会用到的TCP SEQ，可用于关联eBPF DATA与网络中的TCP Packet
@@ -61,6 +70,7 @@ struct socket_bpf_data {
 	uint64_t syscall_len;	// 本次系统调用读、写数据的总长度
 	uint32_t cap_len;	// 返回的cap_data长度
 	uint64_t cap_seq;	// cap_data在Socket中的相对顺序号，从启动时的时钟开始自增1，用于数据乱序排序
+	uint8_t socket_role;	// this message is created by: 0:unkonwn 1:client(connect) 2:server(accept)
 	char *cap_data;		// 返回的应用数据
 };
 
@@ -177,11 +187,6 @@ struct bpf_socktrace_params {
 	struct bpf_offset_param_array offset_array;
 };
 
-struct clear_list_elem {
-	struct list_head list;
-	const char p[0];
-};
-
 /*
  * This structure is used for registration of additional events. 
  */
@@ -198,10 +203,6 @@ static inline char *get_proto_name(uint16_t proto_id)
 		return "HTTP1";
 	case PROTO_HTTP2:
 		return "HTTP2";
-	case PROTO_TLS_HTTP1:
-		return "TLS_HTTP1";
-	case PROTO_TLS_HTTP2:
-		return "TLS_HTTP2";
 	case PROTO_MYSQL:
 		return "MySQL";
 	case PROTO_DNS:
@@ -212,12 +213,34 @@ static inline char *get_proto_name(uint16_t proto_id)
 		return "Kafka";
 	case PROTO_MQTT:
 		return "MQTT";
+	case PROTO_AMQP:
+		return "AMQP";
+	case PROTO_OPENWIRE:
+		return "OpenWire";
+	case PROTO_ZMTP:
+		return "ZMTP";
+	case PROTO_NATS:
+		return "NATS";
+	case PROTO_PULSAR:
+		return "Pulsar";
 	case PROTO_DUBBO:
 		return "Dubbo";
 	case PROTO_SOFARPC:
 		return "SofaRPC";
 	case PROTO_POSTGRESQL:
 		return "PgSQL";
+	case PROTO_ORACLE:
+		return "Oracle";
+	case PROTO_FASTCGI:
+		return "FastCGI";
+	case PROTO_BRPC:
+		return "bRPC";
+	case PROTO_MONGO:
+		return "MongoDB";
+	case PROTO_TLS:
+		return "TLS";
+	case PROTO_CUSTOM:
+		return "Custom";
 	default:
 		return "Unknown";
 	}
@@ -321,4 +344,6 @@ int running_socket_tracer(tracer_callback_t handle,
 int register_event_handle(uint32_t type, void (*fn)(void *));
 int socket_tracer_stop(void);
 int socket_tracer_start(void);
+enum tracer_state get_socket_tracer_state(void);
+int set_protocol_ports_bitmap(int proto_type, const char *ports);
 #endif /* DF_USER_SOCKET_H */

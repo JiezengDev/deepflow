@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,15 +29,19 @@ var (
 )
 
 type PrometheusManager struct {
-	Encoder           *encoder.Encoder
-	SynchronizerCache *cache.Cache
+	Encoder               *encoder.Encoder
+	SynchronizerCache     *cache.Cache
+	APPLabelLayoutUpdater *APPLabelLayoutUpdater
+	Clear                 *Cleaner
 }
 
 func GetSingleton() *PrometheusManager {
 	prometheusManagerOnce.Do(func() {
 		prometheusManager = &PrometheusManager{
-			Encoder:           encoder.GetSingleton(),
-			SynchronizerCache: cache.GetSingleton(),
+			Encoder:               encoder.GetSingleton(),
+			SynchronizerCache:     cache.GetSingleton(),
+			APPLabelLayoutUpdater: GetAPPLabelLayoutUpdater(),
+			Clear:                 GetCleaner(),
 		}
 	})
 	return prometheusManager

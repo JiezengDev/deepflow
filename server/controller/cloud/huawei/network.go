@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,11 +31,10 @@ func (h *HuaWei) getNetworks() ([]model.Network, []model.Subnet, []model.VInterf
 
 	requiredAttrs := []string{"id", "name", "cidr", "vpc_id", "availability_zone"}
 	for project, token := range h.projectTokenMap {
-		jNetworks, err := h.getRawData(
-			fmt.Sprintf("https://vpc.%s.%s/v1/%s/subnets", project.name, h.config.Domain, project.id), token.token, "subnets",
-		)
+		jNetworks, err := h.getRawData(newRawDataGetContext(
+			fmt.Sprintf("https://vpc.%s.%s/v1/%s/subnets", project.name, h.config.Domain, project.id), token.token, "subnets", pageQueryMethodMarker,
+		))
 		if err != nil {
-			log.Errorf("request failed: %v", err)
 			return nil, nil, nil, err
 		}
 
@@ -48,7 +47,6 @@ func (h *HuaWei) getNetworks() ([]model.Network, []model.Subnet, []model.VInterf
 				log.Infof("exclude network: %s, missing attr", name)
 				continue
 			}
-			cidr := jn.Get("cidr").MustString()
 			vpcID := jn.Get("vpc_id").MustString()
 			azLcuuid := h.toolDataSet.azNameToAZLcuuid[jn.Get("availability_zone").MustString()]
 			network := model.Network{
@@ -67,17 +65,33 @@ func (h *HuaWei) getNetworks() ([]model.Network, []model.Subnet, []model.VInterf
 			h.toolDataSet.regionLcuuidToResourceNum[regionLcuuid]++
 			h.toolDataSet.lcuuidToNetwork[id] = network
 
-			subnetLcuuid := common.GenerateUUID(id)
-			subnets = append(
-				subnets,
-				model.Subnet{
+			cidr := jn.Get("cidr").MustString()
+			if cidr != "" {
+				subnetLcuuid := common.GenerateUUID(id + cidr)
+				subnet := model.Subnet{
 					Lcuuid:        subnetLcuuid,
 					Name:          name,
 					CIDR:          cidr,
 					NetworkLcuuid: id,
 					VPCLcuuid:     vpcID,
-				},
-			)
+				}
+				subnets = append(subnets, subnet)
+				h.toolDataSet.networkLcuuidToSubnets[id] = append(h.toolDataSet.networkLcuuidToSubnets[id], subnet)
+			}
+			cidrV6 := jn.Get("cidr_v6").MustString()
+			if cidrV6 != "" {
+				subnetLcuuid := common.GenerateUUID(id + cidrV6)
+				subnet := model.Subnet{
+					Lcuuid:        subnetLcuuid,
+					Name:          name + "_v6",
+					CIDR:          cidrV6,
+					NetworkLcuuid: id,
+					VPCLcuuid:     vpcID,
+				}
+				subnets = append(subnets, subnet)
+				h.toolDataSet.networkLcuuidToSubnets[id] = append(h.toolDataSet.networkLcuuidToSubnets[id], subnet)
+			}
+
 			vifs = append(
 				vifs,
 				model.VInterface{
@@ -93,7 +107,6 @@ func (h *HuaWei) getNetworks() ([]model.Network, []model.Subnet, []model.VInterf
 			)
 			h.toolDataSet.networkLcuuidToCIDR[id] = cidr
 			h.toolDataSet.networkVPCLcuuidToAZLcuuids[vpcID] = append(h.toolDataSet.networkVPCLcuuidToAZLcuuids[vpcID], azLcuuid)
-			h.toolDataSet.networkLcuuidToSubnetLcuuid[id] = subnetLcuuid
 			neutronSubnetID, ok := jn.CheckGet("neutron_subnet_id")
 			if ok {
 				h.toolDataSet.neutronSubnetIDToNetwork[neutronSubnetID.MustString()] = network

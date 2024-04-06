@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -61,7 +61,7 @@ func NewUDPClient(conf UDPConfig) (*UDPClient, error) {
 
 	h := datatype.BaseHeader{
 		FrameSize: datatype.MESSAGE_HEADER_LEN + datatype.FLOW_HEADER_LEN,
-		Type:      datatype.MESSAGE_TYPE_DFSTATS,
+		Type:      datatype.MESSAGE_TYPE_SERVER_DFSTATS,
 	}
 	flowHeader := datatype.FlowHeader{}
 	header := make([]byte, datatype.MESSAGE_HEADER_LEN+datatype.FLOW_HEADER_LEN)

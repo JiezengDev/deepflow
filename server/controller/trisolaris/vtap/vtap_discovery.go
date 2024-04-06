@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,14 +27,16 @@ import (
 	. "github.com/deepflowio/deepflow/server/controller/common"
 	models "github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/dbmgr"
+	"github.com/deepflowio/deepflow/server/controller/trisolaris/utils"
 	. "github.com/deepflowio/deepflow/server/controller/trisolaris/utils"
 )
 
 type VTapRegister struct {
-	tapMode          int
-	vTapGroupID      string
-	defaultVTapGroup string
-	vTapAutoRegister bool
+	tapMode               int
+	vTapGroupID           string
+	defaultVTapGroup      string
+	vTapAutoRegister      bool
+	agentUniqueIdentifier int
 	VTapLKData
 }
 
@@ -81,7 +83,7 @@ func FilterSlice(s []string, filter func(x string) bool) []string {
 }
 
 func newVTapRegister(tapMode int, ctrlIP string, ctrlMac string, hostIPs []string,
-	host string, vTapGroupID string) *VTapRegister {
+	host string, vTapGroupID string, agentUniqueIdentifier int) *VTapRegister {
 	hIPs := FilterSlice(hostIPs, func(x string) bool {
 		if x == "127.0.0.1" {
 			return true
@@ -96,7 +98,8 @@ func newVTapRegister(tapMode int, ctrlIP string, ctrlMac string, hostIPs []strin
 			ctrlMac: ctrlMac,
 			hostIPs: hIPs,
 			host:    host},
-		vTapGroupID: vTapGroupID,
+		vTapGroupID:           vTapGroupID,
+		agentUniqueIdentifier: agentUniqueIdentifier,
 	}
 }
 
@@ -246,13 +249,6 @@ func (r *VTapRegister) registerVTapByHost(db *gorm.DB) (*models.VTap, bool) {
 	return dbVTap, result
 }
 
-func isVMofBMHtype(htype int) bool {
-	if Find[int]([]int{VM_HTYPE_BM_C, VM_HTYPE_BM_N, VM_HTYPE_BM_S}, htype) == true {
-		return true
-	}
-	return false
-}
-
 func (l *VTapLKData) LookUpVTapByPodNode(db *gorm.DB) *VTapLKResult {
 	podNodeMgr := dbmgr.DBMgr[models.PodNode](db)
 	podNodes, err := podNodeMgr.GetBatchFromIPs(l.hostIPs)
@@ -320,7 +316,7 @@ func (l *VTapLKData) LookUpVTapByPodNode(db *gorm.DB) *VTapLKResult {
 					l.getKey(), conn.VMID, err)
 				return nil
 			}
-			if isVMofBMHtype(vm.HType) == true {
+			if utils.IsVMofBMHtype(vm.HType) == true {
 				vTapType = VTAP_TYPE_POD_HOST
 			} else {
 				vTapType = VTAP_TYPE_POD_VM
@@ -336,7 +332,7 @@ func (l *VTapLKData) LookUpVTapByPodNode(db *gorm.DB) *VTapLKResult {
 				log.Errorf("failed to register agent(%s) by querying DB table vm(id=%d) without finding data, err: %s", l.getKey(), matchVif.DeviceID, err)
 				return nil
 			}
-			if isVMofBMHtype(vm.HType) == true {
+			if utils.IsVMofBMHtype(vm.HType) == true {
 				vTapType = VTAP_TYPE_POD_HOST
 			} else {
 				vTapType = VTAP_TYPE_POD_VM
@@ -580,7 +576,7 @@ func (l *VTapLKData) LookUpMirrorVTapByIP(db *gorm.DB) *VTapLKResult {
 			log.Errorf("failed to register agent(%s), host_device(ip=%s) not found vm", host.IP)
 			return nil
 		}
-		if isVMofBMHtype(vm.HType) == true {
+		if utils.IsVMofBMHtype(vm.HType) == true {
 			vTapType = VTAP_TYPE_WORKLOAD_P
 		} else {
 			vTapType = VTAP_TYPE_WORKLOAD_V
@@ -674,7 +670,7 @@ func (l *VTapLKData) LookUpLocalVTapByIP(db *gorm.DB) *VTapLKResult {
 		vTapType     int
 		launchServer string
 	)
-	if isVMofBMHtype(vm.HType) == true {
+	if utils.IsVMofBMHtype(vm.HType) == true {
 		vTapType = VTAP_TYPE_WORKLOAD_P
 	} else {
 		vTapType = VTAP_TYPE_WORKLOAD_V
@@ -747,6 +743,114 @@ func (r *VTapRegister) registerVTapAnalyzerTapMode(db *gorm.DB) (*models.VTap, b
 	return dbVTap, true
 }
 
+func (r *VTapRegister) registerVTapByCtrlIP(db *gorm.DB) (*models.VTap, bool) {
+	vInterfaceID := 0
+	lanIPMgr := dbmgr.DBMgr[models.LANIP](db)
+	lanIP, err := lanIPMgr.GetByOption(lanIPMgr.WithIP(r.ctrlIP))
+	if err != nil || lanIP == nil {
+		log.Errorf("failed to register agent(%s) by querying DB table vinterface_ip(ip = %s) without finding data", r.getKey(), r.ctrlIP)
+		if err != nil {
+			log.Error(err)
+		}
+		wanIPMgr := dbmgr.DBMgr[models.WANIP](db)
+		wanIP, err := wanIPMgr.GetByOption(wanIPMgr.WithIP(r.ctrlIP))
+		if err != nil || wanIP == nil {
+			log.Errorf("failed to register agent(%s) by querying DB table ip_resource(ip = %s) without finding data", r.getKey(), r.ctrlIP)
+			if err != nil {
+				log.Error(err)
+			}
+			return nil, false
+		}
+		vInterfaceID = wanIP.VInterfaceID
+	} else {
+		vInterfaceID = lanIP.VInterfaceID
+	}
+	vif, err := dbmgr.DBMgr[models.VInterface](db).GetFromID(vInterfaceID)
+	if err != nil || vif == nil {
+		log.Errorf("failed to register agent(%s) by querying DB table vinterface(id = %d) without finding data",
+			r.getKey(), vInterfaceID)
+		if err != nil {
+			log.Error(err)
+		}
+		return nil, false
+	}
+
+	vm, err := dbmgr.DBMgr[models.VM](db).GetFromID(vif.DeviceID)
+	if err != nil || vm == nil {
+		log.Errorf("failed to register agent(%s) by querying DB table vm(id = %d) without finding data", r.getKey(), vif.DeviceID)
+		if err != nil {
+			log.Error(err)
+		}
+		return nil, false
+	}
+	var vTapType int
+	if utils.IsVMofBMHtype(vm.HType) == true {
+		vTapType = VTAP_TYPE_WORKLOAD_P
+	} else {
+		vTapType = VTAP_TYPE_WORKLOAD_V
+	}
+	vTapName := fmt.Sprintf("%s-W%d", vm.Name, vm.ID)
+	dbVTap := &models.VTap{
+		CtrlIP:          r.ctrlIP,
+		CtrlMac:         r.ctrlMac,
+		Type:            vTapType,
+		LaunchServer:    r.ctrlIP,
+		LaunchServerID:  vm.ID,
+		Name:            vTapName,
+		AZ:              vm.AZ,
+		Region:          vm.Region,
+		VtapGroupLcuuid: r.getVTapGroupLcuuid(db),
+		State:           VTAP_STATE_PENDING,
+		TapMode:         r.tapMode,
+		Lcuuid:          vm.Lcuuid,
+	}
+	result := r.insertToDB(dbVTap, db)
+	return dbVTap, result
+}
+
+func (r *VTapRegister) registerVTapByCtrlIPMac(db *gorm.DB) (vtap *models.VTap, ok bool) {
+	for {
+		switch r.tapMode {
+		case TAPMODE_LOCAL:
+			vtap, ok = r.registerVTapByHost(db)
+			if ok == true {
+				break
+			}
+			vtap, ok = r.registerVTapByPodNode(db)
+			if ok == true {
+				break
+			}
+			vtap, ok = r.registerVTapByPod(db)
+			if ok == true {
+				break
+			}
+			vtap, ok = r.registerLocalVTapByIP(db)
+		case TAPMODE_MIRROR:
+			vtap, ok = r.registerVTapByHost(db)
+			if ok == true {
+				break
+			}
+			vtap, ok = r.registerVTapByPodNode(db)
+			if ok == true {
+				break
+			}
+			vtap, ok = r.registerVTapByPod(db)
+			if ok == true {
+				break
+			}
+			vtap, ok = r.registerMirrorVTapByIP(db)
+		case TAPMODE_ANALYZER:
+			vtap, ok = r.registerVTapAnalyzerTapMode(db)
+
+		default:
+			log.Errorf("unkown tap_mode(%d) from agent(%s)", r.tapMode, r.getKey())
+		}
+		break
+	}
+
+	return
+}
+
 func (r *VTapRegister) registerVTap(v *VTapInfo, done func()) {
 	defer done()
 	vtapMgr := dbmgr.DBMgr[models.VTap](v.db)
@@ -774,48 +878,20 @@ func (r *VTapRegister) registerVTap(v *VTapInfo, done func()) {
 	log.Infof("register vtap: %s", r)
 	var vtap *models.VTap
 	ok := false
-	for {
-		switch r.tapMode {
-		case TAPMODE_LOCAL:
-			vtap, ok = r.registerVTapByHost(v.db)
-			if ok == true {
-				break
-			}
-			vtap, ok = r.registerVTapByPodNode(v.db)
-			if ok == true {
-				break
-			}
-			vtap, ok = r.registerVTapByPod(v.db)
-			if ok == true {
-				break
-			}
-			vtap, ok = r.registerLocalVTapByIP(v.db)
-		case TAPMODE_MIRROR:
-			vtap, ok = r.registerVTapByHost(v.db)
-			if ok == true {
-				break
-			}
-			vtap, ok = r.registerVTapByPodNode(v.db)
-			if ok == true {
-				break
-			}
-			vtap, ok = r.registerVTapByPod(v.db)
-			if ok == true {
-				break
-			}
-			vtap, ok = r.registerMirrorVTapByIP(v.db)
-		case TAPMODE_ANALYZER:
-			vtap, ok = r.registerVTapAnalyzerTapMode(v.db)
+	switch r.agentUniqueIdentifier {
+	case AGENT_IDENTIFIE_IP_AND_MAC:
+		vtap, ok = r.registerVTapByCtrlIPMac(v.db)
+	case AGENT_IDENTIFIE_IP:
+		vtap, ok = r.registerVTapByCtrlIP(v.db)
+	default:
+		log.Errorf("unkown agent_unique_identifier(%d) from agent(%s)", r.agentUniqueIdentifier, r.getKey())
 
-		default:
-			log.Errorf("unkown tap_mode(%d) from agent(%s)", r.tapMode, r.getKey())
-		}
-		break
 	}
 
 	if vtap != nil && ok == true {
 		v.AddVTapCache(vtap)
 		v.putChRegisterFisnish()
+		log.Infof("finish register vtap: %s", r)
 	}
 }
 

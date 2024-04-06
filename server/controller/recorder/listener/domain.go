@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,7 +34,7 @@ type WholeDomain struct {
 func NewWholeDomain(domainLcuuid string, c *cache.Cache, eq *queue.OverwriteQueue) *WholeDomain {
 	listener := &WholeDomain{
 		cache:         c,
-		eventProducer: event.NewDomain(domainLcuuid, &c.ToolDataSet, eq),
+		eventProducer: event.NewDomain(domainLcuuid, c.ToolDataSet, eq),
 	}
 	return listener
 }

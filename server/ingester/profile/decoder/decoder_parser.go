@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,12 +36,14 @@ type Parser struct {
 	profileName string
 	vtapID      uint16
 	IP          net.IP
+	podID       uint32
 
 	// profileWriter.Write
 	callBack func(interface{})
 
-	platformData *grpc.PlatformInfoTable
-	inTimestamp  time.Time
+	platformData    *grpc.PlatformInfoTable
+	inTimestamp     time.Time
+	compressionAlgo string
 	*observer
 	*processTracer
 	*Counter
@@ -100,7 +102,7 @@ func (p *Parser) stackToInProcess(input *storage.PutInput, stack []string, value
 	onelineStack := strings.Join(stack, ";")
 	atomic.AddInt64(&p.Counter.UncompressSize, int64(len(onelineStack)))
 
-	location, algo := compress(onelineStack)
+	location := compress(onelineStack, p.compressionAlgo)
 	atomic.AddInt64(&p.Counter.CompressedSize, int64(len(location)))
 
 	profileValue := value
@@ -115,10 +117,11 @@ func (p *Parser) stackToInProcess(input *storage.PutInput, stack []string, value
 	ret.FillProfile(input,
 		p.platformData,
 		p.vtapID,
+		p.podID,
 		p.profileName,
 		eventType,
 		location,
-		algo,
+		p.compressionAlgo,
 		int64(profileValue),
 		p.inTimestamp,
 		spyMap[input.SpyName],
@@ -139,23 +142,37 @@ func (s *observer) Observe(k []byte, v int) {
 	// e.g.: convert profile application & profile labels to prometheus series
 }
 
-func compress(src string) (string, string) {
-	dst := make([]byte, 0, len(src))
-	result, err := common.ZstdCompress(dst, []byte(src), zstd.SpeedDefault)
-	if err != nil {
-		log.Errorf("compress error: %v", err)
-		return src, ""
+func compress(src string, algo string) string {
+	switch algo {
+	case "":
+		return src
+	case "zstd":
+		dst := make([]byte, 0, len(src))
+		result, err := common.ZstdCompress(dst, []byte(src), zstd.SpeedDefault)
+		if err != nil {
+			log.Errorf("compress error: %v", err)
+			return src
+		}
+		// str after compressed and algo
+		return string(result)
+	default:
+		return src
 	}
-	// str after compressed and algo
-	return string(result), "zstd"
 }
 
-func deCompress(str []byte) string {
-	dst := make([]byte, 0, len(str))
-	result, err := common.ZstdDecompress(dst, str)
-	if err != nil {
-		log.Errorf("decompress error: %v", err)
-		return ""
+func deCompress(str []byte, algo string) string {
+	switch algo {
+	case "":
+		return string(str)
+	case "zstd":
+		dst := make([]byte, 0, len(str))
+		result, err := common.ZstdDecompress(dst, str)
+		if err != nil {
+			log.Errorf("decompress error: %v", err)
+			return ""
+		}
+		return string(result)
+	default:
+		return string(str)
 	}
-	return string(result)
 }

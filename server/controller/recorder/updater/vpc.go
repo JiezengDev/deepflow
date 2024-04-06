@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,30 +18,55 @@ package updater
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/common"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type VPC struct {
-	UpdaterBase[cloudmodel.VPC, mysql.VPC, *cache.VPC]
+	UpdaterBase[
+		cloudmodel.VPC,
+		mysql.VPC,
+		*diffbase.VPC,
+		*message.VPCAdd,
+		message.VPCAdd,
+		*message.VPCUpdate,
+		message.VPCUpdate,
+		*message.VPCFieldsUpdate,
+		message.VPCFieldsUpdate,
+		*message.VPCDelete,
+		message.VPCDelete]
 }
 
 func NewVPC(wholeCache *cache.Cache, cloudData []cloudmodel.VPC) *VPC {
 	updater := &VPC{
-		UpdaterBase[cloudmodel.VPC, mysql.VPC, *cache.VPC]{
-			cache:        wholeCache,
-			dbOperator:   db.NewVPC(),
-			diffBaseData: wholeCache.VPCs,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.VPC,
+			mysql.VPC,
+			*diffbase.VPC,
+			*message.VPCAdd,
+			message.VPCAdd,
+			*message.VPCUpdate,
+			message.VPCUpdate,
+			*message.VPCFieldsUpdate,
+			message.VPCFieldsUpdate,
+			*message.VPCDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_VPC_EN,
+			wholeCache,
+			db.NewVPC().SetORG(wholeCache.GetORG()),
+			wholeCache.DiffBaseDataSet.VPCs,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
 }
 
-func (v *VPC) getDiffBaseByCloudItem(cloudItem *cloudmodel.VPC) (diffBase *cache.VPC, exists bool) {
+func (v *VPC) getDiffBaseByCloudItem(cloudItem *cloudmodel.VPC) (diffBase *diffbase.VPC, exists bool) {
 	diffBase, exists = v.diffBaseData[cloudItem.Lcuuid]
 	return
 }
@@ -51,7 +76,7 @@ func (v *VPC) generateDBItemToAdd(cloudItem *cloudmodel.VPC) (*mysql.VPC, bool) 
 		Name:         cloudItem.Name,
 		Label:        cloudItem.Label,
 		UID:          cloudItem.Label,
-		CreateMethod: common.CREATE_METHOD_LEARN,
+		CreateMethod: ctrlrcommon.CREATE_METHOD_LEARN,
 		Domain:       v.cache.DomainLcuuid,
 		Region:       cloudItem.RegionLcuuid,
 		CIDR:         cloudItem.CIDR,
@@ -61,26 +86,29 @@ func (v *VPC) generateDBItemToAdd(cloudItem *cloudmodel.VPC) (*mysql.VPC, bool) 
 	return dbItem, true
 }
 
-func (v *VPC) generateUpdateInfo(diffBase *cache.VPC, cloudItem *cloudmodel.VPC) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (v *VPC) generateUpdateInfo(diffBase *diffbase.VPC, cloudItem *cloudmodel.VPC) (*message.VPCFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.VPCFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
-		updateInfo["name"] = cloudItem.Name
+		mapInfo["name"] = cloudItem.Name
+		structInfo.Name.Set(diffBase.Name, cloudItem.Name)
 	}
 	if diffBase.Label != cloudItem.Label {
-		updateInfo["label"] = cloudItem.Label
+		mapInfo["label"] = cloudItem.Label
+		structInfo.Label.Set(diffBase.Label, cloudItem.Label)
 	}
 	if diffBase.RegionLcuuid != cloudItem.RegionLcuuid {
-		updateInfo["region"] = cloudItem.RegionLcuuid
+		mapInfo["region"] = cloudItem.RegionLcuuid
+		structInfo.RegionLcuuid.Set(diffBase.RegionLcuuid, cloudItem.RegionLcuuid)
 	}
 	if diffBase.CIDR != cloudItem.CIDR {
-		updateInfo["cidr"] = cloudItem.CIDR
+		mapInfo["cidr"] = cloudItem.CIDR
+		structInfo.CIDR.Set(diffBase.CIDR, cloudItem.CIDR)
 	}
 	if diffBase.TunnelID != cloudItem.TunnelID {
-		updateInfo["tunnel_id"] = cloudItem.TunnelID
+		mapInfo["tunnel_id"] = cloudItem.TunnelID
+		structInfo.TunnelID.Set(diffBase.TunnelID, cloudItem.TunnelID)
 	}
 
-	if len(updateInfo) > 0 {
-		return updateInfo, true
-	}
-	return nil, false
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

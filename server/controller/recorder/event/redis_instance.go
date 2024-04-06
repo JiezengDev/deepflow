@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,10 +18,10 @@ package event
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/common"
+	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
-	. "github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
+	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 	"github.com/deepflowio/deepflow/server/libs/eventapi"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 )
@@ -31,14 +31,14 @@ type RedisInstance struct {
 	deviceType int
 }
 
-func NewRedisInstance(toolDS *cache.ToolDataSet, eq *queue.OverwriteQueue) *RedisInstance {
+func NewRedisInstance(toolDS *tool.DataSet, eq *queue.OverwriteQueue) *RedisInstance {
 	mng := &RedisInstance{
-		EventManagerBase{
-			resourceType: RESOURCE_TYPE_REDIS_INSTANCE_EN,
-			ToolDataSet:  toolDS,
-			Queue:        eq,
-		},
-		common.VIF_DEVICE_TYPE_REDIS_INSTANCE,
+		newEventManagerBase(
+			ctrlrcommon.RESOURCE_TYPE_REDIS_INSTANCE_EN,
+			toolDS,
+			eq,
+		),
+		ctrlrcommon.VIF_DEVICE_TYPE_REDIS_INSTANCE,
 	}
 	return mng
 }
@@ -72,7 +72,7 @@ func (r *RedisInstance) ProduceByAdd(items []*mysql.RedisInstance) {
 	}
 }
 
-func (r *RedisInstance) ProduceByUpdate(cloudItem *cloudmodel.RedisInstance, diffBase *cache.RedisInstance) {
+func (r *RedisInstance) ProduceByUpdate(cloudItem *cloudmodel.RedisInstance, diffBase *diffbase.RedisInstance) {
 }
 
 func (r *RedisInstance) ProduceByDelete(lcuuids []string) {
@@ -84,7 +84,7 @@ func (r *RedisInstance) ProduceByDelete(lcuuids []string) {
 			var err error
 			name, err = r.ToolDataSet.GetRedisInstanceNameByID(id)
 			if err != nil {
-				log.Errorf("%v, %v", idByLcuuidNotFound(r.resourceType, lcuuid), err)
+				log.Error(r.org.LogPre("%v, %v", idByLcuuidNotFound(r.resourceType, lcuuid), err))
 			}
 		} else {
 			log.Error(nameByIDNotFound(r.resourceType, id))

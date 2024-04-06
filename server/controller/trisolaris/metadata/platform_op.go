@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -151,7 +151,7 @@ func (p *PlatformDataOP) generateVInterfaces() {
 		}
 		device, ok := rawData.typeIDToDevice[typeIDKey]
 		if ok == false {
-			log.Warningf("vif (luccid:%s, domain:%s) not found device(device_type:%d, device_id:%d)",
+			log.Warningf("vif (lcuuid:%s, domain:%s) not found device(device_type:%d, device_id:%d)",
 				vif.Lcuuid, vif.Domain, vif.DeviceType, vif.DeviceID)
 			continue
 		}
@@ -384,14 +384,17 @@ func (p *PlatformDataOP) generateCIDRs() {
 }
 
 func (p *PlatformDataOP) generateGProcessInfo() {
+	rawData := p.GetRawData()
 	dbDataCache := p.metaData.GetDBDataCache()
 	processes := dbDataCache.GetProcesses()
 	gprocessData := newGProcessInfoProto(len(processes))
 	for _, process := range processes {
+		podId := rawData.containerIdToPodId[process.ContainerID]
 		p := &trident.GProcessInfo{
 			GprocessId: proto.Uint32(uint32(process.ID)),
-			NetnsId:    proto.Uint32(process.NetnsID),
 			VtapId:     proto.Uint32(uint32(process.VTapID)),
+			PodId:      proto.Uint32(uint32(podId)),
+			Pid:        proto.Uint32(uint32(process.PID)),
 		}
 		gprocessData.gprocessInfo = append(gprocessData.gprocessInfo, p)
 	}
@@ -410,7 +413,7 @@ func (p *PlatformDataOP) generateIngesterPlatformData() {
 		domainPeerConnProto.peerConns, domainCIDRProto.cidrs, gprocessInfo)
 	oldIngesterPlatformData := p.GetAllPlatformDataForIngester()
 	if oldIngesterPlatformData.GetVersion() == 0 {
-		newIngesterPlatformData.setVersion(uint64(time.Now().Unix()))
+		newIngesterPlatformData.setVersion(uint64(p.metaData.GetStartTime()))
 		p.updateAllPlatformDataForIngester(newIngesterPlatformData)
 	} else if !newIngesterPlatformData.equal(oldIngesterPlatformData) {
 		newIngesterPlatformData.setVersion(oldIngesterPlatformData.GetVersion() + 1)
@@ -588,26 +591,37 @@ func (p *PlatformDataOP) generatePodIPS() {
 	pods := p.metaData.GetDBDataCache().GetPods()
 	podIPs := make([]*trident.PodIp, 0, len(pods))
 	for _, pod := range pods {
-		vifs, ok := rawData.podIDToVifs[pod.ID]
-		if ok == false {
-			continue
+		podNodeIP := ""
+		if podNode := rawData.GetPodNode(pod.PodNodeID); podNode != nil {
+			podNodeIP = podNode.IP
 		}
-		vifs.Each(func(vif interface{}) bool {
-			podVif := vif.(*models.VInterface)
-			ips, ok := rawData.vInterfaceIDToIP[podVif.ID]
-			if ok == false || len(ips) == 0 {
-				return false
-			}
-			data := &trident.PodIp{
-				PodId:        proto.Uint32(uint32(pod.ID)),
-				PodName:      proto.String(pod.Name),
-				EpcId:        proto.Uint32(uint32(pod.VPCID)),
-				Ip:           proto.String(ips[0].GetIp()),
-				PodClusterId: proto.Uint32(uint32(pod.PodClusterID)),
-			}
-			podIPs = append(podIPs, data)
-			return true
-		})
+		podGroupType := uint32(0)
+		if podGroup := rawData.GetPodGroup(pod.PodGroupID); podGroup != nil {
+			podGroupType = PodGroupTypeMap[podGroup.Type]
+		}
+		data := &trident.PodIp{
+			PodId:        proto.Uint32(uint32(pod.ID)),
+			PodName:      proto.String(pod.Name),
+			EpcId:        proto.Uint32(uint32(pod.VPCID)),
+			PodClusterId: proto.Uint32(uint32(pod.PodClusterID)),
+			ContainerIds: strings.Split(pod.ContainerIDs, ", "),
+			PodNodeIp:    proto.String(podNodeIP),
+			PodNsId:      proto.Uint32(uint32(pod.PodNamespaceID)),
+			PodGroupId:   proto.Uint32(uint32(pod.PodGroupID)),
+			PodGroupType: proto.Uint32(podGroupType),
+		}
+		if vifs, ok := rawData.podIDToVifs[pod.ID]; ok == true {
+			vifs.Each(func(vif interface{}) bool {
+				podVif := vif.(*models.VInterface)
+				ips, ok := rawData.vInterfaceIDToIP[podVif.ID]
+				if ok == false || len(ips) == 0 {
+					return false
+				}
+				data.Ip = proto.String(ips[0].GetIp())
+				return true
+			})
+		}
+		podIPs = append(podIPs, data)
 	}
 	p.updatePodIPs(podIPs)
 }

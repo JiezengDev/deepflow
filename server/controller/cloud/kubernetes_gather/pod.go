@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,14 +23,13 @@ import (
 	"time"
 
 	"github.com/bitly/go-simplejson"
-	cloudcommon "github.com/deepflowio/deepflow/server/controller/cloud/common"
 	"github.com/deepflowio/deepflow/server/controller/cloud/kubernetes_gather/expand"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
 	uuid "github.com/satori/go.uuid"
 )
 
-func (k *KubernetesGather) getPods() (pods []model.Pod, nodes []model.PodNode, err error) {
+func (k *KubernetesGather) getPods() (pods []model.Pod, err error) {
 	log.Debug("get pods starting")
 	podTypesMap := map[string]bool{
 		"CloneSet":              false,
@@ -41,7 +40,6 @@ func (k *KubernetesGather) getPods() (pods []model.Pod, nodes []model.PodNode, e
 		"StatefulSet":           false,
 		"ReplicationController": false,
 	}
-	abstractNodes := map[string]int{}
 	for _, p := range k.k8sInfo["*v1.Pod"] {
 		pData, pErr := simplejson.NewJson([]byte(p))
 		if pErr != nil {
@@ -50,7 +48,7 @@ func (k *KubernetesGather) getPods() (pods []model.Pod, nodes []model.PodNode, e
 			return
 		}
 
-		envString := expand.GetPodENV(pData, k.customTagLenMax)
+		envString := expand.GetPodENV(pData, k.envRegex, k.customTagLenMax)
 
 		metaData, ok := pData.CheckGet("metadata")
 		if !ok {
@@ -100,7 +98,7 @@ func (k *KubernetesGather) getPods() (pods []model.Pod, nodes []model.PodNode, e
 				abstractPGName = resourceName[:targetIndex]
 			}
 			uid := common.GetUUID(namespace+abstractPGName, uuid.Nil)
-			// 适配 serverless pod, 需要抽象出一个对应的 node
+			// 适配 serverless pod
 			podGroups, _ = simplejson.NewJson([]byte(fmt.Sprintf(`[{"uid": "%s","kind": "%s"}]`, uid, abstractPGType)))
 		}
 		ID := podGroups.GetIndex(0).Get("uid").MustString()
@@ -165,12 +163,9 @@ func (k *KubernetesGather) getPods() (pods []model.Pod, nodes []model.PodNode, e
 				labels[exK] = exV
 			}
 		}
-		labelSlice := cloudcommon.StringInterfaceMapKVs(labels, ":", 0)
-		labelString := strings.Join(labelSlice, ", ")
 
 		annotations := metaData.Get("annotations")
-
-		annotationString := expand.GetAnnotation(annotations, k.customTagLenMax)
+		annotationString := expand.GetAnnotation(annotations, k.annotationRegex, k.customTagLenMax)
 
 		containerIDs := []string{}
 		containerStatuses := pData.GetPath("status", "containerStatuses")
@@ -187,23 +182,31 @@ func (k *KubernetesGather) getPods() (pods []model.Pod, nodes []model.PodNode, e
 		}
 		sort.Strings(containerIDs)
 
+		var podServiceLcuuid string
+		podServiceLcuuids, ok := k.pgLcuuidToPSLcuuids[podGroupLcuuid]
+		if ok && len(podServiceLcuuids) > 0 {
+			sort.Strings(podServiceLcuuids)
+			podServiceLcuuid = podServiceLcuuids[0]
+		}
+
 		pod := model.Pod{
 			Lcuuid:              podLcuuid,
 			Name:                name,
 			State:               status,
-			VPCLcuuid:           k.VPCUuid,
+			VPCLcuuid:           k.VPCUUID,
 			ENV:                 envString,
-			Label:               labelString,
+			Label:               k.GetLabel(labels),
 			Annotation:          annotationString,
 			ContainerIDs:        strings.Join(containerIDs, ", "),
 			PodReplicaSetLcuuid: podRSLcuuid,
 			PodNodeLcuuid:       k.nodeIPToLcuuid[hostIP],
 			PodGroupLcuuid:      podGroupLcuuid,
+			PodServiceLcuuid:    podServiceLcuuid,
 			PodNamespaceLcuuid:  namespaceLcuuid,
 			CreatedAt:           created,
 			AZLcuuid:            k.azLcuuid,
-			RegionLcuuid:        k.RegionUuid,
-			PodClusterLcuuid:    common.GetUUID(k.UuidGenerate, uuid.Nil),
+			RegionLcuuid:        k.RegionUUID,
+			PodClusterLcuuid:    k.podClusterLcuuid,
 		}
 		pods = append(pods, pod)
 		podIP := pData.Get("status").Get("podIP").MustString()
@@ -222,22 +225,6 @@ func (k *KubernetesGather) getPods() (pods []model.Pod, nodes []model.PodNode, e
 				k.podIPToLcuuid[ip] = podLcuuid
 			}
 		}
-	}
-
-	for nodeIP := range abstractNodes {
-		podClusterLcuuid := common.GetUUID(k.UuidGenerate, uuid.Nil)
-		nodes = append(nodes, model.PodNode{
-			Lcuuid:           common.GetUUID(nodeIP+podClusterLcuuid, uuid.Nil),
-			Name:             nodeIP,
-			Type:             common.POD_NODE_TYPE_NODE,
-			ServerType:       common.POD_NODE_SERVER_TYPE_HOST,
-			State:            common.POD_NODE_STATE_NORMAL,
-			IP:               nodeIP,
-			VPCLcuuid:        k.VPCUuid,
-			AZLcuuid:         k.azLcuuid,
-			RegionLcuuid:     k.RegionUuid,
-			PodClusterLcuuid: common.GetUUID(k.UuidGenerate, uuid.Nil),
-		})
 	}
 	log.Debug("get pods complete")
 	return

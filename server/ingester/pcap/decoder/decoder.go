@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Yunshan Networks
+ * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@ import (
 	"github.com/deepflowio/deepflow/server/ingester/pcap/config"
 	"github.com/deepflowio/deepflow/server/ingester/pcap/dbwriter"
 	"github.com/deepflowio/deepflow/server/libs/codec"
+	"github.com/deepflowio/deepflow/server/libs/grpc"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 	"github.com/deepflowio/deepflow/server/libs/receiver"
 	"github.com/deepflowio/deepflow/server/libs/stats"
@@ -176,5 +177,6 @@ func pcapToStore(vtapID uint16, pcapHeader []byte, pcap *trident.Pcap) *dbwriter
 	for _, id := range pcap.GetAclGids() {
 		s.AclGids = append(s.AclGids, uint16(id))
 	}
+	s.OrgId, s.TeamID = grpc.QueryVtapOrgAndTeamID(vtapID)
 	return s
 }
