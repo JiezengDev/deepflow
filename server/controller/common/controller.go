@@ -23,12 +23,13 @@ import (
 
 	simplejson "github.com/bitly/go-simplejson"
 
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
-func GetSelfController() (*mysql.Controller, error) {
-	var controller *mysql.Controller
-	err := mysql.Db.Where("ip = ?", GetNodeIP()).Find(&controller).Error
+func GetSelfController() (*metadbmodel.Controller, error) {
+	var controller *metadbmodel.Controller
+	err := metadb.DefaultDB.Where("ip = ?", GetNodeIP()).Find(&controller).Error
 	return controller, err
 }
 
@@ -49,8 +50,8 @@ func GetMasterControllerHostPort() (masterIP string, httpPort, grpcPort int, err
 			return
 		}
 	} else {
-		var controllers []*mysql.Controller
-		err = mysql.Db.Where("node_type = ? AND state = ?", CONTROLLER_NODE_TYPE_MASTER, CONTROLLER_STATE_NORMAL).Find(&controllers).Error
+		var controllers []*metadbmodel.Controller
+		err = metadb.DefaultDB.Where("node_type = ? AND state = ?", CONTROLLER_NODE_TYPE_MASTER, CONTROLLER_STATE_NORMAL).Find(&controllers).Error
 		if err != nil {
 			return
 		}
@@ -83,10 +84,4 @@ func GetMasterControllerHostPort() (masterIP string, httpPort, grpcPort int, err
 		masterIP = resp.Get("DATA").Get("NODE_IP").MustString()
 	}
 	return
-}
-
-func CheckSelfAndGetMasterControllerHostPort() (ok bool, masterCtrlIP string, httpPort, grpcPort int, err error) {
-	curCtrlIP := GetPodIP()
-	masterCtrlIP, httpPort, grpcPort, err = GetMasterControllerHostPort()
-	return curCtrlIP == masterCtrlIP, masterCtrlIP, httpPort, grpcPort, err
 }

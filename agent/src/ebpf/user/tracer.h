@@ -44,8 +44,15 @@
 #include <bcc/libbpf.h>
 #include "symbol.h"
 #include <regex.h>
+#include "config.h"
 
-// TODO: 对内存拷贝进行硬件优化。
+#define CTLBIN_INSTALL_PATH  "/usr/bin/deepflow-ebpfctl"
+
+#define PERF_PAGE_DEF_SZ 4096
+
+#define STRINGIFY(x) #x
+#define UPROBE_FUNC_NAME(N) STRINGIFY(df_U_##N)
+#define URETPROBE_FUNC_NAME(N) STRINGIFY(df_UR_##N)
 
 #define LOOP_DELAY_US  100000
 
@@ -55,7 +62,6 @@
 
 #define RING_SIZE 16384
 #define MAX_BULK 32
-#define MAX_PKT_BURST 16
 #define SOCKET_ID_ANY -1
 
 #define NANOSEC_PER_SEC 1000000000ULL	/* 10^9 */
@@ -85,8 +91,15 @@
 #define PERF_READER_TIMEOUT_DEF 100
 #define PERF_READER_NUM_MAX	16
 
-#define DEBUG_BUFF_SIZE 4096
-typedef void (*debug_callback_t)(char *data, int len);
+// The maximum output character value of datadump
+#define DEBUG_BUFF_SIZE 163840
+typedef void (*debug_callback_t) (char *data, int len);
+
+enum perf_event_state {
+	PERF_EV_INIT,
+	PERF_EV_ATTACH,
+	PERF_EV_DETACH
+};
 
 enum tracer_hook_type {
 	HOOK_ATTACH,
@@ -108,15 +121,30 @@ enum probe_type {
 	UPROBE
 };
 
-// index number of feature.
-enum cfg_feature_idx {
-	// Analyze go binary to get symbol address without symbol table
-	FEATURE_UPROBE_GOLANG_SYMBOL,
-	// openssl uprobe
-	FEATURE_UPROBE_OPENSSL,
-	// golang uprobe
-	FEATURE_UPROBE_GOLANG,
-	FEATURE_MAX,
+struct thread_index_entry {
+	pthread_t thread;
+	int index;
+};
+
+struct thread_index_array {
+	struct thread_index_entry *entries;
+	pthread_mutex_t lock;
+};
+
+// PID management for feature-matching processes
+#define pids_match_hash_t        clib_bihash_8_8_t
+#define pids_match_hash_init     clib_bihash_init_8_8
+#define pids_match_hash_kv       clib_bihash_kv_8_8_t
+#define print_hash_pids_match    print_bihash_8_8
+#define pids_match_hash_search   clib_bihash_search_8_8
+#define pids_match_hash_add_del  clib_bihash_add_del_8_8
+#define pids_match_hash_free     clib_bihash_free_8_8
+#define pids_match_hash_key_value_pair_cb        clib_bihash_foreach_key_value_pair_cb_8_8
+#define pids_match_hash_foreach_key_value_pair   clib_bihash_foreach_key_value_pair_8_8
+
+enum match_pids_act {
+	MATCH_PID_ADD,
+	MATCH_PID_DEL,
 };
 
 struct cfg_feature_regex {
@@ -128,13 +156,14 @@ extern struct cfg_feature_regex cfg_feature_regex_array[FEATURE_MAX];
 extern int ebpf_config_protocol_filter[PROTO_NUM];
 extern struct kprobe_port_bitmap allow_port_bitmap;
 extern struct kprobe_port_bitmap bypass_port_bitmap;
+extern bool allow_seg_reasm_protos[PROTO_NUM];
 
 /* *INDENT-OFF* */
 #define probes_set_enter_symbol(t, fn)						\
 do {                                                        			\
 	char *func = (char*)calloc(PROBE_NAME_SZ, 1);             		\
 	if (func != NULL) {                                       		\
-		curr_idx = index++;                  		            	\
+		int curr_idx = t->kprobes_nr++;                  		\
 		t->ksymbols[curr_idx].isret = false;                 	    	\
 		snprintf(func, PROBE_NAME_SZ, "kprobe/%s", fn);           	\
 		t->ksymbols[curr_idx].func = func;                        	\
@@ -147,7 +176,7 @@ do {                                                        			\
 do {                                                        			\
 	char *func = (char*)calloc(PROBE_NAME_SZ, 1);             		\
 	if (func != NULL) {                                       		\
-		curr_idx = index++;                  		            	\
+		int curr_idx = t->kprobes_nr++;                  		\
 		t->ksymbols[curr_idx].isret = true;                 	    	\
 		snprintf(func, PROBE_NAME_SZ, "kretprobe/%s", fn);           	\
 		t->ksymbols[curr_idx].func = func;                        	\
@@ -160,7 +189,7 @@ do {                                                        			\
 do {                            						\
 	char *func = (char*)calloc(PROBE_NAME_SZ, 1);      			\
 	if (func != NULL) {							\
-		curr_idx = index++;						\
+		int curr_idx = t->kprobes_nr++;					\
 		t->ksymbols[curr_idx].isret = false;				\
 		snprintf(func, PROBE_NAME_SZ, "kprobe/%s", fn);			\
 		t->ksymbols[curr_idx].func = func;				\
@@ -169,7 +198,7 @@ do {                            						\
 	}									\
 	func = (char*)calloc(PROBE_NAME_SZ, 1);					\
 	if (func != NULL) {							\
-		curr_idx = index++;						\
+		int curr_idx = t->kprobes_nr++;					\
 		snprintf(func, PROBE_NAME_SZ, "kretprobe/%s", fn);		\
 		t->ksymbols[curr_idx].isret = true;				\
 		t->ksymbols[curr_idx].func = func;				\
@@ -182,13 +211,36 @@ do {                            						\
 do {										\
 	char *name = (char*)calloc(PROBE_NAME_SZ, 1);				\
 	if (name != NULL) {							\
-		curr_idx = index++;						\
 		snprintf(name, PROBE_NAME_SZ, "%s", tp);			\
-		t->tps[curr_idx].name = name;					\
+		t->tps[t->tps_nr++].name = name;				\
 	} else {								\
 		ebpf_error("no memory, probe (tp %s) set failed", tp);		\
 	}									\
 } while(0)
+
+#define kfunc_set_symbol(t, fn, ret)						\
+do {										\
+	char *name = (char*)calloc(PROBE_NAME_SZ, 1);				\
+	if (name != NULL) {							\
+		if ((ret)) {							\
+			snprintf(name, PROBE_NAME_SZ, "fexit/%s", fn);		\
+		} else {							\
+			snprintf(name, PROBE_NAME_SZ, "fentry/%s", fn);		\
+		}								\
+		t->kfuncs[t->kfuncs_nr++].name = name;				\
+	} else {								\
+		ebpf_error("no memory, kfunc('%s') set failed", fn);		\
+	}									\
+} while(0)
+
+#define kprobe_set_symbol(t, fn, ret)						\
+{										\
+	if ((ret)) {								\
+		probes_set_exit_symbol(t, fn);					\
+	} else {								\
+		probes_set_enter_symbol(t, fn);					\
+	}									\
+}
 /* *INDENT-ON* */
 
 enum {
@@ -220,16 +272,22 @@ enum {
 	SOCKOPT_SET_CPDBG_ON,
 	SOCKOPT_SET_CPDBG_OFF,
 	/* get */
-	SOCKOPT_GET_CPDBG_SHOW
+	SOCKOPT_GET_CPDBG_SHOW,
+
+	SOCKOPT_PRINT_MATCH_PIDS = 800,
 };
 
 struct mem_block_head {
 	uint8_t is_last;
 	void *free_ptr;
-	void (*fn)(void *);
-} __attribute__((packed));
+	void (*fn) (void *);
+} __attribute__ ((packed));
 
-typedef void (*tracer_callback_t)(void *cp_data);
+typedef int (*tracer_callback_t) (void *ctx, int queue_id, void *cp_data);
+
+enum {
+    TRACER_CALLBACK_FLAG_KEEP_DATA = 0x1,
+};
 
 struct tracer_probes_conf {
 	char *bin_file;		// only use uprobe;
@@ -237,6 +295,8 @@ struct tracer_probes_conf {
 	int kprobes_nr;
 	struct symbol_tracepoint tps[PROBES_NUM_MAX];
 	int tps_nr;
+	struct symbol_kfunc kfuncs[PROBES_NUM_MAX];
+	int kfuncs_nr;
 	struct list_head uprobe_syms_head;	// uprobe symbol 信息存放链表。
 	int uprobe_count;
 };
@@ -261,11 +321,19 @@ struct tracepoint {
 	int prog_fd;
 };
 
+struct kfunc {
+	char name[PROBE_NAME_SZ];
+	struct ebpf_link *link;
+	struct ebpf_prog *prog;
+	int prog_fd;
+};
+
 struct queue {
+	int id; // Queue Identifier
 	struct bpf_tracer *t;
 	struct ring *r;
 	unsigned int ring_size;	// 队列配置大小，值为2的次幂
-	void *datas_burst[MAX_PKT_BURST];	// burst的方式获取数据
+	void *datas_burst[MAX_EVENTS_BURST];	// burst的方式获取数据
 	int nr;			// datas_burst中data数量
 
 	/*
@@ -296,7 +364,7 @@ struct map_config {
 struct ebpf_object;
 struct perf_reader;
 struct bpf_tracer;
-typedef int (*tracer_op_fun_t)(struct bpf_tracer *);
+typedef int (*tracer_op_fun_t) (struct bpf_tracer *);
 
 /*
  * This is used to read data from the perf buffer, and each MAP
@@ -304,16 +372,16 @@ typedef int (*tracer_op_fun_t)(struct bpf_tracer *);
  * may contain multiple readers.
  */
 struct bpf_perf_reader {
-	char name[NAME_LEN];			// perf ring-buffer map
-	bool is_use;				// false : free, ture : used
-	struct ebpf_map *map;			// ebpf_map address
-	struct perf_reader *readers[MAX_CPU_NR];// percpu readers (read from percpu ring-buffer map)
-	int reader_fds[MAX_CPU_NR];		// percpu reader fds
-	int readers_count;			// readers count
-	unsigned int perf_pages_cnt;		// ring-buffer set memory size (memory pages count)
-	perf_reader_raw_cb raw_cb;		// Used for perf ring-buffer receive callback.
-	perf_reader_lost_cb lost_cb;		// Callback for perf ring-buffer data loss.
-	int epoll_timeout;			// perf poll timeout (ms)
+	char name[NAME_LEN];	// perf ring-buffer map
+	bool is_use;		// false : free, ture : used
+	struct ebpf_map *map;	// ebpf_map address
+	struct perf_reader *readers[MAX_CPU_NR];	// percpu readers (read from percpu ring-buffer map)
+	int reader_fds[MAX_CPU_NR];	// percpu reader fds
+	int readers_count;	// readers count
+	unsigned int perf_pages_cnt;	// ring-buffer set memory size (memory pages count)
+	perf_reader_raw_cb raw_cb;	// Used for perf ring-buffer receive callback.
+	perf_reader_lost_cb lost_cb;	// Callback for perf ring-buffer data loss.
+	int epoll_timeout;	// perf poll timeout (ms)
 	int epoll_fds[MAX_CPU_NR];
 	int epoll_fds_count;
 	struct bpf_tracer *tracer;
@@ -323,13 +391,13 @@ struct bpf_tracer {
 	/*
 	 * tracer info
 	 */
-	char name[NAME_LEN];		// tracer name
+	char name[NAME_LEN];	// tracer name
 	char bpf_load_name[NAME_LEN];	// Tracer bpf load buffer name.
 	// Used to identify which eBPF buffer is loaded by the kernel
-	void *buffer_ptr;		// eBPF bytecodes buffer pointer
-	int buffer_sz;			// eBPF buffer size
+	void *buffer_ptr;	// eBPF bytecodes buffer pointer
+	int buffer_sz;		// eBPF buffer size
 	struct ebpf_object *obj;	// eBPF object
-	bool is_use;			// Whether it is being used.
+	bool is_use;		// Whether it is being used.
 	volatile uint32_t *lock;	// tracer lock
 
 	/*
@@ -337,26 +405,38 @@ struct bpf_tracer {
 	 */
 	struct tracer_probes_conf *tps;	// probe, tracepoint, uprobes config
 	struct list_head probes_head;
-	int probes_count;		// probe count.
+	int probes_count;	// probe count.
 	struct tracepoint tracepoints[PROBES_NUM_MAX];
 	int tracepoints_count;
-	pthread_mutex_t mutex_probes_lock; // Protect the probes operation in multiple threads
+	struct kfunc kfuncs[PROBES_NUM_MAX];
+	int kfuncs_count;
+	pthread_mutex_t mutex_probes_lock;	// Protect the probes operation in multiple threads
 
 	/*
 	 * perf event(type is TRACER_TYPE_PERF_EVENT) for attach fds.
 	 */
 	int per_cpu_fds[MAX_CPU_NR];
-	int sample_freq; // sample frequency, Hertz.
+	int sample_freq;	// sample frequency, Hertz.
+	/*
+	 * Enable CPU sampling?
+	 * For the following scenario:
+	 * If the on-CPU profiler is disabled, this setting will be false,
+	 * which means that perf sampling events will not be enabled, the attach
+	 * operation will not be executed.
+	 */
+	bool enable_sample;
+	// perf event state
+	enum perf_event_state ev_state;
 
 	/*
 	 * Data distribution processing worker, queues
 	 */
-	pthread_t perf_worker[MAX_CPU_NR];      // Main thread for user-space receiving perf-buffer data
-	pthread_t dispatch_workers[MAX_CPU_NR]; // Dispatch threads
-	int dispatch_workers_nr;                // Number of dispatch threads
-	struct queue queues[MAX_CPU_NR];        // Dispatch queues, each dispatch thread has its corresponding queue.
-	void *process_fn;                       // Callback interface passed from the application for data processing
-	void (*datadump) (void *data);          // eBPF data dump handle
+	pthread_t perf_workers[MAX_CPU_NR];	// Main thread for user-space receiving perf-buffer data
+	pthread_t dispatch_workers[MAX_CPU_NR];	// Dispatch threads
+	int dispatch_workers_nr;	// Number of dispatch threads
+	struct queue queues[MAX_CPU_NR];	// Dispatch queues, each dispatch thread has its corresponding queue.
+	void *process_fn;	// Callback interface passed from the application for data processing
+	void (*datadump) (void *data, int64_t boot_time);	// eBPF data dump handle
 
 	/*
 	 * perf ring-buffer from kernel to user.
@@ -370,9 +450,15 @@ struct bpf_tracer {
 	/*
 	 * statistics
 	 */
-	atomic64_t recv;			// User-level program event reception statistics. 
-	atomic64_t lost;			// User-level programs not receiving data in time can cause data loss in the kernel.
-	atomic64_t proto_status[PROTO_NUM];	// Statistical analysis based on different l7 protocols.
+	atomic64_t recv;	// User-level program event reception statistics. 
+	atomic64_t lost;	// User-level programs not receiving data in time can cause data loss in the kernel.
+	atomic64_t proto_stats[PROTO_NUM];	// Statistical analysis based on different l7 protocols.
+	// Packet Statistics Obtained from DPDK
+	atomic64_t rx_pkts;
+	atomic64_t tx_pkts;
+	atomic64_t rx_bytes;
+	atomic64_t tx_bytes;
+	atomic64_t dropped_pkts;
 
 	/*
 	 * maps re-config
@@ -389,15 +475,21 @@ struct bpf_tracer {
 	/*
 	 * tracer 控制接口和运行状态
 	 */
-	volatile enum tracer_state state;// 追踪器状态（Tracker status）
-	bool adapt_success;		 // 是否成功适配内核, true 成功适配，false 适配失败
-	uint32_t data_limit_max;	 // The maximum amount of data returned to the user-reader
+	volatile enum tracer_state state;	// 追踪器状态（Tracker status）
+	bool adapt_success;	// 是否成功适配内核, true 成功适配，false 适配失败
+	uint32_t data_limit_max;	// The maximum amount of data returned to the user-reader
+
+	/*
+	 * Callback function contexts for continuous profiler
+	 * Should only be used to create profiler context
+	 */
+	void *profiler_callback_ctx[PROFILER_CTX_NUM];
 };
 
 #define EXTRA_TYPE_SERVER 0
 #define EXTRA_TYPE_CLIENT 1
 
-typedef int (*extra_waiting_fun_t)();
+typedef int (*extra_waiting_fun_t) ();
 
 struct extra_waiting_op {
 	struct list_head list;
@@ -406,14 +498,14 @@ struct extra_waiting_op {
 	int type;
 };
 
-typedef int (*period_event_fun_t)();
+typedef int (*period_event_fun_t) ();
 
 struct period_event_op {
 	struct list_head list;
 	char name[NAME_LEN];
 	bool is_valid;
 	/* The cycle time of event triggering (unit is microseconds) */
-	uint32_t times; 
+	uint32_t times;
 	period_event_fun_t f;
 };
 
@@ -429,7 +521,7 @@ struct rx_queue_info {
 	uint64_t heap_get_failed;
 	int queue_size;
 	int ring_capacity;
-} __attribute__((aligned(8)));
+} __attribute__ ((aligned(8)));
 
 struct bpf_tracer_param {
 	char name[NAME_LEN];
@@ -437,14 +529,14 @@ struct bpf_tracer_param {
 	int dispatch_workers_nr;
 	unsigned int perf_pg_cnt;
 	/* rx_queues start address 8-byte alignment */
-	struct rx_queue_info rx_queues[MAX_CPU_NR] __attribute__((aligned(8)));
+	struct rx_queue_info rx_queues[MAX_CPU_NR] __attribute__ ((aligned(8)));
 	uint64_t lost;
 	int probes_count;
 	int state;
 	bool adapt_success;
 	uint32_t data_limit_max;
-	uint64_t proto_status[PROTO_NUM];
-} __attribute__((__packed__));
+	uint64_t proto_stats[PROTO_NUM];
+} __attribute__ ((__packed__));
 
 struct bpf_tracer_param_array {
 	int count;
@@ -454,7 +546,15 @@ struct bpf_tracer_param_array {
 struct reader_forward_info {
 	uint64_t queue_id;
 	int cpu_id;
+	struct bpf_tracer *tracer;
 };
+
+// Structure to store kick CPU thread info
+typedef struct {
+	pid_t tid;     // Linux thread ID (TID) of the kernel thread
+	int cpu_id;    // CPU core number the thread is bound to
+	bool can_bind_cpu;
+} kick_thread_info_t;
 
 extern volatile uint32_t *tracers_lock;
 
@@ -491,7 +591,7 @@ struct clear_list_elem {
 static bool inline insert_list(void *elt, uint32_t len, struct list_head *h)
 {
 	struct clear_list_elem *cle;
-	cle = calloc(sizeof(*cle) + len, 1);
+	cle = calloc(1, sizeof(*cle) + len);
 	if (cle == NULL) {
 		ebpf_warning("calloc() failed.\n");
 		return false;
@@ -524,7 +624,11 @@ int set_bypass_port_bitmap(void *bitmap);
 int enable_ebpf_protocol(int protocol);
 int set_feature_regex(int feature, const char *pattern);
 bool is_feature_enabled(int feature);
-bool is_feature_matched(int feature, const char *path);
+bool is_feature_matched(int feature, int pid, const char *path);
+bool is_feature_regex_set(int feature);
+bool php_profiler_enabled(void);
+bool v8_profiler_enabled(void);
+bool python_profiler_enabled(void);
 int bpf_tracer_init(const char *log_file, bool is_stdout);
 int tracer_bpf_load(struct bpf_tracer *tracer);
 int tracer_probes_init(struct bpf_tracer *tracer);
@@ -542,12 +646,14 @@ struct bpf_tracer *setup_bpf_tracer(const char *name,
 				    int workers_nr,
 				    tracer_op_fun_t free_cb,
 				    tracer_op_fun_t create_cb,
-				    void *handle, int freq);
+				    void *handle,
+				    void
+				    *profiler_callback_ctx[PROFILER_CTX_NUM],
+				    int freq);
 int maps_config(struct bpf_tracer *tracer, const char *map_name, int entries);
 struct bpf_tracer *find_bpf_tracer(const char *name);
 int register_period_event_op(const char *name,
-			     period_event_fun_t f,
-			     uint32_t period_time);
+			     period_event_fun_t f, uint32_t period_time);
 int set_period_event_invalid(const char *name);
 
 /**
@@ -570,30 +676,83 @@ void free_probe_from_tracer(struct probe *pb);
 int tracer_hooks_process(struct bpf_tracer *tracer,
 			 enum tracer_hook_type type, int *probes_count);
 int tracer_uprobes_update(struct bpf_tracer *tracer);
+int probe_attach(struct probe *p);
+
 /**
- * create a perf buffer reader.
- * @t tracer
- * @map_name perf buffer map name
- * @raw_cb perf reader raw data callback
- * @lost_cb perf reader data lost callback
- * @pages_cnt How many memory pages are used for ring-buffer
- *            (system page size * pages_cnt)
- * @thread_nr The number of threads required for the reader's work 
- * @epoll_timeout perf epoll timeout
- * @returns perf_reader address on success, NULL on error
+ * @brief Create a perf buffer reader.
+ *
+ * @param t tracer
+ * @param map_name perf buffer map name
+ * @param raw_cb perf reader raw data callback
+ * @param lost_cb perf reader data lost callback
+ * @param pages_cnt How many memory pages are used for ring-buffer
+ * (system page size * pages_cnt)
+ * @param thread_nr The number of threads required for the reader's work 
+ * @param epoll_timeout perf epoll timeout
+ * @return perf_reader address on success, NULL on error
  */
-struct bpf_perf_reader*
-create_perf_buffer_reader(struct bpf_tracer *t,
-			  const char *map_name,
-			  perf_reader_raw_cb raw_cb,
-			  perf_reader_lost_cb lost_cb,
-			  unsigned int pages_cnt,
-			  int thread_nr,
-			  int epoll_timeout);
+struct bpf_perf_reader *create_perf_buffer_reader(struct bpf_tracer *t,
+						  const char *map_name,
+						  perf_reader_raw_cb raw_cb,
+						  perf_reader_lost_cb lost_cb,
+						  unsigned int pages_cnt,
+						  int thread_nr,
+						  int epoll_timeout);
 void free_perf_buffer_reader(struct bpf_perf_reader *reader);
 int release_bpf_tracer(const char *name);
 void free_all_readers(struct bpf_tracer *t);
 int enable_tracer_reader_work(const char *name, int idx,
-			      struct bpf_tracer *tracer,
-			      void *fn);
+			      struct bpf_tracer *tracer, void *fn);
+bool is_rt_kernel(void);
+/**
+ * @brief Enable eBPF segmentation reassembly for the specified protocol.
+ * 
+ * @param protocol Protocols for segmentation reassembly
+ * @return 0 on success, non-zero on error
+ */
+int enable_ebpf_seg_reasm_protocol(int protocol);
+int exec_set_feature_pids(int feature, const int *pids, int num);
+/**
+ * @brief Add regex-matched process list for feature.
+ * 
+ * @param feature Refers to a specific feature module, value: FEATURE_*
+ * @param pids Address of the process list
+ * @param num Number of elements in the process list
+ * @return 0 on success, non-zero on error
+ */
+int set_feature_pids(int feature, const int *pids, int num);
+int init_match_pids_hash(void);
+bool is_pid_match(int feature, int pid);
+struct probe *create_probe(struct bpf_tracer *tracer,
+			   const char *func_name, bool isret,
+			   enum probe_type type, void *private,
+			   bool add_tracer);
+void free_probe_from_conf(struct probe *pb, struct tracer_probes_conf *conf);
+
+/**
+ * @brief Creates and initializes an eBPF object from provided BPF bytecode.
+ *
+ * This function opens and initializes an eBPF object using the specified BPF bytecode,
+ * size, and name. If the initialization fails, a warning message is logged, and `NULL` 
+ * is returned.
+ *
+ * @param[in] bpf_code A pointer to the BPF bytecode buffer.
+ * @param[in] code_size The size of the BPF bytecode buffer in bytes.
+ * @param[in] name A null-terminated string specifying the name of the eBPF program.
+ *
+ * @return A pointer to the initialized `ebpf_object` on success, or `NULL` on failure.
+ */
+struct ebpf_object *create_ebpf_object(const void *bpf_code,
+                                       size_t code_size, const char *name);
+/**
+ * @brief Loads an eBPF object into the kernel.
+ *
+ * This function takes an eBPF object and loads it into the kernel, preparing it
+ * for use in attaching to specific hooks or operations.
+ *
+ * @param[in] obj A pointer to the eBPF object to be loaded.
+ *
+ * @return 0 on success, or a non-zero value on error.
+ */
+int load_ebpf_object(struct ebpf_object *obj);
 #endif /* DF_USER_TRACER_H */

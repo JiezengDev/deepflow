@@ -16,27 +16,29 @@
 
 use public::bytes::read_u16_be;
 
-use public::l7_protocol::L7Protocol;
+use public::l7_protocol::{L7Protocol, LogMessageType};
 use serde::Serialize;
 
 use crate::common::flow::{L7PerfStats, PacketDirection};
 use crate::common::l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface};
-use crate::common::l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam};
-use crate::common::meta_packet::EbpfFlags;
-use crate::config::handler::L7LogDynamicConfig;
-use crate::flow_generator::protocol_logs::value_is_default;
+use crate::common::l7_protocol_log::{
+    L7ParseResult, L7ProtocolParserInterface, LogCache, ParseParam,
+};
+use crate::common::meta_packet::ApplicationFlags;
+use crate::config::handler::{L7LogDynamicConfig, LogParserConfig};
+use crate::flow_generator::protocol_logs::{
+    set_captured_byte, value_is_default, BASE_FIELD_PRIORITY,
+};
 use crate::flow_generator::{Error, Result};
-use crate::HttpLog;
 
 use super::consts::{
     HTTP_STATUS_CLIENT_ERROR_MAX, HTTP_STATUS_CLIENT_ERROR_MIN, HTTP_STATUS_SERVER_ERROR_MAX,
     HTTP_STATUS_SERVER_ERROR_MIN,
 };
-use super::pb_adapter::{ExtendedInfo, TraceInfo};
-use super::{check_http_method, parse_v1_headers, AppProtoHead, LogMessageType};
 use super::{
-    pb_adapter::{L7ProtocolSendLog, L7Request, L7Response},
-    L7ResponseStatus,
+    check_http_method, parse_v1_headers,
+    pb_adapter::{ExtendedInfo, L7ProtocolSendLog, L7Request, L7Response, TraceInfo},
+    AppProtoHead, L7ResponseStatus, PrioField,
 };
 
 const FCGI_RECORD_FIX_LEN: usize = 8;
@@ -81,14 +83,17 @@ pub struct FastCGIInfo {
     pub resp_content_length: Option<u32>,
 
     #[serde(skip_serializing_if = "value_is_default")]
-    pub trace_id: String,
+    pub trace_ids: super::PrioFields,
     #[serde(skip_serializing_if = "value_is_default")]
-    pub span_id: String,
+    pub span_id: PrioField<String>,
 
     #[serde(skip_serializing_if = "value_is_default")]
-    pub x_request_id_0: String,
+    pub x_request_id_0: PrioField<String>,
     #[serde(skip_serializing_if = "value_is_default")]
-    pub x_request_id_1: String,
+    pub x_request_id_1: PrioField<String>,
+
+    captured_request_byte: u32,
+    captured_response_byte: u32,
 
     #[serde(skip)]
     rrt: u64,
@@ -98,6 +103,9 @@ pub struct FastCGIInfo {
 
     #[serde(skip)]
     seq_off: u32,
+
+    #[serde(skip)]
+    is_on_blacklist: bool,
 }
 
 impl L7ProtocolInfoInterface for FastCGIInfo {
@@ -109,8 +117,13 @@ impl L7ProtocolInfoInterface for FastCGIInfo {
         if let L7ProtocolInfo::FastCGIInfo(info) = other {
             self.status = info.status;
             self.status_code = info.status_code;
-            super::swap_if!(self, trace_id, is_empty, info);
-            super::swap_if!(self, span_id, is_empty, info);
+            self.captured_response_byte = info.captured_response_byte;
+            let other_trace_ids = std::mem::take(&mut info.trace_ids);
+            self.trace_ids.merge(other_trace_ids);
+            super::swap_if!(self, span_id, is_default, info);
+            if info.is_on_blacklist {
+                self.is_on_blacklist = info.is_on_blacklist;
+            }
         }
 
         Ok(())
@@ -142,6 +155,10 @@ impl L7ProtocolInfoInterface for FastCGIInfo {
 
     fn get_request_resource_length(&self) -> usize {
         self.path.len()
+    }
+
+    fn is_on_blacklist(&self) -> bool {
+        self.is_on_blacklist
     }
 }
 
@@ -204,6 +221,10 @@ impl FastCGIInfo {
             b"HTTP_USER_AGENT" => self.user_agent = Some(String::from_utf8_lossy(val).to_string()),
             b"DOCUMENT_URI" => self.endpoint = Some(String::from_utf8_lossy(val).to_string()),
             _ => {
+                let Some(config) = config else {
+                    return Ok(());
+                };
+
                 // value must be valid utf8 from here
                 let (Ok(key), Ok(val)) = (std::str::from_utf8(key), std::str::from_utf8(val))
                 else {
@@ -212,46 +233,82 @@ impl FastCGIInfo {
                 let lower_key = key.to_lowercase();
                 let key = lower_key.as_str();
 
-                config.map(|c| {
-                    if c.is_trace_id(key) {
-                        if let Some(id) = HttpLog::decode_id(val, key, HttpLog::TRACE_ID) {
-                            self.trace_id = id;
+                if config.is_trace_id(key) {
+                    for (i, trace) in config.trace_types.iter().enumerate() {
+                        let prio = i as u8 + BASE_FIELD_PRIORITY;
+                        if self.trace_ids.highest_priority() <= prio
+                            && !config.multiple_trace_id_collection
+                        {
+                            break;
+                        }
+                        if !trace.check(key) {
+                            continue;
+                        }
+                        if let Some(trace_id) = trace.decode_trace_id(val) {
+                            self.trace_ids.merge_field(prio, trace_id.to_string());
                         }
                     }
-                });
+                }
 
-                config.map(|c| {
-                    if c.is_span_id(key) {
-                        if let Some(id) = HttpLog::decode_id(val, key, HttpLog::SPAN_ID) {
-                            self.span_id = id;
+                if config.is_span_id(key) {
+                    for (i, span) in config.span_types.iter().enumerate() {
+                        let prio = i as u8 + BASE_FIELD_PRIORITY;
+                        if self.span_id.prio() <= prio {
+                            break;
                         }
+                        if !span.check(key) {
+                            continue;
+                        }
+                        span.decode_span_id(val)
+                            .map(|id| self.span_id = PrioField::new(prio, id.to_string()));
                     }
-                });
+                }
 
-                config.map(|c| {
-                    if c.x_request_id.contains(key) {
-                        if direction == PacketDirection::ClientToServer {
-                            self.x_request_id_0 = val.to_owned();
-                        } else {
-                            self.x_request_id_1 = val.to_owned();
-                        }
+                let x_req_id = if direction == PacketDirection::ClientToServer {
+                    &mut self.x_request_id_0
+                } else {
+                    &mut self.x_request_id_1
+                };
+                for (i, req_id) in config.x_request_id.iter().enumerate() {
+                    let prio = i as u8 + BASE_FIELD_PRIORITY;
+                    if x_req_id.prio() <= prio {
+                        break;
                     }
-                });
+                    if req_id == key {
+                        *x_req_id = PrioField::new(prio, val.to_owned());
+                        break;
+                    }
+                }
             }
         }
 
         Ok(())
+    }
+
+    fn set_is_on_blacklist(&mut self, config: &LogParserConfig) {
+        if let Some(t) = config.l7_log_blacklist_trie.get(&L7Protocol::FastCGI) {
+            self.is_on_blacklist = t.request_resource.is_on_blacklist(&self.path)
+                || t.request_type.is_on_blacklist(&self.method)
+                || t.request_domain.is_on_blacklist(&self.host)
+                || self
+                    .endpoint
+                    .as_ref()
+                    .map(|p| t.endpoint.is_on_blacklist(p))
+                    .unwrap_or_default();
+        }
     }
 }
 
 impl From<FastCGIInfo> for L7ProtocolSendLog {
     fn from(f: FastCGIInfo) -> Self {
         let flags = if f.is_tls {
-            EbpfFlags::TLS.bits()
+            ApplicationFlags::TLS.bits()
         } else {
-            EbpfFlags::NONE.bits()
+            ApplicationFlags::NONE.bits()
         };
         Self {
+            captured_request_byte: f.captured_request_byte,
+            captured_response_byte: f.captured_response_byte,
             req: L7Request {
                 req_type: f.method,
                 domain: f.host,
@@ -265,25 +322,33 @@ impl From<FastCGIInfo> for L7ProtocolSendLog {
             },
             version: Some(f.version.to_string()),
             trace_info: Some(TraceInfo {
-                trace_id: if f.trace_id.is_empty() {
+                span_id: if f.span_id.is_default() {
                     None
                 } else {
-                    Some(f.trace_id)
+                    Some(f.span_id.into_inner())
                 },
-                span_id: if f.span_id.is_empty() {
-                    None
-                } else {
-                    Some(f.span_id)
-                },
+                trace_ids: f.trace_ids.into_strings_top3(),
                 ..Default::default()
             }),
             ext_info: Some(ExtendedInfo {
-                x_request_id_0: Some(f.x_request_id_0),
-                x_request_id_1: Some(f.x_request_id_1),
+                x_request_id_0: Some(f.x_request_id_0.into_inner()),
+                x_request_id_1: Some(f.x_request_id_1.into_inner()),
                 request_id: Some(f.request_id),
                 ..Default::default()
             }),
             flags,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<&FastCGIInfo> for LogCache {
+    fn from(info: &FastCGIInfo) -> Self {
+        LogCache {
+            msg_type: info.msg_type,
+            resp_status: info.status,
+            on_blacklist: info.is_on_blacklist,
+            endpoint: info.get_endpoint(),
             ..Default::default()
         }
     }
@@ -319,7 +384,7 @@ impl FastCGIRecord {
 
 #[derive(Default)]
 pub struct FastCGILog {
-    perf_stats: Option<L7PerfStats>,
+    perf_stats: Vec<L7PerfStats>,
 }
 
 impl FastCGILog {
@@ -328,12 +393,10 @@ impl FastCGILog {
             && status_code <= HTTP_STATUS_CLIENT_ERROR_MAX
         {
             // http客户端请求存在错误
-            self.perf_stats.as_mut().map(|p| p.inc_req_err());
             info.status = L7ResponseStatus::ClientError;
         } else if status_code >= HTTP_STATUS_SERVER_ERROR_MIN
             && status_code <= HTTP_STATUS_SERVER_ERROR_MAX
         {
-            self.perf_stats.as_mut().map(|p| p.inc_resp_err());
             info.status = L7ResponseStatus::ServerError;
         } else {
             info.status = L7ResponseStatus::Ok;
@@ -384,10 +447,10 @@ impl<'a> Iterator for RecordIter<'a> {
 }
 
 impl L7ProtocolParserInterface for FastCGILog {
-    fn check_payload(&mut self, payload: &[u8], _: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], _: &ParseParam) -> Option<LogMessageType> {
         for (r, p, _) in RecordIter::new(payload) {
             match r.record_type {
-                FCGI_END_REQUEST | FCGI_STDOUT => return false,
+                FCGI_END_REQUEST | FCGI_STDOUT => return None,
                 _ => {}
             }
 
@@ -400,24 +463,21 @@ impl L7ProtocolParserInterface for FastCGILog {
                     )
                     .is_ok()
                     {
-                        return true;
+                        return Some(LogMessageType::Request);
                     }
                 }
-                return false;
+                return None;
             }
         }
 
-        false
+        None
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
         let config = param.parse_config.and_then(|c| Some(&c.l7_log_dynamic));
-        if self.perf_stats.is_none() {
-            self.perf_stats = Some(L7PerfStats::default())
-        }
-
         let mut info = FastCGIInfo::default();
 
+        self.perf_stats.clear();
         match param.direction {
             PacketDirection::ClientToServer => {
                 info.msg_type = LogMessageType::Request;
@@ -436,7 +496,6 @@ impl L7ProtocolParserInterface for FastCGILog {
                 if info.method.is_empty() {
                     return Err(Error::L7ProtocolUnknown);
                 }
-                self.perf_stats.as_mut().map(|p| p.inc_req());
             }
             PacketDirection::ServerToClient => {
                 info.msg_type = LogMessageType::Response;
@@ -494,14 +553,27 @@ impl L7ProtocolParserInterface for FastCGILog {
                 if info.status_code.is_none() {
                     return Err(Error::L7ProtocolUnknown);
                 }
-                self.perf_stats.as_mut().map(|p| p.inc_resp());
             }
         }
-        info.cal_rrt(param, None).map(|rrt| {
-            info.rrt = rrt;
-            self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
-        });
         info.is_tls = param.is_tls();
+        set_captured_byte!(info, param);
+        if let Some(config) = param.parse_config {
+            info.set_is_on_blacklist(config);
+        }
+
+        if param.parse_perf {
+            let mut perf_stat = L7PerfStats::default();
+            if info.msg_type == LogMessageType::Response {
+                if let Some(endpoint) = info.load_endpoint_from_cache(param, false) {
+                    info.endpoint = Some(endpoint.to_string());
+                }
+            }
+            if let Some(stats) = info.perf_stats(param) {
+                info.rrt = stats.rrt_sum;
+                perf_stat.sequential_merge(&stats);
+            }
+            self.perf_stats.push(perf_stat);
+        }
         Ok(L7ParseResult::Single(L7ProtocolInfo::FastCGIInfo(info)))
     }
 
@@ -509,8 +581,8 @@ impl L7ProtocolParserInterface for FastCGILog {
         L7Protocol::FastCGI
     }
 
-    fn perf_stats(&mut self) -> Option<L7PerfStats> {
-        self.perf_stats.take()
+    fn perf_stats(&mut self) -> Vec<L7PerfStats> {
+        std::mem::take(&mut self.perf_stats)
     }
 
     fn parsable_on_udp(&self) -> bool {
@@ -592,12 +664,13 @@ fn get_param_val<'a>(param_payload: &'a [u8], key: &str) -> Result<&'a [u8]> {
 mod test {
     use std::{cell::RefCell, path::Path, rc::Rc};
 
+    use public::l7_protocol::LogMessageType;
+
     use crate::common::flow::{L7PerfStats, PacketDirection};
     use crate::common::l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface};
     use crate::common::l7_protocol_log::{L7PerfCache, L7ProtocolParserInterface, ParseParam};
     use crate::flow_generator::protocol_logs::fastcgi::FastCGILog;
     use crate::flow_generator::protocol_logs::L7ResponseStatus;
-    use crate::flow_generator::LogMessageType;
     use crate::{flow_generator::L7_RRT_CACHE_CAPACITY, utils::test::Capture};
 
     use super::FastCGIInfo;
@@ -621,6 +694,8 @@ mod test {
             status_code: Some(200),
             status: L7ResponseStatus::Ok,
             seq_off: 16,
+            captured_request_byte: 576,
+            captured_response_byte: 88,
             ..Default::default()
         };
 
@@ -644,16 +719,16 @@ mod test {
 
     fn check_and_parse(file_name: &str) -> (FastCGIInfo, L7PerfStats) {
         let pcap_file = Path::new(FILE_DIR).join(file_name);
-        let capture = Capture::load_pcap(pcap_file, None);
+        let capture = Capture::load_pcap(pcap_file);
         let log_cache = Rc::new(RefCell::new(L7PerfCache::new(L7_RRT_CACHE_CAPACITY)));
-        let mut p = capture.as_meta_packets();
+        let mut p = capture.collect::<Vec<_>>();
         p[0].lookup_key.direction = PacketDirection::ClientToServer;
         p[1].lookup_key.direction = PacketDirection::ServerToClient;
 
         let mut parser = FastCGILog::default();
         let req_param = &mut ParseParam::new(
             &p[0],
-            log_cache.clone(),
+            Some(log_cache.clone()),
             Default::default(),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             Default::default(),
@@ -661,15 +736,19 @@ mod test {
             true,
         );
         let req_payload = p[0].get_l4_payload().unwrap();
-        assert_eq!((&mut parser).check_payload(req_payload, req_param), true);
+        req_param.set_captured_byte(req_payload.len());
+        assert_eq!(
+            (&mut parser).check_payload(req_payload, req_param),
+            Some(LogMessageType::Request)
+        );
         let info = (&mut parser).parse_payload(req_payload, req_param).unwrap();
         let mut req = info.unwrap_single();
-
+        let mut req_stat = parser.perf_stats().remove(0);
         (&mut parser).reset();
 
-        let resp_param = &ParseParam::new(
+        let resp_param = &mut ParseParam::new(
             &p[1],
-            log_cache.clone(),
+            Some(log_cache.clone()),
             Default::default(),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             Default::default(),
@@ -677,15 +756,18 @@ mod test {
             true,
         );
         let resp_payload = p[1].get_l4_payload().unwrap();
-        assert_eq!((&mut parser).check_payload(resp_payload, resp_param), false);
+        resp_param.set_captured_byte(resp_payload.len());
+        assert_eq!((&mut parser).check_payload(resp_payload, resp_param), None);
         let mut resp = (&mut parser)
             .parse_payload(resp_payload, resp_param)
             .unwrap()
             .unwrap_single();
 
         req.merge_log(&mut resp).unwrap();
+
         if let L7ProtocolInfo::FastCGIInfo(info) = req {
-            return (info, parser.perf_stats.unwrap());
+            req_stat.sequential_merge(&parser.perf_stats().remove(0));
+            return (info, req_stat);
         }
         unreachable!()
     }

@@ -16,15 +16,15 @@
 
 pub(crate) mod cgroups;
 pub(crate) mod command;
-pub(crate) mod environment;
+pub mod environment;
 pub(crate) mod guard;
-pub(crate) mod hasher;
+pub mod hasher;
 pub(crate) mod logger;
 pub(crate) mod lru;
 pub(crate) mod npb_bandwidth_watcher;
 pub(crate) mod possible_host;
 pub(crate) mod process;
-pub(crate) mod stats;
+pub mod stats;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod pid_file;
@@ -33,15 +33,14 @@ pub use public::bytes;
 
 pub mod test;
 
-const WIN_ERROR_CODE_STR: &str = "please browse website(https://docs.microsoft.com/en-us/windows/win32/debug/system-error-codes) to get more detail";
+use std::thread;
+use std::time::Duration;
 
-pub fn notify_exit(code: i32) {
+pub fn clean_and_exit(code: i32) {
+    thread::sleep(Duration::from_secs(1));
+
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    if let Err(_) =
-        nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGTERM)
-    {
-        std::process::exit(code);
-    }
-    #[cfg(target_os = "windows")]
+    pid_file::close();
+
     std::process::exit(code);
 }

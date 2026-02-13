@@ -19,122 +19,84 @@ package tagrecorder
 import (
 	"strings"
 
-	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type ChOSAppTag struct {
-	SubscriberComponent[*message.ProcessFieldsUpdate, message.ProcessFieldsUpdate, mysql.Process, mysql.ChOSAppTag, OSAPPTagKey]
+	UpdaterComponent[metadbmodel.ChOSAppTag, IDKeyKey]
 }
 
 func NewChOSAppTag() *ChOSAppTag {
-	mng := &ChOSAppTag{
-		newSubscriberComponent[*message.ProcessFieldsUpdate, message.ProcessFieldsUpdate, mysql.Process, mysql.ChOSAppTag, OSAPPTagKey](
-			common.RESOURCE_TYPE_PROCESS_EN, RESOURCE_TYPE_CH_OS_APP_TAG,
+	updater := &ChOSAppTag{
+		newUpdaterComponent[metadbmodel.ChOSAppTag, IDKeyKey](
+			RESOURCE_TYPE_CH_OS_APP_TAG,
 		),
 	}
-	mng.subscriberDG = mng
-	return mng
+	updater.updaterDG = updater
+	return updater
 }
 
-// onResourceUpdated implements SubscriberDataGenerator
-func (c *ChOSAppTag) onResourceUpdated(sourceID int, fieldsUpdate *message.ProcessFieldsUpdate) {
-	keysToAdd := make([]OSAPPTagKey, 0)
-	targetsToAdd := make([]mysql.ChOSAppTag, 0)
-	keysToDelete := make([]OSAPPTagKey, 0)
-	targetsToDelete := make([]mysql.ChOSAppTag, 0)
-	var chItem mysql.ChOSAppTag
-	var updateKey OSAPPTagKey
-	updateInfo := make(map[string]interface{})
-	if fieldsUpdate.OSAPPTags.IsDifferent() {
-		new := map[string]string{}
-		old := map[string]string{}
-		newStr := fieldsUpdate.OSAPPTags.GetNew()
-		oldStr := fieldsUpdate.OSAPPTags.GetOld()
-		splitNews := strings.Split(newStr, ", ")
-		splitOlds := strings.Split(oldStr, ", ")
+func (o *ChOSAppTag) generateNewData(db *metadb.DB) (map[IDKeyKey]metadbmodel.ChOSAppTag, bool) {
+	var processes []metadbmodel.Process
+	keyToItem := make(map[IDKeyKey]metadbmodel.ChOSAppTag)
+	gidToOsAppTagMap := make(map[int]map[string]string)
 
-		for _, splitNew := range splitNews {
-			splitSingleTag := strings.Split(splitNew, ":")
+	err := db.Select("gid", "os_app_tags").Find(&processes).Error
+	if err != nil {
+		log.Errorf(dbQueryResourceFailed(o.resourceTypeName, err), db.LogPrefixORGID)
+		return nil, false
+	}
+
+	for _, process := range processes {
+		gid := int(process.GID)
+		osAppTagsMap := map[string]string{}
+		splitOsAppTags := strings.Split(process.OSAPPTags, ", ")
+		for _, singleOsAppTag := range splitOsAppTags {
+			splitSingleTag := strings.Split(singleOsAppTag, ":")
 			if len(splitSingleTag) == 2 {
-				new[strings.Trim(splitSingleTag[0], " ")] = strings.Trim(splitSingleTag[1], " ")
+				osAppTagsMap[strings.Trim(splitSingleTag[0], " ")] = strings.Trim(splitSingleTag[1], " ")
 			}
 		}
-		for _, splitOld := range splitOlds {
-			splitSingleTag := strings.Split(splitOld, ":")
-			if len(splitSingleTag) == 2 {
-				old[strings.Trim(splitSingleTag[0], " ")] = strings.Trim(splitSingleTag[1], " ")
-			}
-		}
-		for k, v := range new {
-			oldV, ok := old[k]
-			if !ok {
-				keysToAdd = append(keysToAdd, OSAPPTagKey{PID: sourceID, Key: k})
-				targetsToAdd = append(targetsToAdd, mysql.ChOSAppTag{
-					PID:   sourceID,
-					Key:   k,
-					Value: v,
-				})
-			} else {
-				if oldV != v {
-					updateKey = OSAPPTagKey{PID: sourceID, Key: k}
-					updateInfo[k] = v
-					mysql.Db.Where("pid = ? and `key` = ?", sourceID, k).First(&chItem) // TODO common
-					if chItem.PID == 0 {
-						keysToAdd = append(keysToAdd, OSAPPTagKey{PID: sourceID, Key: k})
-						targetsToAdd = append(targetsToAdd, mysql.ChOSAppTag{
-							PID:   sourceID,
-							Key:   k,
-							Value: v,
-						})
-					} else if len(updateInfo) > 0 {
-						c.SubscriberComponent.dbOperator.update(chItem, updateInfo, updateKey)
-					}
+		if len(osAppTagsMap) > 0 {
+			osAppTagMap, ok := gidToOsAppTagMap[gid]
+			if ok {
+				for key, value := range osAppTagsMap {
+					osAppTagMap[key] = value
 				}
-			}
-		}
-		for k := range old {
-			if _, ok := new[k]; !ok {
-				keysToDelete = append(keysToDelete, OSAPPTagKey{PID: sourceID, Key: k})
-				targetsToDelete = append(targetsToDelete, mysql.ChOSAppTag{
-					PID: sourceID,
-					Key: k,
-				})
+			} else {
+				gidToOsAppTagMap[gid] = osAppTagsMap
 			}
 		}
 	}
-	if len(keysToAdd) > 0 {
-		c.SubscriberComponent.dbOperator.add(keysToAdd, targetsToAdd)
-	}
-	if len(keysToDelete) > 0 {
-		c.SubscriberComponent.dbOperator.delete(keysToDelete, targetsToDelete)
-	}
-}
 
-// onResourceUpdated implements SubscriberDataGenerator
-func (c *ChOSAppTag) sourceToTarget(source *mysql.Process) (keys []OSAPPTagKey, targets []mysql.ChOSAppTag) {
-	osAppTagsMap := map[string]string{}
-	splitTags := strings.Split(source.OSAPPTags, ", ")
-
-	for _, splitTag := range splitTags {
-		splitSingleTag := strings.Split(splitTag, ":")
-		if len(splitSingleTag) == 2 {
-			osAppTagsMap[strings.Trim(splitSingleTag[0], " ")] = strings.Trim(splitSingleTag[1], " ")
+	for gid, osAppTagMap := range gidToOsAppTagMap {
+		for key, value := range osAppTagMap {
+			itemKey := IDKeyKey{
+				ID:  gid,
+				Key: key,
+			}
+			keyToItem[itemKey] = metadbmodel.ChOSAppTag{
+				ID:    gid,
+				Key:   key,
+				Value: value,
+			}
 		}
 	}
-	for k, v := range osAppTagsMap {
-		keys = append(keys, OSAPPTagKey{PID: source.ID, Key: k})
-		targets = append(targets, mysql.ChOSAppTag{
-			PID:   source.ID,
-			Key:   k,
-			Value: v,
-		})
-	}
-	return
+	return keyToItem, true
 }
 
-// softDeletedTargetsUpdated implements SubscriberDataGenerator
-func (c *ChOSAppTag) softDeletedTargetsUpdated(targets []mysql.ChOSAppTag) {
+func (o *ChOSAppTag) generateKey(dbItem metadbmodel.ChOSAppTag) IDKeyKey {
+	return IDKeyKey{ID: dbItem.ID, Key: dbItem.Key}
+}
 
+func (o *ChOSAppTag) generateUpdateInfo(oldItem, newItem metadbmodel.ChOSAppTag) (map[string]interface{}, bool) {
+	updateInfo := make(map[string]interface{})
+	if oldItem.Value != newItem.Value {
+		updateInfo["value"] = newItem.Value
+	}
+	if len(updateInfo) > 0 {
+		return updateInfo, true
+	}
+	return nil, false
 }

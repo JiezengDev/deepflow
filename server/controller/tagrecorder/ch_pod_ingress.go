@@ -20,55 +20,73 @@ import (
 	"gorm.io/gorm/clause"
 
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type ChPodIngress struct {
-	SubscriberComponent[*message.PodIngressFieldsUpdate, message.PodIngressFieldsUpdate, mysql.PodIngress, mysql.ChPodIngress, IDKey]
+	SubscriberComponent[
+		*message.AddedPodIngresses,
+		message.AddedPodIngresses,
+		*message.UpdatedPodIngress,
+		message.UpdatedPodIngress,
+		*message.DeletedPodIngresses,
+		message.DeletedPodIngresses,
+		metadbmodel.PodIngress,
+		metadbmodel.ChPodIngress,
+		IDKey,
+	]
 }
 
 func NewChPodIngress() *ChPodIngress {
 	mng := &ChPodIngress{
-		newSubscriberComponent[*message.PodIngressFieldsUpdate, message.PodIngressFieldsUpdate, mysql.PodIngress, mysql.ChPodIngress, IDKey](
+		newSubscriberComponent[
+			*message.AddedPodIngresses,
+			message.AddedPodIngresses,
+			*message.UpdatedPodIngress,
+			message.UpdatedPodIngress,
+			*message.DeletedPodIngresses,
+			message.DeletedPodIngresses,
+			metadbmodel.PodIngress,
+			metadbmodel.ChPodIngress,
+			IDKey,
+		](
 			common.RESOURCE_TYPE_POD_INGRESS_EN, RESOURCE_TYPE_CH_POD_INGRESS,
 		),
 	}
 	mng.subscriberDG = mng
+	mng.softDelete = true
 	return mng
 }
 
 // sourceToTarget implements SubscriberDataGenerator
-func (c *ChPodIngress) sourceToTarget(source *mysql.PodIngress) (keys []IDKey, targets []mysql.ChPodIngress) {
+func (c *ChPodIngress) sourceToTarget(md *message.Metadata, source *metadbmodel.PodIngress) (keys []IDKey, targets []metadbmodel.ChPodIngress) {
 	sourceName := source.Name
 	if source.DeletedAt.Valid {
 		sourceName += " (deleted)"
 	}
 
 	keys = append(keys, IDKey{ID: source.ID})
-	targets = append(targets, mysql.ChPodIngress{
-		ID:   source.ID,
-		Name: sourceName,
+	targets = append(targets, metadbmodel.ChPodIngress{
+		ChIDBase:     metadbmodel.ChIDBase{ID: source.ID},
+		Name:         sourceName,
+		PodClusterID: source.PodClusterID,
+		PodNsID:      source.PodNamespaceID,
+		TeamID:       md.GetTeamID(),
+		DomainID:     md.GetDomainID(),
+		SubDomainID:  md.GetSubDomainID(),
 	})
 	return
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChPodIngress) onResourceUpdated(sourceID int, fieldsUpdate *message.PodIngressFieldsUpdate) {
-	updateInfo := make(map[string]interface{})
-	if fieldsUpdate.Name.IsDifferent() {
-		updateInfo["name"] = fieldsUpdate.Name.GetNew()
-	}
-	if len(updateInfo) > 0 {
-		var chItem mysql.ChPodIngress
-		mysql.Db.Where("id = ?", sourceID).First(&chItem)
-		c.SubscriberComponent.dbOperator.update(chItem, updateInfo, IDKey{ID: sourceID})
-	}
+func (c *ChPodIngress) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedPodIngress) {
 }
 
 // softDeletedTargetsUpdated implements SubscriberDataGenerator
-func (c *ChPodIngress) softDeletedTargetsUpdated(targets []mysql.ChPodIngress) {
-	mysql.Db.Clauses(clause.OnConflict{
+func (c *ChPodIngress) softDeletedTargetsUpdated(targets []metadbmodel.ChPodIngress, db *metadb.DB) {
+	db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "id"}},
 		DoUpdates: clause.AssignmentColumns([]string{"name"}),
 	}).Create(&targets)

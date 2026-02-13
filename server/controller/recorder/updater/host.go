@@ -19,61 +19,65 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
+
+// HostMessageFactory Host资源的消息工厂
+type HostMessageFactory struct{}
+
+func (f *HostMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedHosts{}
+}
+
+func (f *HostMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedHost{}
+}
+
+func (f *HostMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedHosts{}
+}
+
+func (f *HostMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedHostFields{}
+}
 
 type Host struct {
 	UpdaterBase[
 		cloudmodel.Host,
-		mysql.Host,
 		*diffbase.Host,
-		*message.HostAdd,
-		message.HostAdd,
-		*message.HostUpdate,
-		message.HostUpdate,
-		*message.HostFieldsUpdate,
-		message.HostFieldsUpdate,
-		*message.HostDelete,
-		message.HostDelete]
+		*metadbmodel.Host,
+		metadbmodel.Host,
+	]
 }
 
 func NewHost(wholeCache *cache.Cache, cloudData []cloudmodel.Host) *Host {
 	updater := &Host{
-		newUpdaterBase[
-			cloudmodel.Host,
-			mysql.Host,
-			*diffbase.Host,
-			*message.HostAdd,
-			message.HostAdd,
-			*message.HostUpdate,
-			message.HostUpdate,
-			*message.HostFieldsUpdate,
-			message.HostFieldsUpdate,
-			*message.HostDelete,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_HOST_EN,
 			wholeCache,
-			db.NewHost().SetORG(wholeCache.GetORG()),
+			db.NewHost().SetMetadata(wholeCache.GetMetadata()),
 			wholeCache.DiffBaseDataSet.Hosts,
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
+	updater.setDataGenerator(updater)
+
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &HostMessageFactory{})
+	}
+
 	return updater
 }
 
-func (h *Host) getDiffBaseByCloudItem(cloudItem *cloudmodel.Host) (diffBase *diffbase.Host, exists bool) {
-	diffBase, exists = h.diffBaseData[cloudItem.Lcuuid]
-	return
-}
-
-func (h *Host) generateDBItemToAdd(cloudItem *cloudmodel.Host) (*mysql.Host, bool) {
-	dbItem := &mysql.Host{
+func (h *Host) generateDBItemToAdd(cloudItem *cloudmodel.Host) (*metadbmodel.Host, bool) {
+	dbItem := &metadbmodel.Host{
 		Name:       cloudItem.Name,
+		UID:        ctrlrcommon.GenerateResourceShortUUID(ctrlrcommon.RESOURCE_TYPE_HOST_EN),
 		IP:         cloudItem.IP,
 		Hostname:   cloudItem.Hostname,
 		Type:       cloudItem.Type,
@@ -86,14 +90,14 @@ func (h *Host) generateDBItemToAdd(cloudItem *cloudmodel.Host) (*mysql.Host, boo
 		State:      ctrlrcommon.HOST_STATE_COMPLETE,
 		AZ:         cloudItem.AZLcuuid,
 		Region:     cloudItem.RegionLcuuid,
-		Domain:     h.cache.DomainLcuuid,
+		Domain:     h.metadata.GetDomainLcuuid(),
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true
 }
 
-func (h *Host) generateUpdateInfo(diffBase *diffbase.Host, cloudItem *cloudmodel.Host) (*message.HostFieldsUpdate, map[string]interface{}, bool) {
-	structInfo := new(message.HostFieldsUpdate)
+func (h *Host) generateUpdateInfo(diffBase *diffbase.Host, cloudItem *cloudmodel.Host) (types.UpdatedFields, map[string]interface{}, bool) {
+	structInfo := new(message.UpdatedHostFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
 		mapInfo["name"] = cloudItem.Name

@@ -19,39 +19,39 @@ package diffbase
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
-func (b *DataSet) AddPodNamespace(dbItem *mysql.PodNamespace, seq int) {
+func (b *DataSet) AddPodNamespace(dbItem *metadbmodel.PodNamespace, seq int) {
 	b.PodNamespaces[dbItem.Lcuuid] = &PodNamespace{
 		DiffBase: DiffBase{
 			Sequence: seq,
 			Lcuuid:   dbItem.Lcuuid,
 		},
-		RegionLcuuid:    dbItem.Region,
-		AZLcuuid:        dbItem.AZ,
-		SubDomainLcuuid: dbItem.SubDomain,
-		CloudTags:       dbItem.CloudTags,
+		RegionLcuuid:     dbItem.Region,
+		AZLcuuid:         dbItem.AZ,
+		SubDomainLcuuid:  dbItem.SubDomain,
+		LearnedCloudTags: dbItem.LearnedCloudTags,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_NAMESPACE_EN, b.PodNamespaces[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_NAMESPACE_EN, b.PodNamespaces[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeletePodNamespace(lcuuid string) {
 	delete(b.PodNamespaces, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_NAMESPACE_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_NAMESPACE_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type PodNamespace struct {
 	DiffBase
-	RegionLcuuid    string            `json:"region_lcuuid"`
-	AZLcuuid        string            `json:"az_lcuuid"`
-	SubDomainLcuuid string            `json:"sub_domain_lcuuid"`
-	CloudTags       map[string]string `json:"cloud_tags"`
+	RegionLcuuid     string            `json:"region_lcuuid"`
+	AZLcuuid         string            `json:"az_lcuuid"`
+	SubDomainLcuuid  string            `json:"sub_domain_lcuuid"`
+	LearnedCloudTags map[string]string `json:"learned_cloud_tags"`
 }
 
 func (p *PodNamespace) Update(cloudItem *cloudmodel.PodNamespace) {
 	p.RegionLcuuid = cloudItem.RegionLcuuid
 	p.AZLcuuid = cloudItem.AZLcuuid
-	p.CloudTags = cloudItem.CloudTags
+	p.LearnedCloudTags = cloudItem.CloudTags
 	log.Info(updateDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_NAMESPACE_EN, p))
 }

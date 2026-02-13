@@ -20,27 +20,38 @@ pub mod c_ffi;
 pub mod shared_obj;
 pub mod wasm;
 
-use public::{bytes::read_u32_be, counter::Countable, l7_protocol::L7Protocol};
+use prost::Message;
+use public::{
+    bytes::read_u32_be,
+    counter::Countable,
+    l7_protocol::{L7Protocol, LogMessageType},
+};
 use serde::Serialize;
 
 use crate::{
-    common::flow::PacketDirection,
-    common::l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
+    common::{
+        flow::PacketDirection,
+        l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
+        l7_protocol_log::LogCache,
+    },
+    config::handler::LogParserConfig,
     flow_generator::{
         protocol_logs::{
             pb_adapter::{
-                ExtendedInfo, KeyVal, L7ProtocolSendLog, L7Request, L7Response, TraceInfo,
+                ExtendedInfo, KeyVal, L7ProtocolSendLog, L7Request, L7Response, MetricKeyVal,
+                TraceInfo,
             },
-            swap_if, L7ResponseStatus, LogMessageType,
+            swap_if, L7ResponseStatus,
         },
         AppProtoHead, Error,
     },
 };
 
-use self::wasm::read_wasm_str;
+use self::wasm::{read_wasm_str, wasm_plugin as pb};
 
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct CustomInfoRequest {
+    pub version: String,
     pub req_type: String,
     pub domain: String,
     pub resource: String,
@@ -53,17 +64,23 @@ pub struct CustomInfoResp {
     pub code: Option<i32>,
     pub exception: String,
     pub result: String,
+    pub req_type: String,
+    pub endpoint: String,
 }
 
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct CustomInfoTrace {
-    pub trace_id: Option<String>,
+    pub trace_ids: Vec<String>,
     pub span_id: Option<String>,
     pub parent_span_id: Option<String>,
+    pub x_request_id_0: Option<String>,
+    pub x_request_id_1: Option<String>,
+    pub http_proxy_client: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct CustomInfo {
+    // fields populated by crate::flow_generator::protocol_logs::plugin::wasm::WasmLog
     #[serde(skip)]
     pub(super) proto: u8,
     pub(super) proto_str: String,
@@ -71,6 +88,10 @@ pub struct CustomInfo {
     #[serde(skip)]
     pub(super) rrt: u64,
 
+    pub captured_request_byte: u32,
+    pub captured_response_byte: u32,
+
+    // all the following fields are populated by data from wasm plugin
     pub req_len: Option<u32>,
     pub resp_len: Option<u32>,
 
@@ -89,10 +110,22 @@ pub struct CustomInfo {
     #[serde(skip)]
     pub attributes: Vec<KeyVal>,
 
+    #[serde(skip)]
+    pub metrics: Vec<MetricKeyVal>,
+
     pub biz_type: u8,
+    pub biz_code: Option<String>,
+    pub biz_scenario: Option<String>,
+    pub biz_response_code: Option<String>,
+
+    #[serde(skip)]
+    pub is_on_blacklist: bool,
+
+    pub is_async: Option<bool>,
+    pub is_reversed: Option<bool>,
 }
 
-impl TryFrom<(&[u8], PacketDirection)> for CustomInfo {
+impl CustomInfo {
     /*
         req len:        4 bytes: | 1 bit: is nil? | 31bit length |
 
@@ -132,13 +165,16 @@ impl TryFrom<(&[u8], PacketDirection)> for CustomInfo {
 
             ) x 2
 
+        l7_protocol_str len: 2 bytes
+        l7_protocol_str:     $(l7_protocol_str len) bytes
+
         need_protocol_merge: 1 byte, the msb indicate is need protocol merge, the lsb indicate is end, such as 1 000000 1
 
         has trace: 1 byte
 
         if has trace:
 
-            trace_id, span_id, parent_span_id
+            trace_ids, span_id, parent_span_id
             (
 
                 key len: 2 bytes
@@ -161,12 +197,10 @@ impl TryFrom<(&[u8], PacketDirection)> for CustomInfo {
             ) x len(kv)
 
         biz type: 1 byte
+        // is async: 1 byte
+        // is reversed: 1 byte
     */
-
-    type Error = Error;
-
-    fn try_from(f: (&[u8], PacketDirection)) -> std::result::Result<Self, Self::Error> {
-        let (buf, dir) = f;
+    fn from_legacy_protocol(buf: &[u8], dir: PacketDirection) -> Result<Self, Error> {
         let mut off = 0;
         let mut info = Self::default();
         if buf.len() < 9 {
@@ -237,9 +271,10 @@ impl TryFrom<(&[u8], PacketDirection)> for CustomInfo {
                 let status = buf[off];
                 match status {
                     0 => info.resp.status = L7ResponseStatus::Ok,
-                    2 => info.resp.status = L7ResponseStatus::NotExist,
+                    2 => info.resp.status = L7ResponseStatus::Timeout,
                     3 => info.resp.status = L7ResponseStatus::ServerError,
                     4 => info.resp.status = L7ResponseStatus::ClientError,
+                    5 => info.resp.status = L7ResponseStatus::Unknown,
                     _ => {
                         return Err(Error::WasmSerializeFail(
                             "recv unexpected status ".to_string(),
@@ -286,6 +321,14 @@ impl TryFrom<(&[u8], PacketDirection)> for CustomInfo {
             }
         }
 
+        if let Some(proto_str) = read_wasm_str(buf, &mut off) {
+            info.proto_str = proto_str;
+        } else {
+            return Err(Error::WasmSerializeFail(
+                "buf len too short when parse l7_protocol_str".to_string(),
+            ));
+        }
+
         // need_protocol_merge
         if off + 1 > buf.len() {
             return Err(Error::WasmSerializeFail(
@@ -316,7 +359,7 @@ impl TryFrom<(&[u8], PacketDirection)> for CustomInfo {
             1 => {
                 if read_wasm_str(buf, &mut off)
                     .and_then(|s| {
-                        info.trace.trace_id = Some(s);
+                        merge_trace_ids(&mut info.trace.trace_ids, &vec![s]);
                         read_wasm_str(buf, &mut off)
                     })
                     .and_then(|s| {
@@ -378,6 +421,141 @@ impl TryFrom<(&[u8], PacketDirection)> for CustomInfo {
 
         Ok(info)
     }
+
+    fn from_protobuf(buf: &[u8], dir: PacketDirection) -> Result<Self, Error> {
+        let pb_info = match pb::AppInfo::decode(buf) {
+            Ok(info) => info,
+            Err(e) => {
+                return Err(Error::WasmSerializeFail(format!(
+                    "decode protobuf failed: {e:?}"
+                )))
+            }
+        };
+
+        let mut info = Self {
+            req_len: pb_info.req_len,
+            resp_len: pb_info.resp_len,
+            request_id: pb_info.request_id,
+            proto_str: pb_info.protocol_str.unwrap_or_default(),
+            need_protocol_merge: pb_info.is_end.is_some(),
+            is_req_end: match pb_info.is_end {
+                Some(true) => dir == PacketDirection::ClientToServer,
+                _ => false,
+            },
+            is_resp_end: match pb_info.is_end {
+                Some(true) => dir == PacketDirection::ServerToClient,
+                _ => false,
+            },
+            attributes: pb_info
+                .attributes
+                .into_iter()
+                .map(|k| KeyVal {
+                    key: k.key,
+                    val: k.val,
+                })
+                .collect(),
+            biz_type: pb_info.biz_type.unwrap_or_default() as u8,
+            biz_code: pb_info.biz_code,
+            biz_scenario: pb_info.biz_scenario,
+            biz_response_code: pb_info.biz_response_code,
+            is_async: pb_info.is_async,
+            is_reversed: pb_info.is_reversed,
+            ..Default::default()
+        };
+        match pb_info.info {
+            Some(pb::app_info::Info::Req(r)) => {
+                info.req = CustomInfoRequest {
+                    version: r.version.unwrap_or_default(),
+                    req_type: r.r#type.unwrap_or_default(),
+                    domain: r.domain.unwrap_or_default(),
+                    resource: r.resource.unwrap_or_default(),
+                    endpoint: r.endpoint.unwrap_or_default(),
+                };
+            }
+            Some(pb::app_info::Info::Resp(r)) => {
+                info.resp = CustomInfoResp {
+                    status: match r.status.and_then(|s| pb::AppRespStatus::try_from(s).ok()) {
+                        Some(pb::AppRespStatus::RespOk) => L7ResponseStatus::Ok,
+                        Some(pb::AppRespStatus::RespTimeout) => L7ResponseStatus::Timeout,
+                        Some(pb::AppRespStatus::RespServerError) => L7ResponseStatus::ServerError,
+                        Some(pb::AppRespStatus::RespClientError) => L7ResponseStatus::ClientError,
+                        Some(pb::AppRespStatus::RespUnknown) => L7ResponseStatus::Unknown,
+                        _ => {
+                            return Err(Error::WasmSerializeFail(
+                                "unexpected resp status".to_string(),
+                            ))
+                        }
+                    },
+                    code: r.code,
+                    result: r.result.unwrap_or_default(),
+                    exception: r.exception.unwrap_or_default(),
+                    req_type: r.r#type.unwrap_or_default(),
+                    endpoint: r.endpoint.unwrap_or_default(),
+                };
+            }
+            _ => (),
+        }
+        if let Some(t) = pb_info.trace {
+            info.trace = CustomInfoTrace {
+                trace_ids: t.trace_ids,
+                span_id: t.span_id,
+                parent_span_id: t.parent_span_id,
+                http_proxy_client: t.http_proxy_client,
+                ..Default::default()
+            };
+            // add trace_id to trace_ids
+            if let Some(trace_id) = t.trace_id {
+                if !info.trace.trace_ids.contains(&trace_id) {
+                    info.trace.trace_ids.push(trace_id.to_string());
+                }
+            }
+            match dir {
+                PacketDirection::ClientToServer => {
+                    info.trace.x_request_id_0 = t.x_request_id;
+                }
+                PacketDirection::ServerToClient => {
+                    info.trace.x_request_id_1 = t.x_request_id;
+                }
+            }
+        }
+        Ok(info)
+    }
+
+    pub fn set_is_on_blacklist(&mut self, config: &LogParserConfig) {
+        if let Some(t) = config.l7_log_blacklist_trie.get(&L7Protocol::Custom) {
+            self.is_on_blacklist = t.request_type.is_on_blacklist(&self.req.req_type)
+                || t.request_resource.is_on_blacklist(&self.req.resource)
+                || t.endpoint.is_on_blacklist(&self.req.endpoint)
+                || t.request_domain.is_on_blacklist(&self.req.domain);
+        }
+    }
+}
+
+impl TryFrom<(&[u8], PacketDirection)> for CustomInfo {
+    type Error = Error;
+
+    fn try_from(f: (&[u8], PacketDirection)) -> std::result::Result<Self, Self::Error> {
+        let (buf, dir) = f;
+
+        // the legacy protocol starts with
+        //     req len:        4 bytes: | 1 bit: is nil? | 31bit length |
+        //
+        // so in the legacy protocol, the first byte will not have the first bit as 0 and other bits as 1
+        // we put a magic `PB` in front to represent protobuf serialized data
+        if buf.len() >= 2 && &buf[..2] == b"PB" {
+            Self::from_protobuf(&buf[2..], dir)
+        } else {
+            Self::from_legacy_protocol(buf, dir)
+        }
+    }
+}
+
+fn merge_trace_ids(a: &mut Vec<String>, b: &Vec<String>) {
+    for item in b {
+        if !a.contains(item) {
+            a.push(item.clone());
+        }
+    }
 }
 
 impl L7ProtocolInfoInterface for CustomInfo {
@@ -388,6 +566,7 @@ impl L7ProtocolInfoInterface for CustomInfo {
     fn merge_log(&mut self, other: &mut L7ProtocolInfo) -> crate::flow_generator::Result<()> {
         if let L7ProtocolInfo::CustomInfo(w) = other {
             // req merge
+            swap_if!(self.req, version, is_empty, w.req);
             swap_if!(self.req, req_type, is_empty, w.req);
             swap_if!(self.req, domain, is_empty, w.req);
             swap_if!(self.req, resource, is_empty, w.req);
@@ -400,6 +579,7 @@ impl L7ProtocolInfoInterface for CustomInfo {
             if w.is_req_end {
                 self.is_req_end = true;
             }
+            self.captured_request_byte += w.captured_request_byte;
 
             // resp merge
             if self.resp.status == L7ResponseStatus::default() {
@@ -420,12 +600,20 @@ impl L7ProtocolInfoInterface for CustomInfo {
             if w.is_resp_end {
                 self.is_resp_end = true;
             }
+            self.captured_response_byte += w.captured_response_byte;
 
             // trace merge
-            swap_if!(self.trace, trace_id, is_none, w.trace);
+            merge_trace_ids(&mut self.trace.trace_ids, &w.trace.trace_ids);
             swap_if!(self.trace, span_id, is_none, w.trace);
             swap_if!(self.trace, parent_span_id, is_none, w.trace);
+            swap_if!(self.trace, x_request_id_0, is_none, w.trace);
+            swap_if!(self.trace, x_request_id_1, is_none, w.trace);
+            swap_if!(self.trace, http_proxy_client, is_none, w.trace);
+
             self.attributes.append(&mut w.attributes);
+
+            swap_if!(self, biz_code, is_none, w);
+            swap_if!(self, biz_scenario, is_none, w);
         }
         Ok(())
     }
@@ -451,11 +639,15 @@ impl L7ProtocolInfoInterface for CustomInfo {
     }
 
     fn get_endpoint(&self) -> Option<String> {
-        None
+        return Some(self.req.endpoint.clone());
     }
 
     fn get_biz_type(&self) -> u8 {
         self.biz_type
+    }
+
+    fn is_reversed(&self) -> bool {
+        self.is_reversed.unwrap_or_default()
     }
 }
 
@@ -464,6 +656,8 @@ impl From<CustomInfo> for L7ProtocolSendLog {
         Self {
             req_len: w.req_len,
             resp_len: w.resp_len,
+            captured_request_byte: w.captured_request_byte,
+            captured_response_byte: w.captured_response_byte,
 
             req: L7Request {
                 req_type: w.req.req_type,
@@ -477,12 +671,12 @@ impl From<CustomInfo> for L7ProtocolSendLog {
                 exception: w.resp.exception,
                 result: w.resp.result,
             },
-            trace_info: if w.trace.trace_id.is_some()
+            trace_info: if !w.trace.trace_ids.is_empty()
                 || w.trace.span_id.is_some()
                 || w.trace.parent_span_id.is_some()
             {
                 Some(TraceInfo {
-                    trace_id: w.trace.trace_id,
+                    trace_ids: w.trace.trace_ids,
                     span_id: w.trace.span_id,
                     parent_span_id: w.trace.parent_span_id,
                 })
@@ -493,8 +687,24 @@ impl From<CustomInfo> for L7ProtocolSendLog {
                 request_id: w.request_id,
                 attributes: Some(w.attributes),
                 protocol_str: Some(w.proto_str),
+                client_ip: w.trace.http_proxy_client,
+                x_request_id_0: w.trace.x_request_id_0,
+                x_request_id_1: w.trace.x_request_id_1,
                 ..Default::default()
             }),
+            biz_response_code: w.biz_response_code.unwrap_or_default(),
+            ..Default::default()
+        }
+    }
+}
+
+impl From<&CustomInfo> for LogCache {
+    fn from(info: &CustomInfo) -> Self {
+        LogCache {
+            msg_type: info.msg_type,
+            resp_status: info.resp.status,
+            on_blacklist: info.is_on_blacklist,
+            endpoint: info.get_endpoint(),
             ..Default::default()
         }
     }

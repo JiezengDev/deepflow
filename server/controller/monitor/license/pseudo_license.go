@@ -22,22 +22,31 @@ import (
 	"strings"
 	"time"
 
-	logging "github.com/op/go-logging"
-
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/monitor/config"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-var log = logging.MustGetLogger("monitor.license")
+var log = logger.MustGetLogger("monitor.license")
 
 var VTAP_LICENSE_TYPE_DEFAULT = common.VTAP_LICENSE_TYPE_A
 var VTAP_LICENSE_FUNCTIONS = []string{
-	strconv.Itoa(common.VTAP_LICENSE_FUNCTION_NETWORK_MONITORING),
-	strconv.Itoa(common.VTAP_LICENSE_FUNCTION_CALL_MONITORING),
-	strconv.Itoa(common.VTAP_LICENSE_FUNCTION_FUNCTION_MONITORING),
-	strconv.Itoa(common.VTAP_LICENSE_FUNCTION_APPLICATION_MONITORING),
-	strconv.Itoa(common.VTAP_LICENSE_FUNCTION_INDICATOR_MONITORING),
+	strconv.Itoa(common.AGENT_LICENSE_FUNCTION_NET_NPB),
+	strconv.Itoa(common.AGENT_LICENSE_FUNCTION_NET_NPMD),
+	strconv.Itoa(common.AGENT_LICENSE_FUNCTION_NET_DPDK),
+	strconv.Itoa(common.AGENT_LICENSE_FUNCTION_TRACE_NET),
+	strconv.Itoa(common.AGENT_LICENSE_FUNCTION_TRACE_SYS),
+	strconv.Itoa(common.AGENT_LICENSE_FUNCTION_TRACE_APP),
+	strconv.Itoa(common.AGENT_LICENSE_FUNCTION_TRACE_IO),
+	strconv.Itoa(common.AGENT_LICENSE_FUNCTION_TRACE_BIZ),
+	strconv.Itoa(common.AGENT_LICENSE_FUNCTION_PROFILE_CPU),
+	strconv.Itoa(common.AGENT_LICENSE_FUNCTION_PROFILE_RAM),
+	strconv.Itoa(common.AGENT_LICENSE_FUNCTION_PROFILE_INT),
+	strconv.Itoa(common.AGENT_LICENSE_FUNCTION_LEGACY_METRIC),
+	strconv.Itoa(common.AGENT_LICENSE_FUNCTION_LEGACY_LOG),
+	strconv.Itoa(common.AGENT_LICENSE_FUNCTION_LEGACY_PROBE),
 }
 
 type VTapLicenseAllocation struct {
@@ -55,11 +64,26 @@ func NewVTapLicenseAllocation(cfg config.MonitorConfig, ctx context.Context) *VT
 	}
 }
 
-func (v *VTapLicenseAllocation) Start() {
+func (v *VTapLicenseAllocation) Start(sCtx context.Context) {
 	log.Info("vtap license allocation and check start")
 	go func() {
-		for range time.Tick(time.Duration(v.cfg.LicenseCheckInterval) * time.Second) {
-			v.allocLicense()
+		ticker := time.NewTicker(time.Duration(v.cfg.LicenseCheckInterval) * time.Second)
+		defer ticker.Stop()
+	LOOP:
+		for {
+			select {
+			case <-ticker.C:
+				if err := metadb.DoOnAllDBs(func(db *metadb.DB) error {
+					v.allocLicense(db)
+					return nil
+				}); err != nil {
+					log.Error(err)
+				}
+			case <-sCtx.Done():
+				break LOOP
+			case <-v.vCtx.Done():
+				break LOOP
+			}
 		}
 	}()
 }
@@ -71,23 +95,20 @@ func (v *VTapLicenseAllocation) Stop() {
 	log.Info("vtap license allocation and check stopped")
 }
 
-func (v *VTapLicenseAllocation) allocLicense() {
-	log.Info("alloc license starting")
+func (v *VTapLicenseAllocation) allocLicense(orgDB *metadb.DB) {
+	log.Info("alloc license starting", orgDB.LogPrefixORGID)
 
-	whereSQL := "license_type IS NULL OR license_functions != ?"
+	whereSQL := "license_functions != ?"
 	licenseFunctions := strings.Join(VTAP_LICENSE_FUNCTIONS, ",")
-	mysql.Db.Model(&mysql.VTap{}).Where(whereSQL, licenseFunctions).Updates(
+	orgDB.Model(&metadbmodel.VTap{}).Where(whereSQL, licenseFunctions).Updates(
 		map[string]interface{}{
 			"license_type":      VTAP_LICENSE_TYPE_DEFAULT,
 			"license_functions": licenseFunctions,
 		},
 	)
-	log.Info("alloc license complete")
+	log.Info("alloc license complete", orgDB.LogPrefixORGID)
 }
 
-func GetSupportedLicenseType(vtapType int) []int {
-	if vtapType == common.VTAP_TYPE_DEDICATED {
-		return []int{}
-	}
-	return []int{common.VTAP_LICENSE_TYPE_A}
+func GetSupportedLicenseFunctions(vtapType int) []int {
+	return []int{}
 }

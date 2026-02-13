@@ -19,76 +19,79 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
+
+// PodNodeMessageFactory defines the message factory for PodNode
+type PodNodeMessageFactory struct{}
+
+func (f *PodNodeMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedPodNodes{}
+}
+
+func (f *PodNodeMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedPodNode{}
+}
+
+func (f *PodNodeMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedPodNodes{}
+}
+
+func (f *PodNodeMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedPodNodeFields{}
+}
 
 type PodNode struct {
 	UpdaterBase[
 		cloudmodel.PodNode,
-		mysql.PodNode,
 		*diffbase.PodNode,
-		*message.PodNodeAdd,
-		message.PodNodeAdd,
-		*message.PodNodeUpdate,
-		message.PodNodeUpdate,
-		*message.PodNodeFieldsUpdate,
-		message.PodNodeFieldsUpdate,
-		*message.PodNodeDelete,
-		message.PodNodeDelete]
+		*metadbmodel.PodNode,
+		metadbmodel.PodNode,
+	]
 }
 
 func NewPodNode(wholeCache *cache.Cache, cloudData []cloudmodel.PodNode) *PodNode {
 	updater := &PodNode{
-		newUpdaterBase[
-			cloudmodel.PodNode,
-			mysql.PodNode,
-			*diffbase.PodNode,
-			*message.PodNodeAdd,
-			message.PodNodeAdd,
-			*message.PodNodeUpdate,
-			message.PodNodeUpdate,
-			*message.PodNodeFieldsUpdate,
-			message.PodNodeFieldsUpdate,
-			*message.PodNodeDelete,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_POD_NODE_EN,
 			wholeCache,
-			db.NewPodNode().SetORG(wholeCache.GetORG()),
+			db.NewPodNode().SetMetadata(wholeCache.GetMetadata()),
 			wholeCache.DiffBaseDataSet.PodNodes,
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
+	updater.setDataGenerator(updater)
+
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &PodNodeMessageFactory{})
+	}
+
 	return updater
 }
 
-func (n *PodNode) getDiffBaseByCloudItem(cloudItem *cloudmodel.PodNode) (diffBase *diffbase.PodNode, exists bool) {
-	diffBase, exists = n.diffBaseData[cloudItem.Lcuuid]
-	return
-}
-
-func (n *PodNode) generateDBItemToAdd(cloudItem *cloudmodel.PodNode) (*mysql.PodNode, bool) {
+func (n *PodNode) generateDBItemToAdd(cloudItem *cloudmodel.PodNode) (*metadbmodel.PodNode, bool) {
 	vpcID, exists := n.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)
 	if !exists {
-		log.Error(n.org.LogPre(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_VPC_EN, cloudItem.VPCLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_POD_NODE_EN, cloudItem.Lcuuid,
-		)))
+		), n.metadata.LogPrefixes)
 		return nil, false
 	}
 	podClusterID, exists := n.cache.ToolDataSet.GetPodClusterIDByLcuuid(cloudItem.PodClusterLcuuid)
 	if !exists {
-		log.Error(n.org.LogPre(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_POD_CLUSTER_EN, cloudItem.PodClusterLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_POD_NODE_EN, cloudItem.Lcuuid,
-		)))
+		), n.metadata.LogPrefixes)
 		return nil, false
 	}
-	dbItem := &mysql.PodNode{
+	dbItem := &metadbmodel.PodNode{
 		Name:         cloudItem.Name,
 		Type:         cloudItem.Type,
 		MemTotal:     cloudItem.MemTotal,
@@ -99,7 +102,7 @@ func (n *PodNode) generateDBItemToAdd(cloudItem *cloudmodel.PodNode) (*mysql.Pod
 		Hostname:     cloudItem.Hostname,
 		PodClusterID: podClusterID,
 		SubDomain:    cloudItem.SubDomainLcuuid,
-		Domain:       n.cache.DomainLcuuid,
+		Domain:       n.metadata.GetDomainLcuuid(),
 		Region:       cloudItem.RegionLcuuid,
 		AZ:           cloudItem.AZLcuuid,
 		VPCID:        vpcID,
@@ -108,8 +111,8 @@ func (n *PodNode) generateDBItemToAdd(cloudItem *cloudmodel.PodNode) (*mysql.Pod
 	return dbItem, true
 }
 
-func (n *PodNode) generateUpdateInfo(diffBase *diffbase.PodNode, cloudItem *cloudmodel.PodNode) (*message.PodNodeFieldsUpdate, map[string]interface{}, bool) {
-	structInfo := new(message.PodNodeFieldsUpdate)
+func (n *PodNode) generateUpdateInfo(diffBase *diffbase.PodNode, cloudItem *cloudmodel.PodNode) (types.UpdatedFields, map[string]interface{}, bool) {
+	structInfo := new(message.UpdatedPodNodeFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.Type != cloudItem.Type {
 		mapInfo["type"] = cloudItem.Type
@@ -118,6 +121,10 @@ func (n *PodNode) generateUpdateInfo(diffBase *diffbase.PodNode, cloudItem *clou
 	if diffBase.Hostname != cloudItem.Hostname {
 		mapInfo["hostname"] = cloudItem.Hostname
 		structInfo.Hostname.Set(diffBase.Hostname, cloudItem.Hostname)
+	}
+	if diffBase.IP != cloudItem.IP {
+		mapInfo["ip"] = cloudItem.IP
+		structInfo.IP.Set(diffBase.IP, cloudItem.IP)
 	}
 	if diffBase.State != cloudItem.State {
 		mapInfo["state"] = cloudItem.State

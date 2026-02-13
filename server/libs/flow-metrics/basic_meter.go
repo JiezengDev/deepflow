@@ -24,23 +24,23 @@ import (
 )
 
 type Traffic struct {
-	PacketTx   uint64 `db:"packet_tx"`
-	PacketRx   uint64 `db:"packet_rx"`
-	ByteTx     uint64 `db:"byte_tx"`
-	ByteRx     uint64 `db:"byte_rx"`
-	L3ByteTx   uint64 `db:"l3_byte_tx"`
-	L3ByteRx   uint64 `db:"l3_byte_rx"`
-	L4ByteTx   uint64 `db:"l4_byte_tx"`
-	L4ByteRx   uint64 `db:"l4_byte_rx"`
-	NewFlow    uint64 `db:"new_flow"`
-	ClosedFlow uint64 `db:"closed_flow"`
+	PacketTx   uint64 `json:"packet_tx" category:"$metrics" sub:"l3_throughput"`
+	PacketRx   uint64 `json:"packet_rx" category:"$metrics" sub:"l3_throughput"`
+	ByteTx     uint64 `json:"byte_tx" category:"$metrics" sub:"l3_throughput"`
+	ByteRx     uint64 `json:"byte_rx" category:"$metrics" sub:"l3_throughput"`
+	L3ByteTx   uint64 `json:"l3_byte_tx" category:"$metrics" sub:"l3_throughput"`
+	L3ByteRx   uint64 `json:"l3_byte_rx" category:"$metrics" sub:"l3_throughput"`
+	L4ByteTx   uint64 `json:"l4_byte_tx" category:"$metrics" sub:"l4_throughput"`
+	L4ByteRx   uint64 `json:"l4_byte_rx" category:"$metrics" sub:"l4_throughput"`
+	NewFlow    uint64 `json:"new_flow" category:"$metrics" sub:"l4_throughput"`
+	ClosedFlow uint64 `json:"closed_flow" category:"$metrics" sub:"l4_throughput"`
 
-	L7Request   uint32 `db:"l7_request"`
-	L7Response  uint32 `db:"l7_response"`
-	SynCount    uint32 `db:"syn_count"`
-	SynackCount uint32 `db:"synack_count"`
+	L7Request   uint32 `json:"l7_request" category:"$metrics" sub:"application"`
+	L7Response  uint32 `json:"l7_response" category:"$metrics" sub:"application"`
+	SynCount    uint32 `json:"syn_count" category:"$metrics" sub:"l4_throughput"`
+	SynackCount uint32 `json:"synack_count" category:"$metrics" sub:"l4_throughput"`
 
-	DirectionScore uint8 `db:"direction_score"`
+	DirectionScore uint8 `json:"direction_score" category:"$metrics" sub:"l4_throughput"`
 }
 
 func (t *Traffic) Reverse() {
@@ -162,7 +162,6 @@ const (
 	TRAFFIC_SYNACK_COUNT
 )
 
-// Columns列和WriteBlock的列需要按顺序一一对应
 func TrafficColumns() []*ckdb.Column {
 	columns := ckdb.NewColumnsWithComment(
 		[][2]string{
@@ -193,57 +192,30 @@ func TrafficColumns() []*ckdb.Column {
 	return columns
 }
 
-// WriteBlock的列需和Columns 按顺序一一对应
-func (t *Traffic) WriteBlock(block *ckdb.Block) {
-	block.Write(
-		t.PacketTx,
-		t.PacketRx,
-		t.PacketTx+t.PacketRx,
-
-		t.ByteTx,
-		t.ByteRx,
-		t.ByteTx+t.ByteRx,
-
-		t.L3ByteTx,
-		t.L3ByteRx,
-		t.L4ByteTx,
-		t.L4ByteRx,
-
-		t.NewFlow,
-		t.ClosedFlow,
-		uint64(t.L7Request),
-		uint64(t.L7Response),
-
-		uint64(t.SynCount),
-		uint64(t.SynackCount),
-		t.DirectionScore,
-	)
-}
-
 type Latency struct {
-	RTTMax       uint32 `db:"rtt_max"`        // us，Trident保证时延最大值不会超过3600s，能容纳在u32内
-	RTTClientMax uint32 `db:"rtt_client_max"` // us
-	RTTServerMax uint32 `db:"rtt_server_max"` // us
-	SRTMax       uint32 `db:"srt_max"`        // us
-	ARTMax       uint32 `db:"art_max"`        // us
-	RRTMax       uint32 `db:"rrt_max"`        // us
-	CITMax       uint32 `db:"cit_max"`        // client idle time max
+	RTTMax       uint32 `json:"rtt_max" category:"$metrics" sub:"delay"`        // us，Trident保证时延最大值不会超过3600s，能容纳在u32内
+	RTTClientMax uint32 `json:"rtt_client_max" category:"$metrics" sub:"delay"` // us
+	RTTServerMax uint32 `json:"rtt_server_max" category:"$metrics" sub:"delay"` // us
+	SRTMax       uint32 `json:"srt_max" category:"$metrics" sub:"delay"`        // us
+	ARTMax       uint32 `json:"art_max" category:"$metrics" sub:"delay"`        // us
+	RRTMax       uint32 `json:"rrt_max" category:"$metrics" sub:"delay"`        // us
+	CITMax       uint32 `json:"cit_max" category:"$metrics" sub:"delay"`        // client idle time max
 
-	RTTSum       uint64 `db:"rtt_sum"`        // us
-	RTTClientSum uint64 `db:"rtt_client_sum"` // us
-	RTTServerSum uint64 `db:"rtt_server_sum"` // us
-	SRTSum       uint64 `db:"srt_sum"`        // us
-	ARTSum       uint64 `db:"art_sum"`        // us
-	RRTSum       uint64 `db:"rrt_sum"`        // us
-	CITSum       uint64 `db:"cit_sum"`
+	RTTSum       uint64 `json:"rtt_sum" category:"$metrics" sub:"delay"`        // us
+	RTTClientSum uint64 `json:"rtt_client_sum" category:"$metrics" sub:"delay"` // us
+	RTTServerSum uint64 `json:"rtt_server_sum" category:"$metrics" sub:"delay"` // us
+	SRTSum       uint64 `json:"srt_sum" category:"$metrics" sub:"delay"`        // us
+	ARTSum       uint64 `json:"art_sum" category:"$metrics" sub:"delay"`        // us
+	RRTSum       uint64 `json:"rrt_sum" category:"$metrics" sub:"delay"`        // us
+	CITSum       uint64 `json:"cit_sum" category:"$metrics" sub:"delay"`
 
-	RTTCount       uint32 `db:"rtt_count"`
-	RTTClientCount uint32 `db:"rtt_client_count"`
-	RTTServerCount uint32 `db:"rtt_server_count"`
-	SRTCount       uint32 `db:"srt_count"`
-	ARTCount       uint32 `db:"art_count"`
-	RRTCount       uint32 `db:"rrt_count"`
-	CITCount       uint32 `db:"cit_count"`
+	RTTCount       uint32 `json:"rtt_count" category:"$metrics" sub:"delay"`
+	RTTClientCount uint32 `json:"rtt_client_count" category:"$metrics" sub:"delay"`
+	RTTServerCount uint32 `json:"rtt_server_count" category:"$metrics" sub:"delay"`
+	SRTCount       uint32 `json:"srt_count" category:"$metrics" sub:"delay"`
+	ARTCount       uint32 `json:"art_count" category:"$metrics" sub:"delay"`
+	RRTCount       uint32 `json:"rrt_count" category:"$metrics" sub:"delay"`
+	CITCount       uint32 `json:"cit_count" category:"$metrics" sub:"delay"`
 }
 
 func (_ *Latency) Reverse() {
@@ -368,7 +340,6 @@ const (
 	LATENCY_CIT
 )
 
-// Columns列和WriteBlock的列需要按顺序一一对应
 func LatencyColumns() []*ckdb.Column {
 	sumColumns := ckdb.NewColumnsWithComment(
 		[][2]string{
@@ -412,43 +383,13 @@ func LatencyColumns() []*ckdb.Column {
 	return columns
 }
 
-// WriteBlock和LatencyColumns的列需要按顺序一一对应
-func (l *Latency) WriteBlock(block *ckdb.Block) {
-	block.Write(
-		float64(l.RTTSum),
-		float64(l.RTTClientSum),
-		float64(l.RTTServerSum),
-		float64(l.SRTSum),
-		float64(l.ARTSum),
-		float64(l.RRTSum),
-		float64(l.CITSum),
-
-		uint64(l.RTTCount),
-		uint64(l.RTTClientCount),
-		uint64(l.RTTServerCount),
-		uint64(l.SRTCount),
-		uint64(l.ARTCount),
-		uint64(l.RRTCount),
-		uint64(l.CITCount),
-
-		l.RTTMax,
-		l.RTTClientMax,
-		l.RTTServerMax,
-		l.SRTMax,
-		l.ARTMax,
-		l.RRTMax,
-		l.CITMax,
-	)
-
-}
-
 type Performance struct {
-	RetransTx     uint64 `db:"retrans_tx"`
-	RetransRx     uint64 `db:"retrans_rx"`
-	ZeroWinTx     uint64 `db:"zero_win_tx"`
-	ZeroWinRx     uint64 `db:"zero_win_rx"`
-	RetransSyn    uint32 `db:"retrans_syn"`
-	RetransSynack uint32 `db:"retrans_synack"`
+	RetransTx     uint64 `json:"retrans_tx" category:"$metrics"`
+	RetransRx     uint64 `json:"retrans_rx" category:"$metrics"`
+	ZeroWinTx     uint64 `json:"zero_win_tx" category:"$metrics"`
+	ZeroWinRx     uint64 `json:"zero_win_rx" category:"$metrics"`
+	RetransSyn    uint32 `json:"retrans_syn" category:"$metrics"`
+	RetransSynack uint32 `json:"retrans_synack" category:"$metrics"`
 }
 
 func (a *Performance) Reverse() {
@@ -509,7 +450,6 @@ const (
 	PERF_RETRANS_SYNACK
 )
 
-// Columns列和WriteBlock的列需要按顺序一一对应
 func PerformanceColumns() []*ckdb.Column {
 	return ckdb.NewColumnsWithComment(
 		[][2]string{
@@ -527,33 +467,32 @@ func PerformanceColumns() []*ckdb.Column {
 		ckdb.UInt64)
 }
 
-// WriteBlock的列和PerformanceColumns需要按顺序一一对应
-func (a *Performance) WriteBlock(block *ckdb.Block) {
-	block.Write(
-		a.RetransTx, a.RetransRx, a.RetransTx+a.RetransRx,
-		a.ZeroWinTx, a.ZeroWinRx, a.ZeroWinTx+a.ZeroWinRx,
-		uint64(a.RetransSyn), uint64(a.RetransSynack),
-	)
-}
-
 type Anomaly struct {
-	ClientRstFlow       uint64 `db:"client_rst_flow"`
-	ServerRstFlow       uint64 `db:"server_rst_flow"`
-	ServerSynMiss       uint64 `db:"server_syn_miss"`
-	ClientAckMiss       uint64 `db:"client_ack_miss"`
-	ClientHalfCloseFlow uint64 `db:"client_half_close_flow"`
-	ServerHalfCloseFlow uint64 `db:"server_half_close_flow"`
+	ClientRstFlow       uint64 `json:"client_rst_flow" category:"$metrics" sub:"tcp_error"`
+	ServerRstFlow       uint64 `json:"server_rst_flow" category:"$metrics" sub:"tcp_error"`
+	ServerSynMiss       uint64 `json:"server_syn_miss" category:"$metrics" sub:"tcp_error"`
+	ClientAckMiss       uint64 `json:"client_ack_miss" category:"$metrics" sub:"tcp_error"`
+	ClientHalfCloseFlow uint64 `json:"client_half_close_flow" category:"$metrics" sub:"tcp_error"`
+	ServerHalfCloseFlow uint64 `json:"server_half_close_flow" category:"$metrics" sub:"tcp_error"`
 
-	ClientSourcePortReuse uint64 `db:"client_source_port_reuse"`
-	ClientEstablishReset  uint64 `db:"client_establish_other_rst"`
-	ServerReset           uint64 `db:"server_reset"`
-	ServerQueueLack       uint64 `db:"server_queue_lack"`
-	ServerEstablishReset  uint64 `db:"server_establish_other_rst"`
-	TCPTimeout            uint64 `db:"tcp_timeout"`
+	ClientSourcePortReuse uint64 `json:"client_source_port_reuse" category:"$metrics" sub:"tcp_error"`
+	ClientEstablishReset  uint64 `json:"client_establish_other_rst" category:"$metrics" sub:"tcp_error"`
+	ServerReset           uint64 `json:"server_reset" category:"$metrics" sub:"tcp_error"`
+	ServerQueueLack       uint64 `json:"server_queue_lack" category:"$metrics" sub:"tcp_error"`
+	ServerEstablishReset  uint64 `json:"server_establish_other_rst" category:"$metrics" sub:"tcp_error"`
+	TCPTimeout            uint64 `json:"tcp_timeout" category:"$metrics" sub:"tcp_error"`
 
-	L7ClientError uint32 `db:"l7_client_error"`
-	L7ServerError uint32 `db:"l7_server_error"`
-	L7Timeout     uint32 `db:"l7_timeout"`
+	ClientEstablishFail uint64 `json:"client_establish_fail" category:"$metrics" sub:"tcp_error"`
+	ServerEstablishFail uint64 `json:"server_establish_fail" category:"$metrics" sub:"tcp_error"`
+	TCPEstablishFail    uint64 `json:"tcp_establish_fail" category:"$metrics" sub:"tcp_error"`
+	TCPTransferFail     uint64 `json:"tcp_transfer_fail" category:"$metrics" sub:"tcp_error"`
+	TCPRstFail          uint64 `json:"tcp_rst_fail" category:"$metrics" sub:"tcp_error"`
+
+	L7ClientError uint32 `json:"l7_client_error" category:"$metrics" sub:"application"`
+	L7ServerError uint32 `json:"l7_server_error" category:"$metrics" sub:"application"`
+	L7Timeout     uint32 `json:"l7_timeout" category:"$metrics" sub:"application"`
+	OooTx         uint64 `json:"ooo_tx" category:"$metrics"`
+	OooRx         uint64 `json:"ooo_rx" category:"$metrics"`
 }
 
 func (_ *Anomaly) Reverse() {
@@ -578,6 +517,9 @@ func (a *Anomaly) WriteToPB(p *pb.Anomaly) {
 	p.L7ClientError = a.L7ClientError
 	p.L7ServerError = a.L7ServerError
 	p.L7Timeout = a.L7Timeout
+
+	p.ClientOoo = a.OooTx
+	p.ServerOoo = a.OooRx
 }
 
 func (a *Anomaly) ReadFromPB(p *pb.Anomaly) {
@@ -595,9 +537,20 @@ func (a *Anomaly) ReadFromPB(p *pb.Anomaly) {
 	a.ServerEstablishReset = p.ServerEstablishReset
 	a.TCPTimeout = p.TcpTimeout
 
+	a.ClientEstablishFail = a.ClientAckMiss + a.ClientSourcePortReuse + a.ClientEstablishReset
+	a.ServerEstablishFail = a.ServerSynMiss + a.ServerReset + a.ServerQueueLack + a.ServerEstablishReset
+	a.TCPEstablishFail = a.ClientEstablishFail + a.ServerEstablishFail
+	// 表示 传输-客户端/服务端重置, 传输-服务端队列溢出, 传输-连接超时次数
+	a.TCPTransferFail = a.ClientRstFlow + a.ServerRstFlow + a.ServerQueueLack + a.TCPTimeout
+	// 表示所有重置的次数之和，包含建连-客户端/服务端其他重置、建连-服务端直接重置、传输-客户端/服务端重置
+	a.TCPRstFail = a.ClientEstablishReset + a.ServerEstablishReset + a.ServerReset + a.ClientRstFlow + a.ServerRstFlow
+
 	a.L7ClientError = p.L7ClientError
 	a.L7ServerError = p.L7ServerError
 	a.L7Timeout = p.L7Timeout
+
+	a.OooTx = p.ClientOoo
+	a.OooRx = p.ServerOoo
 }
 
 func (a *Anomaly) ConcurrentMerge(other *Anomaly) {
@@ -618,6 +571,9 @@ func (a *Anomaly) ConcurrentMerge(other *Anomaly) {
 	a.L7ClientError += other.L7ClientError
 	a.L7ServerError += other.L7ServerError
 	a.L7Timeout += other.L7Timeout
+
+	a.OooTx = other.OooTx
+	a.OooRx = other.OooRx
 }
 
 func (a *Anomaly) SequentialMerge(other *Anomaly) {
@@ -634,6 +590,7 @@ func (a *Anomaly) MarshalTo(b []byte) int {
 		"tcp_timeout=",
 		"client_establish_fail=", "server_establish_fail=", "tcp_establish_fail=",
 		"l7_client_error=", "l7_server_error=", "l7_timeout=", "l7_error=",
+		"ooo_tx", "ooo_rx",
 	}
 	clientFail := a.ClientAckMiss + a.ClientSourcePortReuse + a.ClientEstablishReset
 	serverFail := a.ServerSynMiss + a.ServerReset + a.ServerQueueLack + a.ServerEstablishReset
@@ -646,6 +603,7 @@ func (a *Anomaly) MarshalTo(b []byte) int {
 		a.TCPTimeout,
 		clientFail, serverFail, clientFail + serverFail,
 		uint64(a.L7ClientError), uint64(a.L7ServerError), uint64(a.L7Timeout), uint64(a.L7ClientError + a.L7ServerError),
+		a.OooTx, a.OooRx,
 	}
 	return marshalKeyValues(b, fields, values)
 }
@@ -675,7 +633,11 @@ const (
 
 	ANOMALY_TRANSFER_FAIL
 	ANOMALY_RST_FAIL
+
+	ANOMALY_OOO_TX
+	ANOMALY_OOO_RX
 )
+
 const (
 	ANOMALY_L7_CLIENT_ERROR = iota
 	ANOMALY_L7_SERVER_ERROR
@@ -683,7 +645,6 @@ const (
 	ANOMALY_L7_ERROR
 )
 
-// Columns列和WriteBlock的列需要按顺序一一对应
 func AnomalyColumns() []*ckdb.Column {
 	anomalColumns := ckdb.NewColumnsWithComment(
 		[][2]string{
@@ -711,6 +672,9 @@ func AnomalyColumns() []*ckdb.Column {
 
 			ANOMALY_TRANSFER_FAIL: {"tcp_transfer_fail", "TCP传输失败次数"},
 			ANOMALY_RST_FAIL:      {"tcp_rst_fail", "TCP重置次数"},
+
+			ANOMALY_OOO_TX: {"ooo_tx", "Total client out of order times"},
+			ANOMALY_OOO_RX: {"ooo_rx", "Total server out of order times"},
 		}, ckdb.UInt64)
 
 	l7AnomalColumns := ckdb.NewColumnsWithComment(
@@ -724,50 +688,8 @@ func AnomalyColumns() []*ckdb.Column {
 	return append(anomalColumns, l7AnomalColumns...)
 }
 
-// WriteBlock的列和AnomalyColumns需要按顺序一一对应
-func (a *Anomaly) WriteBlock(block *ckdb.Block) {
-	clientFail := a.ClientAckMiss + a.ClientSourcePortReuse + a.ClientEstablishReset
-	serverFail := a.ServerSynMiss + a.ServerReset + a.ServerQueueLack + a.ServerEstablishReset
-	// 表示 传输-客户端/服务端重置, 传输-服务端队列溢出, 传输-连接超时次数
-	transferFail := a.ClientRstFlow + a.ServerRstFlow + a.ServerQueueLack + a.TCPTimeout
-	// 表示所有重置的次数之和，包含建连-客户端/服务端其他重置、建连-服务端直接重置、传输-客户端/服务端重置
-	rstFail := a.ClientEstablishReset + a.ServerEstablishReset + a.ServerReset + a.ClientRstFlow + a.ServerRstFlow
-
-	block.Write(
-		a.ClientRstFlow,
-		a.ServerRstFlow,
-
-		a.ServerSynMiss,
-		a.ClientAckMiss,
-
-		a.ClientHalfCloseFlow,
-		a.ServerHalfCloseFlow,
-
-		a.ClientSourcePortReuse,
-		a.ServerReset,
-		a.ServerQueueLack,
-
-		a.ClientEstablishReset,
-		a.ServerEstablishReset,
-
-		a.TCPTimeout,
-
-		clientFail,
-		serverFail,
-		clientFail+serverFail,
-
-		transferFail,
-		rstFail,
-
-		a.L7ClientError,
-		a.L7ServerError,
-		a.L7Timeout,
-		a.L7ClientError+a.L7ServerError,
-	)
-}
-
 type FlowLoad struct {
-	Load uint64 `db:"flow_load"`
+	Load uint64 `json:"flow_load" category:"$metrics" sub:"l4_throughput"`
 }
 
 func (l *FlowLoad) Reverse() {
@@ -802,10 +724,6 @@ const (
 
 func FlowLoadColumns() []*ckdb.Column {
 	return ckdb.NewColumnsWithComment([][2]string{FLOW_LOAD: {"flow_load", "累计活跃连接数"}}, ckdb.UInt64)
-}
-
-func (l *FlowLoad) WriteBlock(block *ckdb.Block) {
-	block.Write(l.Load)
 }
 
 func marshalKeyValues(b []byte, fields []string, values []uint64) int {

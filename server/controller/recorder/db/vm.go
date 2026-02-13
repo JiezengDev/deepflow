@@ -18,52 +18,48 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/recorder/common"
 )
 
 type VM struct {
-	OperatorBase[mysql.VM]
+	OperatorBase[*metadbmodel.VM, metadbmodel.VM]
 }
 
 func NewVM() *VM {
 	operater := &VM{
-		OperatorBase[mysql.VM]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_VM_EN,
-			softDelete:       true,
-			allocateID:       true,
-		},
+		newOperatorBase[*metadbmodel.VM](
+			ctrlrcommon.RESOURCE_TYPE_VM_EN,
+			true,
+			true,
+		),
 	}
-	operater.setter = operater
 	return operater
 }
 
-func (a *VM) setDBItemID(dbItem *mysql.VM, id int) {
-	dbItem.ID = id
-}
-
-func (v *VM) DeleteBatch(lcuuids []string) ([]*mysql.VM, bool) {
-	var vmPodNodeConns []*mysql.VMPodNodeConnection
-	err := v.org.DB.Model(&mysql.VMPodNodeConnection{}).Joins("JOIN vm On vm_pod_node_connection.vm_id = vm.id").Where("vm.lcuuid IN ?", lcuuids).Scan(&vmPodNodeConns).Error
+func (v *VM) DeleteBatch(lcuuids []string) ([]*metadbmodel.VM, bool) {
+	var vmPodNodeConns []*metadbmodel.VMPodNodeConnection
+	err := v.metadata.DB.Model(&metadbmodel.VMPodNodeConnection{}).Joins("JOIN vm On vm_pod_node_connection.vm_id = vm.id").Where("vm.lcuuid IN ?", lcuuids).Scan(&vmPodNodeConns).Error
 	if err != nil {
-		log.Error(v.org.LogPre("get %s (%s lcuuids: %+v) failed: %v", ctrlrcommon.RESOURCE_TYPE_VM_POD_NODE_CONNECTION_EN, ctrlrcommon.RESOURCE_TYPE_VM_EN, lcuuids, err))
+		log.Errorf("get %s (%s lcuuids: %+v) failed: %v", ctrlrcommon.RESOURCE_TYPE_VM_POD_NODE_CONNECTION_EN, ctrlrcommon.RESOURCE_TYPE_VM_EN, lcuuids, err.Error(), v.metadata.LogPrefixes)
 		return nil, false
 	} else {
 		for _, con := range vmPodNodeConns {
-			err = v.org.DB.Delete(con).Error
+			err = v.metadata.DB.Delete(con).Error
 			if err != nil {
-				log.Error(v.org.LogPre("delete %s (info: %+v) failed: %v", ctrlrcommon.RESOURCE_TYPE_VM_POD_NODE_CONNECTION_EN, con, err))
+				log.Errorf("%s (info: %+v) failed: %v", common.LogDelete(ctrlrcommon.RESOURCE_TYPE_VM_POD_NODE_CONNECTION_EN), con, err.Error(), v.metadata.LogPrefixes)
 				continue
 			}
-			log.Info(v.org.LogPre("delete %s (info: %+v) success", ctrlrcommon.RESOURCE_TYPE_VM_POD_NODE_CONNECTION_EN, con))
+			log.Infof("%s (info: %+v) success", common.LogDelete(ctrlrcommon.RESOURCE_TYPE_VM_POD_NODE_CONNECTION_EN), con, v.metadata.LogPrefixes)
 		}
 	}
 
-	var dbItems []*mysql.VM
-	err = v.org.DB.Where("lcuuid IN ?", lcuuids).Delete(&dbItems).Error
+	var dbItems []*metadbmodel.VM
+	err = v.metadata.DB.Where("lcuuid IN ?", lcuuids).Delete(&dbItems).Error
 	if err != nil {
-		log.Error(v.org.LogPre("delete %s (lcuuids: %v) failed: %v", ctrlrcommon.RESOURCE_TYPE_VM_EN, lcuuids, err))
+		log.Errorf("%s (lcuuids: %v) failed: %v", common.LogDelete(ctrlrcommon.RESOURCE_TYPE_VM_EN), lcuuids, err.Error(), v.metadata.LogPrefixes)
 		return nil, false
 	}
-	log.Info(v.org.LogPre("delete %s (lcuuids: %v) success", ctrlrcommon.RESOURCE_TYPE_VM_EN, lcuuids))
+	log.Infof("%s (lcuuids: %v) success", common.LogDelete(ctrlrcommon.RESOURCE_TYPE_VM_EN), lcuuids, v.metadata.LogPrefixes)
 	return dbItems, true
 }

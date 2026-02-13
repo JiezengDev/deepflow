@@ -20,10 +20,11 @@ import (
 	"sync"
 
 	mapset "github.com/deckarep/golang-set/v2"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/deepflowio/deepflow/message/controller"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/prometheus/common"
 )
 
 type metricLabelNameKey struct {
@@ -39,6 +40,7 @@ func newMetricLabelNameKey(metricNameID, labelNameID int) metricLabelNameKey {
 }
 
 type metricLabelName struct {
+	org          *common.ORG
 	lock         sync.Mutex
 	resourceType string
 
@@ -48,8 +50,9 @@ type metricLabelName struct {
 	keys mapset.Set[metricLabelNameKey]
 }
 
-func newMetricLabelName(mn *metricName, l *labelName) *metricLabelName {
+func newMetricLabelName(org *common.ORG, mn *metricName, l *labelName) *metricLabelName {
 	return &metricLabelName{
+		org:               org,
 		resourceType:      "metric_label",
 		metricNameEncoder: mn,
 		labelNameEncoder:  l,
@@ -57,15 +60,15 @@ func newMetricLabelName(mn *metricName, l *labelName) *metricLabelName {
 	}
 }
 
-func (ml *metricLabelName) store(item *mysql.PrometheusMetricLabelName) {
+func (ml *metricLabelName) store(item *metadbmodel.PrometheusMetricLabelName) {
 	if mni, ok := ml.metricNameEncoder.getID(item.MetricName); ok {
 		ml.keys.Add(newMetricLabelNameKey(mni, item.LabelNameID))
 	}
 }
 
 func (ml *metricLabelName) refresh(args ...interface{}) error {
-	var items []*mysql.PrometheusMetricLabelName
-	err := mysql.Db.Find(&items).Error
+	var items []*metadbmodel.PrometheusMetricLabelName
+	err := ml.org.DB.Find(&items).Error
 	if err != nil {
 		return err
 	}
@@ -80,13 +83,13 @@ func (ml *metricLabelName) encode(rMLs []*controller.PrometheusMetricLabelNameRe
 	defer ml.lock.Unlock()
 
 	resp := make([]*controller.PrometheusMetricLabelName, 0)
-	var dbToAdd []*mysql.PrometheusMetricLabelName
+	var dbToAdd []*metadbmodel.PrometheusMetricLabelName
 	respToAdd := make([]*controller.PrometheusMetricLabelName, 0)
 	for _, rML := range rMLs {
 		mn := rML.GetMetricName()
 		mni, ok := ml.metricNameEncoder.getID(mn)
 		if !ok {
-			log.Warningf("%s metric_name: %s id not found", ml.resourceType, mn)
+			log.Warningf("%s metric_name: %s id not found", ml.resourceType, mn, ml.org.LogPrefix)
 			continue
 		}
 		lis := make([]uint32, 0)
@@ -94,14 +97,14 @@ func (ml *metricLabelName) encode(rMLs []*controller.PrometheusMetricLabelNameRe
 		for _, ln := range rML.GetLabelNames() {
 			lni, ok := ml.labelNameEncoder.getID(ln)
 			if !ok {
-				log.Warningf("%s label (name: %s) id not found", ml.resourceType, ln)
+				log.Warningf("%s label (name: %s) id not found", ml.resourceType, ln, ml.org.LogPrefix)
 				continue
 			}
 			if ok := ml.keys.Contains(newMetricLabelNameKey(mni, lni)); ok {
 				lis = append(lis, uint32(lni))
 				continue
 			}
-			dbToAdd = append(dbToAdd, &mysql.PrometheusMetricLabelName{
+			dbToAdd = append(dbToAdd, &metadbmodel.PrometheusMetricLabelName{
 				MetricName:  mn,
 				LabelNameID: lni,
 			})
@@ -120,9 +123,9 @@ func (ml *metricLabelName) encode(rMLs []*controller.PrometheusMetricLabelNameRe
 			})
 		}
 	}
-	err := addBatch(dbToAdd, ml.resourceType)
+	err := addBatch(ml.org.DB, dbToAdd, ml.resourceType)
 	if err != nil {
-		log.Errorf("add %s error: %s", ml.resourceType, err.Error())
+		log.Errorf("add %s error: %s", ml.resourceType, err.Error(), ml.org.LogPrefix)
 		return resp, err
 	}
 	for _, item := range dbToAdd {

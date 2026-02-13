@@ -19,93 +19,96 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	rcommon "github.com/deepflowio/deepflow/server/controller/recorder/common"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
+
+// FloatingIPMessageFactory FloatingIP资源的消息工厂
+type FloatingIPMessageFactory struct{}
+
+func (f *FloatingIPMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedFloatingIPs{}
+}
+
+func (f *FloatingIPMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedFloatingIP{}
+}
+
+func (f *FloatingIPMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedFloatingIPs{}
+}
+
+func (f *FloatingIPMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedFloatingIPFields{}
+}
 
 type FloatingIP struct {
 	UpdaterBase[
 		cloudmodel.FloatingIP,
-		mysql.FloatingIP,
 		*diffbase.FloatingIP,
-		*message.FloatingIPAdd,
-		message.FloatingIPAdd,
-		*message.FloatingIPUpdate,
-		message.FloatingIPUpdate,
-		*message.FloatingIPFieldsUpdate,
-		message.FloatingIPFieldsUpdate,
-		*message.FloatingIPDelete,
-		message.FloatingIPDelete]
+		*metadbmodel.FloatingIP,
+		metadbmodel.FloatingIP,
+	]
 }
 
 func NewFloatingIP(wholeCache *cache.Cache, cloudData []cloudmodel.FloatingIP) *FloatingIP {
 	updater := &FloatingIP{
-		newUpdaterBase[
-			cloudmodel.FloatingIP,
-			mysql.FloatingIP,
-			*diffbase.FloatingIP,
-			*message.FloatingIPAdd,
-			message.FloatingIPAdd,
-			*message.FloatingIPUpdate,
-			message.FloatingIPUpdate,
-			*message.FloatingIPFieldsUpdate,
-			message.FloatingIPFieldsUpdate,
-			*message.FloatingIPDelete,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_FLOATING_IP_EN,
 			wholeCache,
-			db.NewFloatingIP().SetORG(wholeCache.GetORG()),
+			db.NewFloatingIP().SetMetadata(wholeCache.GetMetadata()),
 			wholeCache.DiffBaseDataSet.FloatingIPs,
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
+	updater.setDataGenerator(updater)
+
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &FloatingIPMessageFactory{})
+	}
+
 	return updater
 }
 
-func (f *FloatingIP) getDiffBaseByCloudItem(cloudItem *cloudmodel.FloatingIP) (diffBase *diffbase.FloatingIP, exists bool) {
-	diffBase, exists = f.diffBaseData[cloudItem.Lcuuid]
-	return
-}
-
-func (f *FloatingIP) generateDBItemToAdd(cloudItem *cloudmodel.FloatingIP) (*mysql.FloatingIP, bool) {
+func (f *FloatingIP) generateDBItemToAdd(cloudItem *cloudmodel.FloatingIP) (*metadbmodel.FloatingIP, bool) {
 	networkID, exists := f.cache.ToolDataSet.GetNetworkIDByLcuuid(cloudItem.NetworkLcuuid)
 	if !exists {
-		log.Error(f.org.LogPre(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_NETWORK_EN, cloudItem.NetworkLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_FLOATING_IP_EN, cloudItem.Lcuuid,
-		)))
+		), f.metadata.LogPrefixes)
 		return nil, false
 	}
 	vmID, exists := f.cache.ToolDataSet.GetVMIDByLcuuid(cloudItem.VMLcuuid)
 	if !exists {
-		log.Error(f.org.LogPre(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_VM_EN, cloudItem.VMLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_FLOATING_IP_EN, cloudItem.Lcuuid,
-		)))
+		), f.metadata.LogPrefixes)
 		return nil, false
 	}
 	vpcID, exists := f.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)
 	if !exists {
-		log.Error(f.org.LogPre(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_VPC_EN, cloudItem.VPCLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_FLOATING_IP_EN, cloudItem.Lcuuid,
-		)))
+		), f.metadata.LogPrefixes)
 		return nil, false
 	}
 	ip := rcommon.FormatIP(cloudItem.IP)
 	if ip == "" {
-		log.Error(f.org.LogPre(ipIsInvalid(
+		log.Error(ipIsInvalid(
 			ctrlrcommon.RESOURCE_TYPE_FLOATING_IP_EN, cloudItem.Lcuuid, cloudItem.IP,
-		)))
+		), f.metadata.LogPrefixes)
 		return nil, false
 	}
-	dbItem := &mysql.FloatingIP{
-		Domain:    f.cache.DomainLcuuid,
+	dbItem := &metadbmodel.FloatingIP{
+		Domain:    f.metadata.GetDomainLcuuid(),
 		Region:    cloudItem.RegionLcuuid,
 		IP:        ip,
 		NetworkID: networkID,
@@ -116,16 +119,16 @@ func (f *FloatingIP) generateDBItemToAdd(cloudItem *cloudmodel.FloatingIP) (*mys
 	return dbItem, true
 }
 
-func (f *FloatingIP) generateUpdateInfo(diffBase *diffbase.FloatingIP, cloudItem *cloudmodel.FloatingIP) (*message.FloatingIPFieldsUpdate, map[string]interface{}, bool) {
-	structInfo := new(message.FloatingIPFieldsUpdate)
+func (f *FloatingIP) generateUpdateInfo(diffBase *diffbase.FloatingIP, cloudItem *cloudmodel.FloatingIP) (types.UpdatedFields, map[string]interface{}, bool) {
+	structInfo := new(message.UpdatedFloatingIPFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.VPCLcuuid != cloudItem.VPCLcuuid {
 		vpcID, exists := f.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)
 		if !exists {
-			log.Error(f.org.LogPre(resourceAForResourceBNotFound(
+			log.Error(resourceAForResourceBNotFound(
 				ctrlrcommon.RESOURCE_TYPE_VPC_EN, cloudItem.VPCLcuuid,
 				ctrlrcommon.RESOURCE_TYPE_FLOATING_IP_EN, cloudItem.Lcuuid,
-			)))
+			), f.metadata.LogPrefixes)
 			return nil, nil, false
 		}
 		mapInfo["epc_id"] = vpcID
@@ -136,5 +139,6 @@ func (f *FloatingIP) generateUpdateInfo(diffBase *diffbase.FloatingIP, cloudItem
 		mapInfo["region"] = cloudItem.RegionLcuuid
 		structInfo.RegionLcuuid.Set(diffBase.RegionLcuuid, cloudItem.RegionLcuuid)
 	}
+
 	return structInfo, mapInfo, len(mapInfo) > 0
 }

@@ -19,76 +19,81 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
+
+// SubDomainMessageFactory SubDomain资源的消息工厂
+type SubDomainMessageFactory struct{}
+
+func (f *SubDomainMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedSubDomains{}
+}
+
+func (f *SubDomainMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedSubDomain{}
+}
+
+func (f *SubDomainMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedSubDomains{}
+}
+
+func (f *SubDomainMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedSubDomainFields{}
+}
 
 type SubDomain struct {
 	UpdaterBase[
 		cloudmodel.SubDomain,
-		mysql.SubDomain,
 		*diffbase.SubDomain,
-		*message.SubDomainAdd,
-		message.SubDomainAdd,
-		*message.SubDomainUpdate,
-		message.SubDomainUpdate,
-		*message.SubDomainFieldsUpdate,
-		message.SubDomainFieldsUpdate,
-		*message.SubDomainDelete,
-		message.SubDomainDelete]
+		*metadbmodel.SubDomain,
+		metadbmodel.SubDomain,
+	]
 }
 
 func NewSubDomain(wholeCache *cache.Cache, cloudData []cloudmodel.SubDomain) *SubDomain {
 	updater := &SubDomain{
-		newUpdaterBase[
-			cloudmodel.SubDomain,
-			mysql.SubDomain,
-			*diffbase.SubDomain,
-			*message.SubDomainAdd,
-			message.SubDomainAdd,
-			*message.SubDomainUpdate,
-			message.SubDomainUpdate,
-			*message.SubDomainFieldsUpdate,
-			message.SubDomainFieldsUpdate,
-			*message.SubDomainDelete,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_SUB_DOMAIN_EN,
 			wholeCache,
-			db.NewSubDomain().SetORG(wholeCache.GetORG()),
+			db.NewSubDomain().SetMetadata(wholeCache.GetMetadata()),
 			wholeCache.DiffBaseDataSet.SubDomains,
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
+	updater.setDataGenerator(updater)
+
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &SubDomainMessageFactory{})
+	}
+
 	return updater
 }
 
-func (d *SubDomain) getDiffBaseByCloudItem(cloudItem *cloudmodel.SubDomain) (diffBase *diffbase.SubDomain, exists bool) {
-	diffBase, exists = d.diffBaseData[cloudItem.Lcuuid]
-	return
-}
-
-func (d *SubDomain) generateDBItemToAdd(cloudItem *cloudmodel.SubDomain) (*mysql.SubDomain, bool) {
-	dbItem := &mysql.SubDomain{
+func (d *SubDomain) generateDBItemToAdd(cloudItem *cloudmodel.SubDomain) (*metadbmodel.SubDomain, bool) {
+	dbItem := &metadbmodel.SubDomain{
+		TeamID:      cloudItem.TeamID,
 		Name:        cloudItem.Name,
 		DisplayName: cloudItem.DisplayName,
 		ClusterID:   cloudItem.ClusterID,
 		Config:      cloudItem.Config,
-		Domain:      d.cache.DomainLcuuid,
+		Domain:      d.metadata.GetDomainLcuuid(),
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true
 }
 
-func (d *SubDomain) generateUpdateInfo(diffBase *diffbase.SubDomain, cloudItem *cloudmodel.SubDomain) (*message.SubDomainFieldsUpdate, map[string]interface{}, bool) {
-	structInfo := new(message.SubDomainFieldsUpdate)
+func (d *SubDomain) generateUpdateInfo(diffBase *diffbase.SubDomain, cloudItem *cloudmodel.SubDomain) (types.UpdatedFields, map[string]interface{}, bool) {
+	structInfo := new(message.UpdatedSubDomainFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
 		mapInfo["name"] = cloudItem.Name
 		structInfo.Name.Set(diffBase.Name, cloudItem.Name)
 	}
+
 	return structInfo, mapInfo, len(mapInfo) > 0
 }

@@ -17,32 +17,38 @@
 package router
 
 import (
+	"fmt"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/binding"
 
 	"github.com/deepflowio/deepflow/server/controller/config"
-	mysqlcfg "github.com/deepflowio/deepflow/server/controller/db/mysql/config"
+	metadbcfg "github.com/deepflowio/deepflow/server/controller/db/metadb/config"
 	httpcommon "github.com/deepflowio/deepflow/server/controller/http/common"
+	"github.com/deepflowio/deepflow/server/controller/http/common/response"
 	"github.com/deepflowio/deepflow/server/controller/http/model"
-	"github.com/deepflowio/deepflow/server/controller/http/router/common"
 	"github.com/deepflowio/deepflow/server/controller/http/service"
 )
 
 type ORGData struct {
-	mysqlCfg mysqlcfg.MySqlConfig
+	metadbCfg metadbcfg.Config
+	cfg       *config.ControllerConfig
 }
 
 func NewDatabase(cfg *config.ControllerConfig) *ORGData {
 	return &ORGData{
-		mysqlCfg: cfg.MySqlCfg,
+		metadbCfg: cfg.MetadbCfg,
+		cfg:       cfg,
 	}
 }
 
 func (d *ORGData) RegisterTo(e *gin.Engine) {
+	e.GET("/v1/orgs/", d.Get)
 	e.POST("/v1/org/", d.Create)
-	e.DELETE("/v1/org/:id/", d.Delete)
+	e.DELETE("/v1/org/:id/", d.Delete)        // provide for real-time call when deleting an organization
+	e.DELETE("/v1/org/", d.DeleteNonRealTime) // provide for non-real-time call from master controller after deleting an organization
+	e.GET("/v1/alloc-org-id/", d.AllocORGID)
 }
 
 func (d *ORGData) Create(c *gin.Context) {
@@ -50,20 +56,49 @@ func (d *ORGData) Create(c *gin.Context) {
 	var body model.ORGDataCreate
 	err = c.ShouldBindBodyWith(&body, binding.JSON)
 	if err != nil {
-		common.BadRequestResponse(c, httpcommon.INVALID_POST_DATA, err.Error())
+		response.JSON(c, response.SetOptStatus(httpcommon.INVALID_POST_DATA), response.SetError(err))
 		return
 	}
 
-	resp, err := service.CreateORGData(body, d.mysqlCfg)
-	common.JsonResponse(c, map[string]interface{}{"DATABASE": resp}, err)
+	resp, err := service.CreateORGData(body, d.metadbCfg)
+	response.JSON(c, response.SetData(map[string]interface{}{"DATABASE": resp}), response.SetError(err))
 }
 
 func (d *ORGData) Delete(c *gin.Context) {
 	orgID, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		common.BadRequestResponse(c, httpcommon.INVALID_POST_DATA, err.Error())
+		response.JSON(c, response.SetOptStatus(httpcommon.INVALID_POST_DATA), response.SetError(err))
 		return
 	}
-	err = service.DeleteORGData(orgID, d.mysqlCfg)
-	common.JsonResponse(c, nil, err)
+	err = service.DeleteORGData(orgID, d.metadbCfg)
+	response.JSON(c, response.SetError(err))
+}
+
+func (d *ORGData) DeleteNonRealTime(c *gin.Context) {
+	orgIDs, ok := c.GetQueryArray("org_id")
+	if !ok {
+		response.JSON(c, response.SetOptStatus(httpcommon.INVALID_POST_DATA), response.SetError(fmt.Errorf("org_id is required")))
+		return
+	}
+	ints := make([]int, 0, len(orgIDs))
+	for _, id := range orgIDs {
+		i, err := strconv.Atoi(id)
+		if err != nil {
+			response.JSON(c, response.SetOptStatus(httpcommon.INVALID_POST_DATA), response.SetError(err))
+			return
+		}
+		ints = append(ints, i)
+	}
+	err := service.DeleteORGDataNonRealTime(ints)
+	response.JSON(c, response.SetError(err))
+}
+
+func (d *ORGData) Get(c *gin.Context) {
+	data, err := service.GetORGData(d.cfg)
+	response.JSON(c, response.SetData(data), response.SetError(err))
+}
+
+func (d *ORGData) AllocORGID(c *gin.Context) {
+	data, err := service.AllocORGID()
+	response.JSON(c, response.SetData(data), response.SetError(err))
 }

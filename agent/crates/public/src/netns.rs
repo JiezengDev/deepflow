@@ -48,9 +48,12 @@ use num_enum::IntoPrimitive;
 use regex::Regex;
 use thiserror::Error;
 
-use super::utils::net::{
-    self, addr_list, link_by_name, link_list, links_by_name_regex, route_list, rule_list, Addr,
-    Link, MacAddr, IF_TYPE_IPVLAN,
+use crate::{
+    proto::agent as pb,
+    utils::net::{
+        self, addr_list, link_by_name, link_list, links_by_name_regex, route_list, rule_list, Addr,
+        Link, MacAddr, IF_TYPE_IPVLAN,
+    },
 };
 
 #[derive(Debug, Error)]
@@ -112,7 +115,11 @@ impl fmt::Display for InterfaceInfo {
 
 impl PartialEq for InterfaceInfo {
     fn eq(&self, other: &Self) -> bool {
-        self.tap_idx.eq(&other.tap_idx) && self.mac.eq(&other.mac)
+        // In practice there are some CNI plugins that use IPVLAN and create pod interfaces with the same mac address.
+        // It's not enough to distinguish them by tap_index and mac address in this situation. Thus ns_inode is also used.
+        self.tap_idx.eq(&other.tap_idx)
+            && self.mac.eq(&other.mac)
+            && self.ns_inode.eq(&other.ns_inode)
     }
 }
 
@@ -129,6 +136,22 @@ impl Ord for InterfaceInfo {
         match (self.tap_idx.cmp(&other.tap_idx), self.mac.cmp(&other.mac)) {
             (Ordering::Equal, mac) => mac,
             (tap, _) => tap,
+        }
+    }
+}
+
+impl From<&InterfaceInfo> for pb::InterfaceInfo {
+    fn from(info: &InterfaceInfo) -> Self {
+        Self {
+            mac: Some(info.mac.into()),
+            name: Some(info.name.to_string()),
+            device_id: Some(info.device_id.to_string()),
+            tap_index: Some(info.tap_idx),
+            ip: info.ips.iter().map(ToString::to_string).collect(),
+            netns: Some(info.tap_ns.to_string()),
+            netns_id: Some(info.ns_inode as u32),
+            if_type: info.if_type.clone(),
+            ..Default::default()
         }
     }
 }
@@ -153,7 +176,7 @@ pub enum NsFile {
 }
 
 impl NsFile {
-    fn get_inode(&self) -> Result<u64> {
+    pub fn get_inode(&self) -> Result<u64> {
         match self {
             Self::Root => Ok(fs::metadata(ROOT_NS_PATH)?.ino()),
             Self::Named(name) => {
@@ -162,6 +185,32 @@ impl NsFile {
             }
             Self::Proc(ino) => Ok(*ino),
         }
+    }
+
+    // opening root and named namespaces is consistent
+    //
+    // opening a proc namespace will need to iterate /proc/$pid/ns/net entries to find netns file
+    // which cost more cpu and can fail when process terminates
+    pub fn open_and_setns(&self) -> Result<()> {
+        if !supported() {
+            return Ok(());
+        }
+        let path = match self {
+            NsFile::Root => Cow::Borrowed(Path::new(ROOT_NS_PATH)),
+            NsFile::Named(name) => Cow::Owned(Path::new(NAMED_PATH).join(name)),
+            NsFile::Proc(inode) => Cow::Owned(get_proc_path_by_inode(*inode)?),
+        };
+        let fp = File::open(&*path)?;
+        let r = set_netns(&fp);
+        if let Err(e) = r.as_ref() {
+            debug!("open {} and setns failed: {:?}", path.display(), e);
+        }
+        r
+    }
+
+    pub fn from_pid_with_root(root: &str, pid: u32) -> Result<Self> {
+        let path: PathBuf = [root, &pid.to_string(), "ns", "net"].iter().collect();
+        Ok(Self::Proc(fs::metadata(path)?.ino()))
     }
 }
 
@@ -307,7 +356,10 @@ fn generate_masklen_map_in(map: &mut HashMap<IpAddr, u8>) -> Result<()> {
     Ok(())
 }
 
-pub fn interfaces_linked_with(ns: &Vec<NsFile>) -> Result<HashMap<NsFile, Vec<InterfaceInfo>>> {
+pub fn interfaces_linked_with<S: AsRef<[NsFile]>>(
+    ns: S,
+) -> Result<HashMap<NsFile, Vec<InterfaceInfo>>> {
+    let ns = ns.as_ref();
     // find all net namespaces
     let mut all_ns = HashMap::new();
     for path in get_named_file_paths().into_iter() {
@@ -618,23 +670,6 @@ pub fn reset_netns() -> Result<()> {
     })
 }
 
-pub fn open_named_and_setns(ns: &NsFile) -> Result<()> {
-    if !supported() {
-        return Ok(());
-    }
-    let path = match ns {
-        NsFile::Root => Cow::Borrowed(Path::new(ROOT_NS_PATH)),
-        NsFile::Named(name) => Cow::Owned(Path::new(NAMED_PATH).join(name)),
-        _ => unimplemented!(),
-    };
-    let fp = File::open(&*path)?;
-    let r = set_netns(&fp);
-    if let Err(e) = r.as_ref() {
-        debug!("open {} and setns failed: {:?}", path.display(), e);
-    }
-    r
-}
-
 fn get_named_file_paths() -> Vec<PathBuf> {
     let paths = if let Ok(entries) = fs::read_dir(NAMED_PATH) {
         entries
@@ -676,7 +711,33 @@ fn open_root_or_named_ns_file(ns: &NsFile) -> Result<(File, PathBuf)> {
     }
 }
 
-fn get_proc_cache() -> Result<HashMap<u64, Vec<u32>>> {
+// get a possible path by netns inode from process net namespaces
+fn get_proc_path_by_inode(inode: u64) -> Result<PathBuf> {
+    for proc in fs::read_dir(PROC_PATH)? {
+        let Ok(proc) = proc else {
+            // ignore file not found probably caused by process terminated
+            continue;
+        };
+        match proc.file_type() {
+            Ok(t) if t.is_dir() => (),
+            _ => {
+                debug!("skipped {}", proc.path().display());
+                continue;
+            }
+        }
+
+        let mut ns_path = proc.path();
+        ns_path.extend(&["ns", "net"]);
+        if let Ok(fp) = fs::metadata(&ns_path) {
+            if fp.ino() == inode {
+                return Ok(ns_path);
+            }
+        }
+    }
+    Err(Error::NotFound)
+}
+
+pub fn get_proc_cache() -> Result<HashMap<u64, Vec<u32>>> {
     let mut cache = HashMap::new();
     for proc in fs::read_dir(PROC_PATH)? {
         let Ok(proc) = proc else {
@@ -754,28 +815,28 @@ impl WrappedSocket {
 }
 
 pub fn link_by_name_in_netns<S: AsRef<str>>(name: S, ns: &NsFile) -> Result<Link> {
-    let _ = open_named_and_setns(ns)?;
+    let _ = ns.open_and_setns()?;
     let link = link_by_name(name.as_ref())?;
     reset_netns()?;
     Ok(link)
 }
 
 pub fn links_by_name_regex_in_netns<S: AsRef<str>>(regex: S, ns: &NsFile) -> Result<Vec<Link>> {
-    let _ = open_named_and_setns(ns)?;
+    let _ = ns.open_and_setns()?;
     let links = links_by_name_regex(regex.as_ref())?;
     reset_netns()?;
     Ok(links)
 }
 
 pub fn link_list_in_netns(ns: &NsFile) -> Result<Vec<Link>> {
-    let _ = open_named_and_setns(ns)?;
+    let _ = ns.open_and_setns()?;
     let links = link_list()?;
     reset_netns()?;
     Ok(links)
 }
 
 pub fn addr_list_in_netns(ns: &NsFile) -> Result<Vec<Addr>> {
-    let _ = open_named_and_setns(ns)?;
+    let _ = ns.open_and_setns()?;
     let addrs = addr_list()?;
     reset_netns()?;
     Ok(addrs)

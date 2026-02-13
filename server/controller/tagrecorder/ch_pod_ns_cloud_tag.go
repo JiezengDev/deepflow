@@ -18,17 +18,38 @@ package tagrecorder
 
 import (
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type ChPodNSCloudTag struct {
-	SubscriberComponent[*message.PodNamespaceFieldsUpdate, message.PodNamespaceFieldsUpdate, mysql.PodNamespace, mysql.ChPodNSCloudTag, CloudTagKey]
+	SubscriberComponent[
+		*message.AddedPodNamespaces,
+		message.AddedPodNamespaces,
+		*message.UpdatedPodNamespace,
+		message.UpdatedPodNamespace,
+		*message.DeletedPodNamespaces,
+		message.DeletedPodNamespaces,
+		metadbmodel.PodNamespace,
+		metadbmodel.ChPodNSCloudTag,
+		IDKeyKey,
+	]
 }
 
 func NewChPodNSCloudTag() *ChPodNSCloudTag {
 	mng := &ChPodNSCloudTag{
-		newSubscriberComponent[*message.PodNamespaceFieldsUpdate, message.PodNamespaceFieldsUpdate, mysql.PodNamespace, mysql.ChPodNSCloudTag, CloudTagKey](
+		newSubscriberComponent[
+			*message.AddedPodNamespaces,
+			message.AddedPodNamespaces,
+			*message.UpdatedPodNamespace,
+			message.UpdatedPodNamespace,
+			*message.DeletedPodNamespaces,
+			message.DeletedPodNamespaces,
+			metadbmodel.PodNamespace,
+			metadbmodel.ChPodNSCloudTag,
+			IDKeyKey,
+		](
 			common.RESOURCE_TYPE_POD_NAMESPACE_EN, RESOURCE_TYPE_CH_POD_NS_CLOUD_TAG,
 		),
 	}
@@ -37,75 +58,81 @@ func NewChPodNSCloudTag() *ChPodNSCloudTag {
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChPodNSCloudTag) onResourceUpdated(sourceID int, fieldsUpdate *message.PodNamespaceFieldsUpdate) {
-	keysToAdd := make([]CloudTagKey, 0)
-	targetsToAdd := make([]mysql.ChPodNSCloudTag, 0)
-	keysToDelete := make([]CloudTagKey, 0)
-	targetsToDelete := make([]mysql.ChPodNSCloudTag, 0)
-	var chItem mysql.ChPodNSCloudTag
-	updateInfo := make(map[string]interface{})
-	if fieldsUpdate.CloudTags.IsDifferent() {
-		new := fieldsUpdate.CloudTags.GetNew()
-		old := fieldsUpdate.CloudTags.GetOld()
-		for k, v := range new {
-			oldV, ok := old[k]
-			if !ok {
-				keysToAdd = append(keysToAdd, CloudTagKey{ID: sourceID, Key: k})
-				targetsToAdd = append(targetsToAdd, mysql.ChPodNSCloudTag{
-					ID:    sourceID,
-					Key:   k,
-					Value: v,
-				})
-			} else {
-				if oldV != v {
-					key := CloudTagKey{ID: sourceID, Key: k}
-					updateInfo["value"] = v
-					mysql.Db.Where("id = ? and `key` = ?", sourceID, k).First(&chItem)
-					if chItem.ID == 0 {
-						keysToAdd = append(keysToAdd, key)
-						targetsToAdd = append(targetsToAdd, mysql.ChPodNSCloudTag{
-							ID:    sourceID,
-							Key:   k,
-							Value: v,
-						})
-					} else {
-						c.SubscriberComponent.dbOperator.update(chItem, updateInfo, key)
-					}
-				}
-			}
+func (c *ChPodNSCloudTag) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedPodNamespace) {
+	db := md.GetDB()
+	fieldsUpdate := updateMessage.GetFields().(*message.UpdatedPodNamespaceFields)
+	newSource := updateMessage.GetNewMetadbItem().(*metadbmodel.PodNamespace)
+	sourceID := newSource.ID
+	new := map[string]string{}
+	old := map[string]string{}
+	keysToDelete := make([]IDKeyKey, 0)
+	targetsToDelete := make([]metadbmodel.ChPodNSCloudTag, 0)
+
+	if !fieldsUpdate.LearnedCloudTags.IsDifferent() && !fieldsUpdate.CustomCloudTags.IsDifferent() {
+		return
+	}
+
+	if fieldsUpdate.LearnedCloudTags.IsDifferent() {
+		for k, v := range fieldsUpdate.LearnedCloudTags.GetNew() {
+			new[k] = v
 		}
-		for k := range old {
-			if _, ok := new[k]; !ok {
-				keysToDelete = append(keysToDelete, CloudTagKey{ID: sourceID, Key: k})
-				targetsToDelete = append(targetsToDelete, mysql.ChPodNSCloudTag{
-					ID:  sourceID,
-					Key: k,
-				})
-			}
+		for k, v := range fieldsUpdate.LearnedCloudTags.GetOld() {
+			old[k] = v
+		}
+	} else {
+		for k, v := range newSource.LearnedCloudTags {
+			new[k] = v
+			old[k] = v
 		}
 	}
-	if len(keysToAdd) > 0 {
-		c.SubscriberComponent.dbOperator.add(keysToAdd, targetsToAdd)
+	// custom cloud tag has a higher priority
+	if fieldsUpdate.CustomCloudTags.IsDifferent() {
+		for k, v := range fieldsUpdate.CustomCloudTags.GetNew() {
+			new[k] = v
+		}
+		for k, v := range fieldsUpdate.CustomCloudTags.GetOld() {
+			old[k] = v
+		}
+	} else {
+		for k, v := range newSource.CustomCloudTags {
+			new[k] = v
+			old[k] = v
+		}
 	}
+
+	for k := range old {
+		if _, ok := new[k]; !ok {
+			keysToDelete = append(keysToDelete, NewIDKeyKey(sourceID, k))
+			targetsToDelete = append(targetsToDelete, metadbmodel.ChPodNSCloudTag{
+				ChIDBase: metadbmodel.ChIDBase{ID: sourceID},
+				Key:      k,
+			})
+		}
+	}
+
 	if len(keysToDelete) > 0 {
-		c.SubscriberComponent.dbOperator.delete(keysToDelete, targetsToDelete)
+		c.SubscriberComponent.dbOperator.delete(keysToDelete, targetsToDelete, db)
 	}
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChPodNSCloudTag) sourceToTarget(source *mysql.PodNamespace) (keys []CloudTagKey, targets []mysql.ChPodNSCloudTag) {
-	for k, v := range source.CloudTags {
-		keys = append(keys, CloudTagKey{ID: source.ID, Key: k})
-		targets = append(targets, mysql.ChPodNSCloudTag{
-			ID:    source.ID,
-			Key:   k,
-			Value: v,
+func (c *ChPodNSCloudTag) sourceToTarget(md *message.Metadata, source *metadbmodel.PodNamespace) (keys []IDKeyKey, targets []metadbmodel.ChPodNSCloudTag) {
+	cloudTagMap := MergeCloudTags(source.LearnedCloudTags, source.CustomCloudTags)
+	for k, v := range cloudTagMap {
+		keys = append(keys, NewIDKeyKey(source.ID, k))
+		targets = append(targets, metadbmodel.ChPodNSCloudTag{
+			ChIDBase:    metadbmodel.ChIDBase{ID: source.ID},
+			Key:         k,
+			Value:       v,
+			TeamID:      md.GetTeamID(),
+			DomainID:    md.GetDomainID(),
+			SubDomainID: md.GetSubDomainID(),
 		})
 	}
 	return
 }
 
 // softDeletedTargetsUpdated implements SubscriberDataGenerator
-func (c *ChPodNSCloudTag) softDeletedTargetsUpdated(targets []mysql.ChPodNSCloudTag) {
+func (c *ChPodNSCloudTag) softDeletedTargetsUpdated(targets []metadbmodel.ChPodNSCloudTag, db *metadb.DB) {
 
 }

@@ -20,82 +20,86 @@ import (
 	"encoding/json"
 	"strings"
 
-	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type ChOSAppTags struct {
-	SubscriberComponent[*message.ProcessFieldsUpdate, message.ProcessFieldsUpdate, mysql.Process, mysql.ChOSAppTags, OSAPPTagsKey]
+	UpdaterComponent[metadbmodel.ChOSAppTags, IDKey]
 }
 
 func NewChOSAppTags() *ChOSAppTags {
-	mng := &ChOSAppTags{
-		newSubscriberComponent[*message.ProcessFieldsUpdate, message.ProcessFieldsUpdate, mysql.Process, mysql.ChOSAppTags, OSAPPTagsKey](
-			common.RESOURCE_TYPE_PROCESS_EN, RESOURCE_TYPE_CH_OS_APP_TAGS,
+	updater := &ChOSAppTags{
+		newUpdaterComponent[metadbmodel.ChOSAppTags, IDKey](
+			RESOURCE_TYPE_CH_OS_APP_TAGS,
 		),
 	}
-	mng.subscriberDG = mng
-	return mng
+	updater.updaterDG = updater
+	return updater
 }
 
-// onResourceUpdated implements SubscriberDataGenerator
-func (c *ChOSAppTags) onResourceUpdated(sourceID int, fieldsUpdate *message.ProcessFieldsUpdate) {
-	updateInfo := make(map[string]interface{})
-	if fieldsUpdate.OSAPPTags.IsDifferent() {
-		osAppTagsMap := map[string]string{}
-		splitTags := strings.Split(fieldsUpdate.OSAPPTags.GetNew(), ", ")
+func (o *ChOSAppTags) generateNewData(db *metadb.DB) (map[IDKey]metadbmodel.ChOSAppTags, bool) {
+	var processes []metadbmodel.Process
+	keyToItem := make(map[IDKey]metadbmodel.ChOSAppTags)
+	gidToOsAppTagMap := make(map[int]map[string]string)
 
-		for _, splitTag := range splitTags {
-			splitSingleTag := strings.Split(splitTag, ":")
+	err := db.Select("gid", "os_app_tags").Find(&processes).Error
+	if err != nil {
+		log.Errorf(dbQueryResourceFailed(o.resourceTypeName, err), db.LogPrefixORGID)
+		return nil, false
+	}
+
+	for _, process := range processes {
+		gid := int(process.GID)
+		osAppTagsMap := map[string]string{}
+		splitOsAppTags := strings.Split(process.OSAPPTags, ", ")
+		for _, singleOsAppTag := range splitOsAppTags {
+			splitSingleTag := strings.Split(singleOsAppTag, ":")
 			if len(splitSingleTag) == 2 {
 				osAppTagsMap[strings.Trim(splitSingleTag[0], " ")] = strings.Trim(splitSingleTag[1], " ")
 			}
 		}
-		bytes, err := json.Marshal(osAppTagsMap)
+		if len(osAppTagsMap) > 0 {
+			osAppTagMap, ok := gidToOsAppTagMap[gid]
+			if ok {
+				for key, value := range osAppTagsMap {
+					osAppTagMap[key] = value
+				}
+			} else {
+				gidToOsAppTagMap[gid] = osAppTagsMap
+			}
+		}
+	}
+
+	for gid, osAppTagMap := range gidToOsAppTagMap {
+		osAppTagsStr, err := json.Marshal(osAppTagMap)
 		if err != nil {
 			log.Error(err)
-			return
+			return nil, false
 		}
-		updateInfo["os_app_tags"] = string(bytes)
+		key := IDKey{
+			ID: gid,
+		}
+		keyToItem[key] = metadbmodel.ChOSAppTags{
+			ID:        gid,
+			OSAPPTags: string(osAppTagsStr),
+		}
+	}
+
+	return keyToItem, true
+}
+
+func (o *ChOSAppTags) generateKey(dbItem metadbmodel.ChOSAppTags) IDKey {
+	return IDKey{ID: dbItem.ID}
+}
+
+func (o *ChOSAppTags) generateUpdateInfo(oldItem, newItem metadbmodel.ChOSAppTags) (map[string]interface{}, bool) {
+	updateInfo := make(map[string]interface{})
+	if oldItem.OSAPPTags != newItem.OSAPPTags {
+		updateInfo["os_app_tags"] = newItem.OSAPPTags
 	}
 	if len(updateInfo) > 0 {
-		var chItem mysql.ChOSAppTags
-		mysql.Db.Where("pid = ?", sourceID).First(&chItem)
-		if chItem.PID == 0 {
-			c.SubscriberComponent.dbOperator.add(
-				[]OSAPPTagsKey{{PID: sourceID}},
-				[]mysql.ChOSAppTags{{PID: sourceID, OSAPPTags: updateInfo["os_app_tags"].(string)}},
-			)
-		} else {
-			c.SubscriberComponent.dbOperator.update(chItem, updateInfo, OSAPPTagsKey{PID: sourceID})
-		}
+		return updateInfo, true
 	}
-}
-
-// onResourceUpdated implements SubscriberDataGenerator
-func (c *ChOSAppTags) sourceToTarget(item *mysql.Process) (keys []OSAPPTagsKey, targets []mysql.ChOSAppTags) {
-	if item.OSAPPTags == "" {
-		return
-	}
-	osAppTagsMap := map[string]string{}
-	splitTags := strings.Split(item.OSAPPTags, ", ")
-
-	for _, splitTag := range splitTags {
-		splitSingleTag := strings.Split(splitTag, ":")
-		if len(splitSingleTag) == 2 {
-			osAppTagsMap[strings.Trim(splitSingleTag[0], " ")] = strings.Trim(splitSingleTag[1], " ")
-		}
-	}
-	bytes, err := json.Marshal(osAppTagsMap)
-	if err != nil {
-		log.Error(err)
-		return
-	}
-	return []OSAPPTagsKey{{PID: item.ID}}, []mysql.ChOSAppTags{{PID: item.ID, OSAPPTags: string(bytes)}}
-}
-
-// softDeletedTargetsUpdated implements SubscriberDataGenerator
-func (c *ChOSAppTags) softDeletedTargetsUpdated(targets []mysql.ChOSAppTags) {
-
+	return nil, false
 }

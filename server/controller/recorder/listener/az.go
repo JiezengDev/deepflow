@@ -18,7 +18,7 @@ package listener
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 )
@@ -34,7 +34,7 @@ func NewAZ(c *cache.Cache) *AZ {
 	return listener
 }
 
-func (a *AZ) OnUpdaterAdded(addedDBItems []*mysql.AZ) {
+func (a *AZ) OnUpdaterAdded(addedDBItems []*metadbmodel.AZ) {
 	a.cache.AddAZs(addedDBItems)
 }
 
@@ -42,6 +42,6 @@ func (a *AZ) OnUpdaterUpdated(cloudItem *cloudmodel.AZ, diffBase *diffbase.AZ) {
 	diffBase.Update(cloudItem)
 }
 
-func (a *AZ) OnUpdaterDeleted(lcuuids []string) {
+func (a *AZ) OnUpdaterDeleted(lcuuids []string, deletedDBItems []*metadbmodel.AZ) {
 	a.cache.DeleteAZs(lcuuids)
 }

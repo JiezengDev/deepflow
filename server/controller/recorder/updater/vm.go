@@ -18,69 +18,72 @@ package updater
 
 import (
 	"encoding/json"
+	"time"
 
 	cloudcommon "github.com/deepflowio/deepflow/server/controller/cloud/common"
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
+	"github.com/deepflowio/deepflow/server/controller/recorder/statsd"
 )
 
+type VMMessageFactory struct{}
+
+func (f *VMMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedVMs{}
+}
+
+func (f *VMMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedVM{}
+}
+
+func (f *VMMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedVMs{}
+}
+
+func (f *VMMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedVMFields{}
+}
+
 type VM struct {
-	UpdaterBase[
-		cloudmodel.VM,
-		mysql.VM,
+	UpdaterBase[cloudmodel.VM,
 		*diffbase.VM,
-		*message.VMAdd,
-		message.VMAdd,
-		*message.VMUpdate,
-		message.VMUpdate,
-		*message.VMFieldsUpdate,
-		message.VMFieldsUpdate,
-		*message.VMDelete,
-		message.VMDelete]
+		*metadbmodel.VM,
+		metadbmodel.VM,
+	]
 }
 
 func NewVM(wholeCache *cache.Cache, cloudData []cloudmodel.VM) *VM {
 	updater := &VM{
-		newUpdaterBase[
-			cloudmodel.VM,
-			mysql.VM,
-			*diffbase.VM,
-			*message.VMAdd,
-			message.VMAdd,
-			*message.VMUpdate,
-			message.VMUpdate,
-			*message.VMFieldsUpdate,
-			message.VMFieldsUpdate,
-			*message.VMDelete,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_VM_EN,
 			wholeCache,
-			db.NewVM().SetORG(wholeCache.GetORG()),
+			db.NewVM().SetMetadata(wholeCache.GetMetadata()),
 			wholeCache.DiffBaseDataSet.VMs,
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
+	updater.setDataGenerator(updater)
+
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &VMMessageFactory{})
+	}
+
 	return updater
 }
 
-func (m *VM) getDiffBaseByCloudItem(cloudItem *cloudmodel.VM) (diffBase *diffbase.VM, exists bool) {
-	diffBase, exists = m.diffBaseData[cloudItem.Lcuuid]
-	return
-}
-
-func (m *VM) generateDBItemToAdd(cloudItem *cloudmodel.VM) (*mysql.VM, bool) {
+func (m *VM) generateDBItemToAdd(cloudItem *cloudmodel.VM) (*metadbmodel.VM, bool) {
 	vpcID, exists := m.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)
 	if !exists {
-		log.Error(m.org.LogPre(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_VPC_EN, cloudItem.VPCLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_VM_EN, cloudItem.Lcuuid,
-		)))
+		), m.metadata.LogPrefixes)
 		return nil, false
 	}
 	var hostID int
@@ -91,39 +94,60 @@ func (m *VM) generateDBItemToAdd(cloudItem *cloudmodel.VM) (*mysql.VM, bool) {
 	if cloudItem.CloudTags != nil {
 		cloudTags = cloudItem.CloudTags
 	}
-	dbItem := &mysql.VM{
-		Name:         cloudItem.Name,
-		Label:        cloudItem.Label,
-		IP:           cloudItem.IP,
-		Hostname:     cloudItem.Hostname,
-		UID:          cloudItem.Label,
-		State:        cloudItem.State,
-		HType:        cloudItem.HType,
-		LaunchServer: cloudItem.LaunchServer,
-		HostID:       hostID,
-		Domain:       m.cache.DomainLcuuid,
-		Region:       cloudItem.RegionLcuuid,
-		AZ:           cloudItem.AZLcuuid,
-		VPCID:        vpcID,
-		CloudTags:    cloudTags,
+	networkID := 0
+	if cloudItem.NetworkLcuuid != "" {
+		networkID, exists = m.cache.ToolDataSet.GetNetworkIDByLcuuid(cloudItem.NetworkLcuuid)
+		if !exists {
+			log.Error(resourceAForResourceBNotFound(
+				ctrlrcommon.RESOURCE_TYPE_NETWORK_EN, cloudItem.NetworkLcuuid,
+				ctrlrcommon.RESOURCE_TYPE_VM_EN, cloudItem.Lcuuid,
+			), m.metadata.LogPrefixes)
+		}
+	}
+	if cloudItem.Label == "" {
+		cloudItem.Label = ctrlrcommon.GenerateResourceShortUUID(ctrlrcommon.RESOURCE_TYPE_CHOST_EN)
+	}
+	dbItem := &metadbmodel.VM{
+		Name:             cloudItem.Name,
+		Label:            cloudItem.Label,
+		IP:               cloudItem.IP,
+		Hostname:         cloudItem.Hostname,
+		UID:              cloudItem.Label,
+		State:            cloudItem.State,
+		HType:            cloudItem.HType,
+		LaunchServer:     cloudItem.LaunchServer,
+		HostID:           hostID,
+		Domain:           m.metadata.GetDomainLcuuid(),
+		Region:           cloudItem.RegionLcuuid,
+		AZ:               cloudItem.AZLcuuid,
+		VPCID:            vpcID,
+		LearnedCloudTags: cloudTags,
+		CustomCloudTags:  make(map[string]string),
+		NetworkID:        networkID,
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	if !cloudItem.CreatedAt.IsZero() {
 		dbItem.CreatedAt = cloudItem.CreatedAt
+		m.recordStatsd(cloudItem)
 	}
 	return dbItem, true
 }
 
-func (m *VM) generateUpdateInfo(diffBase *diffbase.VM, cloudItem *cloudmodel.VM) (*message.VMFieldsUpdate, map[string]interface{}, bool) {
-	structInfo := new(message.VMFieldsUpdate)
+func (m *VM) recordStatsd(cloudItem *cloudmodel.VM) {
+	syncDelay := time.Since(cloudItem.CreatedAt).Seconds()
+	m.statsd.GetMonitor(statsd.TagTypeVMSyncDelay).Fill(int(syncDelay))
+}
+
+func (m *VM) generateUpdateInfo(diffBase *diffbase.VM, cloudItem *cloudmodel.VM) (types.UpdatedFields, map[string]interface{}, bool) {
+	structInfo := new(message.UpdatedVMFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.VPCLcuuid != cloudItem.VPCLcuuid {
 		vpcID, exists := m.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)
 		if !exists {
-			log.Error(m.org.LogPre(resourceAForResourceBNotFound(
+			log.Error(resourceAForResourceBNotFound(
 				ctrlrcommon.RESOURCE_TYPE_VPC_EN, cloudItem.VPCLcuuid,
 				ctrlrcommon.RESOURCE_TYPE_VM_EN, cloudItem.Lcuuid,
-			)))
+			), m.metadata.LogPrefixes)
 			return nil, nil, false
 		}
 		mapInfo["epc_id"] = vpcID
@@ -133,6 +157,14 @@ func (m *VM) generateUpdateInfo(diffBase *diffbase.VM, cloudItem *cloudmodel.VM)
 	if diffBase.Name != cloudItem.Name {
 		mapInfo["name"] = cloudItem.Name
 		structInfo.Name.Set(diffBase.Name, cloudItem.Name)
+	}
+
+	if cloudItem.Label == "" {
+		if diffBase.Label == "" {
+			cloudItem.Label = ctrlrcommon.GenerateResourceShortUUID(ctrlrcommon.RESOURCE_TYPE_CHOST_EN)
+		} else {
+			cloudItem.Label = diffBase.Label
+		}
 	}
 	if diffBase.Label != cloudItem.Label {
 		mapInfo["label"] = cloudItem.Label
@@ -173,14 +205,30 @@ func (m *VM) generateUpdateInfo(diffBase *diffbase.VM, cloudItem *cloudmodel.VM)
 		mapInfo["az"] = cloudItem.AZLcuuid
 		structInfo.AZLcuuid.Set(diffBase.AZLcuuid, cloudItem.AZLcuuid)
 	}
-	if cloudcommon.DiffMap(diffBase.CloudTags, cloudItem.CloudTags) {
+	if cloudcommon.DiffMap(diffBase.LearnedCloudTags, cloudItem.CloudTags) {
 		updateTags := map[string]string{}
 		if cloudItem.CloudTags != nil {
 			updateTags = cloudItem.CloudTags
 		}
 		tagsJson, _ := json.Marshal(updateTags)
-		mapInfo["cloud_tags"] = tagsJson
-		structInfo.CloudTags.Set(diffBase.CloudTags, cloudItem.CloudTags)
+		mapInfo["learned_cloud_tags"] = tagsJson
+		structInfo.LearnedCloudTags.Set(diffBase.LearnedCloudTags, cloudItem.CloudTags)
+	}
+	if diffBase.NetworkLcuuid != cloudItem.NetworkLcuuid {
+		networkID := 0
+		if cloudItem.NetworkLcuuid != "" {
+			var exists bool
+			networkID, exists = m.cache.ToolDataSet.GetNetworkIDByLcuuid(cloudItem.NetworkLcuuid)
+			if !exists {
+				log.Error(resourceAForResourceBNotFound(
+					ctrlrcommon.RESOURCE_TYPE_NETWORK_EN, cloudItem.NetworkLcuuid,
+					ctrlrcommon.RESOURCE_TYPE_VM_EN, cloudItem.Lcuuid,
+				), m.metadata.LogPrefixes)
+			}
+		}
+		mapInfo["vl2id"] = networkID
+		structInfo.NetworkID.SetNew(networkID)
+		structInfo.NetworkLcuuid.Set(diffBase.NetworkLcuuid, cloudItem.NetworkLcuuid)
 	}
 
 	return structInfo, mapInfo, len(mapInfo) > 0

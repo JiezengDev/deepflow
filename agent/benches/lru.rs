@@ -21,9 +21,10 @@ use std::{net::Ipv4Addr, time::Instant};
 
 use criterion::*;
 use deepflow_agent::{
-    _L7PerfCache as L7PerfCache, _LogCache as LogCache, _LogMessageType as LogMessageType,
+    _L7PerfCache as L7PerfCache, _LogCache as LogCache, _LogCacheKey as LogCacheKey,
 };
 use lru::LruCache;
+use public::l7_protocol::LogMessageType;
 use rand::prelude::*;
 use uluru::LRUCache;
 
@@ -430,12 +431,13 @@ fn rrt_lru(c: &mut Criterion) {
             let start = Instant::now();
             for item in seeds {
                 cache.rrt_cache.put(
-                    ((item.flow_id as u128) << 64) | item.stream_id.unwrap_or_default() as u128,
+                    LogCacheKey(
+                        ((item.flow_id as u128) << 64) | item.stream_id.unwrap_or_default() as u128,
+                    ),
                     LogCache {
                         msg_type: LogMessageType::Request,
                         time: item.duration.as_micros() as u64,
-                        kafka_info: None,
-                        multi_merge_info: None,
+                        ..Default::default()
                     },
                 );
             }
@@ -457,20 +459,21 @@ fn rrt_lru(c: &mut Criterion) {
             let mut cache = L7PerfCache::new(1000);
             for item in &seeds {
                 cache.rrt_cache.put(
-                    ((item.flow_id as u128) << 64) | item.stream_id.unwrap_or_default() as u128,
+                    LogCacheKey(
+                        ((item.flow_id as u128) << 64) | item.stream_id.unwrap_or_default() as u128,
+                    ),
                     LogCache {
                         msg_type: LogMessageType::Request,
                         time: item.duration.as_micros() as u64,
-                        kafka_info: None,
-                        multi_merge_info: None,
+                        ..Default::default()
                     },
                 );
             }
             let start = Instant::now();
             for item in &seeds {
-                cache.rrt_cache.get(
-                    &(((item.flow_id as u128) << 64) | item.stream_id.unwrap_or_default() as u128),
-                );
+                cache.rrt_cache.get(&LogCacheKey(
+                    ((item.flow_id as u128) << 64) | item.stream_id.unwrap_or_default() as u128,
+                ));
             }
             start.elapsed()
         })
@@ -490,20 +493,21 @@ fn rrt_lru(c: &mut Criterion) {
             let mut cache = L7PerfCache::new(1000);
             for item in &seeds {
                 cache.rrt_cache.put(
-                    ((item.flow_id as u128) << 64) | item.stream_id.unwrap_or_default() as u128,
+                    LogCacheKey(
+                        ((item.flow_id as u128) << 64) | item.stream_id.unwrap_or_default() as u128,
+                    ),
                     LogCache {
                         msg_type: LogMessageType::Request,
                         time: item.duration.as_micros() as u64,
-                        kafka_info: None,
-                        multi_merge_info: None,
+                        ..Default::default()
                     },
                 );
             }
             let start = Instant::now();
             for item in &seeds {
-                cache.rrt_cache.get(
-                    &(((item.flow_id as u128) << 64) | item.stream_id.unwrap_or_default() as u128),
-                );
+                cache.rrt_cache.get(&LogCacheKey(
+                    ((item.flow_id as u128) << 64) | item.stream_id.unwrap_or_default() as u128,
+                ));
             }
             start.elapsed()
         })

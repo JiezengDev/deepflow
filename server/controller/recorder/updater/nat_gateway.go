@@ -19,74 +19,77 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
+
+// NATGatewayMessageFactory NATGateway资源的消息工厂
+type NATGatewayMessageFactory struct{}
+
+func (f *NATGatewayMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedNATGateways{}
+}
+
+func (f *NATGatewayMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedNATGateway{}
+}
+
+func (f *NATGatewayMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedNATGateways{}
+}
+
+func (f *NATGatewayMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedNATGatewayFields{}
+}
 
 type NATGateway struct {
 	UpdaterBase[
 		cloudmodel.NATGateway,
-		mysql.NATGateway,
 		*diffbase.NATGateway,
-		*message.NATGatewayAdd,
-		message.NATGatewayAdd,
-		*message.NATGatewayUpdate,
-		message.NATGatewayUpdate,
-		*message.NATGatewayFieldsUpdate,
-		message.NATGatewayFieldsUpdate,
-		*message.NATGatewayDelete,
-		message.NATGatewayDelete]
+		*metadbmodel.NATGateway,
+		metadbmodel.NATGateway,
+	]
 }
 
 func NewNATGateway(wholeCache *cache.Cache, cloudData []cloudmodel.NATGateway) *NATGateway {
 	updater := &NATGateway{
-		newUpdaterBase[
-			cloudmodel.NATGateway,
-			mysql.NATGateway,
-			*diffbase.NATGateway,
-			*message.NATGatewayAdd,
-			message.NATGatewayAdd,
-			*message.NATGatewayUpdate,
-			message.NATGatewayUpdate,
-			*message.NATGatewayFieldsUpdate,
-			message.NATGatewayFieldsUpdate,
-			*message.NATGatewayDelete,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_NAT_GATEWAY_EN,
 			wholeCache,
-			db.NewNATGateway().SetORG(wholeCache.GetORG()),
+			db.NewNATGateway().SetMetadata(wholeCache.GetMetadata()),
 			wholeCache.DiffBaseDataSet.NATGateways,
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
+	updater.setDataGenerator(updater)
+
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &NATGatewayMessageFactory{})
+	}
+
 	return updater
 }
 
-func (g *NATGateway) getDiffBaseByCloudItem(cloudItem *cloudmodel.NATGateway) (diffBase *diffbase.NATGateway, exists bool) {
-	diffBase, exists = g.diffBaseData[cloudItem.Lcuuid]
-	return
-}
-
-func (g *NATGateway) generateDBItemToAdd(cloudItem *cloudmodel.NATGateway) (*mysql.NATGateway, bool) {
+func (g *NATGateway) generateDBItemToAdd(cloudItem *cloudmodel.NATGateway) (*metadbmodel.NATGateway, bool) {
 	vpcID, exists := g.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)
 	if !exists {
-		log.Error(g.org.LogPre(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_VPC_EN, cloudItem.VPCLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_NAT_GATEWAY_EN, cloudItem.Lcuuid,
-		)))
+		), g.metadata.LogPrefixes)
 		return nil, false
 	}
 
-	dbItem := &mysql.NATGateway{
+	dbItem := &metadbmodel.NATGateway{
 		Name:        cloudItem.Name,
 		Label:       cloudItem.Label,
 		UID:         cloudItem.Label,
 		FloatingIPs: cloudItem.FloatingIPs,
-		Domain:      g.cache.DomainLcuuid,
+		Domain:      g.metadata.GetDomainLcuuid(),
 		Region:      cloudItem.RegionLcuuid,
 		VPCID:       vpcID,
 	}
@@ -94,8 +97,8 @@ func (g *NATGateway) generateDBItemToAdd(cloudItem *cloudmodel.NATGateway) (*mys
 	return dbItem, true
 }
 
-func (g *NATGateway) generateUpdateInfo(diffBase *diffbase.NATGateway, cloudItem *cloudmodel.NATGateway) (*message.NATGatewayFieldsUpdate, map[string]interface{}, bool) {
-	structInfo := new(message.NATGatewayFieldsUpdate)
+func (g *NATGateway) generateUpdateInfo(diffBase *diffbase.NATGateway, cloudItem *cloudmodel.NATGateway) (types.UpdatedFields, map[string]interface{}, bool) {
+	structInfo := new(message.UpdatedNATGatewayFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
 		mapInfo["name"] = cloudItem.Name

@@ -14,23 +14,27 @@
  * limitations under the License.
  */
 
-#[cfg(target_os = "linux")]
-pub mod kubernetes;
-#[cfg(target_os = "linux")]
-mod libvirt_xml_extractor;
-mod platform_synchronizer;
-#[cfg(target_os = "linux")]
-pub mod prometheus;
+cfg_if::cfg_if! {
+    if #[cfg(target_os = "linux")] {
+        mod libvirt_xml_extractor;
+        pub mod kubernetes;
 
-#[cfg(target_os = "linux")]
-pub use kubernetes::{ApiWatcher, GenericPoller, Poller};
-#[cfg(target_os = "linux")]
-pub use libvirt_xml_extractor::LibvirtXmlExtractor;
+        pub use libvirt_xml_extractor::LibvirtXmlExtractor;
+        pub use kubernetes::{ApiWatcher, GenericPoller, Poller};
+    }
+}
+
+mod platform_synchronizer;
+pub use platform_synchronizer::process_info_enabled;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub use platform_synchronizer::ProcRegRewrite;
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub use platform_synchronizer::SocketSynchronizer;
-pub use platform_synchronizer::{process_info_enabled, PlatformSynchronizer};
+pub use platform_synchronizer::{
+    get_os_app_tag_by_exec, OsAppTag, ProcessData, ProcessDataOp, SocketSynchronizer,
+};
+
+mod querier;
+pub mod synchronizer;
+
+pub const IGNORED_INTERFACES: [&str; 1] = ["kube-ipvs0"];
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceEntry {
@@ -38,4 +42,16 @@ pub struct InterfaceEntry {
     pub mac: public::utils::net::MacAddr,
     pub domain_uuid: String,
     pub domain_name: String,
+}
+
+impl From<&InterfaceEntry> for public::proto::agent::InterfaceInfo {
+    fn from(entry: &InterfaceEntry) -> Self {
+        Self {
+            name: Some(entry.name.clone()),
+            mac: Some(entry.mac.into()),
+            device_id: Some(entry.domain_uuid.clone()),
+            device_name: Some(entry.domain_name.clone()),
+            ..Default::default()
+        }
+    }
 }

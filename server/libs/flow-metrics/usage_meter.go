@@ -24,14 +24,14 @@ import (
 )
 
 type UsageMeter struct {
-	PacketTx uint64 `db:"packet_tx"`
-	PacketRx uint64 `db:"packet_rx"`
-	ByteTx   uint64 `db:"byte_tx"`
-	ByteRx   uint64 `db:"byte_rx"`
-	L3ByteTx uint64 `db:"l3_byte_tx"`
-	L3ByteRx uint64 `db:"l3_byte_rx"`
-	L4ByteTx uint64 `db:"l4_byte_tx"`
-	L4ByteRx uint64 `db:"l4_byte_rx"`
+	PacketTx uint64 `json:"packet_tx" category:"$metrics" sub:"NPB"`
+	PacketRx uint64 `json:"packet_rx" category:"$metrics" sub:"NPB"`
+	ByteTx   uint64 `json:"byte_tx" category:"$metrics" sub:"NPB"`
+	ByteRx   uint64 `json:"byte_rx" category:"$metrics" sub:"NPB"`
+	L3ByteTx uint64 `json:"l3_byte_tx" category:"$metrics" sub:"NPB"`
+	L3ByteRx uint64 `json:"l3_byte_rx" category:"$metrics" sub:"NPB"`
+	L4ByteTx uint64 `json:"l4_byte_tx" category:"$metrics" sub:"NPB"`
+	L4ByteRx uint64 `json:"l4_byte_rx" category:"$metrics" sub:"NPB"`
 }
 
 func (m *UsageMeter) Reverse() {
@@ -51,17 +51,6 @@ func (m *UsageMeter) Name() string {
 
 func (m *UsageMeter) VTAPName() string {
 	return MeterVTAPNames[m.ID()]
-}
-
-func (m *UsageMeter) WriteToPB(p *pb.UsageMeter) {
-	p.PacketTx = m.PacketTx
-	p.PacketRx = m.PacketRx
-	p.ByteTx = m.ByteTx
-	p.ByteRx = m.ByteRx
-	p.L3ByteTx = m.L3ByteTx
-	p.L3ByteRx = m.L3ByteRx
-	p.L4ByteTx = m.L4ByteTx
-	p.L4ByteRx = m.L4ByteRx
 }
 
 func (m *UsageMeter) ReadFromPB(p *pb.UsageMeter) {
@@ -128,7 +117,6 @@ const (
 	USAGE_L4_BYTE_RX
 )
 
-// Columns列和WriteBlock的列需要一一对应
 func UsageMeterColumns() []*ckdb.Column {
 	return ckdb.NewColumnsWithComment(
 		[][2]string{
@@ -146,24 +134,6 @@ func UsageMeterColumns() []*ckdb.Column {
 			USAGE_L4_BYTE_RX: {"l4_byte_rx", "累计接收应用层负载总字节数"},
 		},
 		ckdb.UInt64)
-}
-
-// WriteBlock需要和Colums的列一一对应
-func (m *UsageMeter) WriteBlock(block *ckdb.Block) {
-	block.Write(
-		m.PacketTx,
-		m.PacketRx,
-		m.PacketTx+m.PacketRx,
-
-		m.ByteTx,
-		m.ByteRx,
-		m.ByteTx+m.ByteRx,
-
-		m.L3ByteTx,
-		m.L3ByteRx,
-		m.L4ByteTx,
-		m.L4ByteRx,
-	)
 }
 
 func (m *UsageMeter) Merge(other *UsageMeter) {

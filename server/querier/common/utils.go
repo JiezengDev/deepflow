@@ -18,8 +18,8 @@ package common
 
 import (
 	"bufio"
-	"io/ioutil"
 	"os"
+	"slices"
 	"strings"
 )
 
@@ -42,7 +42,7 @@ func LoadDbDescriptions(dir string) (map[string]interface{}, error) {
 }
 
 func readDir(dir string, desMap map[string]interface{}) error {
-	files, err := ioutil.ReadDir(dir)
+	files, err := os.ReadDir(dir)
 	if err != nil {
 		// TODO
 		return err
@@ -88,4 +88,24 @@ func readFile(fileName string) ([][]interface{}, error) {
 		data = append(data, lineSlice)
 	}
 	return data, nil
+}
+
+func TransMapItem(name, table string) (nameNoPrefix string, nameNoSuffix string, transKey string) {
+	for preffix, tag := range TRANS_MAP_ITEM_TAG {
+		if strings.HasPrefix(name, preffix) {
+			nameNoSuffix = name
+			transKey = tag
+			if slices.Contains(PEER_TABLES, table) {
+				for _, suffix := range []string{"_0", "_1"} {
+					if strings.HasSuffix(name, suffix) {
+						transKey += suffix
+						nameNoSuffix = strings.TrimSuffix(nameNoSuffix, suffix)
+					}
+				}
+			}
+			nameNoPrefix = strings.TrimPrefix(nameNoSuffix, preffix)
+			return
+		}
+	}
+	return
 }

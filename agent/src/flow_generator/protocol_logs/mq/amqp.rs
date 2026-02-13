@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+use std::{mem, str};
+
 use serde::Serialize;
 use serde_json::{value::Value, Map, Number};
 
@@ -25,21 +27,26 @@ use crate::{
         enums::IpProtocol,
         flow::{L7PerfStats, L7Protocol},
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
-        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
-        meta_packet::EbpfFlags,
+        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, LogCache, ParseParam},
+        meta_packet::ApplicationFlags,
     },
+    config::handler::LogParserConfig,
     flow_generator::{
         error::Result,
         protocol_logs::{
             decode_base64_to_string,
             pb_adapter::{L7ProtocolSendLog, L7Request, L7Response, TraceInfo},
-            AppProtoHead, LogMessageType,
+            set_captured_byte, value_is_default, AppProtoHead, L7ResponseStatus, PrioFields,
+            BASE_FIELD_PRIORITY,
         },
     },
     utils::bytes::{read_u16_be, read_u32_be, read_u64_be},
 };
 
-#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+use public::l7_protocol::LogMessageType;
+
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq, num_enum::FromPrimitive)]
+#[repr(u16)]
 pub enum ReplyCode {
     Success = 200,
     ContentTooLarge = 311,
@@ -60,6 +67,47 @@ pub enum ReplyCode {
     NotAllowed = 530,
     NotImplemented = 540,
     InternalError = 541,
+    #[num_enum(catch_all)]
+    Unknown(u16),
+}
+
+impl From<ReplyCode> for L7ResponseStatus {
+    fn from(code: ReplyCode) -> Self {
+        match code {
+            ReplyCode::Success => Self::Ok,
+            ReplyCode::ConnectionForced | ReplyCode::ResourceError | ReplyCode::InternalError => {
+                Self::ServerError
+            }
+            _ => Self::ClientError,
+        }
+    }
+}
+
+impl From<ReplyCode> for i32 {
+    fn from(code: ReplyCode) -> Self {
+        match code {
+            ReplyCode::Success => 200,
+            ReplyCode::ContentTooLarge => 311,
+            ReplyCode::NoRoute => 312,
+            ReplyCode::NoConsumers => 313,
+            ReplyCode::ConnectionForced => 320,
+            ReplyCode::InvalidPath => 402,
+            ReplyCode::AccessRefused => 403,
+            ReplyCode::NotFound => 404,
+            ReplyCode::ResourceLocked => 405,
+            ReplyCode::PreconditionFailed => 406,
+            ReplyCode::FrameError => 501,
+            ReplyCode::SyntaxError => 502,
+            ReplyCode::CommandInvalid => 503,
+            ReplyCode::ChannelError => 504,
+            ReplyCode::UnexpectedFrame => 505,
+            ReplyCode::ResourceError => 506,
+            ReplyCode::NotAllowed => 530,
+            ReplyCode::NotImplemented => 540,
+            ReplyCode::InternalError => 541,
+            ReplyCode::Unknown(code) => code as i32,
+        }
+    }
 }
 
 #[derive(Serialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -281,18 +329,35 @@ pub struct AmqpInfo {
     #[serde(rename = "routing_key", skip_serializing_if = "Option::is_none")]
     routing_key: Option<String>,
 
-    #[serde(rename = "trace_id", skip_serializing_if = "Option::is_none")]
-    trace_id: Option<String>,
+    #[serde(rename = "trace_ids", skip_serializing_if = "value_is_default")]
+    trace_ids: PrioFields,
     #[serde(rename = "span_id", skip_serializing_if = "Option::is_none")]
     span_id: Option<String>,
 
+    captured_request_byte: u32,
+    captured_response_byte: u32,
+
     req_len: Option<u32>,
     resp_len: Option<u32>,
-    resp_code: Option<i32>,
+
+    resp_status: L7ResponseStatus,
+    resp_code: Option<ReplyCode>,
+    resp_text: Option<String>,
+
+    #[serde(skip)]
+    req_type: Option<String>,
+    #[serde(skip)]
+    endpoint: Option<String>,
+    #[serde(skip)]
+    is_on_blacklist: bool,
 }
 
 fn slice_to_string(slice: &[u8]) -> String {
     String::from_utf8_lossy(slice).to_string()
+}
+
+fn read_short(buffer: &[u8]) -> Option<(&[u8], u16)> {
+    Some((buffer.get(2..)?, read_u16_be(buffer.get(0..2)?)))
 }
 
 fn read_short_str(buffer: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -413,6 +478,23 @@ fn read_table(payload: &[u8]) -> Option<(&[u8], Value)> {
 }
 
 impl AmqpInfo {
+    fn generate_endpoint(&self) -> Option<String> {
+        let (exchange, exchange_len) = self
+            .exchange
+            .as_ref()
+            .map(|r| (r.as_str(), r.len()))
+            .unwrap_or(("", 0));
+        let (routing_key, routing_key_len) = self
+            .routing_key
+            .as_ref()
+            .map(|r| (r.as_str(), r.len()))
+            .unwrap_or(("", 0));
+        if exchange_len + routing_key_len == 0 {
+            return self.queue.clone();
+        }
+        Some(format!("{}.{}", exchange, routing_key))
+    }
+
     fn get_packet_type(&self) -> String {
         if self.is_protcol_header {
             return "Protocol-Header".to_string();
@@ -679,57 +761,108 @@ impl AmqpInfo {
         };
         Some(slice_to_string(routing_key))
     }
+
+    fn has_reply_code(&self) -> bool {
+        match (self.class_id, self.method_id) {
+            (ClassType::Basic, MethodType::Return)
+            | (ClassType::Connection, MethodType::Close)
+            | (ClassType::Channel, MethodType::Close) => true,
+            _ => false,
+        }
+    }
+
+    fn parse_reply_code_and_text<'a>(&self, arguments: &'a [u8]) -> Option<(ReplyCode, &'a str)> {
+        if !self.has_reply_code() {
+            return None;
+        }
+        let (arguments, code) = read_short(arguments)?;
+        let (_arguments, text) = read_short_str(arguments)?;
+        Some((
+            ReplyCode::from(code),
+            str::from_utf8(text).unwrap_or_default(),
+        ))
+    }
+
+    fn set_is_on_blacklist(&mut self, config: &LogParserConfig) {
+        if let Some(t) = config.l7_log_blacklist_trie.get(&L7Protocol::AMQP) {
+            self.is_on_blacklist = self
+                .req_type
+                .as_ref()
+                .map(|p| t.request_type.is_on_blacklist(p))
+                .unwrap_or_default()
+                || self
+                    .vhost
+                    .as_ref()
+                    .map(|p| t.request_domain.is_on_blacklist(p))
+                    .unwrap_or_default()
+                || self
+                    .endpoint
+                    .as_ref()
+                    .map(|p| t.endpoint.is_on_blacklist(p) || t.request_resource.is_on_blacklist(p))
+                    .unwrap_or_default();
+        }
+    }
 }
 
 #[derive(Default)]
 pub struct AmqpLog {
-    perf_stats: Option<L7PerfStats>,
-
+    perf_stats: Vec<L7PerfStats>,
     vhost: Option<String>,
 }
 
 impl From<AmqpInfo> for L7ProtocolSendLog {
     fn from(info: AmqpInfo) -> Self {
         let flags = match info.is_tls {
-            true => EbpfFlags::TLS.bits(),
-            false => EbpfFlags::NONE.bits(),
-        };
-        let req_type = info.get_packet_type();
-        let type1_len = info.exchange.as_ref().map_or(0, |r| r.len())
-            + info.routing_key.as_ref().map_or(0, |r| r.len());
-        let endpoint = if type1_len > 0 {
-            format!(
-                "{}.{}",
-                info.exchange.unwrap_or_default(),
-                info.routing_key.unwrap_or_default()
-            )
-        } else {
-            info.queue.unwrap_or_default()
+            true => ApplicationFlags::TLS.bits(),
+            false => ApplicationFlags::NONE.bits(),
         };
         let log = L7ProtocolSendLog {
+            captured_request_byte: info.captured_request_byte,
+            captured_response_byte: info.captured_response_byte,
             version: Some(std::str::from_utf8(AMQPVERSION).unwrap().to_string()),
             flags,
             req_len: info.req_len,
             resp_len: info.resp_len,
             req: L7Request {
-                req_type,
+                req_type: info.req_type.unwrap_or_default(),
                 domain: info.vhost.unwrap_or_default(),
-                resource: endpoint.clone(),
-                endpoint: endpoint.clone(),
+                resource: info.endpoint.clone().unwrap_or_default(),
+                endpoint: info.endpoint.unwrap_or_default(),
                 ..Default::default()
             },
-            resp: L7Response {
-                code: info.resp_code,
-                ..Default::default()
+            resp: {
+                let mut resp = L7Response {
+                    code: info.resp_code.map(|x| x.into()),
+                    status: info.resp_status,
+                    ..Default::default()
+                };
+                if resp.status == L7ResponseStatus::Ok {
+                    resp.result = info.resp_text.unwrap_or_default();
+                } else {
+                    resp.exception = info.resp_text.unwrap_or_default();
+                }
+                resp
             },
             trace_info: Some(TraceInfo {
-                trace_id: info.trace_id,
+                trace_ids: info.trace_ids.into_strings_top3(),
                 span_id: info.span_id,
                 ..Default::default()
             }),
             ..Default::default()
         };
         log
+    }
+}
+
+impl From<&AmqpInfo> for LogCache {
+    fn from(info: &AmqpInfo) -> Self {
+        LogCache {
+            msg_type: info.msg_type,
+            resp_status: L7ResponseStatus::Ok,
+            on_blacklist: info.is_on_blacklist,
+            endpoint: info.get_endpoint(),
+            ..Default::default()
+        }
     }
 }
 
@@ -748,17 +881,33 @@ impl L7ProtocolInfoInterface for AmqpInfo {
                 req.resp_len = rsp.resp_len;
             }
             if req.resp_code.is_none() {
-                req.resp_code = rsp.raw_method_id.map(|x| x as i32);
+                req.resp_code = rsp.resp_code;
+            }
+            if req.resp_text.is_none() {
+                mem::swap(&mut req.resp_text, &mut rsp.resp_text);
+            }
+            if req.resp_status == L7ResponseStatus::Unknown {
+                req.resp_status = rsp.resp_status;
             }
             if req.routing_key.as_ref().map_or(0, |r| r.len()) == 0 {
-                req.routing_key = rsp.routing_key.clone();
+                mem::swap(&mut req.routing_key, &mut rsp.routing_key);
             }
             if req.queue.as_ref().map_or(0, |r| r.len()) == 0 {
-                req.queue = rsp.queue.clone();
+                mem::swap(&mut req.queue, &mut rsp.queue);
             }
             if req.exchange.as_ref().map_or(0, |r| r.len()) == 0 {
-                req.exchange = rsp.exchange.clone();
+                mem::swap(&mut req.exchange, &mut rsp.exchange);
             }
+            if req.req_type.is_none() {
+                req.req_type = rsp.req_type.clone();
+            }
+            if req.endpoint.is_none() {
+                req.endpoint = rsp.endpoint.clone();
+            }
+            if rsp.is_on_blacklist {
+                req.is_on_blacklist = rsp.is_on_blacklist;
+            }
+            req.captured_response_byte = rsp.captured_response_byte;
         }
         Ok(())
     }
@@ -774,32 +923,45 @@ impl L7ProtocolInfoInterface for AmqpInfo {
     fn get_request_domain(&self) -> String {
         self.vhost.clone().unwrap_or_default()
     }
+
+    fn get_endpoint(&self) -> Option<String> {
+        self.endpoint.clone()
+    }
+
+    fn is_on_blacklist(&self) -> bool {
+        self.is_on_blacklist
+    }
 }
 
 impl L7ProtocolParserInterface for AmqpLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
         if !param.ebpf_type.is_raw_protocol() {
-            return false;
+            return None;
         }
         if param.l4_protocol != IpProtocol::TCP {
-            return false;
+            return None;
         }
-        return payload.starts_with(AMQPHEADER);
+        if payload.starts_with(AMQPHEADER) {
+            Some(LogMessageType::Request)
+        } else {
+            None
+        }
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
-        if self.perf_stats.is_none() && param.parse_perf {
-            self.perf_stats = Some(L7PerfStats::default())
-        };
+        self.perf_stats.clear();
 
         let mut offset = 0;
         let mut vec = Vec::new();
         if payload.starts_with(AMQPHEADER) {
             offset += AMQPHEADER.len();
-            let mut info = AmqpInfo::default();
-            info.is_protcol_header = true;
-            info.is_tls = param.is_tls();
-            info.msg_type = info.get_log_message_type();
+            let info = AmqpInfo {
+                is_protcol_header: true,
+                is_tls: param.is_tls(),
+                msg_type: LogMessageType::Session,
+                resp_status: L7ResponseStatus::Ok,
+                ..Default::default()
+            };
             vec.push(L7ProtocolInfo::AmqpInfo(info));
         }
         loop {
@@ -821,6 +983,11 @@ impl L7ProtocolParserInterface for AmqpLog {
             if payload.get(offset + info.payload_size as usize) != Some(&b'\xCE') {
                 break;
             }
+            let multiple_trace_id_collection = if let Some(config) = param.parse_config {
+                config.l7_log_dynamic.multiple_trace_id_collection
+            } else {
+                true
+            };
             match info.frame_type {
                 FrameType::Method => {
                     if info.payload_size < 4 {
@@ -858,7 +1025,9 @@ impl L7ProtocolParserInterface for AmqpLog {
                     if let Some((trace_id, span_id)) =
                         info.parse_trace_span(&payload[offset + 12..])
                     {
-                        info.trace_id = Some(trace_id);
+                        if multiple_trace_id_collection || info.trace_ids.is_empty() {
+                            info.trace_ids.merge_field(BASE_FIELD_PRIORITY, trace_id);
+                        }
                         info.span_id = Some(span_id);
                     }
                 }
@@ -881,16 +1050,66 @@ impl L7ProtocolParserInterface for AmqpLog {
                 }
             }
 
-            offset += info.payload_size as usize;
-            if payload.get(offset) != Some(&b'\xCE') {
-                break;
+            if info.has_reply_code() {
+                if let Some((code, text)) = info.parse_reply_code_and_text(&payload[offset + 4..]) {
+                    info.resp_status = code.into();
+                    info.resp_code = Some(code);
+                    info.resp_text = Some(text.to_string());
+                }
             }
+
+            offset += info.payload_size as usize;
+            debug_assert_eq!(payload.get(offset), Some(&b'\xCE'));
             offset += 1;
 
-            info.msg_type = info.get_log_message_type();
+            match info.resp_code {
+                Some(code) if code != ReplyCode::Success => match info.class_id {
+                    // basic.return is session
+                    ClassType::Basic => {
+                        debug_assert_eq!(info.method_id, MethodType::Return);
+                        info.msg_type = LogMessageType::Session;
+                    }
+                    // connection close with non-200 reply code is of LogMessageType::Response and there wouldn't be a "close-ok"
+                    ClassType::Connection => {
+                        debug_assert_eq!(info.method_id, MethodType::Close);
+                        info.msg_type = LogMessageType::Response;
+                    }
+                    // channel close with non-200 reply code is also a response, but there would be a "close-ok"
+                    // in this case, client will send two messages (including a close-ok) and server will reply only once
+                    // so we need to duplicate this "close" message as both
+                    // - response to previous client request (treat resp_len as 0)
+                    // - request for client "close-ok"
+                    ClassType::Channel => {
+                        debug_assert_eq!(info.method_id, MethodType::Close);
 
+                        // response to previous client request
+                        vec.push(L7ProtocolInfo::AmqpInfo(AmqpInfo {
+                            msg_type: LogMessageType::Response,
+                            resp_len: Some(0),
+                            ..info.clone()
+                        }));
+                        // request for client "close-ok"
+                        info.resp_status = L7ResponseStatus::Unknown;
+                        info.msg_type = LogMessageType::Request;
+                    }
+                    _ => unreachable!(),
+                },
+                _ => {
+                    info.msg_type = info.get_log_message_type();
+                    if matches!(
+                        info.msg_type,
+                        LogMessageType::Response | LogMessageType::Session
+                    ) {
+                        info.resp_status = L7ResponseStatus::Ok;
+                    }
+                }
+            }
             match info.msg_type {
-                LogMessageType::Request => info.req_len = Some((offset - offset_begin) as u32),
+                LogMessageType::Request => {
+                    info.req_len = Some((offset - offset_begin) as u32);
+                    info.req_type = Some(info.get_packet_type());
+                    info.endpoint = info.generate_endpoint();
+                }
                 LogMessageType::Response => info.resp_len = Some((offset - offset_begin) as u32),
                 _ => {}
             }
@@ -898,22 +1117,24 @@ impl L7ProtocolParserInterface for AmqpLog {
         }
         for info in &mut vec {
             if let L7ProtocolInfo::AmqpInfo(info) = info {
-                if info.msg_type != LogMessageType::Session {
-                    info.cal_rrt(param, None).map(|rtt| {
-                        info.rtt = rtt;
-                        self.perf_stats.as_mut().map(|p| p.update_rrt(rtt));
-                    });
-                }
                 info.is_tls = param.is_tls();
-
-                match info.msg_type {
-                    LogMessageType::Request => {
-                        self.perf_stats.as_mut().map(|p| p.inc_req());
+                set_captured_byte!(info, param);
+                info.endpoint = info.generate_endpoint();
+                if let Some(config) = param.parse_config {
+                    info.set_is_on_blacklist(config);
+                }
+                if param.parse_perf {
+                    let mut perf_stat = L7PerfStats::default();
+                    if info.msg_type == LogMessageType::Response {
+                        if let Some(endpoint) = info.load_endpoint_from_cache(param, false) {
+                            info.endpoint = Some(endpoint.to_string());
+                        }
                     }
-                    LogMessageType::Response => {
-                        self.perf_stats.as_mut().map(|p| p.inc_resp());
+                    if let Some(stats) = info.perf_stats(param) {
+                        info.rtt = stats.rrt_sum;
+                        perf_stat.sequential_merge(&stats);
                     }
-                    _ => {}
+                    self.perf_stats.push(perf_stat);
                 }
             }
         }
@@ -931,12 +1152,12 @@ impl L7ProtocolParserInterface for AmqpLog {
     fn reset(&mut self) {
         let mut s = Self::default();
         s.vhost = self.vhost.take();
-        s.perf_stats = self.perf_stats.take();
+        s.perf_stats = self.perf_stats();
         *self = s;
     }
 
-    fn perf_stats(&mut self) -> Option<L7PerfStats> {
-        self.perf_stats.take()
+    fn perf_stats(&mut self) -> Vec<L7PerfStats> {
+        std::mem::take(&mut self.perf_stats)
     }
 
     fn protocol(&self) -> L7Protocol {
@@ -950,24 +1171,66 @@ impl L7ProtocolParserInterface for AmqpLog {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-    use std::rc::Rc;
-    use std::{cell::RefCell, fs};
+    use std::{
+        cell::RefCell,
+        fmt::{self, Write},
+        fs,
+        path::Path,
+        rc::Rc,
+    };
 
     use super::*;
 
     use crate::{
         common::{flow::PacketDirection, l7_protocol_log::L7PerfCache, MetaPacket},
         flow_generator::L7_RRT_CACHE_CAPACITY,
-        utils::test::Capture,
+        utils::test::{Capture, WrappedDebugStruct},
     };
 
     const FILE_DIR: &str = "resources/test/flow_generator/amqp";
 
+    struct ValidateInfo<'a>(&'a L7ProtocolInfo);
+
+    impl fmt::Debug for ValidateInfo<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let info = match self.0 {
+                L7ProtocolInfo::AmqpInfo(info) => info,
+                _ => return Err(fmt::Error),
+            };
+            let mut d = WrappedDebugStruct::from(f.debug_struct("AmqpInfo"));
+            d.field_skip_default("msg_type", &info.msg_type)
+                .field("resp_status", &info.resp_status)
+                .field("captured_request_byte", &info.captured_request_byte)
+                .field("captured_response_byte", &info.captured_response_byte)
+                .field("req_len", &info.req_len)
+                .field("resp_len", &info.resp_len)
+                .field("rtt", &info.rtt)
+                .field_skip_default("resp_code", &info.resp_code)
+                .field_skip_default("resp_text", &info.resp_text)
+                .field_skip_default("vhost", &info.vhost)
+                .field_skip_default("is_protcol_header", &info.is_protcol_header)
+                .field("frame_type", &info.frame_type)
+                .field("channel_id", &info.channel_id)
+                .field("payload_size", &info.payload_size)
+                .field_skip_default("class_id", &info.class_id)
+                .field_skip_default("method_id", &info.method_id)
+                .field_skip_default("raw_method_id", &info.raw_method_id)
+                .field_skip_default("body_size", &info.body_size)
+                .field_skip_default("queue", &info.queue)
+                .field_skip_default("exchange", &info.exchange)
+                .field_skip_default("routing_key", &info.routing_key)
+                .field_skip_default("trace_ids", &info.trace_ids)
+                .field_skip_default("span_id", &info.span_id)
+                .field_skip_default("req_type", &info.req_type)
+                .field_skip_default("endpoint", &info.endpoint)
+                .finish()
+        }
+    }
+
     fn run(name: &str) -> String {
-        let capture = Capture::load_pcap(Path::new(FILE_DIR).join(name), None);
+        let capture = Capture::load_pcap(Path::new(FILE_DIR).join(name));
         let log_cache = Rc::new(RefCell::new(L7PerfCache::new(L7_RRT_CACHE_CAPACITY)));
-        let mut packets = capture.as_meta_packets();
+        let mut packets = capture.collect::<Vec<_>>();
         if packets.is_empty() {
             return "".to_string();
         }
@@ -986,19 +1249,19 @@ mod tests {
                 Some(p) => p,
                 None => continue,
             };
-            let param = &ParseParam::new(
+            let param = &mut ParseParam::new(
                 packet as &MetaPacket,
-                log_cache.clone(),
+                Some(log_cache.clone()),
                 Default::default(),
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 Default::default(),
                 true,
                 true,
             );
-
+            param.set_captured_byte(payload.len());
             if first_packet {
                 first_packet = false;
-                if !amqp.check_payload(payload, param) {
+                if amqp.check_payload(payload, param).is_none() {
                     output.push_str("not amqp\n");
                     break;
                 }
@@ -1008,11 +1271,11 @@ mod tests {
             if let Ok(info) = info {
                 match info {
                     L7ParseResult::Single(s) => {
-                        output.push_str(&format!("{:?}\n", s));
+                        let _ = write!(&mut output, "{:?}\n", ValidateInfo(&s));
                     }
                     L7ParseResult::Multi(m) => {
                         for i in m {
-                            output.push_str(&format!("{:?}\n", i));
+                            let _ = write!(&mut output, "{:?}\n", ValidateInfo(&i));
                         }
                     }
                     L7ParseResult::None => {
@@ -1020,7 +1283,7 @@ mod tests {
                     }
                 }
             } else {
-                output.push_str(&format!("{:?}\n", AmqpInfo::default()));
+                output.push_str("not amqp\n");
             }
         }
         output
@@ -1032,6 +1295,7 @@ mod tests {
             ("amqp1.pcap", "amqp1.result"),
             ("amqp2.pcap", "amqp2.result"),
             ("amqp3.pcap", "amqp3.result"),
+            ("amqp-error.pcap", "amqp-error.result"),
         ];
 
         for item in files.iter() {

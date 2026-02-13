@@ -16,48 +16,58 @@
 
 package common
 
-import "fmt"
+import (
+	"fmt"
 
-type Logger struct {
-	ORGID           int
-	DomainName      string
-	DomainLcuuid    string
-	SubDomainLcuuid string
-	MsgPre          string
+	"github.com/deepflowio/deepflow/server/libs/logger"
+)
+
+var log = logger.MustGetLogger("recorder.common")
+
+func LogAdd(resourceType string) string {
+	return fmt.Sprintf("add %s", resourceType)
 }
 
-func NewLogger(orgID int) *Logger {
-	return &Logger{
-		ORGID:  orgID,
-		MsgPre: fmt.Sprintf("oid: %d, ", orgID),
+func LogUpdate(resourceType string) string {
+	return fmt.Sprintf("update %s", resourceType)
+}
+
+func LogDelete(resourceType string) string {
+	return fmt.Sprintf("delete %s", resourceType)
+}
+
+func ResourceAForResourceBNotFound(resourceA, lcuuidA, resourceB, lcuuidB string) string {
+	return fmt.Sprintf("%s (lcuuid: %s) for %s (lcuuid: %s) not found", resourceA, lcuuidA, resourceB, lcuuidB)
+}
+
+type Loggable interface {
+	ToLoggable() interface{}
+}
+
+func ToLoggable(do bool, data interface{}) interface{} {
+	if !do {
+		return data
 	}
-}
-
-func (l *Logger) AppendDomainName(domainName string) {
-	l.DomainName = domainName
-	l.MsgPre += fmt.Sprintf("dn: %s, ", domainName)
-}
-
-func (l *Logger) AppendDomainLcuuid(domainLcuuid string) {
-	l.DomainLcuuid = domainLcuuid
-	l.MsgPre += fmt.Sprintf("dl: %s, ", domainLcuuid)
-}
-
-func (l *Logger) AppendSubDomainLcuuid(subDomainLcuuid string) {
-	l.SubDomainLcuuid = subDomainLcuuid
-	l.MsgPre += fmt.Sprintf("sbl: %s, ", subDomainLcuuid)
-}
-
-func (l *Logger) AddPre(format string, a ...any) string {
-	return l.MsgPre + fmt.Sprintf(format, a...)
-}
-
-func CopyLogger(l *Logger) *Logger {
-	return &Logger{
-		ORGID:           l.ORGID,
-		DomainName:      l.DomainName,
-		DomainLcuuid:    l.DomainLcuuid,
-		SubDomainLcuuid: l.SubDomainLcuuid,
-		MsgPre:          l.MsgPre,
+	if loggable, ok := data.(Loggable); ok {
+		return loggable.ToLoggable()
 	}
+	if dict, ok := data.(map[string]interface{}); ok {
+		// copy dict except for these keys
+		keysToRemove := []string{"compressed_data", "compressed_metadata", "compressed_spec"}
+		newDict := make(map[string]interface{})
+		for k, v := range dict {
+			skip := false
+			for _, key := range keysToRemove {
+				if k == key {
+					skip = true
+					break
+				}
+			}
+			if !skip {
+				newDict[k] = v
+			}
+		}
+		return newDict
+	}
+	return data
 }

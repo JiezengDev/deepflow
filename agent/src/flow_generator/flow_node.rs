@@ -20,16 +20,18 @@ use super::{perf::FlowLog, FlowState, FLOW_METRICS_PEER_DST, FLOW_METRICS_PEER_S
 use crate::common::{
     decapsulate::TunnelType,
     endpoint::EndpointDataPov,
-    enums::{EthernetType, TapType, TcpFlags},
+    enums::{CaptureNetworkType, EthernetType, TcpFlags},
     flow::{FlowMetricsPeer, L7PerfStats, PacketDirection, SignalSource, TcpPerfStats},
     lookup_key::LookupKey,
     meta_packet::MetaPacket,
     tagged_flow::TaggedFlow,
     TapPort, Timestamp,
 };
-use public::{proto::common::TridentType, utils::net::MacAddr};
+use crate::utils::environment::{is_tt_hyper_v, is_tt_pod};
+use public::{proto::agent::AgentType, utils::net::MacAddr};
 
 use npb_pcap_policy::PolicyData;
+use packet_segmentation_reassembly::PacketSegmentationReassembly;
 use packet_sequence_block::PacketSequenceBlock;
 
 #[repr(u8)]
@@ -86,7 +88,16 @@ impl FlowMapKey {
         }
     }
 
-    pub(super) fn new(lookup_key: &LookupKey, tap_port: TapPort) -> Self {
+    pub(super) fn new(packet: &MetaPacket) -> Self {
+        if packet.tap_port.is_from(TapPort::FROM_EBPF) {
+            return Self {
+                lhs: 0,
+                rhs: packet.generate_ebpf_flow_id(),
+            };
+        }
+
+        let lookup_key = &packet.lookup_key;
+        let tap_port = &packet.tap_port;
         match lookup_key.eth_type {
             EthernetType::IPV4 | EthernetType::IPV6 => {
                 let lhs = Self::l3_hash(lookup_key);
@@ -142,6 +153,9 @@ pub struct FlowNode {
 
     // Enterprise Edition Feature: packet-sequence
     pub packet_sequence_block: Option<Box<PacketSequenceBlock>>,
+
+    // tcp segments
+    pub tcp_segments: Option<PacketSegmentationReassembly>,
 }
 
 impl FlowNode {
@@ -187,7 +201,7 @@ impl FlowNode {
         ignore_l2_end: bool,
         ignore_tor_mac: bool,
         ignore_idc_vlan: bool,
-        trident_type: TridentType,
+        agent_type: AgentType,
     ) -> bool {
         if meta_packet.signal_source == SignalSource::EBPF {
             if self.tagged_flow.flow.flow_id != meta_packet.generate_ebpf_flow_id() {
@@ -209,7 +223,10 @@ impl FlowNode {
         let flow = &self.tagged_flow.flow;
         let flow_key = &flow.flow_key;
         let meta_lookup_key = &meta_packet.lookup_key;
-        if flow_key.tap_port.ignore_nat_source() != meta_packet.tap_port.ignore_nat_source()
+        // TapPort comparison ignored tunnel_type and nat_source:
+        //   tunnel_type: support aggregation of packets with and without tunnels(eg: weave cni)
+        //   nat_source: possible extraction from TCP options address, can be ignored
+        if flow_key.tap_port.get_tap_mac() != meta_packet.tap_port.get_tap_mac()
             || flow_key.tap_type != meta_lookup_key.tap_type
         {
             return false;
@@ -220,7 +237,7 @@ impl FlowNode {
         }
 
         if flow.vlan != meta_packet.vlan
-            && meta_lookup_key.tap_type != TapType::Cloud
+            && meta_lookup_key.tap_type != CaptureNetworkType::Cloud
             && !ignore_idc_vlan
         {
             return false;
@@ -259,31 +276,25 @@ impl FlowNode {
             || (meta_packet.tunnel.is_none() && flow.tunnel.tunnel_type != TunnelType::None)
         {
             // 微软ACS存在非对称隧道流量，需要排除
-            if !Self::is_hyper_v(trident_type) {
+            if !is_tt_hyper_v(agent_type) && !is_tt_pod(agent_type) {
                 return false;
             }
         }
 
         // Ipv4/Ipv6 solve
-        let mac_match = Self::mac_match(meta_packet, ignore_l2_end, ignore_tor_mac, trident_type);
+        let mac_match = Self::mac_match(meta_packet, ignore_l2_end, ignore_tor_mac, agent_type);
         if flow_key.ip_src == meta_lookup_key.src_ip
             && flow_key.ip_dst == meta_lookup_key.dst_ip
             && flow_key.port_src == meta_lookup_key.src_port
             && flow_key.port_dst == meta_lookup_key.dst_port
         {
-            // l3 protocols, such as icmp, can determine the direction of packets according
-            // to icmp type, so there is no need to correct the direction of packets
-            if meta_lookup_key.is_tcp() || meta_lookup_key.is_udp() {
-                meta_packet.lookup_key.direction = PacketDirection::ClientToServer;
-            }
+            meta_packet.lookup_key.direction = PacketDirection::ClientToServer;
         } else if flow_key.ip_src == meta_lookup_key.dst_ip
             && flow_key.ip_dst == meta_lookup_key.src_ip
             && flow_key.port_src == meta_lookup_key.dst_port
             && flow_key.port_dst == meta_lookup_key.src_port
         {
-            if meta_lookup_key.is_tcp() || meta_lookup_key.is_udp() {
-                meta_packet.lookup_key.direction = PacketDirection::ServerToClient;
-            }
+            meta_packet.lookup_key.direction = PacketDirection::ServerToClient;
         } else {
             return false;
         }
@@ -294,10 +305,6 @@ impl FlowNode {
                 flow_key.mac_dst,
                 mac_match,
             )
-    }
-
-    fn is_hyper_v(trident_type: TridentType) -> bool {
-        trident_type == TridentType::TtHyperVCompute || trident_type == TridentType::TtHyperVNetwork
     }
 
     // Microsoft ACS：
@@ -313,21 +320,22 @@ impl FlowNode {
         meta_packet: &MetaPacket,
         ignore_l2_end: bool,
         ignore_tor_mac: bool,
-        trident_type: TridentType,
+        agent_type: AgentType,
     ) -> MatchMac {
         let ignore_mac = meta_packet.tunnel.is_some()
-            && ((Self::is_hyper_v(trident_type) && meta_packet.tunnel.unwrap().tier < 2)
+            && ((is_tt_hyper_v(agent_type) && meta_packet.tunnel.unwrap().tier < 2)
                 || meta_packet.tunnel.unwrap().tunnel_type == TunnelType::TencentGre
                 || meta_packet.tunnel.unwrap().tunnel_type == TunnelType::Ipip);
+        let is_from_gateway = meta_packet.tap_port.is_from(TapPort::FROM_GATEWAY_MAC);
 
         // return value stands different match type, defined by MAC_MATCH_*
         // TODO: maybe should consider L2End0 and L2End1 when InPort == 0x30000
-        let is_from_isp = meta_packet.lookup_key.tap_type != TapType::Cloud;
-        if is_from_isp || ignore_mac || ignore_tor_mac {
+        let is_from_isp = meta_packet.lookup_key.tap_type != CaptureNetworkType::Cloud;
+        if is_from_isp || ignore_mac || ignore_tor_mac || is_from_gateway {
             return MatchMac::None;
         }
 
-        let is_from_trident = meta_packet.lookup_key.tap_type == TapType::Cloud
+        let is_from_trident = meta_packet.lookup_key.tap_type == CaptureNetworkType::Cloud
             && meta_packet.tap_port.split_fields().0 > 0;
 
         if !ignore_l2_end && is_from_trident {
@@ -385,5 +393,76 @@ impl FlowNode {
                     && lookup_key.l2_end_1 == peers[0].is_l2_end
             }
         }
+    }
+
+    pub fn contain_pcap_policy(&self) -> bool {
+        match (
+            self.policy_data_cache[0].as_ref(),
+            self.policy_data_cache[1].as_ref(),
+        ) {
+            (Some(i), Some(j)) => i.contain_pcap() || j.contain_pcap(),
+            (None, Some(j)) => j.contain_pcap(),
+            (Some(i), None) => i.contain_pcap(),
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use public::proto::agent::AgentType;
+
+    use super::{FlowNode, PacketSegmentationReassembly};
+    use crate::common::{decapsulate::TunnelType, MetaPacket, TapPort};
+    use crate::utils::test::Capture;
+
+    #[test]
+    fn test_packet_segmentation_reassembly() {
+        let mut outputs = vec![];
+        let mut tcp_segments = PacketSegmentationReassembly::default();
+
+        let capture = Capture::load_pcap("resources/test/flow_generator/tcp-segment.pcap");
+        let mut packets = capture.collect::<Vec<_>>();
+
+        for packet in &mut packets {
+            if let Some(mut packets) = tcp_segments.inject(packet.to_owned_segment()) {
+                outputs.append(&mut packets);
+            }
+        }
+
+        let outputs = outputs
+            .drain(..)
+            .map(|x| x.into_any().downcast::<MetaPacket>().unwrap())
+            .collect::<Vec<Box<MetaPacket>>>();
+
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].payload_len, 2896);
+        assert_eq!(outputs[0].packet_len, 2962);
+        assert_eq!(outputs[0].get_l4_payload().as_ref().unwrap()[1447], 2);
+        assert_eq!(outputs[0].get_l4_payload().as_ref().unwrap()[1448], 0x2c);
+        assert_eq!(outputs[1].payload_len, 2896);
+        assert_eq!(outputs[1].packet_len, 2962);
+    }
+
+    #[test]
+    fn match_vxlan_and_none() {
+        let mut node = FlowNode::default();
+        let mut meta_packet = MetaPacket::default();
+
+        node.tagged_flow.flow.flow_key.tap_port =
+            TapPort::from_local_mac(0, TunnelType::Vxlan, 0x11223344);
+        meta_packet.tap_port = TapPort::from_local_mac(0, TunnelType::None, 0x11223344);
+        assert_eq!(
+            node.match_node(&mut meta_packet, true, true, true, AgentType::TtProcess),
+            true
+        );
+
+        node.tagged_flow.flow.flow_key.tap_port =
+            TapPort::from_local_mac(0, TunnelType::None, 0x11223344);
+        meta_packet.tap_port = TapPort::from_local_mac(0, TunnelType::Vxlan, 0x11223344);
+        assert_eq!(
+            node.match_node(&mut meta_packet, true, true, true, AgentType::TtProcess),
+            true
+        );
     }
 }

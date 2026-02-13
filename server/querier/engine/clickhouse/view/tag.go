@@ -50,11 +50,18 @@ func (s *Tags) Append(t Node) {
 }
 
 func (s *Tags) WriteTo(buf *bytes.Buffer) {
-	for i, tag := range s.tags {
-		tag.WriteTo(buf)
-		if i < len(s.tags)-1 {
+	first := true
+	for _, tag := range s.tags {
+		node, ok := tag.(*Tag)
+		// remove auto ip tag
+		if ok && (strings.HasPrefix(node.Value, "auto_instance_ip") || strings.HasPrefix(node.Value, "auto_service_ip")) {
+			continue
+		}
+		if !first {
 			buf.WriteString(", ")
 		}
+		tag.WriteTo(buf)
+		first = false
 	}
 }
 

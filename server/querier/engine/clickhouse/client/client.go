@@ -18,16 +18,18 @@ package client
 
 import (
 	"context"
-	"reflect"
-
-	//"database/sql"
 	"fmt"
+	"net"
+	"reflect"
+	"strconv"
+	"strings"
 	"time"
 	"unsafe"
 
 	clickhouse "github.com/ClickHouse/clickhouse-go/v2"
 	//"github.com/k0kubun/pp"
 
+	ctrCommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/querier/common"
 	"github.com/deepflowio/deepflow/server/querier/config"
 	"github.com/deepflowio/deepflow/server/querier/statsd"
@@ -44,10 +46,13 @@ type QueryParams struct {
 	Callbacks       map[string]func(result *common.Result) error
 	QueryUUID       string
 	ColumnSchemaMap map[string]*common.ColumnSchema
+	ORGID           string
+	SimpleSql       bool
 }
 
 // All ClickHouse Client share one connection
 var connection clickhouse.Conn
+var version string
 
 type Client struct {
 	Host       string
@@ -58,9 +63,10 @@ type Client struct {
 	DB         string
 	Context    context.Context
 	Debug      *Debug
+	Version    string
 }
 
-func (c *Client) init(query_uuid string) error {
+func (c *Client) Init(query_uuid string) error {
 	if query_uuid == "" {
 		query_uuid = uuid.NewString()
 	}
@@ -72,7 +78,7 @@ func (c *Client) init(query_uuid string) error {
 	}
 	if connection == nil { // FIXME: add a RWLock
 		conn, err := clickhouse.Open(&clickhouse.Options{
-			Addr: []string{fmt.Sprintf("%s:%d", c.Host, c.Port)},
+			Addr: []string{net.JoinHostPort(c.Host, strconv.Itoa(c.Port))},
 			Auth: clickhouse.Auth{
 				Database: "default",
 				Username: c.UserName,
@@ -97,6 +103,10 @@ func (c *Client) init(query_uuid string) error {
 		connection = conn
 	}
 	c.connection = connection
+	if version == "" {
+		version, _ = c.GetVersion()
+		c.Version = version
+	}
 	return nil
 }
 
@@ -105,16 +115,35 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) DoQuery(params *QueryParams) (result *common.Result, err error) {
-	sqlstr, callbacks, query_uuid, columnSchemaMap := params.Sql, params.Callbacks, params.QueryUUID, params.ColumnSchemaMap
+	sqlstr, callbacks, query_uuid, columnSchemaMap, simpleSql := params.Sql, params.Callbacks, params.QueryUUID, params.ColumnSchemaMap, params.SimpleSql
 	queryCacheStr := ""
 	if params.UseQueryCache {
-		queryCacheStr = " SETTINGS use_query_cache = true, query_cache_store_results_of_queries_with_nondeterministic_functions = 1"
+		queryCacheStr = " SETTINGS use_query_cache = true"
+		if version > ctrCommon.CLICK_HOUSE_VERSION {
+			queryCacheStr += ", query_cache_nondeterministic_function_handling = 'save'"
+		} else {
+			queryCacheStr += ", query_cache_store_results_of_queries_with_nondeterministic_functions = 1"
+		}
 		if params.QueryCacheTTL != "" {
 			queryCacheStr += fmt.Sprintf(", query_cache_ttl = %s", params.QueryCacheTTL)
 		}
 		sqlstr += queryCacheStr
 	}
-	err = c.init(query_uuid)
+	// ORGID
+	if !simpleSql && params.ORGID != common.DEFAULT_ORG_ID && params.ORGID != "" {
+		orgIDInt, err := strconv.Atoi(params.ORGID)
+		if err != nil {
+			return nil, err
+		}
+		sqlstr = strings.ReplaceAll(sqlstr, "flow_tag", fmt.Sprintf("%04d_flow_tag", orgIDInt))
+	}
+	// live view
+	if version > ctrCommon.CLICK_HOUSE_VERSION {
+		sqlstr = strings.ReplaceAll(sqlstr, "app_label_live_view", "app_label_map")
+		sqlstr = strings.ReplaceAll(sqlstr, "target_label_live_view", "target_label_map")
+	}
+
+	err = c.Init(query_uuid)
 	if err != nil {
 		return nil, err
 	}
@@ -150,6 +179,7 @@ func (c *Client) DoQuery(params *QueryParams) (result *common.Result, err error)
 	columnValues := make([]interface{}, len(columns))
 	for i := range columns {
 		columnValues[i] = reflect.New(columns[i].ScanType()).Interface()
+		columnSchemas[i].ValueType = columns[i].DatabaseTypeName()
 	}
 	resSize := 0
 	for rows.Next() {
@@ -158,15 +188,10 @@ func (c *Client) DoQuery(params *QueryParams) (result *common.Result, err error)
 			return nil, err
 		}
 		record := make([]interface{}, 0, len(columns))
-		for i, rawValue := range columnValues {
-			value, valueType, err := TransType(rawValue, columns[i].Name(), columns[i].DatabaseTypeName())
-			if err != nil {
-				c.Debug.Error = fmt.Sprintf("%s", err)
-				return nil, err
-			}
+		for _, rawValue := range columnValues {
+			value := TransType(rawValue)
 			resSize += int(unsafe.Sizeof(value))
 			record = append(record, value)
-			columnSchemas[i].ValueType = valueType
 		}
 		values = append(values, record)
 	}
@@ -187,7 +212,7 @@ func (c *Client) DoQuery(params *QueryParams) (result *common.Result, err error)
 			QueryTime:    uint64(queryTime),
 		},
 	)
-	c.Debug.QueryTime = int64(queryTime)
+	c.Debug.QueryTime = fmt.Sprintf("%.9fs", float64(queryTime)/1e9)
 	result = &common.Result{
 		Columns: columnNames,
 		Values:  values,
@@ -199,7 +224,49 @@ func (c *Client) DoQuery(params *QueryParams) (result *common.Result, err error)
 			log.Error("Execute Callback %v Error: %v", callback, err)
 		}
 	}
-	log.Debugf("sql: %s, query_uuid: %s", sqlstr, c.Debug.QueryUUID)
 	log.Infof("query_uuid: %s. query api statistics: %d rows, %d columns, %d bytes, cost %f ms", c.Debug.QueryUUID, resRows, resColumns, resSize, float64(queryTime.Milliseconds()))
 	return result, nil
+}
+
+func (c *Client) GetVersion() (version string, err error) {
+	defer c.Close()
+	ctx := c.Context
+	if c.Context == nil {
+		ctx = context.Background()
+	}
+	sqlstr := "SELECT version()"
+	rows, err := c.connection.Query(ctx, sqlstr)
+	if err != nil {
+		log.Errorf("query clickhouse Error: %s, sql: %s", err, sqlstr)
+		return
+	}
+	defer rows.Close()
+	columns := rows.ColumnTypes()
+	columnNames := make([]interface{}, 0, len(columns))
+	// 获取列名和列类型
+	for _, column := range columns {
+		columnNames = append(columnNames, column.Name())
+	}
+	columnValues := make([]interface{}, len(columns))
+	for i := range columns {
+		columnValues[i] = reflect.New(columns[i].ScanType()).Interface()
+	}
+	for rows.Next() {
+		if err = rows.Scan(columnValues...); err != nil {
+			return
+		}
+		for _, rawValue := range columnValues {
+			value := TransType(rawValue)
+			version, _ = value.(string)
+			log.Infof("database version is %s", version)
+			return
+		}
+	}
+	// Even if the query operation produces an error, it does not necessarily return an error in the'err 'parameter,
+	// so the return value of the'rows. Err () ' method must be checked to ensure that the query operation is successful
+	if err = rows.Err(); err != nil {
+		log.Errorf("query clickhouse Error: %s, sql: %s", err, sqlstr)
+		return
+	}
+	return
 }

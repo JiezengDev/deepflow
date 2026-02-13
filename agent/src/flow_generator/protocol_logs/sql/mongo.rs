@@ -19,17 +19,21 @@ use std::ffi::CStr;
 use bson::{self, Document};
 use serde::Serialize;
 
-use super::super::{AppProtoHead, LogMessageType};
+use public::l7_protocol::LogMessageType;
+
+use super::super::AppProtoHead;
 use crate::common::flow::L7PerfStats;
 use crate::common::l7_protocol_log::L7ParseResult;
+use crate::config::handler::LogParserConfig;
+use crate::flow_generator::protocol_logs::set_captured_byte;
 use crate::{
     common::{
         enums::IpProtocol,
         flow::L7Protocol,
         flow::PacketDirection,
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
-        l7_protocol_log::{L7ProtocolParserInterface, ParseParam},
-        meta_packet::EbpfFlags,
+        l7_protocol_log::{L7ProtocolParserInterface, LogCache, ParseParam},
+        meta_packet::ApplicationFlags,
     },
     flow_generator::{
         protocol_logs::{
@@ -41,7 +45,7 @@ use crate::{
     utils::bytes,
 };
 
-#[derive(Serialize, Debug, Default, Clone)]
+#[derive(Serialize, Debug, Clone)]
 pub struct MongoDBInfo {
     msg_type: LogMessageType,
     #[serde(skip)]
@@ -72,7 +76,40 @@ pub struct MongoDBInfo {
     #[serde(rename = "response_status")]
     pub status: L7ResponseStatus,
 
+    captured_request_byte: u32,
+    captured_response_byte: u32,
+
     rrt: u64,
+
+    #[serde(skip)]
+    is_on_blacklist: bool,
+    #[serde(skip)]
+    reply_false: bool,
+}
+
+impl Default for MongoDBInfo {
+    fn default() -> Self {
+        Self {
+            msg_type: LogMessageType::Request,
+            is_tls: false,
+            req_len: 0,
+            resp_len: 0,
+            request_id: 0,
+            response_id: 0,
+            op_code: 0,
+            op_code_name: String::new(),
+            request: String::new(),
+            response: String::new(),
+            response_code: 0,
+            exception: String::new(),
+            status: L7ResponseStatus::Ok,
+            captured_request_byte: 0,
+            captured_response_byte: 0,
+            rrt: 0,
+            is_on_blacklist: false,
+            reply_false: false,
+        }
+    }
 }
 
 impl L7ProtocolInfoInterface for MongoDBInfo {
@@ -102,11 +139,18 @@ impl L7ProtocolInfoInterface for MongoDBInfo {
     fn get_request_resource_length(&self) -> usize {
         self.request.len()
     }
+
+    fn is_on_blacklist(&self) -> bool {
+        self.is_on_blacklist
+    }
 }
 
 // 协议文档: https://www.mongodb.com/docs/manual/reference/mongodb-wire-protocol/
 impl MongoDBInfo {
     fn merge(&mut self, other: &mut Self) {
+        if other.is_on_blacklist {
+            self.is_on_blacklist = other.is_on_blacklist;
+        }
         match other.msg_type {
             LogMessageType::Request => {
                 self.req_len = other.req_len;
@@ -114,6 +158,7 @@ impl MongoDBInfo {
                 self.op_code = other.op_code;
                 std::mem::swap(&mut self.request, &mut other.request);
                 self.request_id = other.request_id;
+                self.captured_request_byte = other.captured_request_byte;
             }
             LogMessageType::Response => {
                 self.response_code = other.response_code;
@@ -122,8 +167,16 @@ impl MongoDBInfo {
                 self.status = other.status;
                 self.response_id = other.response_id;
                 std::mem::swap(&mut self.response, &mut other.response);
+                self.captured_response_byte = other.captured_response_byte;
             }
             _ => {}
+        }
+    }
+
+    fn set_is_on_blacklist(&mut self, config: &LogParserConfig) {
+        if let Some(t) = config.l7_log_blacklist_trie.get(&L7Protocol::MongoDB) {
+            self.is_on_blacklist = t.request_resource.is_on_blacklist(&self.request)
+                || t.request_type.is_on_blacklist(&self.op_code_name);
         }
     }
 }
@@ -131,15 +184,17 @@ impl MongoDBInfo {
 impl From<MongoDBInfo> for L7ProtocolSendLog {
     fn from(f: MongoDBInfo) -> Self {
         let flags = if f.is_tls {
-            EbpfFlags::TLS.bits()
+            ApplicationFlags::TLS.bits()
         } else {
-            EbpfFlags::NONE.bits()
+            ApplicationFlags::NONE.bits()
         };
         let log = L7ProtocolSendLog {
+            captured_request_byte: f.captured_request_byte,
+            captured_response_byte: f.captured_response_byte,
             req_len: std::option::Option::<u32>::from(f.req_len),
             req: L7Request {
                 req_type: f.op_code_name,
-                resource: f.request.to_string(),
+                resource: f.request,
                 ..Default::default()
             },
             resp_len: std::option::Option::<u32>::from(f.resp_len),
@@ -161,42 +216,66 @@ impl From<MongoDBInfo> for L7ProtocolSendLog {
     }
 }
 
+impl From<&MongoDBInfo> for LogCache {
+    fn from(info: &MongoDBInfo) -> Self {
+        LogCache {
+            msg_type: info.msg_type,
+            resp_status: info.status,
+            on_blacklist: info.is_on_blacklist,
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct MongoDBLog {
     info: MongoDBInfo,
-    perf_stats: Option<L7PerfStats>,
+    perf_stats: Vec<L7PerfStats>,
 }
 
 impl L7ProtocolParserInterface for MongoDBLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
         if !param.ebpf_type.is_raw_protocol() {
-            return false;
+            return None;
         }
         if param.l4_protocol != IpProtocol::TCP {
-            return false;
+            return None;
         }
         let mut header = MongoDBHeader::default();
         let offset = header.decode(payload);
         if offset < 0 {
-            return false;
+            return None;
         }
 
         self.info.is_tls = param.is_tls();
-        return header.is_request();
+        if header.is_request() {
+            Some(LogMessageType::Request)
+        } else {
+            None
+        }
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
         let mut info = MongoDBInfo::default();
-        if self.perf_stats.is_none() {
-            self.perf_stats = Some(L7PerfStats::default())
-        };
 
         self.parse(payload, param.l4_protocol, param.direction, &mut info)?;
-        info.cal_rrt(param, None).map(|rrt| {
-            info.rrt = rrt;
-            self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
-        });
         info.is_tls = param.is_tls();
+        set_captured_byte!(info, param);
+        if let Some(config) = param.parse_config {
+            info.set_is_on_blacklist(config);
+        }
+        self.perf_stats.clear();
+        if param.parse_perf {
+            let mut perf_stat = L7PerfStats::default();
+            if let Some(mut stats) = info.perf_stats(param) {
+                if info.reply_false {
+                    stats.inc_resp_err();
+                }
+                info.rrt = stats.rrt_sum;
+                perf_stat.sequential_merge(&stats);
+            }
+            self.perf_stats.push(perf_stat);
+        }
         if param.parse_log {
             Ok(L7ParseResult::Single(L7ProtocolInfo::MongoDBInfo(info)))
         } else {
@@ -212,8 +291,8 @@ impl L7ProtocolParserInterface for MongoDBLog {
         false
     }
 
-    fn perf_stats(&mut self) -> Option<L7PerfStats> {
-        self.perf_stats.take()
+    fn perf_stats(&mut self) -> Vec<L7PerfStats> {
+        std::mem::take(&mut self.perf_stats)
     }
 }
 
@@ -236,7 +315,7 @@ const _HEADER_SIZE: usize = 16;
 
 const _EXCEPTION_OFFSET: usize = 20;
 const _COLLECTION_NAME_OFFSET: usize = 20;
-const _QUERY_DOC_OFFSET: usize = _COLLECTION_NAME_OFFSET + 8; // 8 is sizeof(Number to skip + Number to Reture)
+const _QUERY_DOC_OFFSET: usize = _COLLECTION_NAME_OFFSET + 8; // 8 is sizeof(Number to skip + Number to Return)
 const _MSG_DOC_SECTION_OFFSET: usize = _HEADER_SIZE + 4; // 4 is sizeof(Message Flags)
 
 impl MongoDBLog {
@@ -264,15 +343,11 @@ impl MongoDBLog {
             info.msg_type = LogMessageType::Request;
             self.info.req_len = header.length;
             info.request_id = header.request_id;
-            self.perf_stats
-                .as_mut()
-                .map(|p: &mut L7PerfStats| p.inc_req());
         } else {
             info.msg_type = LogMessageType::Response;
             self.info.resp_len = header.length;
             info.request_id = header.response_to;
             info.response_id = header.request_id;
-            self.perf_stats.as_mut().map(|p| p.inc_resp());
         }
 
         // command decode
@@ -298,9 +373,6 @@ impl MongoDBLog {
                                 msg_body.sections.c_string.unwrap_or(_UNKNOWN.to_string());
                         }
                         info.response_code = msg_body.sections.doc.get_i32("code").unwrap_or(0);
-                        if info.response_code > 0 {
-                            self.perf_stats.as_mut().map(|p| p.inc_req_err());
-                        }
                     }
                     _ => {
                         info.request = msg_body.sections.doc.to_string();
@@ -311,9 +383,7 @@ impl MongoDBLog {
                 // "OP_REPLY"
                 let mut msg_body = MongoOpReply::default();
                 msg_body.decode(&payload[_HEADER_SIZE..])?;
-                if !msg_body.reply_ok {
-                    self.perf_stats.as_mut().map(|p| p.inc_resp_err());
-                }
+                info.reply_false = !msg_body.reply_ok;
                 info.response = msg_body.doc.to_string();
                 info.exception = msg_body.response_msg;
             }
@@ -394,7 +464,7 @@ impl MongoDBHeader {
         if payload.len() < 16 {
             return -1;
         }
-        self.length = bytes::read_u32_le(payload) & 0xffffff;
+        self.length = bytes::read_u32_le(payload);
         if self.length < payload.len() as u32 {
             return -1;
         }
@@ -460,7 +530,7 @@ impl MongoOpMsg {
         let section_len = bytes::read_u32_le(
             &payload[Self::_DOC_LENGTH_OFFSET..Self::_DOC_LENGTH_OFFSET + Self::_DOC_LENGTH_LEN],
         );
-        if payload.len() < Self::_DOC_LENGTH_LEN + section_len as usize {
+        if payload.len() < Self::_KIND_LEN + section_len as usize {
             return Ok(false);
         }
         let _ = sections.decode(&payload);
@@ -623,9 +693,9 @@ mod tests {
     const FILE_DIR: &str = "resources/test/flow_generator/mongo";
 
     fn run(name: &str) -> String {
-        let capture = Capture::load_pcap(Path::new(FILE_DIR).join(name), None);
+        let capture = Capture::load_pcap(Path::new(FILE_DIR).join(name));
         let log_cache = Rc::new(RefCell::new(L7PerfCache::new(L7_RRT_CACHE_CAPACITY)));
-        let mut packets = capture.as_meta_packets();
+        let mut packets = capture.collect::<Vec<_>>();
         if packets.is_empty() {
             return "".to_string();
         }
@@ -644,17 +714,18 @@ mod tests {
             };
 
             let mut mongo = MongoDBLog::default();
-            let param = &ParseParam::new(
+            let param = &mut ParseParam::new(
                 packet as &MetaPacket,
-                log_cache.clone(),
+                Some(log_cache.clone()),
                 Default::default(),
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 Default::default(),
                 true,
                 true,
             );
+            param.set_captured_byte(payload.len());
 
-            let is_mongo = mongo.check_payload(payload, param);
+            let is_mongo = mongo.check_payload(payload, param).is_some();
             let info = mongo.parse_payload(payload, param);
             if let Ok(info) = info {
                 match info.unwrap_single() {
@@ -676,7 +747,10 @@ mod tests {
 
     #[test]
     fn check() {
-        let files = vec![("mongo.pcap", "mongo.result")];
+        let files = vec![
+            ("mongo.pcap", "mongo.result"),
+            ("mongo-msg.pcap", "mongo-msg.result"),
+        ];
 
         for item in files.iter() {
             let expected = fs::read_to_string(&Path::new(FILE_DIR).join(item.1)).unwrap();

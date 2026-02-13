@@ -21,9 +21,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -99,17 +100,17 @@ func IPFilterStringToHex(ip string) string {
 
 func ParseResponse(response *http.Response) (map[string]interface{}, error) {
 	var result map[string]interface{}
-	body, err := ioutil.ReadAll(response.Body)
+	body, err := io.ReadAll(response.Body)
 	if err == nil {
 		err = json.Unmarshal(body, &result)
 	}
 	return result, err
 }
 
-func GetDatasources(db string, table string) ([]string, error) {
+func GetDatasources(db string, table string, orgID string) ([]string, error) {
 	var datasources []string
 	switch db {
-	case "flow_metrics":
+	case "flow_metrics", DB_NAME_PROFILE, DB_NAME_EVENT:
 		var tsdbType string
 		if table == "network" || table == "network_map" {
 			tsdbType = "network"
@@ -117,14 +118,21 @@ func GetDatasources(db string, table string) ([]string, error) {
 			tsdbType = "application"
 		} else if table == TABLE_NAME_VTAP_ACL {
 			tsdbType = TABLE_NAME_VTAP_ACL
+		} else if table == TABLE_NAME_IN_PROCESS_METRICS {
+			tsdbType = TABLE_NAME_IN_PROCESS_METRICS
+		} else if table == TABLE_NAME_FILE_EVENT_METRICS {
+			tsdbType = TABLE_NAME_FILE_EVENT_METRICS
+		} else {
+			return datasources, nil
 		}
 		client := &http.Client{}
-		url := fmt.Sprintf("http://localhost:20417/v1/data-sources/?type=%s", tsdbType)
-		reqest, err := http.NewRequest("GET", url, nil)
+		url := fmt.Sprintf("http://localhost:%d/v1/data-sources/?type=%s", config.ControllerCfg.ListenPort, tsdbType)
+		request, err := http.NewRequest("GET", url, nil)
 		if err != nil {
 			return datasources, err
 		}
-		response, err := client.Do(reqest)
+		request.Header.Set("X-Org-Id", orgID)
+		response, err := client.Do(request)
 		if err != nil {
 			return datasources, err
 		}
@@ -148,7 +156,7 @@ func GetDatasources(db string, table string) ([]string, error) {
 	return datasources, nil
 }
 
-func GetDatasourceInterval(db string, table string, name string) (int, error) {
+func GetDatasourceInterval(db string, table string, name string, orgID string) (int, error) {
 	var tsdbType string
 	switch db {
 	case DB_NAME_FLOW_LOG, DB_NAME_EVENT, DB_NAME_PROFILE:
@@ -167,13 +175,13 @@ func GetDatasourceInterval(db string, table string, name string) (int, error) {
 		} else if table == TABLE_NAME_VTAP_ACL {
 			tsdbType = TABLE_NAME_VTAP_ACL
 		}
-	case DB_NAME_DEEPFLOW_SYSTEM, DB_NAME_EXT_METRICS, DB_NAME_PROMETHEUS:
+	case DB_NAME_DEEPFLOW_ADMIN, DB_NAME_DEEPFLOW_TENANT, DB_NAME_EXT_METRICS, DB_NAME_PROMETHEUS:
 		tsdbType = db
 	default:
 		return 1, nil
 	}
 	client := &http.Client{}
-	url := fmt.Sprintf("http://localhost:20417/v1/data-sources/?type=%s", tsdbType)
+	url := fmt.Sprintf("http://localhost:%d/v1/data-sources/?type=%s", config.ControllerCfg.ListenPort, tsdbType)
 	if name != "" {
 		url += fmt.Sprintf("&name=%s", name)
 	}
@@ -181,6 +189,7 @@ func GetDatasourceInterval(db string, table string, name string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
+	reqest.Header.Set("X-Org-Id", orgID)
 	response, err := client.Do(reqest)
 	if err != nil {
 		return 1, err
@@ -199,7 +208,7 @@ func GetDatasourceInterval(db string, table string, name string) (int, error) {
 	return int(body["DATA"].([]interface{})[0].(map[string]interface{})["INTERVAL"].(float64)), nil
 }
 
-func GetExtTables(db, queryCacheTTL string, useQueryCache bool, ctx context.Context) (values []interface{}) {
+func GetExtTables(db, where, queryCacheTTL, orgID string, useQueryCache bool, ctx context.Context, DebugInfo *client.DebugInfo) (values []interface{}) {
 	chClient := client.Client{
 		Host:     config.Cfg.Clickhouse.Host,
 		Port:     config.Cfg.Clickhouse.Port,
@@ -209,55 +218,35 @@ func GetExtTables(db, queryCacheTTL string, useQueryCache bool, ctx context.Cont
 		Context:  ctx,
 	}
 	sql := ""
-	if db == "ext_metrics" {
-		sql = "SELECT table FROM flow_tag.ext_metrics_custom_field GROUP BY table"
-		chClient.DB = "flow_tag"
-	} else if db == "deepflow_system" {
-		sql = "SELECT table FROM flow_tag.deepflow_system_custom_field GROUP BY table"
+	if slices.Contains([]string{DB_NAME_EXT_METRICS, DB_NAME_DEEPFLOW_ADMIN, DB_NAME_DEEPFLOW_TENANT, DB_NAME_PROMETHEUS}, db) {
+		if where != "" {
+			sql = fmt.Sprintf("SELECT table FROM flow_tag.%s_custom_field ", db) + " WHERE " + strings.Replace(where, " name ", " table ", -1) + " GROUP BY table"
+		} else {
+			sql = fmt.Sprintf("SELECT table FROM flow_tag.%s_custom_field GROUP BY table", db)
+		}
 		chClient.DB = "flow_tag"
 	} else {
-		sql = "SHOW TABLES FROM " + db
-	}
-	rst, err := chClient.DoQuery(&client.QueryParams{Sql: sql, UseQueryCache: useQueryCache, QueryCacheTTL: queryCacheTTL})
-	if err != nil {
-		log.Error(err)
-		return nil
-	}
-	for _, _table := range rst.Values {
-		table := _table.([]interface{})[0].(string)
-		if !strings.HasSuffix(table, "_local") {
-			datasources, _ := GetDatasources(db, table)
-			values = append(values, []interface{}{table, datasources})
+		// there is currently no such scene
+		if where != "" {
+			sql = "SHOW TABLES FROM " + db + " WHERE " + where
+		} else {
+			sql = "SHOW TABLES FROM " + db
 		}
 	}
-	return values
-}
-
-func GetPrometheusTables(db, queryCacheTTL string, useQueryCache bool, ctx context.Context) (values []interface{}) {
-	chClient := client.Client{
-		Host:     config.Cfg.Clickhouse.Host,
-		Port:     config.Cfg.Clickhouse.Port,
-		UserName: config.Cfg.Clickhouse.User,
-		Password: config.Cfg.Clickhouse.Password,
-		DB:       db,
-		Context:  ctx,
-	}
-	sql := ""
-	if db == "prometheus" {
-		sql = "SELECT table FROM flow_tag.prometheus_custom_field GROUP BY table"
-		chClient.DB = "flow_tag"
-	} else {
-		sql = "SHOW TABLES FROM " + db
-	}
-	rst, err := chClient.DoQuery(&client.QueryParams{Sql: sql, UseQueryCache: useQueryCache, QueryCacheTTL: queryCacheTTL})
+	// for debug
+	chClient.Debug = client.NewDebug(sql)
+	rst, err := chClient.DoQuery(&client.QueryParams{Sql: sql, UseQueryCache: useQueryCache, QueryCacheTTL: queryCacheTTL, ORGID: orgID})
 	if err != nil {
 		log.Error(err)
 		return nil
 	}
+	if DebugInfo != nil {
+		DebugInfo.Debug = append(DebugInfo.Debug, *chClient.Debug)
+	}
 	for _, _table := range rst.Values {
 		table := _table.([]interface{})[0].(string)
 		if !strings.HasSuffix(table, "_local") {
-			datasources, _ := GetDatasources(db, table)
+			datasources, _ := GetDatasources(db, table, orgID)
 			values = append(values, []interface{}{table, datasources})
 		}
 	}

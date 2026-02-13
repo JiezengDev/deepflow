@@ -17,41 +17,43 @@
 package model
 
 import (
-	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"time"
+
+	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 )
 
 type KubernetesGatherResource struct {
-	ErrorState             int
-	ErrorMessage           string
-	Region                 model.Region
-	AZ                     model.AZ
-	VPC                    model.VPC
-	PodCluster             model.PodCluster
-	PodNodes               []model.PodNode
-	PodNamespaces          []model.PodNamespace
-	PodGroups              []model.PodGroup
-	PodReplicaSets         []model.PodReplicaSet
-	Pods                   []model.Pod
-	PodServices            []model.PodService
-	PodServicePorts        []model.PodServicePort
-	PodGroupPorts          []model.PodGroupPort
-	PodIngresses           []model.PodIngress
-	PodIngressRules        []model.PodIngressRule
-	PodIngressRuleBackends []model.PodIngressRuleBackend
-	PodNodeNetwork         model.Network
-	PodNodeSubnets         []model.Subnet
-	PodNodeVInterfaces     []model.VInterface
-	PodNodeIPs             []model.IP
-	PodServiceNetwork      model.Network
-	PodServiceSubnets      []model.Subnet
-	PodServiceVInterfaces  []model.VInterface
-	PodServiceIPs          []model.IP
-	PodNetwork             model.Network
-	PodSubnets             []model.Subnet
-	PodVInterfaces         []model.VInterface
-	PodIPs                 []model.IP
-	PrometheusTargets      []model.PrometheusTarget
+	ErrorState                   int
+	ErrorMessage                 string
+	Region                       model.Region
+	AZ                           model.AZ
+	VPC                          model.VPC
+	PodCluster                   model.PodCluster
+	PodNodes                     []model.PodNode
+	PodNamespaces                []model.PodNamespace
+	PodGroups                    []model.PodGroup
+	PodGroupConfigMapConnections []model.PodGroupConfigMapConnection
+	PodReplicaSets               []model.PodReplicaSet
+	ConfigMaps                   []model.ConfigMap
+	Pods                         []model.Pod
+	PodServices                  []model.PodService
+	PodServicePorts              []model.PodServicePort
+	PodGroupPorts                []model.PodGroupPort
+	PodIngresses                 []model.PodIngress
+	PodIngressRules              []model.PodIngressRule
+	PodIngressRuleBackends       []model.PodIngressRuleBackend
+	PodNodeNetwork               model.Network
+	PodNodeSubnets               []model.Subnet
+	PodNodeVInterfaces           []model.VInterface
+	PodNodeIPs                   []model.IP
+	PodServiceNetwork            model.Network
+	PodServiceSubnets            []model.Subnet
+	PodServiceVInterfaces        []model.VInterface
+	PodServiceIPs                []model.IP
+	PodNetwork                   model.Network
+	PodSubnets                   []model.Subnet
+	PodVInterfaces               []model.VInterface
+	PodIPs                       []model.IP
 }
 
 type KubernetesGatherBasicInfo struct {
@@ -59,6 +61,7 @@ type KubernetesGatherBasicInfo struct {
 	Name                  string        `json:"name"`
 	ClusterID             string        `json:"cluster_id"`
 	PortNameRegex         string        `json:"port_name_regex"`
+	TeamID                int           `json:"team_id"`
 	PodNetIPv4CIDRMaxMask int           `json:"pod_net_ipv4_cidr_max_mask"`
 	PodNetIPv6CIDRMaxMask int           `json:"pod_net_ipv6_cidr_max_mask"`
 	Interval              time.Duration `json:"interval"`

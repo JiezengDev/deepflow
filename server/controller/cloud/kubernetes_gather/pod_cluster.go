@@ -19,38 +19,39 @@ package kubernetes_gather
 import (
 	"errors"
 
+	"github.com/bitly/go-simplejson"
+
+	cloudcommon "github.com/deepflowio/deepflow/server/controller/cloud/common"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-
-	"github.com/bitly/go-simplejson"
-	uuid "github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (k *KubernetesGather) getPodCluster() (model.PodCluster, error) {
-	log.Debug("get pod cluster starting")
-	vInfo, ok := k.k8sInfo["*version.Info"]
-	if !ok || len(vInfo) == 0 {
+	log.Debug("get pod cluster starting", logger.NewORGPrefix(k.orgID))
+	vEntries, ok := k.k8sEntries["*version.Info"]
+	if !ok || len(vEntries) == 0 {
 		return model.PodCluster{}, errors.New("not found k8s version info")
 	}
 
-	vJson, vErr := simplejson.NewJson([]byte(vInfo[0]))
+	vJson, vErr := simplejson.NewJson(vEntries[0])
 	if vErr != nil {
-		log.Errorf("pod cluster initialization version json error: (%s)", vErr.Error())
+		log.Errorf("pod cluster initialization version json error: (%s)", vErr.Error(), logger.NewORGPrefix(k.orgID))
 		return model.PodCluster{}, vErr
 	}
 	version := vJson.Get("gitVersion").MustString()
 	if version == "" {
 		return model.PodCluster{}, errors.New("not found k8s gitversion")
 	}
-	k.podClusterLcuuid = common.GetUUID(k.UuidGenerate, uuid.Nil)
+	k.podClusterLcuuid = common.GetUUIDByOrgID(k.orgID, k.UuidGenerate)
 	podCluster := model.PodCluster{
 		Lcuuid:       k.podClusterLcuuid,
-		Version:      K8S_VERSION_PREFIX + " " + version,
+		Version:      cloudcommon.K8S_VERSION_PREFIX + " " + version,
 		Name:         k.Name,
 		VPCLcuuid:    k.VPCUUID,
 		AZLcuuid:     k.azLcuuid,
 		RegionLcuuid: k.RegionUUID,
 	}
-	log.Debug("get pod cluster complete")
+	log.Debug("get pod cluster complete", logger.NewORGPrefix(k.orgID))
 	return podCluster, nil
 }

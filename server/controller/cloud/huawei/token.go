@@ -18,11 +18,15 @@ package huawei
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
 	cloudcommon "github.com/deepflowio/deepflow/server/controller/cloud/common"
-	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
+
+// This project is not an actual project that is visible to the console, so ignore its exceptions when learning
+var ignoredProjectName = "MOS"
 
 type Token struct {
 	token     string
@@ -92,48 +96,51 @@ func (h *HuaWei) createToken(projectName, projectID string) (*Token, error) {
 	return &Token{resp.Get("X-Subject-Token").MustString(), resp.Get("token").Get("expires_at").MustString()}, nil
 }
 
-func (h *HuaWei) refreshTokenMap() (err error) {
-	log.Infof("refresh cloud (%s) token map", h.name)
-
+func (h *HuaWei) refreshTokenMap() error {
+	log.Infof("refresh cloud (%s) token map", h.name, logger.NewORGPrefix(h.orgID))
+	var err error
 	token, err := h.getToken(h.config.ProjectName, h.config.ProjectID)
 	if err != nil {
-		return
+		return err
 	}
 	h.toolDataSet.configProjectToken = token.token
 
 	projectIDs := []string{}
 	jProjects, err := h.getRawData(newRawDataGetContext(fmt.Sprintf("https://%s/v3/auth/projects", h.config.IAMHost), token.token, "projects", pageQueryMethodNotPage))
 	if err != nil {
-		return
+		return err
 	}
 	for i := range jProjects {
 		jp := jProjects[i]
 		if !cloudcommon.CheckJsonAttributes(jp, []string{"id", "name"}) {
-			continue
+			err := fmt.Errorf("json attributes not match, id: %s, name: %s", jp.Get("id").MustString(), jp.Get("name").MustString())
+			log.Error(err.Error(), logger.NewORGPrefix(h.orgID))
+			return err
 		}
 		name := jp.Get("name").MustString()
-		if len(h.config.IncludeRegions) > 0 && !common.Contains(h.config.IncludeRegions, name) {
-			log.Infof("exclude project: %s, not included", name)
-			continue
-		}
-		if common.Contains(h.config.ExcludeRegions, name) {
-			log.Infof("exclude project: %s", name)
+		if _, ok := h.config.IncludeRegions[name]; !ok {
+			log.Infof("exclude project: %s, not included", name, logger.NewORGPrefix(h.orgID))
 			continue
 		}
 
 		id := jp.Get("id").MustString()
 		token, err = h.getToken(name, id)
 		if err != nil {
-			log.Errorf("get token failed, pass this project (%s, %s)", name, id)
-			continue
+			msg := fmt.Sprintf("get token failed, pass this project (%s, %s)", name, id)
+			if name == ignoredProjectName {
+				log.Info(msg, logger.NewORGPrefix(h.orgID))
+			} else {
+				log.Error(msg, logger.NewORGPrefix(h.orgID))
+			}
+			return err
 		}
 		projectIDs = append(projectIDs, id)
 		h.projectTokenMap[Project{name, id}] = token
 	}
 
 	for p, t := range h.projectTokenMap {
-		if !common.Contains(projectIDs, p.id) {
-			log.Infof("project (%+v) lose", p)
+		if !slices.Contains(projectIDs, p.id) {
+			log.Infof("exclude project: %+v, not in project list: %+v", p, jProjects, logger.NewORGPrefix(h.orgID))
 			delete(h.projectTokenMap, p)
 			continue
 		}
@@ -141,15 +148,14 @@ func (h *HuaWei) refreshTokenMap() (err error) {
 			fmt.Sprintf("https://vpc.%s.%s/v1/%s/vpcs", p.name, h.config.Domain, p.id), t.token, "vpcs", pageQueryMethodMarker,
 		))
 		if err != nil {
-			delete(h.projectTokenMap, p)
-			continue
+			return err
 		} else if len(jvpcs) == 0 {
-			log.Infof("exclude project (%+v), has no vpc", p)
+			log.Infof("exclude project: %+v, has no vpc", p, logger.NewORGPrefix(h.orgID))
 			delete(h.projectTokenMap, p)
 			continue
 		}
-		log.Infof("project info (%+v)", p)
-		log.Debugf("token info (%+v)", t)
+		log.Infof("project info (%+v)", p, logger.NewORGPrefix(h.orgID))
+		log.Debugf("token info (%+v)", t, logger.NewORGPrefix(h.orgID))
 	}
-	return
+	return nil
 }

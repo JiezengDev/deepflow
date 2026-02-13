@@ -17,21 +17,23 @@
 package idmng
 
 import (
-	"sort"
+	"fmt"
 	"sync"
 
 	mapset "github.com/deckarep/golang-set/v2"
-	"github.com/op/go-logging"
 
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql/query"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb/query"
 	"github.com/deepflowio/deepflow/server/controller/recorder/common"
 	. "github.com/deepflowio/deepflow/server/controller/recorder/config"
-	. "github.com/deepflowio/deepflow/server/controller/recorder/constraint"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-var log = logging.MustGetLogger("recorder.idmng")
+var log = logger.MustGetLogger("recorder.idmng")
+
+var minID = 1
 
 type IDManager struct {
 	org *common.ORG
@@ -40,6 +42,7 @@ type IDManager struct {
 }
 
 func newIDManager(cfg RecorderConfig, orgID int) (*IDManager, error) {
+	log.Infof("create id manager for org: %d", orgID)
 	org, err := common.NewORG(orgID)
 	if err != nil {
 		log.Errorf("failed to create org object: %s", err.Error())
@@ -47,38 +50,49 @@ func newIDManager(cfg RecorderConfig, orgID int) (*IDManager, error) {
 	}
 	mng := &IDManager{org: org}
 	mng.resourceTypeToIDPool = map[string]IDPoolUpdater{
-		ctrlrcommon.RESOURCE_TYPE_REGION_EN:        newIDPool[mysql.Region](mng.org, ctrlrcommon.RESOURCE_TYPE_REGION_EN, cfg.ResourceMaxID0),
-		ctrlrcommon.RESOURCE_TYPE_AZ_EN:            newIDPool[mysql.AZ](mng.org, ctrlrcommon.RESOURCE_TYPE_AZ_EN, cfg.ResourceMaxID0),
-		ctrlrcommon.RESOURCE_TYPE_HOST_EN:          newIDPool[mysql.Host](mng.org, ctrlrcommon.RESOURCE_TYPE_HOST_EN, cfg.ResourceMaxID0),
-		ctrlrcommon.RESOURCE_TYPE_VPC_EN:           newIDPool[mysql.VPC](mng.org, ctrlrcommon.RESOURCE_TYPE_VPC_EN, cfg.ResourceMaxID0),
-		ctrlrcommon.RESOURCE_TYPE_NETWORK_EN:       newIDPool[mysql.Network](mng.org, ctrlrcommon.RESOURCE_TYPE_NETWORK_EN, cfg.ResourceMaxID0),
-		ctrlrcommon.RESOURCE_TYPE_POD_CLUSTER_EN:   newIDPool[mysql.PodCluster](mng.org, ctrlrcommon.RESOURCE_TYPE_POD_CLUSTER_EN, cfg.ResourceMaxID0),
-		ctrlrcommon.RESOURCE_TYPE_POD_NAMESPACE_EN: newIDPool[mysql.PodNamespace](mng.org, ctrlrcommon.RESOURCE_TYPE_POD_NAMESPACE_EN, cfg.ResourceMaxID0),
+		ctrlrcommon.RESOURCE_TYPE_REGION_EN:        newIDPool[metadbmodel.Region](mng.org, ctrlrcommon.RESOURCE_TYPE_REGION_EN, cfg.ResourceMaxID0),
+		ctrlrcommon.RESOURCE_TYPE_AZ_EN:            newIDPool[metadbmodel.AZ](mng.org, ctrlrcommon.RESOURCE_TYPE_AZ_EN, cfg.ResourceMaxID0),
+		ctrlrcommon.RESOURCE_TYPE_HOST_EN:          newIDPool[metadbmodel.Host](mng.org, ctrlrcommon.RESOURCE_TYPE_HOST_EN, cfg.ResourceMaxID0),
+		ctrlrcommon.RESOURCE_TYPE_VPC_EN:           newIDPool[metadbmodel.VPC](mng.org, ctrlrcommon.RESOURCE_TYPE_VPC_EN, cfg.ResourceMaxID0),
+		ctrlrcommon.RESOURCE_TYPE_NETWORK_EN:       newIDPool[metadbmodel.Network](mng.org, ctrlrcommon.RESOURCE_TYPE_NETWORK_EN, cfg.ResourceMaxID0),
+		ctrlrcommon.RESOURCE_TYPE_POD_CLUSTER_EN:   newIDPool[metadbmodel.PodCluster](mng.org, ctrlrcommon.RESOURCE_TYPE_POD_CLUSTER_EN, cfg.ResourceMaxID0),
+		ctrlrcommon.RESOURCE_TYPE_POD_NAMESPACE_EN: newIDPool[metadbmodel.PodNamespace](mng.org, ctrlrcommon.RESOURCE_TYPE_POD_NAMESPACE_EN, cfg.ResourceMaxID0),
 
-		ctrlrcommon.RESOURCE_TYPE_VM_EN:              newIDPool[mysql.VM](mng.org, ctrlrcommon.RESOURCE_TYPE_VM_EN, cfg.ResourceMaxID1),
-		ctrlrcommon.RESOURCE_TYPE_VROUTER_EN:         newIDPool[mysql.VRouter](mng.org, ctrlrcommon.RESOURCE_TYPE_VROUTER_EN, cfg.ResourceMaxID1),
-		ctrlrcommon.RESOURCE_TYPE_DHCP_PORT_EN:       newIDPool[mysql.DHCPPort](mng.org, ctrlrcommon.RESOURCE_TYPE_DHCP_PORT_EN, cfg.ResourceMaxID1),
-		ctrlrcommon.RESOURCE_TYPE_RDS_INSTANCE_EN:    newIDPool[mysql.RDSInstance](mng.org, ctrlrcommon.RESOURCE_TYPE_RDS_INSTANCE_EN, cfg.ResourceMaxID1),
-		ctrlrcommon.RESOURCE_TYPE_REDIS_INSTANCE_EN:  newIDPool[mysql.RedisInstance](mng.org, ctrlrcommon.RESOURCE_TYPE_REDIS_INSTANCE_EN, cfg.ResourceMaxID1),
-		ctrlrcommon.RESOURCE_TYPE_NAT_GATEWAY_EN:     newIDPool[mysql.NATGateway](mng.org, ctrlrcommon.RESOURCE_TYPE_NAT_GATEWAY_EN, cfg.ResourceMaxID1),
-		ctrlrcommon.RESOURCE_TYPE_LB_EN:              newIDPool[mysql.LB](mng.org, ctrlrcommon.RESOURCE_TYPE_LB_EN, cfg.ResourceMaxID1),
-		ctrlrcommon.RESOURCE_TYPE_POD_NODE_EN:        newIDPool[mysql.PodNode](mng.org, ctrlrcommon.RESOURCE_TYPE_POD_NODE_EN, cfg.ResourceMaxID1),
-		ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN:     newIDPool[mysql.PodService](mng.org, ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN, cfg.ResourceMaxID1),
-		ctrlrcommon.RESOURCE_TYPE_POD_EN:             newIDPool[mysql.Pod](mng.org, ctrlrcommon.RESOURCE_TYPE_POD_EN, cfg.ResourceMaxID1),
-		ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_EN:     newIDPool[mysql.PodIngress](mng.org, ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_EN, cfg.ResourceMaxID1),
-		ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN:       newIDPool[mysql.PodGroup](mng.org, ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN, cfg.ResourceMaxID1),
-		ctrlrcommon.RESOURCE_TYPE_POD_REPLICA_SET_EN: newIDPool[mysql.PodReplicaSet](mng.org, ctrlrcommon.RESOURCE_TYPE_POD_REPLICA_SET_EN, cfg.ResourceMaxID1),
-		ctrlrcommon.RESOURCE_TYPE_PROCESS_EN:         newIDPool[mysql.Process](mng.org, ctrlrcommon.RESOURCE_TYPE_PROCESS_EN, cfg.ResourceMaxID1),
+		ctrlrcommon.RESOURCE_TYPE_VM_EN:              newIDPool[metadbmodel.VM](mng.org, ctrlrcommon.RESOURCE_TYPE_VM_EN, cfg.ResourceMaxID1),
+		ctrlrcommon.RESOURCE_TYPE_VROUTER_EN:         newIDPool[metadbmodel.VRouter](mng.org, ctrlrcommon.RESOURCE_TYPE_VROUTER_EN, cfg.ResourceMaxID1),
+		ctrlrcommon.RESOURCE_TYPE_DHCP_PORT_EN:       newIDPool[metadbmodel.DHCPPort](mng.org, ctrlrcommon.RESOURCE_TYPE_DHCP_PORT_EN, cfg.ResourceMaxID1),
+		ctrlrcommon.RESOURCE_TYPE_RDS_INSTANCE_EN:    newIDPool[metadbmodel.RDSInstance](mng.org, ctrlrcommon.RESOURCE_TYPE_RDS_INSTANCE_EN, cfg.ResourceMaxID1),
+		ctrlrcommon.RESOURCE_TYPE_REDIS_INSTANCE_EN:  newIDPool[metadbmodel.RedisInstance](mng.org, ctrlrcommon.RESOURCE_TYPE_REDIS_INSTANCE_EN, cfg.ResourceMaxID1),
+		ctrlrcommon.RESOURCE_TYPE_NAT_GATEWAY_EN:     newIDPool[metadbmodel.NATGateway](mng.org, ctrlrcommon.RESOURCE_TYPE_NAT_GATEWAY_EN, cfg.ResourceMaxID1),
+		ctrlrcommon.RESOURCE_TYPE_LB_EN:              newIDPool[metadbmodel.LB](mng.org, ctrlrcommon.RESOURCE_TYPE_LB_EN, cfg.ResourceMaxID1),
+		ctrlrcommon.RESOURCE_TYPE_POD_NODE_EN:        newIDPool[metadbmodel.PodNode](mng.org, ctrlrcommon.RESOURCE_TYPE_POD_NODE_EN, cfg.ResourceMaxID1),
+		ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN:     newIDPool[metadbmodel.PodService](mng.org, ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN, cfg.ResourceMaxID1),
+		ctrlrcommon.RESOURCE_TYPE_POD_EN:             newIDPool[metadbmodel.Pod](mng.org, ctrlrcommon.RESOURCE_TYPE_POD_EN, cfg.ResourceMaxID1),
+		ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_EN:     newIDPool[metadbmodel.PodIngress](mng.org, ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_EN, cfg.ResourceMaxID1),
+		ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN:       newIDPool[metadbmodel.PodGroup](mng.org, ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN, cfg.ResourceMaxID1),
+		ctrlrcommon.RESOURCE_TYPE_POD_REPLICA_SET_EN: newIDPool[metadbmodel.PodReplicaSet](mng.org, ctrlrcommon.RESOURCE_TYPE_POD_REPLICA_SET_EN, cfg.ResourceMaxID1),
+		ctrlrcommon.RESOURCE_TYPE_PROCESS_EN:         newIDPool[metadbmodel.Process](mng.org, ctrlrcommon.RESOURCE_TYPE_PROCESS_EN, cfg.ResourceMaxID1),
+		ctrlrcommon.RESOURCE_TYPE_GPROCESS_EN:        newProcessGIDPool(mng.org, ctrlrcommon.RESOURCE_TYPE_GPROCESS_EN, cfg.ResourceMaxID1),
+		ctrlrcommon.RESOURCE_TYPE_VTAP_EN:            newIDPool[metadbmodel.VTap](mng.org, ctrlrcommon.RESOURCE_TYPE_VTAP_EN, cfg.ResourceMaxID0),
+	}
 
-		// both recorder and prometheus need to insert data into prometheus_target, they equally share the id pool of prometheus_target.
-		// recorder uses ids [1, max/2+max%2], prometheus uses ids [max/2+max%2+1, max].
-		ctrlrcommon.RESOURCE_TYPE_PROMETHEUS_TARGET_EN: newIDPool[mysql.PrometheusTarget](mng.org, ctrlrcommon.RESOURCE_TYPE_PROMETHEUS_TARGET_EN, cfg.ResourceMaxID1/2+cfg.ResourceMaxID1%2),
+	orgTableExists, err := metadb.CheckIfORGTableExists()
+	if err != nil {
+		log.Errorf("failed to check if org table exists: %s", err.Error())
+		return nil, err
+	}
+	if orgTableExists && orgID == ctrlrcommon.DEFAULT_ORG_ID {
+		mng.resourceTypeToIDPool[ctrlrcommon.RESOURCE_TYPE_ORG_EN] = newORGIDPool(
+			mng.org, ctrlrcommon.RESOURCE_TYPE_ORG_EN, ctrlrcommon.ORG_ID_MAX,
+		)
 	}
 	return mng, nil
 }
 
 func (m *IDManager) Refresh() error {
-	log.Info(m.org.LogPre("refresh id pools"))
+	log.Info("refresh id pools started", m.org.LogPrefix)
+	defer log.Info("refresh id pools completed", m.org.LogPrefix)
+
 	var result error
 	for _, idPool := range m.resourceTypeToIDPool {
 		err := idPool.refresh()
@@ -92,7 +106,7 @@ func (m *IDManager) Refresh() error {
 func (m *IDManager) AllocateIDs(resourceType string, count int) []int {
 	idPool, ok := m.resourceTypeToIDPool[resourceType]
 	if !ok {
-		log.Error(m.org.LogPre("resource type (%s) does not need to allocate id", resourceType))
+		log.Errorf("resource type: %s does not need to allocate id", resourceType, m.org.LogPrefix)
 		return []int{}
 	}
 	ids, _ := idPool.allocate(count)
@@ -102,7 +116,7 @@ func (m *IDManager) AllocateIDs(resourceType string, count int) []int {
 func (m *IDManager) RecycleIDs(resourceType string, ids []int) {
 	idPool, ok := m.resourceTypeToIDPool[resourceType]
 	if !ok {
-		log.Error(m.org.LogPre("resource type (%s) does not need to allocate id", resourceType))
+		log.Errorf("resource type: %s does not need to allocate id", resourceType, m.org.LogPrefix)
 		return
 	}
 	idPool.recycle(ids)
@@ -115,84 +129,74 @@ type IDPoolUpdater interface {
 	recycle(ids []int)
 }
 
+type idGetter[MT metadbmodel.ResourceNeedBeAllocatedIDConstraint] interface {
+	getRealID(*MT) int
+}
+
 // 缓存资源可用于分配的ID，提供ID的刷新、分配、回收接口
-type IDPool[MT MySQLModel] struct {
-	org          *common.ORG
-	resourceType string
-	mutex        sync.RWMutex
-	max          int
-	usableIDs    []int
+type IDPool[MT metadbmodel.ResourceNeedBeAllocatedIDConstraint] struct {
+	mutex    sync.RWMutex
+	keyField string
+	AscIDAllocator
+
+	idGetter idGetter[MT]
 }
 
-func newIDPool[MT MySQLModel](org *common.ORG, resourceType string, max int) *IDPool[MT] {
-	return &IDPool[MT]{
-		org: org,
-
-		resourceType: resourceType,
-		max:          max,
+func newIDPool[MT metadbmodel.ResourceNeedBeAllocatedIDConstraint](org *common.ORG, resourceType string, max int) *IDPool[MT] {
+	p := &IDPool[MT]{
+		keyField:       "id",
+		AscIDAllocator: NewAscIDAllocator(org, resourceType, minID, max),
 	}
+	p.SetInUseIDsProvider(p)
+	return p
 }
 
-func (p *IDPool[MT]) refresh() error {
-	log.Info(p.org.LogPre("refresh %s id pools started", p.resourceType))
+func (p *IDPool[MT]) resetKeyField(keyField string) {
+	p.keyField = keyField
+}
 
-	var items []*MT
-	var err error
-	// TODO do not handle concrete resource in common, create new type IDPool for process and target
-	if p.resourceType == ctrlrcommon.RESOURCE_TYPE_PROCESS_EN {
-		items, err = query.FindInBatches[MT](p.org.DB.Unscoped().Select("id"))
-	} else if p.resourceType == ctrlrcommon.RESOURCE_TYPE_PROMETHEUS_TARGET_EN {
-		err = p.org.DB.Unscoped().Where(&mysql.PrometheusTarget{CreateMethod: ctrlrcommon.PROMETHEUS_TARGET_CREATE_METHOD_RECORDER}).Select("id").Find(&items).Error
-	} else {
-		err = p.org.DB.Unscoped().Select("id").Find(&items).Error
-	}
+func (p *IDPool[MT]) load() (mapset.Set[int], error) {
+	items, err := query.FindInBatches[MT](p.org.DB.Unscoped().Select(p.keyField))
 	if err != nil {
-		log.Error(p.org.LogPre("db query %s failed: %v", p.resourceType, err))
-		return err
+		log.Errorf("failed to query %s: %v", p.resourceType, err, p.org.LogPrefix)
+		return nil, err
 	}
 	inUseIDsSet := mapset.NewSet[int]()
 	for _, item := range items {
-		inUseIDsSet.Add((*item).GetID())
+		inUseIDsSet.Add(p.getID(item))
 	}
-	allIDsSet := mapset.NewSet[int]()
-	for i := 1; i <= p.max; i++ {
-		allIDsSet.Add(i)
-	}
+	log.Infof("loaded %s ids successfully", p.resourceType, p.org.LogPrefix)
+	return inUseIDsSet, nil
+}
 
+func (p *IDPool[MT]) check(ids []int) ([]int, error) {
+	var dbItems []*MT
+	err := p.org.DB.Unscoped().Where(fmt.Sprintf("%s IN ?", p.keyField), ids).Find(&dbItems).Error
+	if err != nil {
+		log.Errorf("failed to query %s: %v", p.resourceType, err, p.org.LogPrefix)
+		return nil, err
+	}
+	inUseIDs := make([]int, 0)
+	if len(dbItems) != 0 {
+		for _, item := range dbItems {
+			inUseIDs = append(inUseIDs, p.getID(item))
+		}
+		log.Infof("%s ids: %+v are in use.", p.resourceType, inUseIDs, p.org.LogPrefix)
+	}
+	return inUseIDs, nil
+}
+
+func (p *IDPool[MT]) getID(item *MT) int {
+	if p.idGetter == nil {
+		return (*item).GetID()
+	}
+	return p.idGetter.getRealID(item)
+}
+
+func (p *IDPool[MT]) refresh() error {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-	// 可用ID = 所有ID（1~max）- db中正在使用的ID
-	// 排序原则：大于db正在使用的max值的ID（未曾被使用过的ID）优先，小于db正在使用的max值的ID（已被使用过且已回收的ID）在后
-	var usableIDs []int
-	if inUseIDsSet.Cardinality() != 0 {
-		inUseIDs := inUseIDsSet.ToSlice()
-		sort.IntSlice(inUseIDs).Sort()
-		maxInUseID := inUseIDs[len(inUseIDs)-1]
-
-		usableIDsSet := allIDsSet.Difference(inUseIDsSet)
-		usedIDs := []int{}
-		usableIDs = usableIDsSet.ToSlice()
-		sort.IntSlice(usableIDs).Sort()
-		for _, id := range usableIDs {
-			if id < maxInUseID {
-				usedIDs = append(usedIDs, id)
-				usableIDsSet.Remove(id)
-			} else {
-				break
-			}
-		}
-		usableIDs = usableIDsSet.ToSlice()
-		sort.IntSlice(usableIDs).Sort()
-		sort.IntSlice(usedIDs).Sort()
-		usableIDs = append(usableIDs, usedIDs...)
-	} else {
-		usableIDs = allIDsSet.ToSlice()
-		sort.IntSlice(usableIDs).Sort()
-	}
-	p.usableIDs = usableIDs
-
-	log.Info(p.org.LogPre("refresh %s id pools (usable ids count: %d) completed", p.resourceType, len(p.usableIDs)))
-	return nil
+	return p.Refresh()
 }
 
 // 批量分配ID，若ID池中数量不足，分配ID池所有ID；反之分配指定个数ID。
@@ -200,43 +204,41 @@ func (p *IDPool[MT]) refresh() error {
 func (p *IDPool[MT]) allocate(count int) (ids []int, err error) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-
-	if len(p.usableIDs) == 0 {
-		log.Error(p.org.LogPre("%s has no more usable ids", p.resourceType))
-		return
-	}
-
-	trueCount := count
-	if len(p.usableIDs) < count {
-		trueCount = len(p.usableIDs)
-	}
-	ids = make([]int, trueCount)
-	copy(ids, p.usableIDs[:trueCount])
-	p.usableIDs = p.usableIDs[trueCount:]
-
-	var dbItems []*MT
-	err = p.org.DB.Unscoped().Where("id IN ?", ids).Find(&dbItems).Error
-	if err != nil {
-		log.Error(p.org.LogPre("db query %s failed: %v", p.resourceType, err))
-		return
-	}
-	if len(dbItems) != 0 {
-		inUseIDs := make([]int, 0, len(dbItems))
-		for _, item := range dbItems {
-			inUseIDs = append(inUseIDs, (*item).GetID())
-		}
-		log.Info(p.org.LogPre("%s ids: %+v are in use.", p.resourceType, inUseIDs))
-		ids = mapset.NewSet(ids...).Difference(mapset.NewSet(inUseIDs...)).ToSlice()
-	}
-	log.Info(p.org.LogPre("allocate %s ids: %v (expected count: %d, true count: %d)", p.resourceType, ids, count, len(ids)))
-	return
+	return p.Allocate(count)
 }
 
 func (p *IDPool[MT]) recycle(ids []int) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
+	p.Recycle(ids)
+}
 
-	sort.IntSlice(ids).Sort()
-	p.usableIDs = append(p.usableIDs, ids...)
-	log.Info(p.org.LogPre("recycle %s ids: %v", p.resourceType, ids))
+type ProcessGIDPool struct {
+	*IDPool[metadbmodel.Process]
+}
+
+func newProcessGIDPool(org *common.ORG, resourceType string, max int) IDPoolUpdater {
+	p := &ProcessGIDPool{newIDPool[metadbmodel.Process](org, resourceType, max)}
+	p.idGetter = p
+	p.resetKeyField("gid")
+	return p
+}
+
+func (p *ProcessGIDPool) getRealID(item *metadbmodel.Process) int {
+	return int(item.GID)
+}
+
+type ORGIDPool struct {
+	*IDPool[metadbmodel.ORG]
+}
+
+func newORGIDPool(org *common.ORG, resourceType string, max int) IDPoolUpdater {
+	p := &ORGIDPool{newIDPool[metadbmodel.ORG](org, resourceType, max)}
+	p.idGetter = p
+	p.resetKeyField("org_id")
+	return p
+}
+
+func (p *ORGIDPool) getRealID(item *metadbmodel.ORG) int {
+	return item.ORGID
 }

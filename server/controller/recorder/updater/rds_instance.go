@@ -19,68 +19,72 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
+
+// RDSInstanceMessageFactory defines the message factory for RDSInstance
+type RDSInstanceMessageFactory struct{}
+
+func (f *RDSInstanceMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedRDSInstances{}
+}
+
+func (f *RDSInstanceMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedRDSInstance{}
+}
+
+func (f *RDSInstanceMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedRDSInstances{}
+}
+
+func (f *RDSInstanceMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedRDSInstanceFields{}
+}
 
 type RDSInstance struct {
 	UpdaterBase[
 		cloudmodel.RDSInstance,
-		mysql.RDSInstance,
 		*diffbase.RDSInstance,
-		*message.RDSInstanceAdd,
-		message.RDSInstanceAdd,
-		*message.RDSInstanceUpdate,
-		message.RDSInstanceUpdate,
-		*message.RDSInstanceFieldsUpdate,
-		message.RDSInstanceFieldsUpdate,
-		*message.RDSInstanceDelete,
-		message.RDSInstanceDelete]
+		*metadbmodel.RDSInstance,
+		metadbmodel.RDSInstance,
+	]
 }
 
 func NewRDSInstance(wholeCache *cache.Cache, cloudData []cloudmodel.RDSInstance) *RDSInstance {
 	updater := &RDSInstance{
-		newUpdaterBase[
-			cloudmodel.RDSInstance,
-			mysql.RDSInstance,
-			*diffbase.RDSInstance,
-			*message.RDSInstanceAdd,
-			message.RDSInstanceAdd,
-			*message.RDSInstanceUpdate,
-			message.RDSInstanceUpdate,
-			*message.RDSInstanceFieldsUpdate,
-			message.RDSInstanceFieldsUpdate,
-			*message.RDSInstanceDelete,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_RDS_INSTANCE_EN,
 			wholeCache,
-			db.NewRDSInstance().SetORG(wholeCache.GetORG()),
+			db.NewRDSInstance().SetMetadata(wholeCache.GetMetadata()),
 			wholeCache.DiffBaseDataSet.RDSInstances,
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
+	updater.setDataGenerator(updater)
+
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &RDSInstanceMessageFactory{})
+	}
+
 	return updater
 }
 
-func (r *RDSInstance) getDiffBaseByCloudItem(cloudItem *cloudmodel.RDSInstance) (diffBase *diffbase.RDSInstance, exists bool) {
-	diffBase, exists = r.diffBaseData[cloudItem.Lcuuid]
-	return
-}
-
-func (r *RDSInstance) generateDBItemToAdd(cloudItem *cloudmodel.RDSInstance) (*mysql.RDSInstance, bool) {
+// Implement DataGenerator interface
+func (r *RDSInstance) generateDBItemToAdd(cloudItem *cloudmodel.RDSInstance) (*metadbmodel.RDSInstance, bool) {
 	vpcID, exists := r.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)
 	if !exists {
-		log.Error(r.org.LogPre(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_VPC_EN, cloudItem.VPCLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_RDS_INSTANCE_EN, cloudItem.Lcuuid,
-		)))
+		), r.metadata.LogPrefixes)
 		return nil, false
 	}
-	dbItem := &mysql.RDSInstance{
+	dbItem := &metadbmodel.RDSInstance{
 		Name:    cloudItem.Name,
 		Label:   cloudItem.Label,
 		UID:     cloudItem.Label,
@@ -89,7 +93,7 @@ func (r *RDSInstance) generateDBItemToAdd(cloudItem *cloudmodel.RDSInstance) (*m
 		Version: cloudItem.Version,
 		Series:  cloudItem.Series,
 		Model:   cloudItem.Model,
-		Domain:  r.cache.DomainLcuuid,
+		Domain:  r.metadata.GetDomainLcuuid(),
 		Region:  cloudItem.RegionLcuuid,
 		AZ:      cloudItem.AZLcuuid,
 		VPCID:   vpcID,
@@ -98,8 +102,8 @@ func (r *RDSInstance) generateDBItemToAdd(cloudItem *cloudmodel.RDSInstance) (*m
 	return dbItem, true
 }
 
-func (r *RDSInstance) generateUpdateInfo(diffBase *diffbase.RDSInstance, cloudItem *cloudmodel.RDSInstance) (*message.RDSInstanceFieldsUpdate, map[string]interface{}, bool) {
-	structInfo := new(message.RDSInstanceFieldsUpdate)
+func (r *RDSInstance) generateUpdateInfo(diffBase *diffbase.RDSInstance, cloudItem *cloudmodel.RDSInstance) (types.UpdatedFields, map[string]interface{}, bool) {
+	structInfo := new(message.UpdatedRDSInstanceFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
 		mapInfo["name"] = cloudItem.Name

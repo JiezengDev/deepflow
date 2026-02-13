@@ -22,7 +22,7 @@ use std::sync::{
     Arc, Condvar, Mutex,
 };
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use cadence::{Metric, MetricBuilder, MetricError, MetricResult, MetricSink, StatsdClient};
 use log::{debug, info, warn};
@@ -37,13 +37,9 @@ use public::{
 };
 
 const STATS_PREFIX: &'static str = "deepflow_agent";
-const TICK_CYCLE: Duration = Duration::from_secs(10);
+const TICK_CYCLE: Duration = Duration::from_secs(1);
+pub const STATS_MIN_INTERVAL: Duration = Duration::from_secs(10);
 const STATS_SENDER_QUEUE_SIZE: usize = 4096;
-
-pub enum StatsOption {
-    Tag(&'static str, String),
-    Interval(Duration),
-}
 
 struct Source {
     module: &'static str,
@@ -113,6 +109,8 @@ impl Batch {
             tag_values,
             metrics_float_names,
             metrics_float_values,
+            org_id: 0,
+            team_id: 0,
         }
     }
 }
@@ -128,6 +126,45 @@ impl Sendable for ArcBatch {
 
     fn message_type(&self) -> SendMessageType {
         SendMessageType::DeepflowStats
+    }
+}
+
+pub struct NoTagModule(pub &'static str);
+
+impl Module for NoTagModule {
+    fn name(&self) -> &'static str {
+        self.0
+    }
+}
+
+pub struct SingleTagModule<T: ToString>(pub &'static str, pub &'static str, pub T);
+
+impl<T: ToString> Module for SingleTagModule<T> {
+    fn name(&self) -> &'static str {
+        self.0
+    }
+
+    fn tags(&self) -> Vec<StatsOption> {
+        vec![StatsOption::Tag(self.1, self.2.to_string())]
+    }
+}
+
+#[derive(Default)]
+pub struct QueueStats {
+    pub id: usize,
+    pub module: &'static str,
+}
+
+impl Module for QueueStats {
+    fn name(&self) -> &'static str {
+        "queue"
+    }
+
+    fn tags(&self) -> Vec<StatsOption> {
+        vec![
+            StatsOption::Tag("index", self.id.to_string()),
+            StatsOption::Tag("module", self.module.to_owned()),
+        ]
     }
 }
 
@@ -149,7 +186,7 @@ pub struct Collector {
 
 impl Collector {
     pub fn new<S: AsRef<str>>(hostname: S, ntp_diff: Arc<AtomicI64>) -> Self {
-        Self::with_min_interval(hostname, TICK_CYCLE, ntp_diff)
+        Self::with_min_interval(hostname, STATS_MIN_INTERVAL, ntp_diff)
     }
 
     pub fn with_min_interval<S: AsRef<str>>(
@@ -177,14 +214,12 @@ impl Collector {
             receiver: Arc::new(stats_queue_receiver),
             ntp_diff,
         };
-        Self::register_countable(
-            &s,
-            "queue",
+        s.register_countable(
+            &QueueStats {
+                module: "0-stats-to-sender",
+                ..Default::default()
+            },
             Countable::Owned(Box::new(counter)),
-            vec![
-                StatsOption::Tag("module", "0-stats-to-sender".to_string()),
-                StatsOption::Tag("index", "0".to_string()),
-            ],
         );
         return s;
     }
@@ -193,70 +228,77 @@ impl Collector {
         self.receiver.clone()
     }
 
-    pub fn register_countable(
-        &self,
-        module: &'static str,
-        countable: Countable,
-        options: Vec<StatsOption>,
-    ) {
+    fn prepare_source(module: &dyn Module, countable: Countable, min_interval: u64) -> Source {
         let mut source = Source {
-            module,
-            interval: Duration::from_secs(self.min_interval.load(Ordering::Relaxed)),
+            module: module.name(),
+            interval: Duration::from_secs(min_interval),
             countable,
             tags: vec![],
             skip: 0,
         };
-        for option in options {
-            match option {
+        for tag in module.tags() {
+            match tag {
                 StatsOption::Tag(k, v) if !source.tags.iter().any(|(key, _)| key == &k) => {
                     source.tags.push((k, v))
                 }
-                StatsOption::Interval(interval)
-                    if interval.as_secs() >= self.min_interval.load(Ordering::Relaxed) =>
-                {
+                _ => warn!(
+                    "ignored duplicated tag or option for module {}",
+                    source.module
+                ),
+            }
+        }
+        for option in module.options() {
+            match option {
+                StatsOption::Interval(interval) if interval.as_secs() >= min_interval => {
                     source.interval = Duration::from_secs(
                         interval.as_secs() / TICK_CYCLE.as_secs() * TICK_CYCLE.as_secs(),
                     )
                 }
                 _ => warn!(
-                    "ignored duplicated tag or invalid interval for module {}",
+                    "ignored tag or invalid interval for module {}",
                     source.module
                 ),
             }
         }
-        if source.interval > TICK_CYCLE {
-            source.skip = ((60
-                - SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-                    % 60)
-                / TICK_CYCLE.as_secs()) as i64;
+        if source.interval.as_secs() > min_interval {
+            source.skip = (source.interval.as_secs() / min_interval) as i64;
         }
+        source
+    }
+
+    pub fn register_countable(&self, module: &dyn Module, countable: Countable) {
+        self.register_countables(std::iter::once((module, countable)));
+    }
+
+    pub fn register_countables<'a, I>(&self, countables: I)
+    where
+        I: Iterator<Item = (&'a dyn Module, Countable)>,
+    {
+        let min_interval = self.min_interval.load(Ordering::Relaxed);
         let mut sources = self.sources.lock().unwrap();
+        let new_items = countables
+            .map(|(m, c)| Self::prepare_source(m, c, min_interval))
+            .collect::<Vec<_>>();
         sources.retain(|s| {
             let closed = s.countable.closed();
-            let equals = s == &source;
+            let equals = new_items.iter().any(|item| item == s);
             if !closed && equals {
-                warn!(
-                    "Found duplicated counter source {}, please check if the old one is correctly closed.",
-                    source
-                );
+                warn!("Found duplicated counter source {s}, please check if the old one is correctly closed.");
             }
             !closed && !equals
         });
-        sources.push(source);
+        sources.extend(new_items);
     }
 
-    pub fn deregister_countables<I>(&self, countables: I)
+    pub fn deregister_countables<'a, I>(&self, countables: I)
     where
-        I: Iterator<Item = (&'static str, Vec<StatsOption>)>,
+        I: Iterator<Item = &'a dyn Module> + 'a,
     {
         let mut tags = vec![];
         let mut sources = self.sources.lock().unwrap();
-        for (module, options) in countables {
+        for m in countables {
             tags.clear();
-            for option in options {
+            for option in m.tags() {
                 match option {
                     StatsOption::Tag(k, v) if !tags.iter().any(|(key, _)| key == &k) => {
                         tags.push((k, v))
@@ -264,7 +306,7 @@ impl Collector {
                     _ => (),
                 }
             }
-            sources.retain(|s| !(s.module == module && s.tags == tags));
+            sources.retain(|s| !(s.module == m.name() && s.tags == tags));
         }
     }
 
@@ -273,6 +315,9 @@ impl Collector {
     }
 
     pub fn set_hostname(&self, hostname: String) {
+        if hostname.is_empty() {
+            return;
+        }
         let mut last = self.hostname.lock().unwrap();
         if *last != hostname {
             info!("set stats hostname to {:?}", hostname);
@@ -339,44 +384,8 @@ impl Collector {
             thread::Builder::new()
                 .name("stats-collector".to_owned())
                 .spawn(move || {
+                    let mut last_run = 0u64;
                     loop {
-                        let host = hostname.lock().unwrap().clone();
-                        {
-                            pre_hooks.lock().unwrap().iter_mut().for_each(|hook| hook());
-                        }
-
-                        let now = get_timestamp(ntp_diff.load(Ordering::Relaxed)).as_secs() as u32;
-                        {
-                            let mut sources = sources.lock().unwrap();
-                            let min_interval_loaded = min_interval.load(Ordering::Relaxed);
-                            // TODO: use Vec::retain_mut after stablize in rust 1.61.0
-                            sources.retain(|s| !s.countable.closed());
-                            for source in sources.iter_mut() {
-                                source.skip -= 1;
-                                if source.skip > 0 {
-                                    continue;
-                                }
-                                source.skip = (source.interval.as_secs().max(min_interval_loaded)
-                                    / TICK_CYCLE.as_secs())
-                                    as i64;
-                                let points = source.countable.get_counters();
-                                if !points.is_empty() {
-                                    let batch = Arc::new(Batch {
-                                        module: source.module,
-                                        hostname: host.clone(),
-                                        tags: source.tags.clone(),
-                                        points,
-                                        timestamp: now,
-                                    });
-                                    if let Err(_) = sender.send(ArcBatch(batch.clone())) {
-                                        debug!(
-                                        "stats to send queue failed because queue have terminated"
-                                    );
-                                    }
-                                }
-                            }
-                        }
-
                         let (running, timer) = &*running;
                         let mut running = running.lock().unwrap();
                         if !*running {
@@ -385,6 +394,48 @@ impl Collector {
                         running = timer.wait_timeout(running, TICK_CYCLE).unwrap().0;
                         if !*running {
                             break;
+                        }
+
+                        let min_interval_loaded = min_interval.load(Ordering::Relaxed);
+                        let now = get_timestamp(ntp_diff.load(Ordering::Relaxed)).as_secs();
+                        if now / min_interval_loaded == last_run / min_interval_loaded {
+                            continue;
+                        }
+                        last_run = now;
+
+                        let host = hostname.lock().unwrap().clone();
+                        {
+                            pre_hooks.lock().unwrap().iter_mut().for_each(|hook| hook());
+                        }
+
+                        {
+                            let mut sources = sources.lock().unwrap();
+                            // TODO: use Vec::retain_mut after stablize in rust 1.61.0
+                            sources.retain(|s| !s.countable.closed());
+                            for source in sources.iter_mut() {
+                                source.skip -= 1;
+                                if source.skip > 0 {
+                                    continue;
+                                }
+                                source.skip = (source.interval.as_secs().max(min_interval_loaded)
+                                    / min_interval_loaded)
+                                    as i64;
+                                let points = source.countable.get_counters();
+                                if !points.is_empty() {
+                                    let batch = Arc::new(Batch {
+                                        module: source.module,
+                                        hostname: host.clone(),
+                                        tags: source.tags.clone(),
+                                        points,
+                                        timestamp: now as u32,
+                                    });
+                                    if let Err(_) = sender.send(ArcBatch(batch.clone())) {
+                                        debug!(
+                                        "stats to send queue failed because queue have terminated"
+                                    );
+                                    }
+                                }
+                            }
                         }
                     }
                 })

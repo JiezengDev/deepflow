@@ -17,9 +17,10 @@
 package kubernetes_gather
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"reflect"
 	"testing"
 
@@ -27,34 +28,35 @@ import (
 	. "github.com/smartystreets/goconvey/convey"
 
 	cloudconfig "github.com/deepflowio/deepflow/server/controller/cloud/config"
-	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/config"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/genesis"
+	gcommon "github.com/deepflowio/deepflow/server/controller/genesis/common"
 )
 
 func TestKubernetes(t *testing.T) {
 	Convey("TestKubernetes", t, func() {
-		k8sConfig := mysql.SubDomain{
+		k8sConfig := metadbmodel.SubDomain{
 			Name:        "test_k8s",
 			DisplayName: "test_k8s",
 			ClusterID:   "d-01LMvvfQPZ",
 			Config:      fmt.Sprintf(`{"node_port_name_regex": "","pod_net_ipv4_cidr_max_mask": %v,"pod_net_ipv6_cidr_max_mask": %v,"region_uuid": "%s","vpc_uuid": ""}`, common.K8S_POD_IPV4_NETMASK, common.K8S_POD_IPV6_NETMASK, common.DEFAULT_REGION),
 		}
 
-		k8s := NewKubernetesGather(nil, &k8sConfig, cloudconfig.CloudConfig{}, false)
+		k8s := NewKubernetesGather(metadb.DefaultDB, nil, &k8sConfig, cloudconfig.CloudConfig{}, false)
 		type KResource struct {
-			Pod        []string `json:"*v1.Pod"`
-			Info       []string `json:"*version.Info"`
-			Node       []string `json:"*v1.Node"`
-			Ingress    []string `json:"*v1beta1.Ingress"`
-			Service    []string `json:"*v1.Service"`
-			ConfigMap  []string `json:"*v1.ConfigMap"`
-			DaemonSet  []string `json:"*v1.DaemonSet"`
-			Namespace  []string `json:"*v1.Namespace"`
-			Deployment []string `json:"*v1.Deployment"`
-			ReplicaSet []string `json:"*v1.ReplicaSet"`
+			Pod        [][]byte `json:"*v1.Pod"`
+			Info       [][]byte `json:"*version.Info"`
+			Node       [][]byte `json:"*v1.Node"`
+			Ingress    [][]byte `json:"*v1beta1.Ingress"`
+			Service    [][]byte `json:"*v1.Service"`
+			ConfigMap  [][]byte `json:"*v1.ConfigMap"`
+			DaemonSet  [][]byte `json:"*v1.DaemonSet"`
+			Namespace  [][]byte `json:"*v1.Namespace"`
+			Deployment [][]byte `json:"*v1.Deployment"`
+			ReplicaSet [][]byte `json:"*v1.ReplicaSet"`
 		}
 
 		type KDataResp struct {
@@ -64,39 +66,33 @@ func TestKubernetes(t *testing.T) {
 			Resources KResource `json:"resources"`
 		}
 
-		kJsonData, _ := ioutil.ReadFile("./testfiles/kubernetes-info.json")
+		kJsonData, _ := os.ReadFile("./testfiles/kubernetes-info.json")
 		var kData KDataResp
 		json.Unmarshal(kJsonData, &kData)
-		k8sInfo := map[string][]string{}
-		k8sInfo["*v1.Pod"] = kData.Resources.Pod
-		k8sInfo["*v1.Node"] = kData.Resources.Node
-		k8sInfo["*version.Info"] = kData.Resources.Info
-		k8sInfo["*v1beta1.Ingress"] = kData.Resources.Ingress
-		k8sInfo["*v1.Service"] = kData.Resources.Service
-		k8sInfo["*v1.ConfigMap"] = kData.Resources.ConfigMap
-		k8sInfo["*v1.DaemonSet"] = kData.Resources.DaemonSet
-		k8sInfo["*v1.Namespace"] = kData.Resources.Namespace
-		k8sInfo["*v1.Deployment"] = kData.Resources.Deployment
-		k8sInfo["*v1.ReplicaSet"] = kData.Resources.ReplicaSet
-		k8sInfoPatch := gomonkey.ApplyPrivateMethod(reflect.TypeOf(k8s), "getKubernetesInfo", func(_ *KubernetesGather) (map[string][]string, error) {
-			return k8sInfo, nil
+		k8sEntries := map[string][][]byte{}
+		k8sEntries["*v1.Pod"] = kData.Resources.Pod
+		k8sEntries["*v1.Node"] = kData.Resources.Node
+		k8sEntries["*version.Info"] = kData.Resources.Info
+		k8sEntries["*v1beta1.Ingress"] = kData.Resources.Ingress
+		k8sEntries["*v1.Service"] = kData.Resources.Service
+		k8sEntries["*v1.ConfigMap"] = kData.Resources.ConfigMap
+		k8sEntries["*v1.DaemonSet"] = kData.Resources.DaemonSet
+		k8sEntries["*v1.Namespace"] = kData.Resources.Namespace
+		k8sEntries["*v1.Deployment"] = kData.Resources.Deployment
+		k8sEntries["*v1.ReplicaSet"] = kData.Resources.ReplicaSet
+		k8sEntriesPatch := gomonkey.ApplyPrivateMethod(reflect.TypeOf(k8s), "getKubernetesEntries", func(_ *KubernetesGather) (map[string][][]byte, error) {
+			return k8sEntries, nil
 		})
-		defer k8sInfoPatch.Reset()
+		defer k8sEntriesPatch.Reset()
 
-		g := genesis.NewGenesis(&config.ControllerConfig{})
-		vJsonData, _ := ioutil.ReadFile("./testfiles/vinterfaces.json")
-		var vData genesis.GenesisSyncData
+		g := genesis.NewGenesis(context.Background(), true, &config.ControllerConfig{})
+		vJsonData, _ := os.ReadFile("./testfiles/vinterfaces.json")
+		var vData gcommon.GenesisSyncDataResponse
 		json.Unmarshal(vJsonData, &vData)
-		vinterfacesInfoPatch := gomonkey.ApplyMethod(reflect.TypeOf(g), "GetGenesisSyncResponse", func(_ *genesis.Genesis) (genesis.GenesisSyncData, error) {
+		vinterfacesInfoPatch := gomonkey.ApplyMethod(reflect.TypeOf(g), "GetGenesisSyncResponse", func(_ *genesis.Genesis, _ int) (gcommon.GenesisSyncDataResponse, error) {
 			return vData, nil
 		})
 		defer vinterfacesInfoPatch.Reset()
-
-		pData := []model.PrometheusTarget{}
-		prometheusTargetInfoPatch := gomonkey.ApplyMethod(reflect.TypeOf(g), "GetPrometheusResponse", func(_ *genesis.Genesis) ([]model.PrometheusTarget, error) {
-			return pData, nil
-		})
-		defer prometheusTargetInfoPatch.Reset()
 
 		k8sGatherData, _ := k8s.GetKubernetesGatherData()
 		Convey("k8sGatherResource number should be equal", func() {

@@ -24,7 +24,7 @@ use serde::Serialize;
 use super::meter::Meter;
 
 use crate::common::{
-    enums::{IpProtocol, TapType},
+    enums::{CaptureNetworkType, IpProtocol},
     flow::{L7Protocol, SignalSource},
     tap_port::TapPort,
 };
@@ -34,8 +34,7 @@ use public::{
     utils::net::MacAddr,
 };
 
-const METRICS_VERSION: u32 = 20220117;
-#[derive(Debug)]
+#[derive(Serialize, Debug)]
 pub struct Document {
     pub timestamp: u32,
     pub tagger: Tagger,
@@ -69,8 +68,14 @@ impl Document {
 
 impl From<Document> for metric::Document {
     fn from(d: Document) -> Self {
+        let timestamp = if d.flags.contains(DocumentFlag::PER_SECOND_METRICS) {
+            d.timestamp - d.tagger.time_span
+        } else {
+            d.timestamp - d.tagger.time_span * 60
+        };
+
         metric::Document {
-            timestamp: d.timestamp,
+            timestamp,
             tag: Some(d.tagger.into()),
             meter: Some(d.meter.into()),
             flags: d.flags.bits(),
@@ -91,12 +96,19 @@ impl Sendable for BoxedDocument {
         SendMessageType::Metrics
     }
 
-    fn version(&self) -> u32 {
-        METRICS_VERSION
+    fn to_kv_string(&self, dst: &mut String) {
+        let json = serde_json::to_string(&(*self.0)).unwrap();
+        dst.push_str(&json);
+        dst.push('\n');
+    }
+
+    fn file_name(&self) -> &str {
+        "flow_metrics"
     }
 }
 
 bitflags! {
+    #[derive(Serialize)]
     pub struct DocumentFlag: u32 {
         const NONE = 0; // PER_MINUTE_METRICS
         const PER_SECOND_METRICS = 1<<0;
@@ -110,6 +122,7 @@ impl Default for DocumentFlag {
 }
 
 bitflags! {
+    #[derive(Serialize)]
     pub struct Code:u64 {
         const NONE = 0;
 
@@ -149,7 +162,7 @@ impl Default for Code {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Direction {
     None,
@@ -173,9 +186,45 @@ pub enum Direction {
     App = SIDE_APP,                                                         // app(for otel)
 }
 
+impl Direction {
+    pub fn reverse(&mut self) -> Direction {
+        match *self {
+            Self::ClientToServer => *self = Self::ServerToClient,
+            Self::ServerToClient => *self = Self::ClientToServer,
+            Self::ClientNodeToServer => *self = Self::ServerNodeToClient,
+            Self::ServerNodeToClient => *self = Self::ClientNodeToServer,
+            Self::ClientHypervisorToServer => *self = Self::ServerHypervisorToClient,
+            Self::ServerHypervisorToClient => *self = Self::ClientHypervisorToServer,
+            Self::ClientGatewayHypervisorToServer => *self = Self::ServerGatewayHypervisorToClient,
+            Self::ServerGatewayHypervisorToClient => *self = Self::ClientGatewayHypervisorToServer,
+            Self::ClientGatewayToServer => *self = Self::ServerGatewayToClient,
+            Self::ServerGatewayToClient => *self = Self::ClientGatewayToServer,
+            Self::ClientProcessToServer => *self = Self::ServerProcessToClient,
+            Self::ServerProcessToClient => *self = Self::ClientProcessToServer,
+            Self::ClientAppToServer => *self = Self::ServerAppToClient,
+            Self::ServerAppToClient => *self = Self::ClientAppToServer,
+            _ => {}
+        }
+
+        *self
+    }
+}
+
 impl Default for Direction {
     fn default() -> Self {
         Direction::ClientToServer
+    }
+}
+
+impl From<&[Direction; 2]> for Direction {
+    fn from(value: &[Direction; 2]) -> Self {
+        if value[0] != Direction::None && value[1] == Direction::None {
+            value[0]
+        } else if value[0] == Direction::None && value[1] != Direction::None {
+            value[1]
+        } else {
+            Direction::None
+        }
     }
 }
 
@@ -203,7 +252,7 @@ impl Direction {
     }
 }
 
-#[derive(Serialize, Debug, PartialEq, Eq, Clone, Copy, TryFromPrimitive)]
+#[derive(Serialize, Debug, PartialEq, Eq, Clone, Copy, TryFromPrimitive, Hash)]
 #[repr(u8)]
 pub enum TapSide {
     Rest = 0,
@@ -227,6 +276,28 @@ pub enum TapSide {
 
 impl TapSide {
     pub const MAX: Self = Self::ServerApp;
+
+    pub fn reverse(&mut self) -> Self {
+        match *self {
+            Self::Client => *self = Self::Server,
+            Self::Server => *self = Self::Client,
+            Self::ClientNode => *self = Self::ServerNode,
+            Self::ServerNode => *self = Self::ClientNode,
+            Self::ClientHypervisor => *self = Self::ServerHypervisor,
+            Self::ServerHypervisor => *self = Self::ClientHypervisor,
+            Self::ClientGatewayHypervisor => *self = Self::ServerGatewayHypervisor,
+            Self::ServerGatewayHypervisor => *self = Self::ClientGatewayHypervisor,
+            Self::ClientGateway => *self = Self::ServerGateway,
+            Self::ServerGateway => *self = Self::ClientGateway,
+            Self::ClientProcess => *self = Self::ServerProcess,
+            Self::ServerProcess => *self = Self::ClientProcess,
+            Self::ClientApp => *self = Self::ServerApp,
+            Self::ServerApp => *self = Self::ClientApp,
+            _ => {}
+        }
+
+        *self
+    }
 }
 
 impl Default for TapSide {
@@ -270,7 +341,7 @@ impl From<SpanKind> for TapSide {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Serialize, Debug, Clone)]
 pub struct Tagger {
     pub code: Code,
 
@@ -292,9 +363,9 @@ pub struct Tagger {
     pub protocol: IpProtocol,
     pub acl_gid: u16,
     pub server_port: u16, // tunnel_ip_id also uses this field
-    pub vtap_id: u16,
+    pub agent_id: u16,
     pub tap_port: TapPort,
-    pub tap_type: TapType,
+    pub tap_type: CaptureNetworkType,
     pub l7_protocol: L7Protocol,
 
     pub gpid: u32,
@@ -306,6 +377,21 @@ pub struct Tagger {
     pub biz_type: u8,
     pub signal_source: SignalSource,
     pub pod_id: u32,
+    // request-reponse time span
+    pub time_span: u32,
+}
+
+impl Tagger {
+    pub fn reverse(&mut self, server_port: u16) {
+        std::mem::swap(&mut self.ip, &mut self.ip1);
+        std::mem::swap(&mut self.l3_epc_id, &mut self.l3_epc_id1);
+        std::mem::swap(&mut self.mac, &mut self.mac1);
+        std::mem::swap(&mut self.gpid, &mut self.gpid_1);
+
+        self.server_port = server_port;
+        self.tap_side.reverse();
+        self.direction.reverse();
+    }
 }
 
 impl Default for Tagger {
@@ -326,9 +412,9 @@ impl Default for Tagger {
             protocol: IpProtocol::default(),
             acl_gid: 0,
             server_port: 0,
-            vtap_id: 0,
+            agent_id: 0,
             tap_port: TapPort::default(),
-            tap_type: TapType::default(),
+            tap_type: CaptureNetworkType::default(),
             l7_protocol: L7Protocol::default(),
 
             gpid: 0,
@@ -340,6 +426,7 @@ impl Default for Tagger {
             signal_source: SignalSource::default(),
             pod_id: 0,
             biz_type: 0,
+            time_span: 0,
         }
     }
 }
@@ -384,7 +471,7 @@ impl From<Tagger> for metric::MiniTag {
                 protocol: u8::from(t.protocol) as u32,
                 acl_gid: t.acl_gid as u32,
                 server_port: t.server_port as u32,
-                vtap_id: t.vtap_id as u32,
+                vtap_id: t.agent_id as u32,
                 tap_port: t.tap_port.0,
                 tap_type: u16::from(t.tap_type) as u32,
                 l7_protocol: t.l7_protocol as u32,

@@ -34,6 +34,15 @@
 
 struct task_struct;
 
+#ifndef BPF_FUNC_task_pt_regs
+// Helper ID for bpf_task_pt_regs (introduced in Linux 5.15, GPL-only).
+#define BPF_FUNC_task_pt_regs 175
+#endif
+#ifndef BPF_FUNC_get_current_task_btf
+// Helper ID for bpf_get_current_task_btf (introduced in Linux 5.11).
+#define BPF_FUNC_get_current_task_btf 158
+#endif
+
 /*
  * bpf helpers
  */
@@ -79,6 +88,12 @@ static long
     (void *)16;
 static __u64 __attribute__ ((__unused__)) (*bpf_get_current_task) (void) =
     (void *)35;
+static struct task_struct
+    __attribute__ ((__unused__)) * (*bpf_get_current_task_btf) (void) =
+    (void *)BPF_FUNC_get_current_task_btf;
+static struct pt_regs
+    __attribute__ ((__unused__)) * (*bpf_task_pt_regs) (struct task_struct *task) =
+    (void *)BPF_FUNC_task_pt_regs;
 static long
     __attribute__ ((__unused__)) (*bpf_perf_event_output) (void *ctx, void *map,
 							   __u64 flags,
@@ -111,10 +126,39 @@ static long
 							       const void
 							       *unsafe_ptr) =
     (void *)115;
+static int
+    __attribute__ ((__unused__)) (*bpf_sock_ops_cb_flags_set) (void *skops,
+							       int flags) =
+    (void *)59;
+static int
+    __attribute__ ((__unused__)) (*bpf_reserve_hdr_opt) (void *skops,
+							 __u32 reserve_len,
+							 __u32 flags) =
+    (void *)144;
+static int
+    __attribute__ ((__unused__)) (*bpf_store_hdr_opt) (void *skops,
+						       void *from,
+						       __u32 len,
+						       __u32 flags) =
+    (void *)143;
 
 static int
     __attribute__ ((__unused__)) (*bpf_get_stackid) (void *ctx, void *map,
 						     int flags) = (void *)27;
+
+static int
+    __attribute__ ((__unused__)) (*bpf_get_stack) (void *ctx, void *buf, __u32 size,
+						     int flags) = (void *)67;
+
+/* llvm builtin functions that eBPF C program may use to 
+ * emit BPF_LD_ABS and BPF_LD_IND instructions 
+ */
+unsigned long long load_byte(void *skb,
+			     unsigned long long off) asm("llvm.bpf.load.byte");
+unsigned long long load_half(void *skb,
+			     unsigned long long off) asm("llvm.bpf.load.half");
+unsigned long long load_word(void *skb,
+			     unsigned long long off) asm("llvm.bpf.load.word");
 
 #if __GNUC__ && !__clang__
 #define SEC(name) __attribute__((section(name), used))
@@ -200,6 +244,10 @@ struct pt_regs {
 #define PT_REGS_RC(x) ((x)->regs[0])
 #define PT_REGS_SP(x) ((x)->sp)
 #define PT_REGS_IP(x) ((x)->pc)
+
+#define PSR_MODE32_BIT 0x00000010
+#define PSR_MODE_MASK  0x0000000f
+#define PSR_MODE_EL0t  0x00000000
 #else
 _Pragma("GCC error \"Must specify a BPF target arch\"");
 #endif
@@ -255,12 +303,94 @@ _Pragma("GCC error \"PT_GO_REGS_PARM\"");
 #define __stringify(x)  __stringify_1(x)
 
 #define NAME(N)  __##N
+#define MAP_MAX_ENTRIES_DEF 40960
 
-#define PROGTP(F) SEC("prog/tp/"__stringify(F)) int bpf_prog_tp__##F
-#define PROGKP(F) SEC("prog/kp/"__stringify(F)) int bpf_prog_kp__##F
-#define KRETPROG(F) SEC("kretprobe/"__stringify(F)) int kretprobe__##F
-#define KPROG(F) SEC("kprobe/"__stringify(F)) int kprobe__##F
-#define TPPROG(F) SEC("tracepoint/syscalls/"__stringify(F)) int bpf_func_##F
+/*
+ * DeepFlow eBPF program naming convention:
+ *
+ *   'df_<type_identifier>_<probe_name>'
+ *
+ * type_identifier:
+ *   "T"   - tracepoint/syscalls/sys_* / tracepoint/sched/sched_*
+ *   "K"   - kprobe
+ *   "KR"  - kretprobe
+ *   "U"   - uprobe
+ *   "UR"  - uretprobe
+ *   "TP"  - Tailcall eBPF prog of tracepoint type
+ *   "KP"  - Tailcall eBPF prog of kprobe type
+ *
+ * probe_name:
+ *   The name of the tracepoint or the kernel interface.
+ * 
+ * For example:
+ * tracepoint: prog->name:df_T_enter_recvfrom
+ * kprobe: prog->name:df_K_sys_sendmsg
+ * kretprobe: prog->name:df_KR_sys_sendmsg
+ *
+ * For probes of type fentry/fexit, use the 'kfunc__' or 'kretfunc__'
+ * prefixes, as these specific prefixes are utilized during loading
+ * to perform corresponding BTF operations.
+ */
+
+#define TP_SYSCALL_PROG(F) SEC("tracepoint/syscalls/sys_"__stringify(F)) int df_T_##F
+#define TP_SCHED_PROG(F) SEC("tracepoint/sched/sched_"__stringify(F)) int df_T_##F
+#define PROGTP(F) SEC("prog/tp/"__stringify(F)) int df_TP_##F
+#define PROGKP(F) SEC("prog/kp/"__stringify(F)) int df_KP_##F
+#define PROGPE(F) SEC("prog/pe/"__stringify(F)) int df_PE_##F
+#define KPROG(F) SEC("kprobe/"__stringify(F)) int df_K_##F
+#define KRETPROG(F) SEC("kretprobe/"__stringify(F)) int df_KR_##F
+#define UPROG(F) SEC("uprobe/"__stringify(F)) int df_U_##F
+#define URETPROG(F) SEC("uretprobe/"__stringify(F)) int df_UR_##F
+#define PERF_EVENT_PROG(F) SEC("perf_event") int df_##F
+#define SOCKPROG(F) SEC("socket/"__stringify(F)) int df_S_##F
+
+#define ___bpf_concat(a, b) a ## b
+#define ___bpf_apply(fn, n) ___bpf_concat(fn, n)
+#define ___bpf_nth(_, _1, _2, _3, _4, _5, _6, _7, _8, _9, _a, _b, _c, N, ...) N
+#define ___bpf_narg(...) \
+	___bpf_nth(_, ##__VA_ARGS__, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0)
+#define ___bpf_empty(...) \
+	___bpf_nth(_, ##__VA_ARGS__, N, N, N, N, N, N, N, N, N, N, 0)
+
+#define ___bpf_ctx_cast0() ctx
+#define ___bpf_ctx_cast1(x) ___bpf_ctx_cast0(), (void *)ctx[0]
+#define ___bpf_ctx_cast2(x, args...) ___bpf_ctx_cast1(args), (void *)ctx[1]
+#define ___bpf_ctx_cast3(x, args...) ___bpf_ctx_cast2(args), (void *)ctx[2]
+#define ___bpf_ctx_cast4(x, args...) ___bpf_ctx_cast3(args), (void *)ctx[3]
+#define ___bpf_ctx_cast5(x, args...) ___bpf_ctx_cast4(args), (void *)ctx[4]
+#define ___bpf_ctx_cast6(x, args...) ___bpf_ctx_cast5(args), (void *)ctx[5]
+#define ___bpf_ctx_cast7(x, args...) ___bpf_ctx_cast6(args), (void *)ctx[6]
+#define ___bpf_ctx_cast8(x, args...) ___bpf_ctx_cast7(args), (void *)ctx[7]
+#define ___bpf_ctx_cast9(x, args...) ___bpf_ctx_cast8(args), (void *)ctx[8]
+#define ___bpf_ctx_cast10(x, args...) ___bpf_ctx_cast9(args), (void *)ctx[9]
+#define ___bpf_ctx_cast11(x, args...) ___bpf_ctx_cast10(args), (void *)ctx[10]
+#define ___bpf_ctx_cast12(x, args...) ___bpf_ctx_cast11(args), (void *)ctx[11]
+#define ___bpf_ctx_cast(args...) \
+	___bpf_apply(___bpf_ctx_cast, ___bpf_narg(args))(args)
+
+#define BPF_PROG(name, args...)                                 \
+int name(unsigned long long *ctx);                              \
+__attribute__((__always_inline__))                           	\
+static int ____##name(unsigned long long *ctx, ##args);         \
+int name(unsigned long long *ctx)                               \
+{                                                               \
+	int __ret;                                              \
+                                                                \
+	_Pragma("GCC diagnostic push")                          \
+	_Pragma("GCC diagnostic ignored \"-Wint-conversion\"")  \
+	__ret = ____##name(___bpf_ctx_cast(args));              \
+	_Pragma("GCC diagnostic pop")                           \
+	return __ret;                                           \
+}                                                               \
+static int ____##name(unsigned long long *ctx, ##args)
+
+#define KFUNC_PROG(event, args...) \
+	SEC("fentry/"__stringify(event)) \
+	BPF_PROG(kfunc__ ## event, ##args)
+
+#define KRETFUNC_PROG(event, args...) \
+	SEC("fexit/"__stringify(event)) \
+	BPF_PROG(kretfunc__ ## event, ##args)
 
 #ifndef CUR_CPU_IDENTIFIER
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
@@ -289,18 +419,20 @@ struct bpf_map_def {
 	unsigned int key_size;
 	unsigned int value_size;
 	unsigned int max_entries;
+	__u32 feat_flags;
 };
 
-#define __BPF_MAP_DEF(_kt, _vt, _ents) \
+#define __BPF_MAP_DEF(_kt, _vt, _ents, _f) \
 	.key_size = sizeof(_kt),       \
 	.value_size = sizeof(_vt),     \
-	.max_entries = (_ents)
+	.max_entries = (_ents),	\
+	.feat_flags = (_f)
 
-#define MAP_ARRAY(name, key_type, value_type, max_entries) \
+#define MAP_ARRAY(name, key_type, value_type, max_entries, feat) \
 struct bpf_map_def SEC("maps") __##name = \
 {   \
     .type = BPF_MAP_TYPE_ARRAY, \
-    __BPF_MAP_DEF(key_type, value_type, max_entries), \
+    __BPF_MAP_DEF(key_type, value_type, max_entries, feat), \
 }; \
 static_always_inline __attribute__((unused)) value_type * name ## __lookup(key_type *key) \
 { \
@@ -316,11 +448,11 @@ static_always_inline __attribute__((unused)) int name ## __delete(key_type *key)
 }
 
 // BPF_MAP_TYPE_ARRAY define
-#define MAP_PERARRAY(name, key_type, value_type, max_entries) \
+#define MAP_PERARRAY(name, key_type, value_type, max_entries, feat) \
 struct bpf_map_def SEC("maps") __##name = \
 {   \
     .type = BPF_MAP_TYPE_PERCPU_ARRAY, \
-    __BPF_MAP_DEF(key_type, value_type, max_entries), \
+    __BPF_MAP_DEF(key_type, value_type, max_entries, feat), \
 }; \
 static_always_inline __attribute__((unused)) value_type * name ## __lookup(key_type *key) \
 { \
@@ -335,33 +467,34 @@ static_always_inline __attribute__((unused)) int name ## __delete(key_type *key)
     return bpf_map_delete_elem(& __##name, (const void *)key); \
 }
 
-#define MAP_PERF_EVENT(name, key_type, value_type, max_entries) \
+#define MAP_PERF_EVENT(name, key_type, value_type, max_entries, feat) \
 struct bpf_map_def SEC("maps") __ ## name = \
 {   \
     .type = BPF_MAP_TYPE_PERF_EVENT_ARRAY, \
-    __BPF_MAP_DEF(key_type, value_type, max_entries), \
+    __BPF_MAP_DEF(key_type, value_type, max_entries, feat), \
 };
 
-#define MAP_PROG_ARRAY(name, key_type, value_type, max_entries) \
+#define MAP_PROG_ARRAY(name, key_type, value_type, max_entries, feat) \
 struct bpf_map_def SEC("maps") __ ## name = \
 {   \
     .type = BPF_MAP_TYPE_PROG_ARRAY, \
-    __BPF_MAP_DEF(key_type, value_type, max_entries), \
+    __BPF_MAP_DEF(key_type, value_type, max_entries, feat), \
 };
 
-#define MAP_STACK_TRACE(name, max) \
+#define MAP_STACK_TRACE(name, max, f) \
 struct bpf_map_def SEC("maps") __ ## name = { \
   .type = BPF_MAP_TYPE_STACK_TRACE, \
   .key_size = sizeof(__u32), \
   .value_size = PERF_MAX_STACK_DEPTH * sizeof(__u64), \
   .max_entries = (max), \
+  .feat_flags = (f), \
 };
 
-#define MAP_HASH(name, key_type, value_type, max_entries) \
+#define MAP_HASH(name, key_type, value_type, max_entries, feat) \
 struct bpf_map_def SEC("maps") __##name = \
 {   \
     .type = BPF_MAP_TYPE_HASH, \
-    __BPF_MAP_DEF(key_type, value_type, max_entries), \
+    __BPF_MAP_DEF(key_type, value_type, max_entries, feat), \
 }; \
 static_always_inline __attribute__((unused)) value_type * name ## __lookup(key_type *key) \
 { \
@@ -377,16 +510,19 @@ static_always_inline __attribute__((unused)) int name ## __delete(key_type *key)
 }
 
 #define BPF_HASH3(_name, _key_type, _leaf_type) \
-  MAP_HASH(_name, _key_type, _leaf_type, 40960)
+  MAP_HASH(_name, _key_type, _leaf_type, MAP_MAX_ENTRIES_DEF, 0)
 
 #define BPF_HASH4(_name, _key_type, _leaf_type, _size) \
-  MAP_HASH(_name, _key_type, _leaf_type, _size)
+  MAP_HASH(_name, _key_type, _leaf_type, _size, 0)
+
+#define BPF_HASH5(_name, _key_type, _leaf_type, _size, _feat) \
+  MAP_HASH(_name, _key_type, _leaf_type, _size, _feat)
 
 // helper for default-variable macro function
-#define BPF_HASHX(_1, _2, _3, _4, NAME, ...) NAME
+#define BPF_HASHX(_1, _2, _3, _4, _5, NAME, ...) NAME
 
 #define BPF_HASH(...) \
-  BPF_HASHX(__VA_ARGS__, BPF_HASH4, BPF_HASH3)(__VA_ARGS__)
+  BPF_HASHX(__VA_ARGS__, BPF_HASH5, BPF_HASH4, BPF_HASH3)(__VA_ARGS__)
 
 #define BPF_LEN_CAP(x, cap) (x < cap ? (x & (cap - 1)) : cap)
 

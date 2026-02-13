@@ -24,17 +24,11 @@ pod_service           , K8s Service                       ,
 pod_group_type        , K8s Workload Type                 ,
 pod_group             , K8s Workload                      , Such as Deployment, StatefulSet, Daemonset, etc.
 pod                   , K8s POD                           ,
-service               , Service                           ,
-resource_gl0_type     , Type - K8s POD First              , Deprecated，please use auto_instance_type.
-resource_gl0          , Instance - K8s POD First          , Deprecated，please use auto_instance.
-resource_gl1_type     , Type - K8s Workload First         , Deprecated，please use auto_service_type.
-resource_gl1          , Instance - K8s Workload First     , Deprecated，please use auto_service.
-resource_gl2_type     , Type - K8s Service First          , Deprecated，please use auto_service_type.
-resource_gl2          , Instance - K8s Service First      , Deprecated，please use auto_service.
-auto_instance_type    , Type - K8s POD First              , The type of 'auto_instance'.
-auto_instance         , Instance - K8s POD First          , The instance of IP, when the instance is an IP, auto_instance_id displayed as a subnet ID.
-auto_service_type     , Type - K8s Service First          , The type of 'auto_service'.
-auto_service          , Instance - K8s Service First      , On the basis of 'auto_instance', aggregate K8s service ClusterIP and workload into service, when the instance is an IP, auto_service_id displayed as a subnet ID.
+service               , Service                           , Deprecated，please use pod_service
+auto_instance_type    , Auto Instance Type                , The type of 'auto_instance'.
+auto_instance         , Auto Instance Tag                 , The instance of IP, when the instance is an IP, auto_instance_id displayed as a subnet ID.
+auto_service_type     , Auto Service Type                 , The type of 'auto_service'.
+auto_service          , Auto Service Tag                  , On the basis of 'auto_instance', aggregate K8s service ClusterIP and workload into service, when the instance is an IP, auto_service_id displayed as a subnet ID.
 gprocess              , Process                           ,
 tap_port_host         , Tap Port Host                     , Deprecated，please use capture_nic_host.
 tap_port_chost        , Tap Port Cloud Host               , Deprecated，please use capture_nic_chost.
@@ -54,6 +48,7 @@ k8s.annotation        , K8s Annotation                    ,
 k8s.env               , K8s Env                           ,
 cloud.tag             , Cloud Tag                         ,
 os.app                , OS APP                            ,
+biz_service.group     , Biz Service Group                 ,
 
 eth_type              , Ether Type                        ,
 vlan                  , VLAN TAG                          ,
@@ -94,11 +89,13 @@ l7_protocol           , Application Protocol              ,
 request_domain        , Request Domain                    ,
 
 flow_id               , Flow ID                           ,
+aggregated_flow_ids   , Aggregated Flow IDs               ,
 start_time            , Start Time                        , Unit: microseconds. Indicates the start time of the flow within the current natural minute, and indicates the first packet time for a newly created flow.
 end_time              , End Time                          , Unit: microseconds. Indicates the end time of the flow within the current natural minute. If the flow is closed within this minute, it is the end packet time or the timeout time of the flow state machine.
 close_type            , Flow Close Type                   ,
 status                , Status                            , Determined by the close_type and protocol: Normal/ForceReport/Non-TCP timeout/Disconnected* = Normal, Client* = Client Error, Server*/TCP Timeout = Server Error, others = Unknown.
 is_new_flow           , New Flow Flag                     ,
+init_ipid             , Initial IPID                      ,
 
 signal_source         , Signal Source                     ,
 tap                   , Traffic Access Point              , Deprecated，please use capture_network_type.

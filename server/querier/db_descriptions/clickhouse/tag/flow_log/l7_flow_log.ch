@@ -5,7 +5,7 @@ time                      , 时间                     , 将 end_time 取整到�
 region                    , 区域                     ,
 az                        , 可用区                   ,
 host                      , 宿主机                   , 承载虚拟机的宿主机。
-chost                     , 云服务器                 , 包括虚拟机、裸金属服务器。
+chost                     , 云主机                   , 包括虚拟机、裸金属服务器。
 vpc                       , VPC                      ,
 l2_vpc                    , 转发 VPC                 , MAC 地址所在的 VPC。
 subnet                    , 子网                     ,
@@ -24,28 +24,22 @@ pod_service               , K8s 容器服务             ,
 pod_group_type            , K8s 工作负载类型         ,
 pod_group                 , K8s 工作负载             , 例如 Deployment、StatefulSet、Daemonset 等。
 pod                       , K8s 容器 POD             ,
-service                   , 服务                     ,
-resource_gl0_type         , 类型-容器 POD 优先       , 已废弃，请使用 auto_instance_type。
-resource_gl0              , 资源-容器 POD 优先       , 已废弃，请使用 auto_instance。
-resource_gl1_type         , 类型-工作负载优先        , 已废弃，请使用 auto_service_type。
-resource_gl1              , 资源-工作负载优先        , 已废弃，请使用 auto_service。
-resource_gl2_type         , 类型-服务优先            , 已废弃，请使用 auto_service_type。
-resource_gl2              , 资源-服务优先            , 已废弃，请使用 auto_service。
-auto_instance_type        , 类型-容器 POD 优先       , `auto_instance`实例对应的类型。
-auto_instance             , 资源-容器 POD 优先       , IP 对应的实例，实例为IP时，auto_instance_id显示为子网ID。
-auto_service_type         , 类型-服务优先            , `auto_service`实例对应的类型。
-auto_service              , 资源-服务优先            , 在`auto_instance`基础上，将容器服务的 ClusterIP 与工作负载聚合为服务，实例为IP时，auto_service_id显示为子网ID。
+service                   , 服务                     , 已废弃，请使用 pod_service
+auto_instance_type        , 自动实例类型              , `auto_instance`实例对应的类型。
+auto_instance             , 自动实例                 , IP 对应的实例，实例为IP时，auto_instance_id显示为子网ID。
+auto_service_type         , 自动服务类型             , `auto_service`实例对应的类型。
+auto_service              , 自动服务                , 在`auto_instance`基础上，将容器服务的 ClusterIP 与工作负载聚合为服务，实例为IP时，auto_service_id显示为子网ID。
 gprocess                  , 进程                     ,
 tap_port_host             , 采集网卡所属宿主机       , 已废弃，请使用 capture_nic_host。
-tap_port_chost            , 采集网卡所属云服务器     , 已废弃，请使用 capture_nic_chost。
+tap_port_chost            , 采集网卡所属云主机       , 已废弃，请使用 capture_nic_chost。
 tap_port_pod_node         , 采集网卡所属容器节点     , 已废弃，请使用 capture_nic_pod_node。
 capture_nic_host          , 采集网卡所属宿主机       ,
-capture_nic_chost         , 采集网卡所属云服务器     ,
+capture_nic_chost         , 采集网卡所属云主机       ,
 capture_nic_pod_node      , 采集网卡所属容器节点     ,
 host_ip                   , 宿主机                   , 宿主机的管理 IP。
 host_hostname             , 宿主机                   , 宿主机的 Hostname。
-chost_ip                  , 云服务器                 , 云服务器的主 IP。
-chost_hostname            , 云服务器                 , 云服务器的 Hostname。
+chost_ip                  , 云主机                   , 云主机的主 IP。
+chost_hostname            , 云主机                   , 云主机的 Hostname。
 pod_node_ip               , K8s 容器节点             , 容器节点的主 IP。
 pod_node_hostname         , K8s 容器节点             , 容器节点的 Hostname。
 
@@ -55,6 +49,7 @@ k8s.env                   , K8s Env                  ,
 attribute                 , Attribute                , OpenTelemetry Span 属性，以及应用协议特有属性。
 cloud.tag                 , Cloud Tag                ,
 os.app                    , OS APP                   ,
+biz_service.group         , 服务组                   ,
 
 ip                        , IP 地址                  ,
 is_ipv4                   , IPv4 标志                ,
@@ -70,8 +65,10 @@ req_tcp_seq               , 请求 TCP Seq 号          ,
 resp_tcp_seq              , 响应 TCP Seq 号          ,
 
 l7_protocol               , 应用协议                 , 
-l7_protocol_str           , 应用协议                 , 字符串形式。
+l7_protocol_str           , 应用协议                 , 已废弃，请使用 biz_protocol。
 is_tls                    , TLS                      ,
+is_async                  , 异步                     ,
+is_reversed               , 反向                     ,
 version                   , 协议版本                 ,
 type                      , 日志类型                 ,
 request_type              , 请求类型                 ,
@@ -79,7 +76,7 @@ request_domain            , 请求域名                 ,
 request_resource          , 请求资源                 ,
 request_id                , 请求 ID                  ,
 response_status           , 响应状态                 ,
-response_code             , 响应码                   ,
+response_code             , 应用响应码               ,
 response_exception        , 响应异常                 ,
 response_result           , 响应结果                 ,
 events                    , 事件                     ,
@@ -88,7 +85,7 @@ app_service               , 应用服务                 ,
 app_instance              , 应用实例                 ,
 endpoint                  , 端点                     ,
 process_id                , 进程 ID                  ,
-process_kname             , 内核线程名               ,
+process_kname             , 系统进程                 ,
 
 trace_id                  , TraceID                  ,
 span_id                   , SpanID                   ,
@@ -129,4 +126,9 @@ capture_nic_name          , 采集网卡名称             , 当采集位置类�
 capture_nic_type          , 采集网卡类型             , 表示流量采集位置的类型，包括 OTel（应用 Span）、eBPF（Socket Data）、本地网卡（云内流量）、云网关网卡（云网关流量）、分光镜像（传统 IDC 流量）等。
 tap_side                  , 路径统计位置             , 已废弃，请使用 observation_point。
 observation_point         , 观测点                   , 采集位置在流量路径中所处的逻辑位置，例如客户端应用、客户端进程、客户端网卡、客户端容器节点、服务端容器节点、服务端网卡、服务端进程、服务端应用等。
+
 biz_type                  , 业务类型                 ,
+biz_code                  , 业务识别码               , 用于识别业务类型（例如手机银行转账、缴费）。
+biz_scenario              , 业务场景                 , 用于细分业务场景（如本人转本人、本地跨行）。
+biz_response_code         , 业务响应码               ,
+biz_protocol              , 业务协议                 ,

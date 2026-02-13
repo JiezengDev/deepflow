@@ -19,40 +19,32 @@ package diffbase
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 )
 
-func (b *DataSet) AddPeerConnection(dbItem *mysql.PeerConnection, seq int, toolDataSet *tool.DataSet) {
-	remoteRegionLcuuid, _ := toolDataSet.GetRegionLcuuidByID(dbItem.RemoteRegionID)
-	localRegionLcuuid, _ := toolDataSet.GetRegionLcuuidByID(dbItem.LocalRegionID)
+func (b *DataSet) AddPeerConnection(dbItem *metadbmodel.PeerConnection, seq int, toolDataSet *tool.DataSet) {
 	b.PeerConnections[dbItem.Lcuuid] = &PeerConnection{
 		DiffBase: DiffBase{
 			Sequence: seq,
 			Lcuuid:   dbItem.Lcuuid,
 		},
-		Name:               dbItem.Name,
-		RemoteRegionLcuuid: remoteRegionLcuuid,
-		LocalRegionLcuuid:  localRegionLcuuid,
+		Name: dbItem.Name,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_PEER_CONNECTION_EN, b.PeerConnections[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_PEER_CONNECTION_EN, b.PeerConnections[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeletePeerConnection(lcuuid string) {
 	delete(b.PeerConnections, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_PEER_CONNECTION_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_PEER_CONNECTION_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type PeerConnection struct {
 	DiffBase
-	Name               string `json:"name"`
-	RemoteRegionLcuuid string `json:"remote_region_lcuuid"`
-	LocalRegionLcuuid  string `json:"local_region_lcuuid"`
+	Name string `json:"name"`
 }
 
 func (p *PeerConnection) Update(cloudItem *cloudmodel.PeerConnection) {
 	p.Name = cloudItem.Name
-	p.RemoteRegionLcuuid = cloudItem.RemoteRegionLcuuid
-	p.LocalRegionLcuuid = cloudItem.LocalRegionLcuuid
 	log.Info(updateDiffBase(ctrlrcommon.RESOURCE_TYPE_PEER_CONNECTION_EN, p))
 }

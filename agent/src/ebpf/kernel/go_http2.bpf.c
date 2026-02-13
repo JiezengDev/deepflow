@@ -237,17 +237,18 @@ http2_fill_common_socket_1(struct http2_header_data *data,
 	send_buffer->source = DATA_SOURCE_GO_HTTP2_UPROBE;
 	send_buffer->is_tls = is_http2_tls();
 	send_buffer->timestamp = bpf_ktime_get_ns();
+	send_buffer->cap_timestamp = send_buffer->timestamp;
 	bpf_get_current_comm(send_buffer->comm, sizeof(send_buffer->comm));
 
 	// tcp_seq, direction
 	int tcp_seq;
 	enum traffic_direction direction;
 	if (data->read) {
-		tcp_seq = get_tcp_read_seq_from_fd(data->fd);
+		tcp_seq = get_tcp_read_seq(data->fd, NULL, NULL);
 		tcp_seq = get_previous_read_tcp_seq(data->fd, tcp_seq);
 		direction = T_INGRESS;
 	} else {
-		tcp_seq = get_tcp_write_seq_from_fd(data->fd);
+		tcp_seq = get_tcp_write_seq(data->fd, NULL, NULL);
 		direction = T_EGRESS;
 	}
 
@@ -323,9 +324,9 @@ http2_fill_common_socket_2(struct http2_header_data *data,
 	__u32 tgid = id >> 32;
 	__u32 k0 = 0;
 
-	// trace_conf, generator for socket_id
-	struct trace_conf_t *trace_conf = trace_conf_map__lookup(&k0);
-	if (trace_conf == NULL)
+	// tracer_ctx, generator for socket_id
+	struct tracer_ctx_s *tracer_ctx = tracer_ctx_map__lookup(&k0);
+	if (tracer_ctx == NULL)
 		return false;
 
 	struct trace_stats *trace_stats = trace_stats_map__lookup(&k0);
@@ -334,17 +335,18 @@ http2_fill_common_socket_2(struct http2_header_data *data,
 
 	// Update and get socket_id
 	__u64 conn_key;
-	struct socket_info_t *socket_info_ptr;
+	struct socket_info_s *socket_info_ptr;
 	conn_key = gen_conn_key_id((__u64) tgid, (__u64) data->fd);
 	socket_info_ptr = socket_info_map__lookup(&conn_key);
 	if (is_socket_info_valid(socket_info_ptr)) {
 		send_buffer->socket_id = socket_info_ptr->uid;
 	} else {
-		send_buffer->socket_id = trace_conf->socket_id + 1;
-		trace_conf->socket_id++;
+		send_buffer->socket_id = tracer_ctx->socket_id + 1;
+		tracer_ctx->socket_id++;
 
-		struct socket_info_t sk_info = {
+		struct socket_info_s sk_info = {
 			.uid = send_buffer->socket_id,
+			.l7_proto = PROTO_HTTP2,
 		};
 
 		if (!socket_info_map__update(&conn_key, &sk_info)) {
@@ -352,7 +354,7 @@ http2_fill_common_socket_2(struct http2_header_data *data,
 		}
 	}
 
-	__u32 timeout = trace_conf->go_tracing_timeout;
+	__u32 timeout = tracer_ctx->go_tracing_timeout;
 	struct trace_key_t trace_key = get_trace_key(timeout, true);
 	struct trace_info_t *trace_info_ptr = trace_map__lookup(&trace_key);
 
@@ -364,7 +366,7 @@ http2_fill_common_socket_2(struct http2_header_data *data,
 	if (timeout != 0) {
 		trace_process(socket_info_ptr, &conn_info,
 			      send_buffer->socket_id, id, trace_info_ptr,
-			      trace_conf, trace_stats,
+			      tracer_ctx, trace_stats,
 			      &send_buffer->thread_trace_id,
 			      send_buffer->timestamp, &trace_key);
 	}
@@ -542,8 +544,7 @@ static __inline bool skip_http2_uprobe(struct ebpf_proc_info *info)
 }
 
 // func (cc *http2ClientConn) writeHeader(name, value string)
-SEC("uprobe/go_http2ClientConn_writeHeader")
-int uprobe_go_http2ClientConn_writeHeader(struct pt_regs *ctx)
+UPROG(go_http2ClientConn_writeHeader) (struct pt_regs *ctx)
 {
 	struct member_fields_offset *offset = retrieve_ready_kern_offset();
 	if (offset == NULL)
@@ -602,8 +603,7 @@ int uprobe_go_http2ClientConn_writeHeader(struct pt_regs *ctx)
 }
 
 // func (cc *http2ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize int, hdrs []byte) error
-SEC("uprobe/go_http2ClientConn_writeHeaders")
-int uprobe_go_http2ClientConn_writeHeaders(struct pt_regs *ctx)
+UPROG(go_http2ClientConn_writeHeaders) (struct pt_regs *ctx)
 {
 	struct member_fields_offset *offset = retrieve_ready_kern_offset();
 	if (offset == NULL)
@@ -648,8 +648,7 @@ int uprobe_go_http2ClientConn_writeHeaders(struct pt_regs *ctx)
 }
 
 // func (sc *http2serverConn) processHeaders(f *http2MetaHeadersFrame) error
-SEC("uprobe/go_http2serverConn_processHeaders")
-int uprobe_go_http2serverConn_processHeaders(struct pt_regs *ctx)
+UPROG(go_http2serverConn_processHeaders) (struct pt_regs *ctx)
 {
 	struct member_fields_offset *offset = retrieve_ready_kern_offset();
 	if (offset == NULL)
@@ -688,8 +687,7 @@ int uprobe_go_http2serverConn_processHeaders(struct pt_regs *ctx)
 }
 
 // func (sc *http2serverConn) writeHeaders(st *http2stream, headerData *http2writeResHeaders) error
-SEC("uprobe/go_http2serverConn_writeHeaders")
-int uprobe_go_http2serverConn_writeHeaders(struct pt_regs *ctx)
+UPROG(go_http2serverConn_writeHeaders) (struct pt_regs *ctx)
 {
 	struct member_fields_offset *offset = retrieve_ready_kern_offset();
 	if (offset == NULL)
@@ -778,8 +776,7 @@ int uprobe_go_http2serverConn_writeHeaders(struct pt_regs *ctx)
 }
 
 // func (rl *http2clientConnReadLoop) handleResponse(cs *http2clientStream, f *http2MetaHeadersFrame) (*Response, error)
-SEC("uprobe/go_http2clientConnReadLoop_handleResponse")
-int uprobe_go_http2clientConnReadLoop_handleResponse(struct pt_regs *ctx)
+UPROG(go_http2clientConnReadLoop_handleResponse) (struct pt_regs *ctx)
 {
 	struct member_fields_offset *offset = retrieve_ready_kern_offset();
 	if (offset == NULL)
@@ -818,8 +815,7 @@ int uprobe_go_http2clientConnReadLoop_handleResponse(struct pt_regs *ctx)
 }
 
 // func (l *loopyWriter) writeHeader(streamID uint32, endStream bool, hf []hpack.HeaderField, onWrite func()) error
-SEC("uprobe/go_loopyWriter_writeHeader")
-int uprobe_go_loopyWriter_writeHeader(struct pt_regs *ctx)
+UPROG(go_loopyWriter_writeHeader) (struct pt_regs *ctx)
 {
 	struct member_fields_offset *offset = retrieve_ready_kern_offset();
 	if (offset == NULL)
@@ -863,8 +859,7 @@ int uprobe_go_loopyWriter_writeHeader(struct pt_regs *ctx)
 }
 
 // func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(*Stream), traceCtx func(context.Context, string) context.Context) (fatal bool)
-SEC("uprobe/go_http2Server_operateHeaders")
-int uprobe_go_http2Server_operateHeaders(struct pt_regs *ctx)
+UPROG(go_http2Server_operateHeaders) (struct pt_regs *ctx)
 {
 	struct member_fields_offset *offset = retrieve_ready_kern_offset();
 	if (offset == NULL)
@@ -904,8 +899,7 @@ int uprobe_go_http2Server_operateHeaders(struct pt_regs *ctx)
 }
 
 // func (t *http2Client) operateHeaders(frame *http2.MetaHeadersFrame)
-SEC("uprobe/go_http2Client_operateHeaders")
-int uprobe_go_http2Client_operateHeaders(struct pt_regs *ctx)
+UPROG(go_http2Client_operateHeaders) (struct pt_regs *ctx)
 {
 	struct member_fields_offset *offset = retrieve_ready_kern_offset();
 	if (offset == NULL)
@@ -983,6 +977,7 @@ static __inline int fill_http2_dataframe_base(struct __http2_stack *stack,
 	send_buffer->tgid = tgid;
 	send_buffer->pid = (__u32) pid_tgid;
 	send_buffer->timestamp = bpf_ktime_get_ns();
+	send_buffer->cap_timestamp = send_buffer->timestamp;
 	bpf_get_current_comm(send_buffer->comm, sizeof(send_buffer->comm));
 	send_buffer->tcp_seq = 0;
 	send_buffer->data_type = PROTO_HTTP2;
@@ -1035,9 +1030,9 @@ static __inline int fill_http2_dataframe_base(struct __http2_stack *stack,
 	}
 
 	__u32 k0 = 0;
-	// trace_conf, generator for socket_id
-	struct trace_conf_t *trace_conf = trace_conf_map__lookup(&k0);
-	if (trace_conf == NULL)
+	// tracer_ctx, generator for socket_id
+	struct tracer_ctx_s *tracer_ctx = tracer_ctx_map__lookup(&k0);
+	if (tracer_ctx == NULL)
 		return -1;
 
 	struct trace_stats *trace_stats = trace_stats_map__lookup(&k0);
@@ -1046,17 +1041,18 @@ static __inline int fill_http2_dataframe_base(struct __http2_stack *stack,
 
 	// Update and get socket_id
 	__u64 conn_key;
-	struct socket_info_t *socket_info_ptr;
+	struct socket_info_s *socket_info_ptr;
 	conn_key = gen_conn_key_id((__u64) tgid, (__u64) fd);
 	socket_info_ptr = socket_info_map__lookup(&conn_key);
 	if (is_socket_info_valid(socket_info_ptr)) {
 		send_buffer->socket_id = socket_info_ptr->uid;
 	} else {
-		send_buffer->socket_id = trace_conf->socket_id + 1;
-		trace_conf->socket_id++;
+		send_buffer->socket_id = tracer_ctx->socket_id + 1;
+		tracer_ctx->socket_id++;
 
-		struct socket_info_t sk_info = {
+		struct socket_info_s sk_info = {
 			.uid = send_buffer->socket_id,
+			.l7_proto = PROTO_HTTP2,
 		};
 
 		if (!socket_info_map__update(&conn_key, &sk_info)) {
@@ -1099,9 +1095,7 @@ static __inline int fill_http2_dataframe_data(struct __http2_stack *stack,
 
 // grpc dataframe
 // func (fr *Framer) checkFrameOrder(f Frame) error
-SEC("uprobe/golang_org_x_net_http2_Framer_checkFrameOrder")
-static int
-uprobe_golang_org_x_net_http2_Framer_checkFrameOrder(struct pt_regs *ctx)
+UPROG(golang_org_x_net_http2_Framer_checkFrameOrder) (struct pt_regs *ctx)
 {
 	struct member_fields_offset *offset = retrieve_ready_kern_offset();
 	if (offset == NULL)
@@ -1159,9 +1153,7 @@ uprobe_golang_org_x_net_http2_Framer_checkFrameOrder(struct pt_regs *ctx)
 }
 
 // func (f *Framer) WriteDataPadded(streamID uint32, endStream bool, data, pad []byte) error
-SEC("uprobe/golang_org_x_net_http2_Framer_WriteDataPadded")
-static int
-uprobe_golang_org_x_net_http2_Framer_WriteDataPadded(struct pt_regs *ctx)
+UPROG(golang_org_x_net_http2_Framer_WriteDataPadded) (struct pt_regs *ctx)
 {
 	struct member_fields_offset *offset = retrieve_ready_kern_offset();
 	if (offset == NULL)

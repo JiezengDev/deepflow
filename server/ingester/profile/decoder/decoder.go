@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/deepflowio/deepflow/server/ingester/common"
+	"github.com/deepflowio/deepflow/server/ingester/flow_tag"
 	profile_common "github.com/deepflowio/deepflow/server/ingester/profile/common"
 	"github.com/deepflowio/deepflow/server/ingester/profile/dbwriter"
 	"github.com/deepflowio/deepflow/server/libs/codec"
@@ -40,7 +41,6 @@ import (
 	logging "github.com/op/go-logging"
 	"github.com/pyroscope-io/pyroscope/pkg/convert/jfr"
 	"github.com/pyroscope-io/pyroscope/pkg/convert/pprof"
-	pprofile "github.com/pyroscope-io/pyroscope/pkg/convert/profile"
 	"github.com/pyroscope-io/pyroscope/pkg/ingestion"
 	"github.com/pyroscope-io/pyroscope/pkg/storage/metadata"
 	"github.com/pyroscope-io/pyroscope/pkg/storage/segment"
@@ -58,13 +58,17 @@ type Counter struct {
 	RawCount           int64 `statsd:"raw-count"`
 	JavaProfileCount   int64 `statsd:"java-profile-count"`
 	GolangProfileCount int64 `statsd:"golang-profile-count"`
-	EBPFProfileCount   int64 `statsd:"EBPF-profile-count"`
+	EBPFProfileCount   int64 `statsd:"ebpf-profile-count"`
 
 	UncompressSize int64 `statsd:"uncompress-size"`
 	CompressedSize int64 `statsd:"compressed-size"`
 
 	TotalTime int64 `statsd:"total-time"`
 	AvgTime   int64 `statsd:"avg-time"`
+
+	OffCpuSplitCount     int64 `statsd:"off-cpu-split-count"`
+	OffCpuSplitIntoCount int64 `statsd:"off-cpu-split-into-count"`
+	OffCputNotSplitCount int64 `statsd:"off-cput-not-split-count"`
 }
 
 var spyMap = map[string]string{
@@ -78,36 +82,57 @@ var spyMap = map[string]string{
 	"eBPF":      "eBPF",
 }
 
-var eBPFEventType = map[pb.ProfileEventType]string{
-	pb.ProfileEventType_External:   "third-party",
-	pb.ProfileEventType_EbpfOnCpu:  "on-cpu",
-	pb.ProfileEventType_EbpfOffCpu: "off-cpu",
+var eBPFEventType = []string{
+	pb.ProfileEventType_External:     "third-party",
+	pb.ProfileEventType_EbpfOnCpu:    "on-cpu",
+	pb.ProfileEventType_EbpfOffCpu:   "off-cpu",
+	pb.ProfileEventType_EbpfMemAlloc: "mem-alloc",
+	pb.ProfileEventType_EbpfMemInUse: "mem-inuse",
+	pb.ProfileEventType_EbpfHbmAlloc: "hbm-alloc",
+	pb.ProfileEventType_EbpfHbmInUse: "hbm-inuse",
 }
 
+const (
+	// when agent(sender) compress data by `profile.DataCompress` flag, should parse _ZSTD_COMPRESS_FLAG to decompress
+	_ZSTD_COMPRESS_FLAG uint8 = 1 // 0x1
+	// when profiler(java-sdk) send data to agent with gzip compress, should parse _GZIP_COMPRESS_FLAG to decompress
+	_GZIP_COMPRESS_FLAG uint8 = 1 << 1 // 0x2
+)
+
 type Decoder struct {
-	index           int
-	msgType         datatype.MessageType
-	platformData    *grpc.PlatformInfoTable
-	inQueue         queue.QueueReader
-	profileWriter   *dbwriter.ProfileWriter
-	compressionAlgo string
+	index               int
+	msgType             datatype.MessageType
+	platformData        *grpc.PlatformInfoTable
+	inQueue             queue.QueueReader
+	profileWriter       *dbwriter.ProfileWriter
+	appServiceTagWriter *flow_tag.AppServiceTagWriter
+	compressionAlgo     string
+
+	offCpuSplittingGranularity int
+
+	orgId, teamId    uint16
+	decompressBuffer []byte
 
 	counter *Counter
 	utils.Closable
 }
 
 func NewDecoder(index int, msgType datatype.MessageType, compressionAlgo string,
+	offCpuSplittingGranularity int,
 	platformData *grpc.PlatformInfoTable,
 	inQueue queue.QueueReader,
-	profileWriter *dbwriter.ProfileWriter) *Decoder {
+	profileWriter *dbwriter.ProfileWriter,
+	appServiceTagWriter *flow_tag.AppServiceTagWriter) *Decoder {
 	return &Decoder{
-		index:           index,
-		msgType:         msgType,
-		platformData:    platformData,
-		inQueue:         inQueue,
-		profileWriter:   profileWriter,
-		compressionAlgo: compressionAlgo,
-		counter:         &Counter{},
+		index:                      index,
+		msgType:                    msgType,
+		platformData:               platformData,
+		inQueue:                    inQueue,
+		profileWriter:              profileWriter,
+		appServiceTagWriter:        appServiceTagWriter,
+		compressionAlgo:            compressionAlgo,
+		offCpuSplittingGranularity: offCpuSplittingGranularity,
+		counter:                    &Counter{},
 	}
 }
 
@@ -140,6 +165,7 @@ func (d *Decoder) Run() {
 				continue
 			}
 			decoder.Init(recvBytes.Buffer[recvBytes.Begin:recvBytes.End])
+			d.orgId, d.teamId = uint16(recvBytes.OrgID), uint16(recvBytes.TeamID)
 			if d.msgType == datatype.MESSAGE_TYPE_PROFILE {
 				d.handleProfileData(recvBytes.VtapID, decoder)
 			}
@@ -147,6 +173,18 @@ func (d *Decoder) Run() {
 		}
 		d.counter.TotalTime += int64(time.Since(start))
 	}
+}
+
+func (d *Decoder) appServiceTagWrite(p *dbwriter.InProcessProfile) {
+	if d.appServiceTagWriter == nil {
+		return
+	}
+
+	if p.AppService == "" && p.AppInstance == "" {
+		return
+	}
+
+	d.appServiceTagWriter.Write(p.Time, dbwriter.PROFILE_TABLE, p.AppService, p.AppInstance, p.OrgId, p.TeamID)
 }
 
 func (d *Decoder) handleProfileData(vtapID uint16, decoder *codec.SimpleDecoder) {
@@ -159,31 +197,36 @@ func (d *Decoder) handleProfileData(vtapID uint16, decoder *codec.SimpleDecoder)
 		}
 
 		parser := &Parser{
-			vtapID:          vtapID,
-			inTimestamp:     time.Now(),
-			callBack:        d.profileWriter.Write,
-			platformData:    d.platformData,
-			IP:              make([]byte, len(profile.Ip)),
-			podID:           profile.PodId,
-			compressionAlgo: d.compressionAlgo,
-			observer:        &observer{},
-			Counter:         d.counter,
+			vtapID:                      vtapID,
+			orgId:                       d.orgId,
+			teamId:                      d.teamId,
+			inTimestamp:                 time.Now(),
+			profileWriterCallback:       d.profileWriter.Write,
+			appServiceTagWriterCallback: d.appServiceTagWrite,
+			platformData:                d.platformData,
+			IP:                          make([]byte, len(profile.Ip)),
+			podID:                       profile.PodId,
+			compressionAlgo:             d.compressionAlgo,
+			observer:                    &observer{},
+			offCpuSplittingGranularity:  d.offCpuSplittingGranularity,
+			Counter:                     d.counter,
 		}
 		copy(parser.IP, profile.Ip[:len(profile.Ip)])
 
+		// for jfr/pprof format, no matter compress or not, it requires decompress to parse profile data
 		switch profile.Format {
 		case "jfr":
 			atomic.AddInt64(&d.counter.JavaProfileCount, 1)
 			metadata := d.buildMetaData(profile)
 			parser.profileName = metadata.Key.AppName()
-			decompressJfr, err := profile_common.GzipDecompress(profile.Data)
-			if err != nil {
-				log.Errorf("decompress java profile data failed, offset=%d, len=%d, err=%s", decoder.Offset(), len(decoder.Bytes()), err)
-				return
+			compressFlag := _GZIP_COMPRESS_FLAG
+			if profile.DataCompressed {
+				compressFlag |= _ZSTD_COMPRESS_FLAG
 			}
-			err = d.sendProfileData(&jfr.RawProfile{
+			log.Debugf("decode java profile data, compression: %d, data: %v", compressFlag, profile.Data)
+			err := d.sendProfileData(&jfr.RawProfile{
 				FormDataContentType: string(profile.ContentType),
-				RawData:             decompressJfr,
+				RawData:             d.decompressData(profile.Data, compressFlag),
 			}, profile.Format, parser, metadata)
 
 			if err != nil {
@@ -194,9 +237,14 @@ func (d *Decoder) handleProfileData(vtapID uint16, decoder *codec.SimpleDecoder)
 			atomic.AddInt64(&d.counter.GolangProfileCount, 1)
 			metadata := d.buildMetaData(profile)
 			parser.profileName = metadata.Key.AppName()
+			var compressFlag uint8 = 0
+			if profile.DataCompressed {
+				compressFlag = _ZSTD_COMPRESS_FLAG
+			}
+			log.Debugf("decode golang profile data, compression: %d, data: %v", compressFlag, profile.Data)
 			err := d.sendProfileData(&pprof.RawProfile{
 				FormDataContentType: string(profile.ContentType),
-				RawData:             profile.Data,
+				RawData:             d.decompressData(profile.Data, compressFlag),
 			}, profile.Format, parser, metadata)
 			if err != nil {
 				log.Errorf("decode golang profile data failed, offset=%d, len=%d, err=%s", decoder.Offset(), len(decoder.Bytes()), err)
@@ -209,9 +257,14 @@ func (d *Decoder) handleProfileData(vtapID uint16, decoder *codec.SimpleDecoder)
 				atomic.AddInt64(&d.counter.GolangProfileCount, 1)
 				metadata := d.buildMetaData(profile)
 				parser.profileName = metadata.Key.AppName()
+				var compressFlag uint8 = 0
+				if profile.DataCompressed {
+					compressFlag = _ZSTD_COMPRESS_FLAG
+				}
+				log.Debugf("decode golang profile data, compression: %d, data: %v", compressFlag, profile.Data)
 				err := d.sendProfileData(&pprof.RawProfile{
 					FormDataContentType: string(profile.ContentType),
-					RawData:             profile.Data,
+					RawData:             d.decompressData(profile.Data, compressFlag),
 					StreamingParser:     true,
 					PoolStreamingParser: true,
 				}, profile.Format, parser, metadata)
@@ -224,11 +277,22 @@ func (d *Decoder) handleProfileData(vtapID uint16, decoder *codec.SimpleDecoder)
 				profile = d.filleBPFData(profile)
 				metadata := d.buildMetaData(profile)
 				parser.profileName = metadata.Key.AppName()
-				parser.processTracer = &processTracer{value: profile.Count, pid: profile.Pid, stime: int64(profile.Stime), eventType: eBPFEventType[profile.EventType]}
-				err := d.sendProfileData(&pprofile.RawProfile{
-					Format:  ingestion.FormatLines,
-					RawData: profile.Data,
-				}, profile.Format, parser, metadata)
+				parser.processTracer = &processTracer{value: profile.WideCount, pid: profile.Pid, stime: int64(profile.Stime), eventType: eBPFEventType[profile.EventType]}
+				if profile.WideCount == 0 {
+					// adapt agent version before v6.6
+					parser.processTracer.value = uint64(profile.Count)
+				}
+				// for ebpf profiling data, directly write, no need to parse
+				log.Debugf("decode ebpf profile data, compression: %d, data: %v", profile.DataCompressed, profile.Data)
+				err := parser.rawStackToInProcess(
+					profile.Data,
+					parser.value,
+					metadata.StartTime,
+					metadata.Units.String(),
+					metadata.SpyName,
+					metadata.Key.Labels(),
+					profile.DataCompressed,
+				)
 				if err != nil {
 					log.Errorf("decode ebpf profile data failed, offset=%d, len=%d, err=%s", decoder.Offset(), len(decoder.Bytes()), err)
 					return
@@ -244,7 +308,7 @@ func (d *Decoder) handleProfileData(vtapID uint16, decoder *codec.SimpleDecoder)
 func (d *Decoder) filleBPFData(profile *pb.Profile) *pb.Profile {
 	profile.From = uint32(profile.Timestamp / 1e9) // ns to s
 	profile.Until = uint32(time.Now().Unix())
-	profile.Units = string(metadata.SamplesUnits)
+	profile.Units = "microseconds" // agent will calculate real time when captured
 	profile.AggregationType = string(metadata.SumAggregationType)
 	profile.SpyName = "eBPF"
 	return profile
@@ -290,6 +354,28 @@ func (d *Decoder) buildMetaData(profile *pb.Profile) ingestion.Metadata {
 		Units:           metadata.Units(profile.Units),
 		AggregationType: metadata.AggregationType(profile.AggregationType),
 	}
+}
+
+func (d *Decoder) decompressData(data []byte, compressFlag uint8) []byte {
+	// zstdCompress comes from agent-sender
+	if compressFlag&_ZSTD_COMPRESS_FLAG == _ZSTD_COMPRESS_FLAG {
+		var err error
+		data, err = profile_common.ZstdDecompress(d.decompressBuffer[:0], data)
+		if err != nil {
+			log.Errorf("decompress profile data failed, decompressType=%d, len=%d, err=%s", _ZSTD_COMPRESS_FLAG, len(data), err)
+			return data
+		}
+	}
+	// gzipCompress comes from application-profiler
+	if compressFlag&_GZIP_COMPRESS_FLAG == _GZIP_COMPRESS_FLAG {
+		var err error
+		data, err = profile_common.GzipDecompress(data)
+		if err != nil {
+			log.Errorf("decompress profile data failed, decompressType=%d, len=%d, err=%s", _GZIP_COMPRESS_FLAG, len(data), err)
+			return data
+		}
+	}
+	return data
 }
 
 func (d *Decoder) sendProfileData(profile ingestion.RawProfile, format string, parser *Parser, metadata ingestion.Metadata) error {

@@ -70,12 +70,19 @@ struct Opts {
     /// optionally `K8S_POD_IP_FOR_DEEPFLOW` can be set to override ip address.
     #[clap(long)]
     sidecar: bool,
+
+    /// Disable cgroups, deepflow-agent will default to checking the CPU and memory resource usage in a loop every 10 seconds to prevent resource usage from exceeding limits.
+    #[clap(long)]
+    cgroups_disabled: bool,
 }
 
 #[cfg(unix)]
 fn wait_on_signals() {
     let mut signals = Signals::new(TERM_SIGNALS).unwrap();
-    signals.forever().next();
+    log::info!(
+        "The Process exits due to signal {:?}.",
+        signals.forever().next()
+    );
     signals.handle().close();
 }
 
@@ -101,7 +108,8 @@ const VERSION_INFO: &'static trident::VersionInfo = &trident::VersionInfo {
 
 fn main() -> Result<()> {
     panic::set_hook(Box::new(|panic_info| {
-        error!("{:?}", panic_info.to_string());
+        error!("{panic_info}");
+        error!("{}", std::backtrace::Backtrace::force_capture());
     }));
     let opts = Opts::parse();
     if opts.version {
@@ -117,6 +125,7 @@ fn main() -> Result<()> {
             trident::RunningMode::Managed
         },
         opts.sidecar,
+        opts.cgroups_disabled,
     )?;
     wait_on_signals();
     t.stop();

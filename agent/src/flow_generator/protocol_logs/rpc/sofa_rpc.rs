@@ -15,10 +15,12 @@
  */
 mod hessian;
 
+use std::borrow::Cow;
+
 use nom::InputTakeAtPosition;
 use public::{
     bytes::{read_u16_be, read_u32_be},
-    l7_protocol::L7Protocol,
+    l7_protocol::{L7Protocol, LogMessageType},
 };
 use serde::Serialize;
 
@@ -26,15 +28,16 @@ use crate::{
     common::{
         flow::L7PerfStats,
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
-        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
-        meta_packet::EbpfFlags,
+        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, LogCache, ParseParam},
+        meta_packet::ApplicationFlags,
     },
+    config::handler::{LogParserConfig, TraceType},
     flow_generator::{
         protocol_logs::{
             pb_adapter::{ExtendedInfo, L7ProtocolSendLog, L7Request, L7Response, TraceInfo},
-            L7ResponseStatus,
+            set_captured_byte, swap_if, L7ResponseStatus, PrioFields, BASE_FIELD_PRIORITY,
         },
-        AppProtoHead, Error, HttpLog, LogMessageType, Result,
+        AppProtoHead, Error, Result,
     },
 };
 
@@ -175,28 +178,56 @@ pub struct SofaRpcInfo {
     target_serv: String,
     method: String,
     cmd_code: u16,
-    trace_id: String,
+    trace_ids: PrioFields,
     span_id: String,
     parent_span_id: String,
 
     req_len: u32,
     resp_len: u32,
+    captured_request_byte: u32,
+    captured_response_byte: u32,
 
     resp_code: u16,
     status: L7ResponseStatus,
+
+    #[serde(skip)]
+    is_on_blacklist: bool,
+    #[serde(skip)]
+    endpoint: Option<String>,
 }
 
 impl SofaRpcInfo {
+    fn generate_endpoint(&self) -> Option<String> {
+        if !self.target_serv.is_empty() || !self.method.is_empty() {
+            Some(format!("{}/{}", self.target_serv, self.method))
+        } else {
+            None
+        }
+    }
+
     fn fill_with_trace_ctx(&mut self, ctx: String) {
         let ctx = decode_new_rpc_trace_context(ctx.as_bytes());
         if !ctx.trace_id.is_empty() {
-            self.trace_id = ctx.trace_id;
+            self.trace_ids
+                .merge_field(BASE_FIELD_PRIORITY, ctx.trace_id);
         }
         if !ctx.span_id.is_empty() {
             self.span_id = ctx.span_id;
         }
         if !ctx.parent_span_id.is_empty() {
             self.parent_span_id = ctx.parent_span_id;
+        }
+    }
+
+    fn set_is_on_blacklist(&mut self, config: &LogParserConfig) {
+        if let Some(t) = config.l7_log_blacklist_trie.get(&L7Protocol::SofaRPC) {
+            self.is_on_blacklist = t.request_resource.is_on_blacklist(&self.target_serv)
+                || t.request_type.is_on_blacklist(&self.method)
+                || self
+                    .endpoint
+                    .as_ref()
+                    .map(|p| t.endpoint.is_on_blacklist(p))
+                    .unwrap_or_default();
         }
     }
 }
@@ -211,6 +242,11 @@ impl L7ProtocolInfoInterface for SofaRpcInfo {
             self.resp_len = s.resp_len;
             self.resp_code = s.resp_code;
             self.status = s.status;
+            self.captured_response_byte = s.captured_response_byte;
+            swap_if!(self, endpoint, is_none, s);
+            if s.is_on_blacklist {
+                self.is_on_blacklist = s.is_on_blacklist;
+            }
         }
         Ok(())
     }
@@ -228,28 +264,30 @@ impl L7ProtocolInfoInterface for SofaRpcInfo {
     }
 
     fn get_endpoint(&self) -> Option<String> {
-        if !self.target_serv.is_empty() || !self.method.is_empty() {
-            Some(format!("{}/{}", self.target_serv, self.method))
-        } else {
-            None
-        }
+        self.endpoint.clone()
+    }
+
+    fn is_on_blacklist(&self) -> bool {
+        self.is_on_blacklist
     }
 }
 
 impl From<SofaRpcInfo> for L7ProtocolSendLog {
     fn from(s: SofaRpcInfo) -> Self {
         let flags = if s.is_tls {
-            EbpfFlags::TLS.bits()
+            ApplicationFlags::TLS.bits()
         } else {
-            EbpfFlags::NONE.bits()
+            ApplicationFlags::NONE.bits()
         };
         Self {
+            captured_request_byte: s.captured_request_byte,
+            captured_response_byte: s.captured_response_byte,
             req_len: Some(s.req_len),
             resp_len: Some(s.resp_len),
             req: L7Request {
                 req_type: s.method.clone(),
                 resource: s.target_serv.clone(),
-                endpoint: format!("{}/{}", s.target_serv.clone(), s.method),
+                endpoint: s.endpoint.unwrap_or_default(),
                 ..Default::default()
             },
             resp: L7Response {
@@ -258,7 +296,7 @@ impl From<SofaRpcInfo> for L7ProtocolSendLog {
                 ..Default::default()
             },
             trace_info: Some(TraceInfo {
-                trace_id: Some(s.trace_id),
+                trace_ids: s.trace_ids.into_strings_top3(),
                 span_id: Some(s.span_id),
                 parent_span_id: Some(s.parent_span_id),
                 ..Default::default()
@@ -274,34 +312,64 @@ impl From<SofaRpcInfo> for L7ProtocolSendLog {
     }
 }
 
-#[derive(Debug)]
-pub struct SofaRpcLog {
-    perf_stats: Option<L7PerfStats>,
-}
-
-impl Default for SofaRpcLog {
-    fn default() -> Self {
-        Self { perf_stats: None }
+impl From<&SofaRpcInfo> for LogCache {
+    fn from(info: &SofaRpcInfo) -> Self {
+        LogCache {
+            msg_type: info.msg_type,
+            resp_status: info.status,
+            on_blacklist: info.is_on_blacklist,
+            endpoint: info.get_endpoint(),
+            ..Default::default()
+        }
     }
 }
 
+#[derive(Debug, Default)]
+pub struct SofaRpcLog {
+    perf_stats: Vec<L7PerfStats>,
+}
+
 impl L7ProtocolParserInterface for SofaRpcLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
         let mut info = SofaRpcInfo::default();
-        self.parse(payload, true, &mut info, param).is_ok()
+        if self.parse(payload, true, &mut info, param).is_ok()
             && info.msg_type == LogMessageType::Request
             && info.cmd_code != CMD_CODE_HEARTBEAT
+        {
+            Some(LogMessageType::Request)
+        } else {
+            None
+        }
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
         let mut info = SofaRpcInfo::default();
+        self.perf_stats.clear();
         match self.parse(payload, false, &mut info, param) {
             Ok(ok) => {
                 if !ok {
                     return Ok(L7ParseResult::None);
                 }
-                self.cal_perf(param, &mut info);
+                info.endpoint = info.generate_endpoint();
                 info.is_tls = param.is_tls();
+                set_captured_byte!(info, param);
+                if let Some(config) = param.parse_config {
+                    info.set_is_on_blacklist(config);
+                }
+
+                if param.parse_perf {
+                    let mut perf_stat = L7PerfStats::default();
+                    if info.msg_type == LogMessageType::Response {
+                        if let Some(endpoint) = info.load_endpoint_from_cache(param, false) {
+                            info.endpoint = Some(endpoint.to_string());
+                        }
+                    }
+                    if let Some(stats) = info.perf_stats(param) {
+                        info.rrt = stats.rrt_sum;
+                        perf_stat.sequential_merge(&stats);
+                    }
+                    self.perf_stats.push(perf_stat);
+                }
                 if param.parse_log {
                     Ok(L7ParseResult::Single(L7ProtocolInfo::SofaRpcInfo(info)))
                 } else {
@@ -320,8 +388,8 @@ impl L7ProtocolParserInterface for SofaRpcLog {
         false
     }
 
-    fn perf_stats(&mut self) -> Option<L7PerfStats> {
-        self.perf_stats.take()
+    fn perf_stats(&mut self) -> Vec<L7PerfStats> {
+        std::mem::take(&mut self.perf_stats)
     }
 }
 
@@ -333,10 +401,6 @@ impl SofaRpcLog {
         info: &mut SofaRpcInfo,
         param: &ParseParam,
     ) -> Result<bool> {
-        if self.perf_stats.is_none() && param.parse_perf {
-            self.perf_stats = Some(L7PerfStats::default())
-        };
-
         let hdr = Hdr::try_from(payload)?;
         info.proto = hdr.proto;
         // now only support bolt v1
@@ -364,11 +428,11 @@ impl SofaRpcLog {
                 payload = &payload[RESP_HDR_LEN..];
                 info.resp_code = hdr.resp_code;
                 info.resp_len = hdr.content_len + (hdr.hdr_len as u32) + (hdr.class_len as u32);
-                if info.resp_code == 8 {
-                    info.status = L7ResponseStatus::ClientError;
-                } else if info.resp_code != 0 {
-                    info.status = L7ResponseStatus::ServerError;
-                }
+                info.status = match info.resp_code {
+                    0 => L7ResponseStatus::Ok,
+                    8 => L7ResponseStatus::ClientError,
+                    _ => L7ResponseStatus::ServerError,
+                };
                 LogMessageType::Response
             }
             _ => return Err(Error::L7ProtocolUnknown),
@@ -395,6 +459,11 @@ impl SofaRpcLog {
         }
 
         payload = &payload[hdr.class_len as usize..];
+        let multiple_trace_id_collection = if let Some(config) = param.parse_config {
+            config.l7_log_dynamic.multiple_trace_id_collection
+        } else {
+            true
+        };
 
         if hdr.hdr_len != 0 {
             let hdr_len = hdr.hdr_len as usize;
@@ -413,7 +482,10 @@ impl SofaRpcLog {
             let sofa_hdr = SofaHdr::from(hdr_payload);
             info.target_serv = sofa_hdr.service;
             info.method = sofa_hdr.method;
-            info.trace_id = sofa_hdr.trace_id;
+            if !sofa_hdr.trace_id.is_empty() {
+                info.trace_ids
+                    .merge_field(BASE_FIELD_PRIORITY, sofa_hdr.trace_id);
+            }
 
             if !sofa_hdr.new_rpc_trace_context.is_empty() {
                 info.fill_with_trace_ctx(sofa_hdr.new_rpc_trace_context);
@@ -422,6 +494,7 @@ impl SofaRpcLog {
         // parse req hessian2 obj
         if hdr.code_c == CODE_C_HESSIAN && payload.len() != 0 && hdr.typ == TYPE_REQ {
             if let Some(h) = HessianObjIterator::new(payload) {
+                let mut got_trace_id = false;
                 for (k, v) in h {
                     let FieldEnum::String(val) = v else {
                         continue;
@@ -431,9 +504,15 @@ impl SofaRpcLog {
                         SERVICE_KEY if info.target_serv.is_empty() => {
                             info.target_serv = val.to_string()
                         }
-                        TRACE_ID_KEY if info.trace_id.is_empty() => info.trace_id = val.to_string(),
+                        TRACE_ID_KEY => {
+                            got_trace_id = true;
+                            if multiple_trace_id_collection || info.trace_ids.is_empty() {
+                                info.trace_ids
+                                    .merge_field(BASE_FIELD_PRIORITY + 1, val.to_string());
+                            }
+                        }
                         _ => {
-                            if !info.trace_id.is_empty()
+                            if got_trace_id
                                 && !info.target_serv.is_empty()
                                 && !info.method.is_empty()
                             {
@@ -455,35 +534,9 @@ impl SofaRpcLog {
             Ok(true)
         }
     }
-
-    fn cal_perf(&mut self, param: &ParseParam, info: &mut SofaRpcInfo) {
-        match info.msg_type {
-            LogMessageType::Request => {
-                self.perf_stats.as_mut().map(|p| p.inc_req());
-            }
-            LogMessageType::Response => {
-                self.perf_stats.as_mut().map(|p| p.inc_resp());
-            }
-            _ => {}
-        }
-
-        match info.status {
-            L7ResponseStatus::ClientError => {
-                self.perf_stats.as_mut().map(|p| p.inc_req_err());
-            }
-            L7ResponseStatus::ServerError => {
-                self.perf_stats.as_mut().map(|p| p.inc_resp_err());
-            }
-            _ => {}
-        }
-
-        info.cal_rrt(param, None).map(|rrt| {
-            info.rrt = rrt;
-            self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
-        });
-    }
 }
 
+#[derive(Debug)]
 struct SofaHdr {
     service: String,
     method: String,
@@ -552,6 +605,7 @@ fn read_b32_kv<'a>(payload: &mut &'a [u8]) -> Option<(&'a [u8], &'a [u8])> {
     Some((key, value))
 }
 
+#[derive(Debug)]
 pub struct RpcTraceContext {
     pub trace_id: String,
     pub span_id: String,
@@ -582,14 +636,17 @@ pub fn decode_new_rpc_trace_context(mut payload: &[u8]) -> RpcTraceContext {
     ctx
 }
 
-pub fn decode_new_rpc_trace_context_with_type(mut payload: &[u8], id_type: u8) -> Option<String> {
+pub fn decode_new_rpc_trace_context_with_type(
+    mut payload: &[u8],
+    id_type: u8,
+) -> Option<Cow<'_, str>> {
     while let Some((key, val)) = read_url_param_kv(&mut payload) {
         match key {
-            RPC_TRACE_CONTEXT_TCID if id_type == HttpLog::TRACE_ID => {
-                return Some(String::from_utf8_lossy(val).to_string())
+            RPC_TRACE_CONTEXT_TCID if id_type == TraceType::TRACE_ID => {
+                return Some(String::from_utf8_lossy(val))
             }
-            RPC_TRACE_CONTEXT_SPID if id_type == HttpLog::SPAN_ID => {
-                return Some(String::from_utf8_lossy(val).to_string())
+            RPC_TRACE_CONTEXT_SPID if id_type == TraceType::SPAN_ID => {
+                return Some(String::from_utf8_lossy(val))
             }
             _ => {}
         }
@@ -612,6 +669,8 @@ fn read_url_param_kv<'a>(payload: &mut &'a [u8]) -> Option<(&'a [u8], &'a [u8])>
 mod test {
     use std::{cell::RefCell, path::Path, rc::Rc};
 
+    use public::l7_protocol::LogMessageType;
+
     use crate::{
         common::{
             flow::{L7PerfStats, PacketDirection},
@@ -619,8 +678,11 @@ mod test {
             l7_protocol_log::{L7PerfCache, L7ProtocolParserInterface, ParseParam},
         },
         flow_generator::{
-            protocol_logs::rpc::sofa_rpc::{CMD_CODE_REQ, CMD_CODE_RESP, PROTO_BOLT_V1},
-            LogMessageType, L7_RRT_CACHE_CAPACITY,
+            protocol_logs::{
+                rpc::sofa_rpc::{CMD_CODE_REQ, CMD_CODE_RESP, PROTO_BOLT_V1},
+                L7ResponseStatus,
+            },
+            L7_RRT_CACHE_CAPACITY,
         },
         utils::test::Capture,
     };
@@ -658,15 +720,16 @@ mod test {
     fn test_sofarpc_old() {
         let pcap_file = Path::new("resources/test/flow_generator/sofarpc/sofa-old.pcap");
         let log_cache = Rc::new(RefCell::new(L7PerfCache::new(L7_RRT_CACHE_CAPACITY)));
-        let capture = Capture::load_pcap(pcap_file, None);
-        let mut p = capture.as_meta_packets();
+        let capture = Capture::load_pcap(pcap_file);
+        let mut p = capture.collect::<Vec<_>>();
         p[0].lookup_key.direction = PacketDirection::ClientToServer;
         p[1].lookup_key.direction = PacketDirection::ServerToClient;
         let mut parser = SofaRpcLog::default();
+        let mut perf_stat = L7PerfStats::default();
 
         let req_param = &mut ParseParam::new(
             &p[0],
-            log_cache.clone(),
+            Some(log_cache.clone()),
             Default::default(),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             Default::default(),
@@ -674,23 +737,30 @@ mod test {
             true,
         );
         let req_payload = p[0].get_l4_payload().unwrap();
-        assert_eq!(parser.check_payload(req_payload, req_param), true);
+        req_param.set_captured_byte(req_payload.len());
+        assert_eq!(
+            parser.check_payload(req_payload, req_param),
+            Some(LogMessageType::Request)
+        );
         let req_info = parser
             .parse_payload(req_payload, req_param)
             .unwrap()
             .unwrap_single();
-
+        for i in parser.perf_stats() {
+            perf_stat.sequential_merge(&i);
+        }
         if let L7ProtocolInfo::SofaRpcInfo(k) = &req_info {
             assert_eq!(k.msg_type, LogMessageType::Request);
             assert_eq!(k.cmd_code, CMD_CODE_REQ);
             assert_eq!(k.method, "testSuccess");
             assert_eq!(k.req_id, 2);
-            assert_eq!(k.trace_id, "0a2200ce167089845152310016143");
+            assert_eq!(k.trace_ids.highest(), "0a2200ce167089845152310016143");
             assert_eq!(k.span_id, "");
             assert_eq!(k.parent_span_id, "");
             assert_eq!(k.proto, PROTO_BOLT_V1);
             assert_eq!(k.req_len, 874);
             assert_eq!(k.target_serv, "com.mycompany.app.common.ServInterface:1.0");
+            assert_eq!(k.captured_request_byte, req_payload.len() as u32);
         } else {
             unreachable!()
         }
@@ -699,33 +769,39 @@ mod test {
 
         let resp_param = &mut ParseParam::new(
             &p[1],
-            log_cache.clone(),
+            Some(log_cache.clone()),
             Default::default(),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             Default::default(),
             true,
             true,
         );
+
         let resp_payload = p[1].get_l4_payload().unwrap();
+        resp_param.set_captured_byte(resp_payload.len());
 
         let resp_info = parser
             .parse_payload(resp_payload, resp_param)
             .unwrap()
             .unwrap_single();
-
+        for i in parser.perf_stats() {
+            perf_stat.sequential_merge(&i);
+        }
         if let L7ProtocolInfo::SofaRpcInfo(k) = &resp_info {
             assert_eq!(k.msg_type, LogMessageType::Response);
             assert_eq!(k.cmd_code, CMD_CODE_RESP);
             assert_eq!(k.req_id, 2);
             assert_eq!(k.proto, PROTO_BOLT_V1);
             assert_eq!(k.resp_code, 0);
+            assert_eq!(k.status, L7ResponseStatus::Ok);
             assert_eq!(k.resp_len, 210);
+            assert_eq!(k.captured_response_byte, resp_payload.len() as u32);
         } else {
             unreachable!()
         }
 
         assert_eq!(
-            parser.perf_stats.unwrap(),
+            perf_stat,
             L7PerfStats {
                 request_count: 1,
                 response_count: 1,
@@ -744,15 +820,15 @@ mod test {
     fn test_sofarpc_new() {
         let pcap_file = Path::new("resources/test/flow_generator/sofarpc/sofa-new.pcap");
         let log_cache = Rc::new(RefCell::new(L7PerfCache::new(L7_RRT_CACHE_CAPACITY)));
-        let capture = Capture::load_pcap(pcap_file, None);
-        let mut p = capture.as_meta_packets();
+        let capture = Capture::load_pcap(pcap_file);
+        let mut p = capture.collect::<Vec<_>>();
         p[0].lookup_key.direction = PacketDirection::ClientToServer;
         p[1].lookup_key.direction = PacketDirection::ServerToClient;
         let mut parser = SofaRpcLog::default();
-
+        let mut perf_stat = L7PerfStats::default();
         let req_param = &mut ParseParam::new(
             &p[0],
-            log_cache.clone(),
+            Some(log_cache.clone()),
             Default::default(),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             Default::default(),
@@ -760,23 +836,30 @@ mod test {
             true,
         );
         let req_payload = p[0].get_l4_payload().unwrap();
-        assert_eq!(parser.check_payload(req_payload, req_param), true);
+        req_param.set_captured_byte(req_payload.len());
+        assert_eq!(
+            parser.check_payload(req_payload, req_param),
+            Some(LogMessageType::Request)
+        );
         let req_info = parser
             .parse_payload(req_payload, req_param)
             .unwrap()
             .unwrap_single();
-
+        for i in parser.perf_stats() {
+            perf_stat.sequential_merge(&i);
+        }
         if let L7ProtocolInfo::SofaRpcInfo(k) = &req_info {
             assert_eq!(k.msg_type, LogMessageType::Request);
             assert_eq!(k.cmd_code, CMD_CODE_REQ);
             assert_eq!(k.method, "testSuccess");
             assert_eq!(k.req_id, 2);
-            assert_eq!(k.trace_id, "0a2200ce1670900283956100813525");
+            assert_eq!(k.trace_ids.highest(), "0a2200ce1670900283956100813525");
             assert_eq!(k.span_id, "0");
             assert_eq!(k.parent_span_id, "");
             assert_eq!(k.proto, PROTO_BOLT_V1);
             assert_eq!(k.req_len, 730);
             assert_eq!(k.target_serv, "com.mycompany.app.common.ServInterface:1.0");
+            assert_eq!(k.captured_request_byte, req_payload.len() as u32);
         } else {
             unreachable!()
         }
@@ -785,7 +868,7 @@ mod test {
 
         let resp_param = &mut ParseParam::new(
             &p[1],
-            log_cache.clone(),
+            Some(log_cache.clone()),
             Default::default(),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             Default::default(),
@@ -793,25 +876,30 @@ mod test {
             true,
         );
         let resp_payload = p[1].get_l4_payload().unwrap();
+        resp_param.set_captured_byte(resp_payload.len());
 
         let resp_info = parser
             .parse_payload(resp_payload, resp_param)
             .unwrap()
             .unwrap_single();
-
+        for i in parser.perf_stats() {
+            perf_stat.sequential_merge(&i);
+        }
         if let L7ProtocolInfo::SofaRpcInfo(k) = &resp_info {
             assert_eq!(k.msg_type, LogMessageType::Response);
             assert_eq!(k.cmd_code, CMD_CODE_RESP);
             assert_eq!(k.req_id, 2);
             assert_eq!(k.proto, PROTO_BOLT_V1);
             assert_eq!(k.resp_code, 0);
+            assert_eq!(k.status, L7ResponseStatus::Ok);
             assert_eq!(k.resp_len, 210);
+            assert_eq!(k.captured_response_byte, resp_payload.len() as u32);
         } else {
             unreachable!()
         }
 
         assert_eq!(
-            parser.perf_stats.unwrap(),
+            perf_stat,
             L7PerfStats {
                 request_count: 1,
                 response_count: 1,

@@ -14,33 +14,120 @@
  * limitations under the License.
  */
 
-use std::{fmt, str};
+use std::{borrow::Cow, cell::OnceCell, collections::HashMap, fmt, str};
 
 use serde::{Serialize, Serializer};
+use strum_macros::Display;
 
-use super::{
-    super::{value_is_default, AppProtoHead, L7ResponseStatus, LogMessageType},
-    ObfuscateCache,
+#[cfg(feature = "enterprise")]
+use enterprise_utils::l7::custom_policy::custom_field_policy::{
+    enums::{Op, Source},
+    Store,
 };
+use public::l7_protocol::{Field, FieldSetter, L7Log, L7LogAttribute, LogMessageType};
+use public_derive::L7Log;
 
 use crate::{
     common::{
         enums::IpProtocol,
-        flow::L7Protocol,
-        flow::{L7PerfStats, PacketDirection},
+        flow::{L7PerfStats, L7Protocol, PacketDirection},
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
-        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
-        meta_packet::EbpfFlags,
+        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, LogCache, ParseParam},
+        meta_packet::ApplicationFlags,
     },
+    config::handler::LogParserConfig,
     flow_generator::{
         error::{Error, Result},
-        protocol_logs::pb_adapter::{L7ProtocolSendLog, L7Request, L7Response},
+        protocol_logs::{
+            pb_adapter::{ExtendedInfo, KeyVal, L7ProtocolSendLog, L7Request, L7Response},
+            set_captured_byte,
+        },
     },
+};
+
+use super::{
+    super::{value_is_default, AppProtoHead, L7ResponseStatus},
+    ObfuscateCache,
 };
 
 const SEPARATOR_SIZE: usize = 2;
 
-#[derive(Serialize, Debug, Default, Clone)]
+#[derive(Clone, Display, Debug, Default)]
+enum ResponseType {
+    #[strum(serialize = "Unknown redis format")]
+    #[default]
+    Unknown,
+    #[strum(serialize = "+ Simple string")]
+    String,
+    #[strum(serialize = "- Simple error")]
+    Error,
+    #[strum(serialize = ": Integer")]
+    Integer,
+    #[strum(serialize = "$ Bulk string")]
+    BulkString,
+    #[strum(serialize = "* Array")]
+    Array,
+    #[strum(serialize = "_ Nulls")]
+    Null,
+    #[strum(serialize = "# Boolean")]
+    Boolean,
+    #[strum(serialize = ", Double")]
+    Double,
+    #[strum(serialize = "( Big number")]
+    BigNumber,
+    #[strum(serialize = "! Bulk error")]
+    BulkError,
+    #[strum(serialize = "= Verbatim string")]
+    VerbatimString,
+    #[strum(serialize = "% Map")]
+    Map,
+    #[strum(serialize = "~ Set")]
+    Set,
+    #[strum(serialize = "> Push")]
+    Push,
+}
+
+impl Serialize for ResponseType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl From<u8> for ResponseType {
+    fn from(value: u8) -> Self {
+        match value {
+            b'+' => ResponseType::String,
+            b'-' => ResponseType::Error,
+            b':' => ResponseType::Integer,
+            b'$' => ResponseType::BulkString,
+            b'*' => ResponseType::Array,
+            b'_' => ResponseType::Null,
+            b'#' => ResponseType::Boolean,
+            b',' => ResponseType::Double,
+            b'(' => ResponseType::BigNumber,
+            b'!' => ResponseType::BulkError,
+            b'=' => ResponseType::VerbatimString,
+            b'%' => ResponseType::Map,
+            b'~' => ResponseType::Set,
+            b'>' => ResponseType::Push,
+            _ => ResponseType::Unknown,
+        }
+    }
+}
+
+#[derive(L7Log, Serialize, Debug, Default, Clone)]
+#[l7_log(version.skip = "true", request_domain.skip = "true", endpoint.skip = "true")]
+#[l7_log(response_code.skip = "true")]
+#[l7_log(request_id.skip = "true", http_proxy_client.skip = "true")]
+#[l7_log(trace_id.skip = "true", span_id.skip = "true", x_request_id.skip = "true")]
+#[l7_log(biz_code.skip = "true", biz_type.skip = "true", biz_scenario.skip = "true")]
+#[l7_log(request_resource.getter = "RedisInfo::get_request_resource", request_resource.setter = "RedisInfo::set_request_resource")]
+#[l7_log(request_type.getter = "RedisInfo::get_request_type", request_type.setter = "RedisInfo::set_request_type")]
+#[l7_log(response_result.getter = "RedisInfo::get_response_result", response_result.setter = "RedisInfo::set_response_result")]
+#[l7_log(response_exception.getter = "RedisInfo::get_response_exception", response_exception.setter = "RedisInfo::set_response_exception")]
 pub struct RedisInfo {
     msg_type: LogMessageType,
     #[serde(skip)]
@@ -70,10 +157,33 @@ pub struct RedisInfo {
         serialize_with = "vec_u8_to_string"
     )]
     pub error: Vec<u8>, // '-'
+    #[l7_log(response_status)]
     #[serde(rename = "response_status")]
     pub resp_status: L7ResponseStatus,
+    response_result: ResponseType,
+
+    captured_request_byte: u32,
+    captured_response_byte: u32,
 
     rrt: u64,
+
+    #[serde(skip)]
+    attributes: Vec<KeyVal>,
+
+    #[serde(skip)]
+    is_on_blacklist: bool,
+
+    #[serde(skip_serializing_if = "value_is_default")]
+    biz_response_code: String,
+}
+
+impl L7LogAttribute for RedisInfo {
+    fn add_attribute(&mut self, name: Cow<'_, str>, value: Cow<'_, str>) {
+        self.attributes.push(KeyVal {
+            key: name.into_owned(),
+            val: value.into_owned(),
+        });
+    }
 }
 
 impl L7ProtocolInfoInterface for RedisInfo {
@@ -103,6 +213,10 @@ impl L7ProtocolInfoInterface for RedisInfo {
     fn get_request_resource_length(&self) -> usize {
         self.request.len()
     }
+
+    fn is_on_blacklist(&self) -> bool {
+        self.is_on_blacklist
+    }
 }
 
 pub fn vec_u8_to_string<S>(v: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
@@ -113,11 +227,70 @@ where
 }
 
 impl RedisInfo {
+    fn get_field_from_bytes(bytes: &Vec<u8>) -> Field<'_> {
+        match str::from_utf8(bytes) {
+            Ok(s) => Field::from(s),
+            Err(_) => Field::None,
+        }
+    }
+
+    fn set_field_to_bytes(field: FieldSetter<'_>, bytes: &mut Vec<u8>) {
+        *bytes = field.into_inner().to_string().into_bytes();
+    }
+
+    pub fn get_request_resource(&self) -> Field<'_> {
+        Self::get_field_from_bytes(&self.request)
+    }
+
+    pub fn set_request_resource(&mut self, setter: FieldSetter<'_>) {
+        Self::set_field_to_bytes(setter, &mut self.request);
+    }
+
+    pub fn get_request_type(&self) -> Field<'_> {
+        Self::get_field_from_bytes(&self.request_type)
+    }
+
+    pub fn set_request_type(&mut self, setter: FieldSetter<'_>) {
+        Self::set_field_to_bytes(setter, &mut self.request_type);
+    }
+
+    pub fn get_response_result(&self) -> Field<'_> {
+        Self::get_field_from_bytes(&self.status)
+    }
+
+    pub fn set_response_result(&mut self, setter: FieldSetter<'_>) {
+        Self::set_field_to_bytes(setter, &mut self.status);
+    }
+
+    pub fn get_response_exception(&self) -> Field<'_> {
+        Self::get_field_from_bytes(&self.error)
+    }
+
+    pub fn set_response_exception(&mut self, setter: FieldSetter<'_>) {
+        Self::set_field_to_bytes(setter, &mut self.error);
+    }
+
     pub fn merge(&mut self, other: &mut Self) -> Result<()> {
         std::mem::swap(&mut self.status, &mut other.status);
         std::mem::swap(&mut self.error, &mut other.error);
+        std::mem::swap(&mut self.response_result, &mut other.response_result);
         self.resp_status = other.resp_status;
+        self.captured_response_byte = other.captured_response_byte;
+        if other.is_on_blacklist {
+            self.is_on_blacklist = other.is_on_blacklist;
+        }
+        self.attributes.append(&mut other.attributes);
         Ok(())
+    }
+
+    fn set_is_on_blacklist(&mut self, config: &LogParserConfig) {
+        if let Some(t) = config.l7_log_blacklist_trie.get(&L7Protocol::Redis) {
+            self.is_on_blacklist = t
+                .request_resource
+                .is_on_blacklist(str::from_utf8(&self.request).unwrap_or_default())
+                || t.request_type
+                    .is_on_blacklist(str::from_utf8(&self.request_type).unwrap_or_default());
+        }
     }
 }
 
@@ -138,6 +311,7 @@ impl fmt::Display for RedisInfo {
             "status: {:?}, ",
             str::from_utf8(&self.status).unwrap_or_default()
         )?;
+        write!(f, "response_result: {:?}, ", &self.response_result)?;
         write!(
             f,
             "error: {:?} }}",
@@ -149,11 +323,13 @@ impl fmt::Display for RedisInfo {
 impl From<RedisInfo> for L7ProtocolSendLog {
     fn from(f: RedisInfo) -> Self {
         let flags = if f.is_tls {
-            EbpfFlags::TLS.bits()
+            ApplicationFlags::TLS.bits()
         } else {
-            EbpfFlags::NONE.bits()
+            ApplicationFlags::NONE.bits()
         };
         let log = L7ProtocolSendLog {
+            captured_request_byte: f.captured_request_byte,
+            captured_response_byte: f.captured_response_byte,
             req: L7Request {
                 req_type: String::from_utf8_lossy(f.request_type.as_slice()).to_string(),
                 resource: String::from_utf8_lossy(f.request.as_slice()).to_string(),
@@ -162,51 +338,112 @@ impl From<RedisInfo> for L7ProtocolSendLog {
             resp: L7Response {
                 status: f.resp_status,
                 exception: String::from_utf8_lossy(f.error.as_slice()).to_string(),
+                result: f.response_result.to_string(),
                 ..Default::default()
             },
+            ext_info: Some(ExtendedInfo {
+                attributes: {
+                    if f.attributes.is_empty() {
+                        None
+                    } else {
+                        Some(f.attributes)
+                    }
+                },
+                ..Default::default()
+            }),
             flags,
+            biz_response_code: f.biz_response_code,
             ..Default::default()
         };
         return log;
     }
 }
 
+impl From<&RedisInfo> for LogCache {
+    fn from(info: &RedisInfo) -> Self {
+        LogCache {
+            msg_type: info.msg_type,
+            resp_status: info.resp_status,
+            on_blacklist: info.is_on_blacklist,
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct RedisLog {
     has_request: bool,
-    perf_stats: Option<L7PerfStats>,
+    perf_stats: Vec<L7PerfStats>,
     obfuscate: bool,
+    #[cfg(feature = "enterprise")]
+    custom_field_store: Store,
 }
 
 impl L7ProtocolParserInterface for RedisLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
         if !param.ebpf_type.is_raw_protocol() {
-            return false;
+            return None;
         }
         if param.l4_protocol != IpProtocol::TCP {
-            return false;
+            return None;
         }
 
-        CommandLine::new(payload).is_ok()
+        if CommandLine::new(payload).is_ok() {
+            Some(LogMessageType::Request)
+        } else {
+            None
+        }
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
-        if self.perf_stats.is_none() && param.parse_perf {
-            self.perf_stats = Some(L7PerfStats::default())
+        #[cfg(feature = "enterprise")]
+        self.custom_field_store.clear();
+        #[cfg(feature = "enterprise")]
+        let custom_policies = param
+            .parse_config
+            .and_then(|config| config.get_custom_field_policies(L7Protocol::Redis.into(), param));
+
+        let mut info = RedisInfo {
+            is_tls: param.is_tls(),
+            ..Default::default()
         };
-        let mut info = RedisInfo::default();
-        info.is_tls = param.is_tls();
-        self.parse(
-            payload,
-            param.l4_protocol,
-            param.direction,
-            param.is_from_ebpf(),
-            &mut info,
-        )?;
-        info.cal_rrt(param, None).map(|rrt| {
-            info.rrt = rrt;
-            self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
-        });
+        self.parse(payload, param.l4_protocol, param.direction, &mut info)?;
+
+        #[cfg(feature = "enterprise")]
+        if let Some(cp) = custom_policies {
+            cp.apply(
+                &mut self.custom_field_store,
+                &info,
+                param.direction.into(),
+                Source::Dummy,
+            );
+            for op in self.custom_field_store.drain_with(cp, &info) {
+                match &op.op {
+                    Op::SaveHeader(_) => (),
+                    Op::SavePayload(key) => {
+                        info.attributes.push(KeyVal {
+                            key: key.to_string(),
+                            val: String::from_utf8_lossy(payload).to_string(),
+                        });
+                    }
+                    _ => (),
+                }
+            }
+        }
+
+        set_captured_byte!(info, param);
+        if let Some(config) = param.parse_config {
+            info.set_is_on_blacklist(config);
+        }
+        self.perf_stats.clear();
+        if param.parse_perf {
+            let mut perf_stat = L7PerfStats::default();
+            if let Some(stats) = info.perf_stats(param) {
+                info.rrt = stats.rrt_sum;
+                perf_stat.sequential_merge(&stats);
+            }
+            self.perf_stats.push(perf_stat);
+        }
         if param.parse_log {
             Ok(L7ParseResult::Single(L7ProtocolInfo::RedisInfo(info)))
         } else {
@@ -222,8 +459,8 @@ impl L7ProtocolParserInterface for RedisLog {
         false
     }
 
-    fn perf_stats(&mut self) -> Option<L7PerfStats> {
-        self.perf_stats.take()
+    fn perf_stats(&mut self) -> Vec<L7PerfStats> {
+        std::mem::take(&mut self.perf_stats)
     }
 
     fn set_obfuscate_cache(&mut self, obfuscate_cache: Option<ObfuscateCache>) {
@@ -233,7 +470,7 @@ impl L7ProtocolParserInterface for RedisLog {
 
 impl RedisLog {
     fn reset(&mut self) {
-        self.perf_stats = None;
+        self.perf_stats = vec![];
     }
 
     fn fill_request(&mut self, request: CommandLine, info: &mut RedisInfo) {
@@ -241,16 +478,14 @@ impl RedisLog {
         info.msg_type = LogMessageType::Request;
         info.request = request.stringify(self.obfuscate);
         self.has_request = true;
-        self.perf_stats.as_mut().map(|p| p.inc_req());
     }
 
-    fn fill_response(&mut self, context: Vec<u8>, info: &mut RedisInfo) {
+    fn fill_response(&mut self, context: (Vec<u8>, ResponseType), info: &mut RedisInfo) {
         info.msg_type = LogMessageType::Response;
         self.has_request = false;
-        self.perf_stats.as_mut().map(|p| p.inc_resp());
-
+        let (context, response_type) = context;
         info.resp_status = L7ResponseStatus::Ok;
-
+        info.response_result = response_type;
         if context.is_empty() {
             return;
         }
@@ -259,7 +494,6 @@ impl RedisLog {
             b'-' | b'!' => {
                 info.error = context;
                 info.resp_status = L7ResponseStatus::ServerError;
-                self.perf_stats.as_mut().map(|p| p.inc_resp_err());
             }
             _ => {}
         }
@@ -270,7 +504,6 @@ impl RedisLog {
         payload: &[u8],
         proto: IpProtocol,
         direction: PacketDirection,
-        is_from_ebpf: bool,
         info: &mut RedisInfo,
     ) -> Result<()> {
         if proto != IpProtocol::TCP {
@@ -282,11 +515,10 @@ impl RedisLog {
 
         match direction {
             // only parse the request with payload start with '*' which indicate is a command start, otherwise assume tcp fragment of request
-            PacketDirection::ClientToServer if payload[0] == b'*' => {
+            PacketDirection::ClientToServer if payload.get(0) == Some(&b'*') => {
                 self.fill_request(CommandLine::new(payload)?, info)
             }
-            // When packet comes from AfPacket, there must be a request before parsing the response.
-            PacketDirection::ServerToClient if self.has_request || is_from_ebpf => {
+            PacketDirection::ServerToClient if self.has_request => {
                 self.fill_response(stringifier::decode(payload, false)?, info)
             }
             _ => return Err(Error::L7ProtocolUnknown),
@@ -456,19 +688,19 @@ mod stringifier {
     fn validate_null(payload: &[u8]) -> Result<&[u8]> {
         assert_eq!(payload[0], b'_');
 
-        if payload.len() < 3 || &payload[1..3] != b"\r\n" {
-            return Err(Error::RedisLogParseFailed);
+        if payload.get(1..3) == Some(b"\r\n".as_ref()) {
+            Ok(&payload[3..])
+        } else {
+            Err(Error::RedisLogParseFailed)
         }
-
-        Ok(&payload[3..])
     }
 
     // #<t|f>\r\n
     fn validate_boolean(payload: &[u8]) -> Result<&[u8]> {
         assert_eq!(payload[0], b'#');
 
-        match &payload[1..4] {
-            b"t\r\n" | b"f\r\n" => Ok(&payload[4..]),
+        match payload.get(1..4) {
+            Some(b"t\r\n") | Some(b"f\r\n") => Ok(&payload[4..]),
             _ => Err(Error::RedisLogParseFailed),
         }
     }
@@ -572,7 +804,7 @@ mod stringifier {
         }
     }
 
-    pub fn decode(payload: &[u8], strict: bool) -> Result<Vec<u8>> {
+    pub fn decode(payload: &[u8], strict: bool) -> Result<(Vec<u8>, ResponseType)> {
         if payload.is_empty() {
             return Err(Error::RedisLogParseFailed);
         }
@@ -584,10 +816,70 @@ mod stringifier {
             (_, Err(Error::RedisLogParseFailed)) | (true, Err(Error::RedisLogParsePartial)) => {
                 Err(Error::RedisLogParseFailed)
             }
-            _ => Ok(output),
+            _ => Ok((output, ResponseType::from(payload[0]))),
         }
     }
 }
+
+struct Command {
+    cmd: String,
+    sub: Vec<String>,
+}
+
+thread_local! {
+    static ALL_COMMANDS: OnceCell<Vec<Command>> = OnceCell::new();
+    static MAX_COMMAND_LENGTH: OnceCell<usize> = OnceCell::new();
+}
+
+fn max_command_length() -> usize {
+    MAX_COMMAND_LENGTH.with(|cell| {
+        let len = cell.get_or_init(|| {
+            ALL_COMMANDS.with(|cell| {
+                let cmds = cell.get_or_init(all_commands);
+                cmds.iter().map(|cmd| cmd.cmd.len()).max().unwrap()
+            })
+        });
+        *len
+    })
+}
+
+fn all_commands() -> Vec<Command> {
+    let mut command_map: HashMap<&str, Vec<String>> = HashMap::new();
+    for line in ALL_COMMNADS_STR.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let mut keys = line.split_whitespace();
+        let key0 = keys.next().unwrap();
+        let key1 = keys.next().unwrap_or_default();
+        command_map.entry(key0).or_default().push(key1.to_owned());
+    }
+    let mut commands = command_map
+        .into_iter()
+        .map(|(cmd, mut sub)| {
+            // remove `sub` for commands without sub commands to save memory
+            // commands (for example, JSON.DEBUG) that can have zero or one more sub commands
+            // can also be removed because validate the second word is pointless
+            if sub.is_empty() || sub.iter().any(|s| s.is_empty()) {
+                Command {
+                    cmd: cmd.to_owned(),
+                    sub: vec![],
+                }
+            } else {
+                sub.sort_unstable();
+                Command {
+                    cmd: cmd.to_owned(),
+                    sub,
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    commands.sort_unstable_by(|k1, k2| k1.cmd.cmp(&k2.cmd));
+    commands
+}
+
+// The list is from https://redis.io/docs/latest/commands/
+const ALL_COMMNADS_STR: &str = include_str!("redis-commands");
 
 struct CommandLine<'a> {
     payload: &'a [u8],
@@ -596,8 +888,6 @@ struct CommandLine<'a> {
 }
 
 impl<'a> CommandLine<'a> {
-    const MAX_COMMAND_LENGTH: usize = 17;
-
     fn new(payload: &'a [u8]) -> Result<Self> {
         if payload.len() < "*0\r\n".len() || payload[0] != b'*' {
             return Err(Error::RedisLogParseFailed);
@@ -605,14 +895,22 @@ impl<'a> CommandLine<'a> {
 
         let (payload, length) = stringifier::read_length(&payload[1..])?;
 
-        let mut cmd_upper = String::new();
         // read command
         let (mut payload_iter, command) = Self::decode_bulk_string(payload)?;
-        if command.len() <= Self::MAX_COMMAND_LENGTH && command.is_ascii() {
-            // SAFTY: checked ascii string
-            unsafe {
-                cmd_upper = str::from_utf8_unchecked(command).to_ascii_uppercase();
-            }
+        if command.len() > max_command_length() {
+            return Err(Error::RedisLogParseFailed);
+        }
+        let Ok(cmd_upper) = str::from_utf8(command).map(|s| s.to_ascii_uppercase()) else {
+            return Err(Error::RedisLogParseFailed);
+        };
+
+        let valid = if length > 1 {
+            Self::check_command(&cmd_upper, Some(payload_iter))
+        } else {
+            Self::check_command(&cmd_upper, None)
+        };
+        if !valid {
+            return Err(Error::RedisLogParseFailed);
         }
 
         // validate rest of the buffer
@@ -627,6 +925,30 @@ impl<'a> CommandLine<'a> {
             payload,
             cmd_upper,
             length: length as usize,
+        })
+    }
+
+    fn check_command(cmd_upper: &str, next_cmds: Option<&[u8]>) -> bool {
+        ALL_COMMANDS.with(|cell| {
+            let cmds = cell.get_or_init(all_commands);
+            match cmds.binary_search_by_key(&cmd_upper, |cmd| &cmd.cmd) {
+                Ok(id) if cmds[id].sub.is_empty() => true,
+                Ok(id) => {
+                    if let Some(next) = next_cmds {
+                        let Ok((_, next_cmd)) = Self::decode_bulk_string(next) else {
+                            return false;
+                        };
+                        let Ok(next_cmd) = str::from_utf8(next_cmd) else {
+                            return false;
+                        };
+                        let next_cmd_upper = next_cmd.to_ascii_uppercase();
+                        cmds[id].sub.binary_search(&next_cmd_upper).is_ok()
+                    } else {
+                        false
+                    }
+                }
+                Err(_) => false,
+            }
         })
     }
 
@@ -933,8 +1255,8 @@ mod tests {
     fn run(name: &str) -> String {
         let pcap_file = Path::new(FILE_DIR).join(name);
         let log_cache = Rc::new(RefCell::new(L7PerfCache::new(L7_RRT_CACHE_CAPACITY)));
-        let capture = Capture::load_pcap(pcap_file, None);
-        let mut packets = capture.as_meta_packets();
+        let capture = Capture::load_pcap(pcap_file);
+        let mut packets = capture.collect::<Vec<_>>();
         if packets.is_empty() {
             return "".to_string();
         }
@@ -953,18 +1275,19 @@ mod tests {
                 None => continue,
             };
 
-            let param = &ParseParam::new(
+            let param = &mut ParseParam::new(
                 packet as &MetaPacket,
-                log_cache.clone(),
+                Some(log_cache.clone()),
                 Default::default(),
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 Default::default(),
                 true,
                 true,
             );
+            param.set_captured_byte(payload.len());
 
             let is_redis = match packet.lookup_key.direction {
-                PacketDirection::ClientToServer => redis.check_payload(payload, param),
+                PacketDirection::ClientToServer => redis.check_payload(payload, param).is_some(),
                 PacketDirection::ServerToClient => stringifier::decode(payload, false).is_ok(),
             };
 
@@ -1022,8 +1345,10 @@ mod tests {
             (("-1\r\n", true), Some("-1")),
             // _\r\n
             (("_\r\n", true), Some("")),
+            (("_\r", true), None),
             // #<t|f>\r\n
             (("#t\r\n", true), Some("")),
+            (("#t\r", true), None),
             // ,[<+|->]<integral>[.<fractional>][<E|e>[sign]<exponent>]\r\n
             // ,inf\r\n
             // ,-inf\r\n
@@ -1044,7 +1369,10 @@ mod tests {
         for (input, expected) in testcases.iter() {
             let output = stringifier::decode(&input.0.as_bytes(), input.1);
             assert_eq!(
-                output.ok().as_ref().and_then(|vs| str::from_utf8(vs).ok()),
+                output
+                    .ok()
+                    .as_ref()
+                    .and_then(|vs| str::from_utf8(&vs.0).ok()),
                 *expected,
                 "testcase input '{}' failed",
                 str::from_utf8(input.0.as_bytes()).unwrap().escape_default()
@@ -1060,6 +1388,35 @@ mod tests {
         for i in 0..(s.len() - 1) {
             assert!(stringifier::decode(&s.as_bytes()[..i], true).is_err());
         }
+    }
+
+    #[test]
+    fn check_command() {
+        // single word command
+        assert!(CommandLine::check_command("SET", None));
+        assert!(CommandLine::check_command("SET", Some(b"$3\r\nkey\r\n")));
+
+        // multi word command
+        assert!(CommandLine::check_command("ACL", Some(b"$4\r\nLIST\r\n")));
+        assert!(CommandLine::check_command(
+            "ACL",
+            Some(b"$7\r\nGENPASS\r\n")
+        ));
+        assert!(!CommandLine::check_command(
+            "ACL",
+            Some(b"$7\r\nINVALID\r\n")
+        ));
+
+        // single or multi
+        assert!(CommandLine::check_command("JSON.DEBUG", None));
+        assert!(CommandLine::check_command(
+            "JSON.DEBUG",
+            Some(b"$6\r\nMEMORY\r\n")
+        ));
+        assert!(CommandLine::check_command(
+            "JSON.DEBUG",
+            Some(b"$14\r\nSOMETHING_ELSE\r\n")
+        ));
     }
 
     #[test]
@@ -1118,12 +1475,12 @@ mod tests {
         let rrt_cache = Rc::new(RefCell::new(L7PerfCache::new(100)));
         let mut redis = RedisLog::default();
 
-        let capture = Capture::load_pcap(Path::new(FILE_DIR).join(pcap), None);
-        let mut packets = capture.as_meta_packets();
+        let capture = Capture::load_pcap(Path::new(FILE_DIR).join(pcap));
+        let mut packets = capture.collect::<Vec<_>>();
         if packets.len() < 2 {
             unreachable!();
         }
-
+        let mut perf_stat = L7PerfStats::default();
         let first_dst_port = packets[0].lookup_key.dst_port;
         for packet in packets.iter_mut() {
             if packet.lookup_key.dst_port == first_dst_port {
@@ -1136,7 +1493,7 @@ mod tests {
                     packet.get_l4_payload().unwrap(),
                     &ParseParam::new(
                         &*packet,
-                        rrt_cache.clone(),
+                        Some(rrt_cache.clone()),
                         Default::default(),
                         #[cfg(any(target_os = "linux", target_os = "android"))]
                         Default::default(),
@@ -1144,9 +1501,12 @@ mod tests {
                         true,
                     ),
                 );
+                for i in redis.perf_stats() {
+                    perf_stat.sequential_merge(&i);
+                }
             }
         }
-        redis.perf_stats.unwrap()
+        perf_stat
     }
 
     fn encode_redis_command(command: &str) -> Vec<u8> {
@@ -1185,7 +1545,7 @@ mod tests {
                 ("BITFIELD key GET type offset INCRBY type", "BITFIELD key GET type offset INCRBY type"),
                 ("BITFIELD key SET type offset", "BITFIELD key SET type offset"),
                 ("CONFIG SET parameter value", "CONFIG SET parameter ?"),
-                ("CONFIG foo bar baz", "CONFIG foo bar baz"),
+                ("CONFIG GET foo bar baz", "CONFIG GET foo bar baz"),
                 ("GEOADD key longitude latitude member longitude latitude member longitude latitude member", "GEOADD key longitude latitude ? longitude latitude ? longitude latitude ?"),
                 ("GEOADD key longitude latitude member longitude latitude member", "GEOADD key longitude latitude ? longitude latitude ?"),
                 ("GEOADD key longitude latitude member", "GEOADD key longitude latitude ?"),
@@ -1235,14 +1595,14 @@ mod tests {
                 ("ZADD key XX INCR score member score member", "ZADD key XX INCR score ? score ?"),
                 ("ZADD key XX INCR score member", "ZADD key XX INCR score ?"),
                 ("ZADD key XX INCR score", "ZADD key XX INCR score"),
-                ("CONFIG command SET k v", "CONFIG command SET k ?"),
                 ("SET *😊®© ❤️", "SET *😊®© ?"),
-                ("SET😊 ❤️*😊®© ❤️", "SET😊 ❤️*😊®© ❤️"),
                 ("ZADD key 😊 member score 😊", "ZADD key 😊 ? score ?"),
             ];
         for (input, expected) in testcases.iter() {
             let redis_str = encode_redis_command(input);
-            let cmdline = CommandLine::new(&redis_str).unwrap();
+            let Ok(cmdline) = CommandLine::new(&redis_str) else {
+                panic!("parse cmdline failed at: {input}");
+            };
             let output = cmdline.stringify(true);
             assert_eq!(
                 str::from_utf8(output.as_slice()).unwrap(),

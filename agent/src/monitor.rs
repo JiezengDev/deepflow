@@ -25,23 +25,31 @@ use std::{
 
 use arc_swap::access::Access;
 use log::{debug, info, warn};
+#[cfg(target_os = "linux")]
+use procfs::{diskstats, DiskStat};
 #[cfg(target_os = "windows")]
 use sysinfo::NetworkExt;
 use sysinfo::{get_current_pid, Pid, ProcessExt, ProcessRefreshKind, System, SystemExt};
 
-use crate::config::handler::EnvironmentAccess;
+#[cfg(target_os = "linux")]
+use crate::utils::{cgroups, environment::SocketInfo};
+
 use crate::{
+    config::handler::EnvironmentAccess,
     error::{Error, Result},
     utils::{
-        process::{get_current_sys_free_memory_percentage, get_file_and_size_sum},
+        environment::get_disk_usage,
+        process::{get_current_sys_memory_percentage, get_file_and_size_sum},
         stats::{
-            Collector, Countable, Counter, CounterType, CounterValue, RefCountable, StatsOption,
+            self, Collector, Countable, Counter, CounterType, CounterValue, RefCountable,
+            StatsOption,
         },
     },
 };
+
 #[cfg(target_os = "linux")]
 use public::netns::{self, NsFile};
-use public::utils::net::link_list;
+use public::utils::net::{link_list, Link};
 
 #[derive(Default)]
 struct NetMetricArg {
@@ -210,27 +218,40 @@ impl RefCountable for SysStatusBroker {
         }
 
         let mut metrics = vec![];
-        let current_sys_free_memory_percentage = get_current_sys_free_memory_percentage();
+        let (current_sys_free_memory_percentage, current_sys_available_memory_percentage) =
+            get_current_sys_memory_percentage();
         metrics.push((
             "sys_free_memory",
             CounterType::Gauged,
             CounterValue::Unsigned(current_sys_free_memory_percentage as u64),
         ));
+        metrics.push((
+            "sys_available_memory",
+            CounterType::Gauged,
+            CounterValue::Unsigned(current_sys_available_memory_percentage as u64),
+        ));
 
+        let config = self.config.load();
+        let sys_memory_limit = config.sys_memory_limit as f64;
+
+        let (sys_free_memory_limit_ratio, sys_available_memory_limit_ratio) =
+            if sys_memory_limit > 0.0 {
+                (
+                    current_sys_free_memory_percentage as f64 / sys_memory_limit,
+                    current_sys_available_memory_percentage as f64 / sys_memory_limit,
+                )
+            } else {
+                (0.0, 0.0) // If sys_memory_limit is set to 0, it means that there is no need to check if the system's free/available memory is too low. In this case, 0.0 will be directly returned, indicating that there will be no low system free/available memory alert.
+            };
         metrics.push((
-            "max_memory",
+            "sys_free_memory_limit_ratio",
             CounterType::Gauged,
-            CounterValue::Unsigned(self.config.load().max_memory as u64),
+            CounterValue::Float(sys_free_memory_limit_ratio),
         ));
         metrics.push((
-            "max_cpus",
+            "sys_available_memory_limit_ratio",
             CounterType::Gauged,
-            CounterValue::Unsigned(self.config.load().max_cpus as u64),
-        ));
-        metrics.push((
-            "system_free_memory_limit",
-            CounterType::Gauged,
-            CounterValue::Unsigned(self.config.load().sys_free_memory_limit as u64),
+            CounterValue::Float(sys_available_memory_limit_ratio),
         ));
 
         match get_file_and_size_sum(&self.log_dir) {
@@ -250,6 +271,7 @@ impl RefCountable for SysStatusBroker {
                 warn!("get file and size sum failed: {:?}", e);
             }
         }
+
         match system_guard.process(self.pid) {
             Some(process) => {
                 let cpu_usage = process.cpu_usage() as f64;
@@ -261,9 +283,19 @@ impl RefCountable for SysStatusBroker {
                     CounterValue::Float(cpu_usage),
                 ));
                 metrics.push((
+                    "max_millicpus_ratio",
+                    CounterType::Gauged,
+                    CounterValue::Float(cpu_usage * 10.0 / config.max_millicpus as f64),
+                ));
+                metrics.push((
                     "memory",
                     CounterType::Gauged,
                     CounterValue::Unsigned(mem_used),
+                ));
+                metrics.push((
+                    "max_memory_ratio",
+                    CounterType::Gauged,
+                    CounterValue::Float(mem_used as f64 / config.max_memory as f64),
                 ));
                 metrics.push((
                     "create_time",
@@ -275,6 +307,33 @@ impl RefCountable for SysStatusBroker {
                 warn!("get process data failed, system status monitor has stopped");
             }
         }
+
+        #[cfg(target_os = "linux")]
+        metrics.push((
+            "open_sockets",
+            CounterType::Gauged,
+            match SocketInfo::get() {
+                Ok(SocketInfo {
+                    tcp,
+                    tcp6,
+                    udp,
+                    udp6,
+                }) => {
+                    CounterValue::Unsigned((tcp.len() + tcp6.len() + udp.len() + udp6.len()) as u64)
+                }
+                Err(_) => CounterValue::Unsigned(0),
+            },
+        ));
+        #[cfg(target_os = "linux")]
+        metrics.push((
+            "page_cache",
+            CounterType::Gauged,
+            if let Some(m_stat) = cgroups::memory_info() {
+                CounterValue::Unsigned(m_stat.stat.cache)
+            } else {
+                CounterValue::Unsigned(0)
+            },
+        ));
         metrics
     }
 }
@@ -305,6 +364,186 @@ impl RefCountable for SysLoad {
     }
 }
 
+struct NetStats<'a>(&'a Link);
+
+impl stats::Module for NetStats<'_> {
+    fn name(&self) -> &'static str {
+        "net"
+    }
+
+    fn tags(&self) -> Vec<StatsOption> {
+        vec![
+            StatsOption::Tag("name", self.0.name.clone()),
+            StatsOption::Tag("mac", self.0.mac_addr.to_string()),
+        ]
+    }
+}
+
+struct FreeDiskUsage {
+    directory: String,
+}
+
+impl stats::Module for FreeDiskUsage {
+    fn name(&self) -> &'static str {
+        "free_disk"
+    }
+
+    fn tags(&self) -> Vec<StatsOption> {
+        vec![StatsOption::Tag("directory", self.directory.clone())]
+    }
+}
+
+impl RefCountable for FreeDiskUsage {
+    fn get_counters(&self) -> Vec<Counter> {
+        let mut metrics = vec![];
+        match get_disk_usage(&self.directory) {
+            Ok((total, free)) => {
+                metrics.push((
+                    "free_disk_percentage",
+                    CounterType::Gauged,
+                    CounterValue::Float(free as f64 * 100.0 / total as f64),
+                ));
+                metrics.push((
+                    "free_disk_absolute",
+                    CounterType::Gauged,
+                    CounterValue::Unsigned(free as u64),
+                ));
+            }
+            Err(e) => {
+                warn!("get disk free usage failed: {:?}", e);
+            }
+        }
+        metrics
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn disk_stat_from_name(name: &str) -> Option<DiskStat> {
+    let Ok(disks) = diskstats() else {
+        return None;
+    };
+
+    for d in disks {
+        if d.name.as_str() == name {
+            return Some(d);
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "linux")]
+struct DiskMonitor {
+    name: String,
+    stat: Arc<Mutex<DiskStat>>,
+}
+
+#[cfg(target_os = "linux")]
+impl DiskMonitor {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            stat: Arc::new(Mutex::new(DiskStat {
+                major: 0,
+                minor: 0,
+                name: String::new(),
+                reads: 0,
+                merged: 0,
+                sectors_read: 0,
+                time_reading: 0,
+                writes: 0,
+                writes_merged: 0,
+                sectors_written: 0,
+                time_writing: 0,
+                in_progress: 0,
+                time_in_progress: 0,
+                weighted_time_in_progress: 0,
+                discards: None,
+                discards_merged: None,
+                sectors_discarded: None,
+                time_discarding: None,
+                flushes: None,
+                time_flushing: None,
+            })),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl RefCountable for DiskMonitor {
+    fn get_counters(&self) -> Vec<Counter> {
+        let mut metrics = vec![];
+        let mut last = self.stat.lock().unwrap();
+        match disk_stat_from_name(self.name.as_str()) {
+            Some(now) if last.sectors_read > 0 => {
+                // KB
+                metrics.push((
+                    "read",
+                    CounterType::Gauged,
+                    CounterValue::Unsigned(if now.sectors_read <= last.sectors_read {
+                        0
+                    } else {
+                        (now.sectors_read - last.sectors_read) * 512 / 1024
+                    }),
+                ));
+                metrics.push((
+                    "write",
+                    CounterType::Gauged,
+                    CounterValue::Unsigned(if now.sectors_written <= last.sectors_written {
+                        0
+                    } else {
+                        (now.sectors_written - last.sectors_written) * 512 / 1024
+                    }),
+                ));
+                // ns
+                metrics.push((
+                    "read_latency",
+                    CounterType::Gauged,
+                    CounterValue::Float(if now.time_reading <= last.time_reading {
+                        0.0
+                    } else {
+                        ((now.time_reading - last.time_reading) * 1000000) as f64
+                            / (now.reads - last.reads) as f64
+                    }),
+                ));
+                metrics.push((
+                    "write_latency",
+                    CounterType::Gauged,
+                    CounterValue::Float(if now.time_writing <= last.time_writing {
+                        0.0
+                    } else {
+                        ((now.time_writing - last.time_writing) * 1000000) as f64
+                            / (now.writes - last.writes) as f64
+                    }),
+                ));
+                *last = now;
+            }
+            Some(now) => {
+                *last = now;
+            }
+            None => {
+                debug!("get disk {} io failed.", self.name);
+            }
+        }
+        metrics
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct DiskModule {
+    name: String,
+}
+
+#[cfg(target_os = "linux")]
+impl stats::Module for DiskModule {
+    fn name(&self) -> &'static str {
+        "disk_io"
+    }
+
+    fn tags(&self) -> Vec<StatsOption> {
+        vec![StatsOption::Tag("name", self.name.clone())]
+    }
+}
 pub struct Monitor {
     stats: Arc<Collector>,
     running: AtomicBool,
@@ -312,6 +551,11 @@ pub struct Monitor {
     sys_load: Arc<SysLoad>,
     link_map: Arc<Mutex<HashMap<String, Arc<LinkStatusBroker>>>>,
     system: Arc<Mutex<System>>,
+    config: EnvironmentAccess,
+    free_disks_config: Arc<Mutex<Vec<String>>>,
+    free_disk_counters: Arc<Mutex<Vec<Arc<FreeDiskUsage>>>>,
+    #[cfg(target_os = "linux")]
+    disks_io: Vec<Arc<DiskMonitor>>,
 }
 
 impl Monitor {
@@ -319,6 +563,18 @@ impl Monitor {
         let mut system = System::new();
         system.refresh_cpu();
         let system = Arc::new(Mutex::new(system));
+        #[cfg(target_os = "linux")]
+        let mut disks_io = vec![];
+        #[cfg(target_os = "linux")]
+        if let Ok(disks) = diskstats() {
+            for d in disks {
+                // /dev/mem, /dev/null & /dev/pts & /dev/loopx & cdrom
+                if d.major == 1 || d.major == 2 || d.major == 7 || d.major == 11 {
+                    continue;
+                }
+                disks_io.push(Arc::new(DiskMonitor::new(d.name)));
+            }
+        };
 
         Ok(Self {
             stats,
@@ -331,6 +587,11 @@ impl Monitor {
             sys_load: Arc::new(SysLoad(system.clone())),
             link_map: Arc::new(Mutex::new(HashMap::new())),
             system,
+            config: config.clone(),
+            free_disks_config: Arc::new(Mutex::new(vec![])),
+            free_disk_counters: Arc::new(Mutex::new(vec![])),
+            #[cfg(target_os = "linux")]
+            disks_io,
         })
     }
 
@@ -349,7 +610,7 @@ impl Monitor {
             let mut link_map_guard = link_map.lock().unwrap();
 
             #[cfg(target_os = "linux")]
-            if let Err(e) = netns::open_named_and_setns(&NsFile::Root) {
+            if let Err(e) = NsFile::Root.open_and_setns() {
                 warn!("agent must have CAP_SYS_ADMIN to run without 'hostNetwork: true'.");
                 warn!("setns error: {}", e);
                 return;
@@ -391,13 +652,9 @@ impl Monitor {
                     continue;
                 }
                 let link_broker = Arc::new(LinkStatusBroker::new());
-                let mut options = vec![];
-                options.push(StatsOption::Tag("name", link.name.clone()));
-                options.push(StatsOption::Tag("mac", link.mac_addr.to_string()));
                 stats.register_countable(
-                    "net",
+                    &NetStats(&link),
                     Countable::Ref(Arc::downgrade(&link_broker) as Weak<dyn RefCountable>),
-                    options,
                 );
                 link_map_guard.insert(link.name.clone(), link_broker);
                 monitor_list.push(link.name.clone());
@@ -446,16 +703,60 @@ impl Monitor {
         }));
 
         self.stats.register_countable(
-            "monitor",
+            &stats::NoTagModule("monitor"),
             Countable::Ref(Arc::downgrade(&self.sys_monitor) as Weak<dyn RefCountable>),
-            vec![],
         );
 
         self.stats.register_countable(
-            "system",
+            &stats::NoTagModule("system"),
             Countable::Ref(Arc::downgrade(&self.sys_load) as Weak<dyn RefCountable>),
-            vec![],
         );
+
+        #[cfg(target_os = "linux")]
+        for disk in &self.disks_io {
+            self.stats.register_countable(
+                &DiskModule {
+                    name: disk.name.clone(),
+                },
+                Countable::Ref(Arc::downgrade(disk) as Weak<dyn RefCountable>),
+            );
+        }
+
+        let config = self.config.clone();
+        let stats_collector = self.stats.clone();
+        let free_disks_config = self.free_disks_config.clone();
+        let free_disk_counters = self.free_disk_counters.clone();
+        self.stats.register_pre_hook(Box::new(move || {
+            let config_load = config.load();
+            let mut free_disks_config = free_disks_config.lock().unwrap();
+            if config_load.free_disk_circuit_breaker_directories == *free_disks_config {
+                return;
+            }
+
+            let mut locked_counters = free_disk_counters.lock().unwrap();
+            let old_data = std::mem::take(&mut *locked_counters);
+            stats_collector
+                .deregister_countables(old_data.iter().map(|c| c.as_ref() as &dyn stats::Module));
+
+            for free_disk in &config_load.free_disk_circuit_breaker_directories {
+                let free_disk_counter = Arc::new(FreeDiskUsage {
+                    directory: free_disk.clone(),
+                });
+                stats_collector.register_countable(
+                    &FreeDiskUsage {
+                        directory: free_disk.clone(),
+                    },
+                    Countable::Ref(Arc::downgrade(&free_disk_counter) as Weak<dyn RefCountable>),
+                );
+                locked_counters.push(free_disk_counter);
+            }
+
+            info!(
+                "update free disk monitor from {:?} to {:?}",
+                free_disks_config, config_load.free_disk_circuit_breaker_directories
+            );
+            *free_disks_config = config_load.free_disk_circuit_breaker_directories.clone();
+        }));
 
         info!("monitor started");
     }

@@ -128,16 +128,10 @@ func AppMeterColumns() []*ckdb.Column {
 	return columns
 }
 
-func (m *AppMeter) WriteBlock(block *ckdb.Block) {
-	m.AppTraffic.WriteBlock(block)
-	m.AppLatency.WriteBlock(block)
-	m.AppAnomaly.WriteBlock(block)
-}
-
 type AppTraffic struct {
-	Request        uint32 `db:"request"`
-	Response       uint32 `db:"response"`
-	DirectionScore uint8  `db:"direction_score"`
+	Request        uint32 `json:"request" category:"$metrics" sub:"throughput"`
+	Response       uint32 `json:"response" category:"$metrics" sub:"throughput"`
+	DirectionScore uint8  `json:"direction_score" category:"$metrics" sub:"throughput"`
 }
 
 func (_ *AppTraffic) Reverse() {
@@ -180,7 +174,6 @@ const (
 	AppTRIFFIC_RRT_COUNT
 )
 
-// Columns列和WriteBlock的列需要按顺序一一对应
 func AppTrafficColumns() []*ckdb.Column {
 	columns := []*ckdb.Column{}
 	columns = append(columns, ckdb.NewColumn("request", ckdb.UInt32).SetComment("累计请求次数"))
@@ -189,15 +182,10 @@ func AppTrafficColumns() []*ckdb.Column {
 	return columns
 }
 
-// WriteBlock和LatencyColumns的列需要按顺序一一对应
-func (t *AppTraffic) WriteBlock(block *ckdb.Block) {
-	block.Write(t.Request, t.Response, t.DirectionScore)
-}
-
 type AppLatency struct {
-	RRTMax   uint32 `db:"rrt_max"` // us
-	RRTSum   uint64 `db:"rrt_sum"` // us
-	RRTCount uint32 `db:"rrt_count"`
+	RRTMax   uint32 `json:"rrt_max" category:"$metrics" sub:"delay"` // us
+	RRTSum   uint64 `json:"rrt_sum" category:"$metrics" sub:"delay"` // us
+	RRTCount uint32 `json:"rrt_count" category:"$metrics" sub:"delay"`
 }
 
 func (_ *AppLatency) Reverse() {
@@ -240,7 +228,6 @@ const (
 	APPLATENCY_RRT_COUNT
 )
 
-// Columns列和WriteBlock的列需要按顺序一一对应
 func AppLatencyColumns() []*ckdb.Column {
 	columns := []*ckdb.Column{}
 	columns = append(columns, ckdb.NewColumn("rrt_max", ckdb.UInt32).SetComment("所有请求响应时延最大值(us)"))
@@ -249,15 +236,10 @@ func AppLatencyColumns() []*ckdb.Column {
 	return columns
 }
 
-// WriteBlock和LatencyColumns的列需要按顺序一一对应
-func (l *AppLatency) WriteBlock(block *ckdb.Block) {
-	block.Write(l.RRTMax, float64(l.RRTSum), uint64(l.RRTCount))
-}
-
 type AppAnomaly struct {
-	ClientError uint32 `db:"client_error"`
-	ServerError uint32 `db:"server_error"`
-	Timeout     uint32 `db:"timeout"`
+	ClientError uint32 `json:"client_error" category:"$metrics" sub:"error"`
+	ServerError uint32 `json:"server_error" category:"$metrics" sub:"error"`
+	Timeout     uint32 `json:"timeout" category:"$metrics" sub:"error"`
 }
 
 func (_ *AppAnomaly) Reverse() {
@@ -303,7 +285,6 @@ const (
 	APPANOMALY_ERROR
 )
 
-// Columns列和WriteBlock的列需要按顺序一一对应
 func AppAnomalyColumns() []*ckdb.Column {
 	columns := ckdb.NewColumnsWithComment(
 		[][2]string{
@@ -313,11 +294,6 @@ func AppAnomalyColumns() []*ckdb.Column {
 			APPANOMALY_ERROR:        {"error", "异常次数"},
 		}, ckdb.UInt64)
 	return columns
-}
-
-// WriteBlock的列和AnomalyColumns需要按顺序一一对应
-func (a *AppAnomaly) WriteBlock(block *ckdb.Block) {
-	block.Write(uint64(a.ClientError), uint64(a.ServerError), uint64(a.Timeout), uint64(a.ClientError+a.ServerError))
 }
 
 func EncodeAppMeterToMetrics(meter *AppMeter) map[string]float64 {

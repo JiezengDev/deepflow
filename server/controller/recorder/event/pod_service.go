@@ -17,36 +17,37 @@
 package event
 
 import (
-	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/recorder/event/config"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 	"github.com/deepflowio/deepflow/server/libs/eventapi"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 )
 
 type PodService struct {
-	EventManagerBase
+	ManagerComponent
+	CUDSubscriberComponent
+	cfg        config.Config
 	deviceType int
 }
 
-func NewPodService(toolDS *tool.DataSet, eq *queue.OverwriteQueue) *PodService {
+func NewPodService(cfg config.Config, q *queue.OverwriteQueue) *PodService {
 	mng := &PodService{
-		newEventManagerBase(
-			ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN,
-			toolDS,
-			eq,
-		),
-		ctrlrcommon.VIF_DEVICE_TYPE_POD_SERVICE,
+		newManagerComponent(ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN, q),
+		newCUDSubscriberComponent(ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN, SubTopic(pubsub.TopicResourceUpdatedFull)),
+		cfg,
+		ctrlrcommon.VIF_DEVICE_TYPE_POD_SERVICE, // PodServiceID 在 ingester 中并未被使用，必须指定 instance_type 为 PodService
 	}
+	mng.SetSubscriberSelf(mng)
 	return mng
 }
 
-func (p *PodService) ProduceByAdd(items []*mysql.PodService) {
-	for _, item := range items {
+func (p *PodService) OnResourceBatchAdded(md *message.Metadata, msg interface{}) {
+	for _, item := range msg.([]*metadbmodel.PodService) {
 		var opts []eventapi.TagFieldOption
-		info, err := p.ToolDataSet.GetPodServiceInfoByID(item.ID)
+		info, err := md.GetToolDataSet().GetPodServiceInfoByID(item.ID)
 		if err != nil {
 			log.Error(err)
 		} else {
@@ -56,7 +57,7 @@ func (p *PodService) ProduceByAdd(items []*mysql.PodService) {
 			}...)
 		}
 		opts = append(opts, []eventapi.TagFieldOption{
-			eventapi.TagPodServiceID(item.ID),
+			eventapi.TagPodServiceID(item.ID), // TODO 此字段在 ingester 中并未被使用，待删除
 			eventapi.TagVPCID(item.VPCID),
 			eventapi.TagL3DeviceType(p.deviceType),
 			eventapi.TagL3DeviceID(item.ID),
@@ -64,7 +65,7 @@ func (p *PodService) ProduceByAdd(items []*mysql.PodService) {
 			eventapi.TagPodNSID(item.PodNamespaceID),
 		}...)
 
-		p.createAndEnqueue(
+		p.createInstanceAndEnqueue(md,
 			item.Lcuuid,
 			eventapi.RESOURCE_EVENT_TYPE_CREATE,
 			item.Name,
@@ -75,24 +76,37 @@ func (p *PodService) ProduceByAdd(items []*mysql.PodService) {
 	}
 }
 
-func (p *PodService) ProduceByUpdate(cloudItem *cloudmodel.PodService, diffBase *diffbase.PodService) {
+func (c *PodService) OnResourceUpdated(md *message.Metadata, msg interface{}) {
+	updateMsg := msg.(*message.UpdatedPodService)
+	dbItem := updateMsg.GetNewMetadbItem().(*metadbmodel.PodService)
+	fields := updateMsg.GetFields().(*message.UpdatedPodServiceFields)
+	if !fields.Metadata.IsDifferent() && !fields.Spec.IsDifferent() {
+		return
+	}
+	eventType := eventapi.RESOURCE_EVENT_TYPE_MODIFY
+	var opts []eventapi.TagFieldOption
+
+	old := JoinMetadataAndSpec(fields.Metadata.GetOld(), fields.Spec.GetOld())
+	new := JoinMetadataAndSpec(fields.Metadata.GetNew(), fields.Spec.GetNew())
+	if old == "" || new == "" {
+		return
+	} else {
+		diff := CompareConfig(old, new, int(c.cfg.ConfigDiffContext))
+
+		opts = []eventapi.TagFieldOption{
+			eventapi.TagPodServiceID(dbItem.ID), // TODO 此字段在 ingester 中并未被使用，待删除
+			eventapi.TagL3DeviceType(c.deviceType),
+			eventapi.TagL3DeviceID(dbItem.ID),
+			eventapi.TagAttributes(
+				[]string{eventapi.AttributeNameConfig, eventapi.AttributeNameConfigDiff},
+				[]string{new, diff}),
+		}
+	}
+	c.createInstanceAndEnqueue(md, dbItem.Lcuuid, eventType, dbItem.Name, c.deviceType, dbItem.ID, opts...)
 }
 
-func (p *PodService) ProduceByDelete(lcuuids []string) {
-	for _, lcuuid := range lcuuids {
-		var id int
-		var name string
-		id, ok := p.ToolDataSet.GetPodServiceIDByLcuuid(lcuuid)
-		if ok {
-			var err error
-			name, err = p.ToolDataSet.GetPodServiceNameByID(id)
-			if err != nil {
-				log.Error(p.org.LogPre("%v, %v", idByLcuuidNotFound(p.resourceType, lcuuid), err))
-			}
-		} else {
-			log.Error(nameByIDNotFound(p.resourceType, id))
-		}
-
-		p.createAndEnqueue(lcuuid, eventapi.RESOURCE_EVENT_TYPE_DELETE, name, p.deviceType, id)
+func (p *PodService) OnResourceBatchDeleted(md *message.Metadata, msg interface{}) {
+	for _, item := range msg.([]*metadbmodel.PodService) {
+		p.createInstanceAndEnqueue(md, item.Lcuuid, eventapi.RESOURCE_EVENT_TYPE_DELETE, item.Name, p.deviceType, item.ID)
 	}
 }

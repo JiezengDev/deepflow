@@ -19,13 +19,17 @@ package eventapi
 import "github.com/deepflowio/deepflow/server/libs/pool"
 
 const (
-	RESOURCE_EVENT_TYPE_CREATE       = "create"
-	RESOURCE_EVENT_TYPE_DELETE       = "delete"
-	RESOURCE_EVENT_TYPE_UPDATE_STATE = "update-state"
-	RESOURCE_EVENT_TYPE_MIGRATE      = "migrate"
-	RESOURCE_EVENT_TYPE_RECREATE     = "recreate"
-	RESOURCE_EVENT_TYPE_ADD_IP       = "add-ip"
-	RESOURCE_EVENT_TYPE_REMOVE_IP    = "remove-ip"
+	RESOURCE_EVENT_TYPE_CREATE            = "create"
+	RESOURCE_EVENT_TYPE_DELETE            = "delete"
+	RESOURCE_EVENT_TYPE_UPDATE_STATE      = "update-state"
+	RESOURCE_EVENT_TYPE_MIGRATE           = "migrate"
+	RESOURCE_EVENT_TYPE_RECREATE          = "recreate"
+	RESOURCE_EVENT_TYPE_ATTACH_IP         = "attach-ip"
+	RESOURCE_EVENT_TYPE_DETACH_IP         = "detach-ip"
+	RESOURCE_EVENT_TYPE_MODIFY            = "modify"
+	RESOURCE_EVENT_TYPE_ATTACH_CONFIG_MAP = "attach-config"
+	RESOURCE_EVENT_TYPE_MODIFY_CONFIG_MAP = "modify-config"
+	RESOURCE_EVENT_TYPE_DETACH_CONFIG_MAP = "detach-config"
 )
 
 type ResourceEvent struct {
@@ -38,10 +42,10 @@ type ResourceEvent struct {
 	AttributeSubnetIDs []uint32
 	AttributeIPs       []string
 	Description        string
-	GProcessID         uint32 // if this value is set, InstanceType and InstanceID are empty
-	GProcessName       string // if this value is set, InstanceName is empty
 
 	IfNeedTagged bool // if need ingester set tag
+	GProcessID   uint32
+	GProcessName string
 	RegionID     uint32
 	AZID         uint32
 	VPCID        uint32
@@ -51,15 +55,59 @@ type ResourceEvent struct {
 	PodClusterID uint32
 	PodNSID      uint32
 	PodNodeID    uint32
-	PodServiceID uint32
+	PodServiceID uint32 // TODO 此字段在 ingester 中并未被使用，待删除
 	PodGroupID   uint32
 	PodGroupType uint8
 	PodID        uint32
 	SubnetID     uint32
 	IP           string
+	ConfigMapID  uint32
+
+	AttributeNames  []string
+	AttributeValues []string
+
+	ORGID  uint16
+	TeamID uint16
 }
 
+const (
+	AttributeNameConfigName = "config_name"
+	AttributeNameConfig     = "config"
+	AttributeNameConfigDiff = "config_diff"
+)
+
 type TagFieldOption func(opts *ResourceEvent)
+
+func TagConfigMapID(id uint32) TagFieldOption {
+	return func(r *ResourceEvent) {
+		r.ConfigMapID = id
+	}
+}
+
+func TagAttributes(names, values []string) TagFieldOption {
+	return func(r *ResourceEvent) {
+		r.AttributeNames = names
+		r.AttributeValues = values
+	}
+}
+
+func TagInstanceType(instanceType uint32) TagFieldOption {
+	return func(r *ResourceEvent) {
+		r.InstanceType = instanceType
+	}
+}
+
+func TagInstanceID(instanceID uint32) TagFieldOption {
+	return func(r *ResourceEvent) {
+		r.InstanceID = instanceID
+	}
+}
+
+func TagInstanceName(instanceName string) TagFieldOption {
+	return func(r *ResourceEvent) {
+		r.InstanceName = instanceName
+	}
+}
 
 func TagAttributeSubnetIDs(netIDs []uint32) TagFieldOption {
 	return func(r *ResourceEvent) {
@@ -135,13 +183,19 @@ func TagPodNodeID(id int) TagFieldOption {
 
 func TagPodServiceID(id int) TagFieldOption {
 	return func(r *ResourceEvent) {
-		r.PodServiceID = uint32(id)
+		r.PodServiceID = uint32(id) // TODO 此字段在 ingester 中并未被使用，待删除
 	}
 }
 
 func TagPodGroupID(id int) TagFieldOption {
 	return func(r *ResourceEvent) {
 		r.PodGroupID = uint32(id)
+	}
+}
+
+func TagPodGroupType(t uint32) TagFieldOption {
+	return func(r *ResourceEvent) {
+		r.PodGroupType = uint8(t)
 	}
 }
 
@@ -163,16 +217,28 @@ func TagIP(ip string) TagFieldOption {
 	}
 }
 
+func TagGProcessID(id uint32) TagFieldOption {
+	return func(r *ResourceEvent) {
+		r.GProcessID = id
+	}
+}
+
+func TagGProcessName(name string) TagFieldOption {
+	return func(r *ResourceEvent) {
+		r.GProcessName = name
+	}
+}
+
 func (r *ResourceEvent) Release() {
 	ReleaseResourceEvent(r)
 }
 
-var poolResourceEvent = pool.NewLockFreePool(func() interface{} {
+var poolResourceEvent = pool.NewLockFreePool(func() *ResourceEvent {
 	return new(ResourceEvent)
 })
 
 func AcquireResourceEvent() *ResourceEvent {
-	return poolResourceEvent.Get().(*ResourceEvent)
+	return poolResourceEvent.Get()
 }
 
 func ReleaseResourceEvent(event *ResourceEvent) {

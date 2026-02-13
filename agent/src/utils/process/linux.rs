@@ -15,16 +15,27 @@
  */
 
 use std::{
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{self, BufReader, Error, ErrorKind, Read, Result, Write},
     net::TcpStream,
     os::unix::fs::OpenOptionsExt,
     path::PathBuf,
     process,
+    sync::{
+        atomic::{AtomicBool, Ordering::Relaxed},
+        Arc, Mutex, RwLock,
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
 };
 
-use log::debug;
+use log::{debug, error, info, trace};
 use nix::sys::utsname::uname;
+use procfs::process::all_processes_with_root;
+
+use crate::config::ProcessMatcher;
+use crate::platform::{get_os_app_tag_by_exec, ProcessData, ProcessDataOp};
 
 //返回当前进程占用内存RSS单位（字节）
 pub fn get_memory_rss() -> Result<u64> {
@@ -245,4 +256,310 @@ fn get_num_from_status_file(pattern: &str, value: &str) -> Result<u32> {
     }
 
     Ok(num)
+}
+
+type ProcessListenerCallback = fn(pids: &Vec<u32>, process_datas: &Vec<ProcessData>);
+
+#[derive(Default, Debug)]
+struct ProcessNode {
+    process_matcher: Vec<ProcessMatcher>,
+
+    pids: Vec<u32>,
+    process_datas: Vec<ProcessData>,
+
+    callback: Option<ProcessListenerCallback>,
+}
+
+#[derive(Default, Debug)]
+struct Features {
+    blacklist: Vec<String>,
+    features: HashMap<String, ProcessNode>,
+}
+
+struct Config {
+    proc_root: String,
+    user: String,
+    command: Vec<String>,
+}
+
+impl Config {
+    fn new(proc_root: String, user: String, command: Vec<String>) -> Self {
+        Self {
+            proc_root,
+            user,
+            command,
+        }
+    }
+
+    fn update(&mut self, proc_root: String, user: String, command: Vec<String>) {
+        self.proc_root = proc_root;
+        self.user = user;
+        self.command = command;
+    }
+}
+
+pub struct ProcessListener {
+    features: Arc<RwLock<Features>>,
+    running: Arc<AtomicBool>,
+    config: Arc<RwLock<Config>>,
+
+    thread_handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl ProcessListener {
+    const INTERVAL: usize = 10;
+
+    pub fn new(
+        process_blacklist: &Vec<String>,
+        process_matcher: &Vec<ProcessMatcher>,
+        proc_root: String,
+        user: String,
+        command: Vec<String>,
+    ) -> Self {
+        let listener = Self {
+            features: Default::default(),
+            running: Arc::new(AtomicBool::new(false)),
+            thread_handle: Mutex::new(None),
+            config: Arc::new(RwLock::new(Config::new(proc_root, user, command))),
+        };
+
+        listener.set(process_blacklist, process_matcher);
+
+        listener
+    }
+
+    pub fn on_config_change(
+        &self,
+        process_blacklist: &Vec<String>,
+        process_matcher: &Vec<ProcessMatcher>,
+        proc_root: String,
+        user: String,
+        command: Vec<String>,
+    ) {
+        self.config
+            .write()
+            .unwrap()
+            .update(proc_root, user, command);
+        self.set(process_blacklist, process_matcher);
+    }
+
+    pub fn set(&self, process_blacklist: &Vec<String>, process_matcher: &Vec<ProcessMatcher>) {
+        let mut features: HashMap<String, ProcessNode> = HashMap::new();
+        let mut current = self.features.write().unwrap();
+
+        for matcher in process_matcher.iter() {
+            for feature in matcher.enabled_features.iter() {
+                if let Some(node) = features.get_mut(feature) {
+                    node.process_matcher.push(matcher.clone());
+                } else {
+                    let mut node = ProcessNode {
+                        process_matcher: vec![matcher.clone()],
+                        ..Default::default()
+                    };
+                    if let Some(mut last_node) = current.features.remove(feature) {
+                        node.callback = last_node.callback.take();
+                        node.pids = last_node.pids;
+                        node.process_datas = last_node.process_datas;
+                    }
+
+                    let _ = features.insert(feature.to_string(), node);
+                }
+            }
+        }
+
+        for (feature, mut node) in current.features.drain() {
+            if node.callback.is_some() {
+                node.process_matcher.clear();
+                features.insert(feature, node);
+            }
+        }
+
+        *current = Features {
+            blacklist: process_blacklist.clone(),
+            features,
+        };
+    }
+
+    pub fn register(&self, feature: &str, callback: ProcessListenerCallback) {
+        info!("Process listener register feature {}", feature);
+        let mut features = self.features.write().unwrap();
+        if let Some(node) = features.features.get_mut(&feature.to_string()) {
+            node.pids = vec![];
+            node.process_datas = vec![];
+            node.callback = Some(callback);
+        } else {
+            let _ = features.features.insert(
+                feature.to_string(),
+                ProcessNode {
+                    process_matcher: vec![],
+                    pids: vec![],
+                    process_datas: vec![],
+                    callback: Some(callback),
+                },
+            );
+        }
+    }
+
+    pub fn stop(&mut self) {
+        self.running.store(false, Relaxed);
+
+        if let Some(handler) = self.thread_handle.lock().unwrap().take() {
+            let _ = handler.join();
+        }
+    }
+
+    fn process(
+        process_data_cache: &mut HashMap<i32, ProcessData>,
+        proc_root: &str,
+        features: &mut Features,
+        user: &str,
+        command: &[String],
+    ) {
+        let (blacklist, features) = (&mut features.blacklist, &mut features.features);
+        if features.is_empty() {
+            return;
+        }
+        let tags_map = match get_os_app_tag_by_exec(user, command) {
+            Ok(tags) => tags,
+            Err(err) => {
+                error!(
+                    "get process tags by execute cmd `{}` with user {} fail: {}",
+                    command.join(" "),
+                    user,
+                    err
+                );
+                HashMap::new()
+            }
+        };
+
+        let mut alive_pids = HashSet::new();
+        let Ok(processes) = all_processes_with_root(proc_root) else {
+            return;
+        };
+        for process in processes {
+            let process = match process {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("get process failed: {}", e);
+                    continue;
+                }
+            };
+            match process.status().map(|s| s.name) {
+                // not found
+                Ok(name) if blacklist.binary_search(&name).is_err() => (),
+                Ok(name) => {
+                    trace!(
+                        "process {name} (pid#{}) ignored because it is in blacklist",
+                        process.pid
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    debug!("get process status failed: {}", e);
+                    continue;
+                }
+            }
+            alive_pids.insert(process.pid);
+            if let Some(old_data) = process_data_cache.get(&process.pid) {
+                if let Some(start_time) = process.stat().ok().and_then(|stat| stat.starttime().ok())
+                {
+                    if Duration::from_secs(start_time.timestamp() as u64) == old_data.start_time {
+                        continue;
+                    }
+                }
+            }
+            process_data_cache.remove(&process.pid);
+            if let Ok(pdata) = ProcessData::try_from(&process) {
+                process_data_cache.insert(process.pid, pdata);
+            }
+        }
+        process_data_cache.retain(|pid, _| alive_pids.contains(pid));
+
+        for (key, value) in features.iter_mut() {
+            if (value.process_matcher.is_empty() && value.pids.is_empty())
+                || value.callback.is_none()
+            {
+                continue;
+            }
+
+            let mut pids = vec![];
+            let mut process_datas = vec![];
+            let mut ignore_pids = HashSet::new();
+
+            for matcher in &value.process_matcher {
+                for pdata in process_data_cache.values() {
+                    if let Some(process_data) = matcher.get_process_data(pdata, &tags_map) {
+                        if matcher.ignore {
+                            ignore_pids.insert(pdata.pid);
+                            continue;
+                        }
+
+                        if !ignore_pids.contains(&pdata.pid) {
+                            pids.push(pdata.pid as u32);
+                            process_datas.push(process_data);
+                        }
+                    }
+                }
+            }
+
+            pids.sort();
+            pids.dedup();
+            process_datas.sort_by_key(|x| x.pid);
+            process_datas.merge_and_dedup();
+
+            if pids != value.pids {
+                debug!("Feature {} update {} pids {:?}.", key, pids.len(), pids);
+                value.callback.as_ref().unwrap()(&pids, &process_datas);
+                value.pids = pids;
+                value.process_datas = process_datas;
+            }
+        }
+    }
+
+    pub fn start(&self) {
+        if self.running.swap(true, Relaxed) {
+            return;
+        }
+        info!("Startting process listener ...");
+        let features = self.features.clone();
+        let running = self.running.clone();
+        let config = self.config.clone();
+
+        running.store(true, Relaxed);
+        *self.thread_handle.lock().unwrap() = Some(
+            thread::Builder::new()
+                .name("process-listener".to_owned())
+                .spawn(move || {
+                    let mut count = 0;
+                    let mut process_data = HashMap::new();
+                    while running.load(Relaxed) {
+                        thread::sleep(Duration::from_secs(1));
+                        count += 1;
+                        if count < Self::INTERVAL {
+                            continue;
+                        }
+                        count = 0;
+                        let current_config = config.read().unwrap();
+                        let mut features = features.write().unwrap();
+
+                        Self::process(
+                            &mut process_data,
+                            &current_config.proc_root,
+                            &mut features,
+                            &current_config.user,
+                            &current_config.command,
+                        );
+
+                        drop(features);
+                        drop(current_config);
+                    }
+                })
+                .unwrap(),
+        );
+    }
+
+    pub fn notify_stop(&self) -> Option<JoinHandle<()>> {
+        self.running.store(false, Relaxed);
+        self.thread_handle.lock().unwrap().take()
+    }
 }

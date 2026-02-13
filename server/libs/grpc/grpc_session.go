@@ -22,7 +22,7 @@ import (
 	"net"
 	"time"
 
-	logging "github.com/op/go-logging"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
@@ -31,7 +31,7 @@ const (
 	DEFAULT_SYNC_TIMEOUT = 8 * time.Second
 )
 
-var log = logging.MustGetLogger("grpc")
+var log = logger.MustGetLogger("grpc")
 
 type SyncFunction func(context.Context, net.IP) error
 
@@ -67,7 +67,7 @@ func (s *GrpcSession) nextServer() error {
 	} else {
 		s.ipIndex = ipIndex
 	}
-	server := fmt.Sprintf("%s:%d", s.ips[ipIndex], s.port)
+	server := net.JoinHostPort(s.ips[ipIndex].String(), fmt.Sprintf("%d", s.port))
 	if s.ips[ipIndex].To4() == nil {
 		server = fmt.Sprintf("[%s]:%d", s.ips[ipIndex], s.port)
 	}

@@ -17,7 +17,6 @@
 package config
 
 import (
-	"io/ioutil"
 	"os"
 
 	"github.com/deepflowio/deepflow/server/ingester/config"
@@ -30,11 +29,11 @@ var log = logging.MustGetLogger("prometheus.config")
 
 const (
 	DefaultDecoderQueueCount            = 1
-	DefaultDecoderQueueSize             = 1 << 14
+	DefaultDecoderQueueSize             = 4096
 	DefaultPrometheusTTL                = 168       // hour
 	DefaultLabelMsgMaxSize              = 100 << 20 // 100M
 	DefaultLabelRequestMetricBatchCount = 128
-	DefaultAppLabelColumnIncrement      = 4
+	DefaultAppLabelColumnIncrement      = 8
 	DefaultAppLabelColumnMinCount       = 8
 	DefaultLabelCacheExpiration         = 86400 // 1 day
 )
@@ -102,7 +101,7 @@ func Load(base *config.Config, path string) *Config {
 		log.Info("no config file, use defaults")
 		return &config.Prometheus
 	}
-	configBytes, err := ioutil.ReadFile(path)
+	configBytes, err := os.ReadFile(path)
 	if err != nil {
 		log.Warning("Read config file error:", err)
 		config.Prometheus.Validate()

@@ -19,69 +19,71 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
+
+// LBListenerMessageFactory LBListener资源的消息工厂
+type LBListenerMessageFactory struct{}
+
+func (f *LBListenerMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedLBListeners{}
+}
+
+func (f *LBListenerMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedLBListener{}
+}
+
+func (f *LBListenerMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedLBListeners{}
+}
+
+func (f *LBListenerMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedLBListenerFields{}
+}
 
 type LBListener struct {
 	UpdaterBase[
 		cloudmodel.LBListener,
-		mysql.LBListener,
 		*diffbase.LBListener,
-		*message.LBListenerAdd,
-		message.LBListenerAdd,
-		*message.LBListenerUpdate,
-		message.LBListenerUpdate,
-		*message.LBListenerFieldsUpdate,
-		message.LBListenerFieldsUpdate,
-		*message.LBListenerDelete,
-		message.LBListenerDelete]
+		*metadbmodel.LBListener,
+		metadbmodel.LBListener,
+	]
 }
 
 func NewLBListener(wholeCache *cache.Cache, cloudData []cloudmodel.LBListener) *LBListener {
 	updater := &LBListener{
-		newUpdaterBase[
-			cloudmodel.LBListener,
-			mysql.LBListener,
-			*diffbase.LBListener,
-			*message.LBListenerAdd,
-			message.LBListenerAdd,
-			*message.LBListenerUpdate,
-			message.LBListenerUpdate,
-			*message.LBListenerFieldsUpdate,
-			message.LBListenerFieldsUpdate,
-			*message.LBListenerDelete,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_LB_LISTENER_EN,
 			wholeCache,
-			db.NewLBListener().SetORG(wholeCache.GetORG()),
+			db.NewLBListener().SetMetadata(wholeCache.GetMetadata()),
 			wholeCache.DiffBaseDataSet.LBListeners,
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
+	updater.setDataGenerator(updater)
+
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &LBListenerMessageFactory{})
+	}
+
 	return updater
 }
 
-func (l *LBListener) getDiffBaseByCloudItem(cloudItem *cloudmodel.LBListener) (diffBase *diffbase.LBListener, exists bool) {
-	diffBase, exists = l.diffBaseData[cloudItem.Lcuuid]
-	return
-}
-
-func (l *LBListener) generateDBItemToAdd(cloudItem *cloudmodel.LBListener) (*mysql.LBListener, bool) {
+func (l *LBListener) generateDBItemToAdd(cloudItem *cloudmodel.LBListener) (*metadbmodel.LBListener, bool) {
 	lbID, exists := l.cache.ToolDataSet.GetLBIDByLcuuid(cloudItem.LBLcuuid)
 	if !exists {
-		log.Error(l.org.LogPre(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_LB_EN, cloudItem.LBLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_LB_LISTENER_EN, cloudItem.Lcuuid,
-		)))
+		), l.metadata.LogPrefixes)
 		return nil, false
 	}
-
-	dbItem := &mysql.LBListener{
+	dbItem := &metadbmodel.LBListener{
 		Name:     cloudItem.Name,
 		LBID:     lbID,
 		IPs:      cloudItem.IPs,
@@ -89,14 +91,14 @@ func (l *LBListener) generateDBItemToAdd(cloudItem *cloudmodel.LBListener) (*mys
 		Label:    cloudItem.Label,
 		Port:     cloudItem.Port,
 		Protocol: cloudItem.Protocol,
-		Domain:   l.cache.DomainLcuuid,
+		Domain:   l.metadata.GetDomainLcuuid(),
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true
 }
 
-func (l *LBListener) generateUpdateInfo(diffBase *diffbase.LBListener, cloudItem *cloudmodel.LBListener) (*message.LBListenerFieldsUpdate, map[string]interface{}, bool) {
-	structInfo := new(message.LBListenerFieldsUpdate)
+func (l *LBListener) generateUpdateInfo(diffBase *diffbase.LBListener, cloudItem *cloudmodel.LBListener) (types.UpdatedFields, map[string]interface{}, bool) {
+	structInfo := new(message.UpdatedLBListenerFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
 		mapInfo["name"] = cloudItem.Name

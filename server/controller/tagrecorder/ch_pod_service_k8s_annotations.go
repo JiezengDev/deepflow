@@ -18,18 +18,39 @@ package tagrecorder
 
 import (
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type ChPodServiceK8sAnnotations struct {
-	SubscriberComponent[*message.PodServiceFieldsUpdate, message.PodServiceFieldsUpdate, mysql.PodService, mysql.ChPodServiceK8sAnnotations, K8sAnnotationsKey]
+	SubscriberComponent[
+		*message.AddedPodServices,
+		message.AddedPodServices,
+		*message.UpdatedPodService,
+		message.UpdatedPodService,
+		*message.DeletedPodServices,
+		message.DeletedPodServices,
+		metadbmodel.PodService,
+		metadbmodel.ChPodServiceK8sAnnotations,
+		IDKey,
+	]
 }
 
 func NewChPodServiceK8sAnnotations() *ChPodServiceK8sAnnotations {
 	mng := &ChPodServiceK8sAnnotations{
-		newSubscriberComponent[*message.PodServiceFieldsUpdate, message.PodServiceFieldsUpdate, mysql.PodService, mysql.ChPodServiceK8sAnnotations, K8sAnnotationsKey](
-			common.RESOURCE_TYPE_POD_SERVICE_EN, RESOURCE_TYPE_CH_K8S_ANNOTATIONS,
+		newSubscriberComponent[
+			*message.AddedPodServices,
+			message.AddedPodServices,
+			*message.UpdatedPodService,
+			message.UpdatedPodService,
+			*message.DeletedPodServices,
+			message.DeletedPodServices,
+			metadbmodel.PodService,
+			metadbmodel.ChPodServiceK8sAnnotations,
+			IDKey,
+		](
+			common.RESOURCE_TYPE_POD_SERVICE_EN, RESOURCE_TYPE_CH_POD_SERVICE_K8S_ANNOTATIONS,
 		),
 	}
 	mng.subscriberDG = mng
@@ -37,47 +58,27 @@ func NewChPodServiceK8sAnnotations() *ChPodServiceK8sAnnotations {
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChPodServiceK8sAnnotations) onResourceUpdated(sourceID int, fieldsUpdate *message.PodServiceFieldsUpdate) {
-	updateInfo := make(map[string]interface{})
-	var annotations string
-	var chItem mysql.ChPodServiceK8sAnnotations
-	if fieldsUpdate.Annotation.IsDifferent() {
-		annotations = common.StrToJsonstr(fieldsUpdate.Annotation.GetNew())
-		if annotations != "" {
-			updateInfo["annotations"] = annotations
-		}
-	}
-	if len(updateInfo) > 0 {
-		mysql.Db.Where("id = ?", sourceID).First(&chItem)
-		if chItem.ID == 0 {
-			c.SubscriberComponent.dbOperator.add(
-				[]K8sAnnotationsKey{{ID: sourceID}},
-				[]mysql.ChPodServiceK8sAnnotations{{
-					ID:          sourceID,
-					Annotations: updateInfo["annotations"].(string),
-				}},
-			)
-		} else {
-			c.SubscriberComponent.dbOperator.update(
-				chItem,
-				updateInfo,
-				K8sAnnotationsKey{ID: sourceID})
-		}
-	}
+func (c *ChPodServiceK8sAnnotations) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedPodService) {
 }
 
 // sourceToTarget implements SubscriberDataGenerator
-func (c *ChPodServiceK8sAnnotations) sourceToTarget(item *mysql.PodService) (keys []K8sAnnotationsKey, targets []mysql.ChPodServiceK8sAnnotations) {
-	if item.Annotation == "" {
+func (c *ChPodServiceK8sAnnotations) sourceToTarget(md *message.Metadata, source *metadbmodel.PodService) (keys []IDKey, targets []metadbmodel.ChPodServiceK8sAnnotations) {
+	if source.Annotation == "" {
 		return
 	}
-	return []K8sAnnotationsKey{{ID: item.ID}}, []mysql.ChPodServiceK8sAnnotations{{
-		ID:          item.ID,
-		Annotations: common.StrToJsonstr(item.Annotation),
+	annotations, _ := StrToJsonAndMap(source.Annotation)
+	return []IDKey{{ID: source.ID}}, []metadbmodel.ChPodServiceK8sAnnotations{{
+		ChIDBase:    metadbmodel.ChIDBase{ID: source.ID},
+		Annotations: annotations,
+		L3EPCID:     source.VPCID,
+		PodNsID:     source.PodNamespaceID,
+		TeamID:      md.GetTeamID(),
+		DomainID:    md.GetDomainID(),
+		SubDomainID: md.GetSubDomainID(),
 	}}
 }
 
 // softDeletedTargetsUpdated implements SubscriberDataGenerator
-func (c *ChPodServiceK8sAnnotations) softDeletedTargetsUpdated(targets []mysql.ChPodServiceK8sAnnotations) {
+func (c *ChPodServiceK8sAnnotations) softDeletedTargetsUpdated(targets []metadbmodel.ChPodServiceK8sAnnotations, db *metadb.DB) {
 
 }

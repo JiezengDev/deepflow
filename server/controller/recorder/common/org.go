@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (c) 2024 Yunshan Networks
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,37 +17,23 @@
 package common
 
 import (
-	"github.com/op/go-logging"
+	// "fmt"
 
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-var log = logging.MustGetLogger("recorder.common")
-
 type ORG struct {
-	ID     int       // org id
-	DB     *mysql.DB // org database connection
-	Logger *Logger   // org log controller
+	ID        int        // org id
+	DB        *metadb.DB // org database connection
+	LogPrefix logger.Prefix
 }
 
 func NewORG(id int) (*ORG, error) {
-	db, err := mysql.GetDB(id)
+	db, err := metadb.GetDB(id)
 	return &ORG{
-		ID:     id,
-		DB:     db,
-		Logger: NewLogger(id),
+		ID:        id,
+		DB:        db,
+		LogPrefix: logger.NewORGPrefix(id),
 	}, err
-}
-
-// LogPre adds org id, domain info, sub_domain info to logs
-func (o *ORG) LogPre(format string, a ...any) string {
-	return o.Logger.AddPre(format, a...)
-}
-
-func ReplaceORGLogger(o *ORG) *ORG {
-	return &ORG{
-		ID:     o.ID,
-		DB:     o.DB,
-		Logger: CopyLogger(o.Logger),
-	}
 }

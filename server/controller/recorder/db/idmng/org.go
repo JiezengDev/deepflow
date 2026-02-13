@@ -19,12 +19,13 @@ package idmng
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
-	"golang.org/x/exp/slices"
-
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/config"
 )
 
@@ -60,18 +61,19 @@ func (m *IDManagers) Init(ctx context.Context, cfg config.RecorderConfig) {
 	m.orgIDToIDMng = make(map[int]*IDManager)
 }
 
-func (m *IDManagers) Start() error {
+func (m *IDManagers) Start(ctx context.Context) error {
 	if m.inUse {
 		return nil
 	}
 	m.inUse = true
+	m.ctx, m.cancel = context.WithCancel(ctx)
 
-	orgIDs, err := mysql.GetORGIDs()
+	orgIDs, err := metadb.GetORGIDs()
 	if err != nil {
 		return fmt.Errorf("failed to get org ids: %v", err)
 	}
 	for _, id := range orgIDs {
-		if _, err := m.NewIDManagerAndInitIfNotExists(id); err != nil {
+		if _, err := m.lazyCreate(id); err != nil {
 			return fmt.Errorf("failed to start id manager for org %d: %v", id, err)
 		}
 	}
@@ -108,6 +110,29 @@ func (m *IDManagers) timedRefresh() {
 	}()
 }
 
+func (m *IDManagers) lazyCreate(orgID int) (*IDManager, error) {
+	db, err := metadb.GetDB(orgID)
+	if err != nil {
+		log.Error("failed to get db: %v", err)
+		return nil, err
+	}
+
+	if orgID != common.DEFAULT_ORG_ID {
+		// 仅当组织中存在 domain 时，才创建组织的 IDManager，以避免内存浪费
+		var domain *metadbmodel.Domain
+		result := db.Limit(1).Find(&domain)
+		if result.Error != nil {
+			log.Errorf("failed to get domain: %v", err, db.LogPrefixORGID)
+			return nil, err
+		}
+		if result.RowsAffected == 0 {
+			log.Infof("no domain in db, skip creating id manager", db.LogPrefixORGID)
+			return nil, nil
+		}
+	}
+	return m.NewIDManagerAndInitIfNotExists(orgID)
+}
+
 func (m *IDManagers) NewIDManagerAndInitIfNotExists(orgID int) (*IDManager, error) {
 	m.mux.Lock()
 	defer m.mux.Unlock()
@@ -137,7 +162,7 @@ func (m *IDManagers) refresh() error {
 }
 
 func (m *IDManagers) checkORGs() error {
-	orgIDs, err := mysql.GetORGIDs()
+	orgIDs, err := metadb.GetORGIDs()
 	if err != nil {
 		return fmt.Errorf("failed to get org ids: %v", err)
 	}

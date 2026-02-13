@@ -21,15 +21,17 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"sort"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	//"github.com/k0kubun/pp"
 	logging "github.com/op/go-logging"
 	"github.com/xwb1989/sqlparser"
-	"golang.org/x/exp/slices"
 
+	ctlcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/querier/common"
 	"github.com/deepflowio/deepflow/server/querier/config"
 	"github.com/deepflowio/deepflow/server/querier/engine/clickhouse/client"
@@ -48,6 +50,12 @@ var INVALID_PROMETHEUS_SUBQUERY_CACHE_ENTRY = "-1"
 var subSqlRegexp = regexp.MustCompile(`\(SELECT\s.+?LIMIT\s.+?\)`)
 var checkWithSqlRegexp = regexp.MustCompile(`WITH\s+\S+\s+AS\s+\(`)
 var letterRegexp = regexp.MustCompile("^[a-zA-Z]")
+var fromRegexp = regexp.MustCompile(`(?i)from\s+(\S+)`)
+var whereRegexp = regexp.MustCompile(`(?i)where\s+(\S.*)`)
+var visibilityRegexp = regexp.MustCompile(`(?i)regexp\s+(\S+)`)
+var notRegexp = regexp.MustCompile(`(?i)(\S+)\s+not regexp\s+(\S+)`)
+
+var Lock sync.Mutex
 
 // Perform regular checks on show SQL and support the following formats:
 // show tag {tag_name} values from {table_name} where xxx order by xxx limit xxx :{tag_name} and {table_name} can be any character
@@ -60,7 +68,27 @@ var letterRegexp = regexp.MustCompile("^[a-zA-Z]")
 // show metrics on db
 // show tables
 // show databases
-var showSqlRegexp = regexp.MustCompile("^show (?:tag ([^\\s]+) values(?: from ([^\\s]+))?(?: where .+)?(?: order by \\w+)?(?: limit\\s+\\d+(,\\s+\\d+)?)?(?: offset \\d+)?|tags(?: from ([^\\s]+))?(?: where .+)?|metrics(?: from ([^\\s]+))?(?: where .+)?|metrics functions(?: from ([^\\s]+))?(?: where .+)?|language|metrics on db|tables|databases)$")
+var showPatterns = []string{
+	//if there are new pattern strings to match, add regular expressions directly here
+	`^show\s+language$`, // 1. show language
+	`^show\s+metrics\s+functions\s*(?:from\s+.*?\s*)?(?:where\s+.*?\s*)?$`,                                                // 2. show metrics functions
+	`(^show\s+metrics(?: from [^\s]+)?(?: where .+)?$)|(^show\s+metrics on db$)`,                                          // 3. show metrics or show metrics on db
+	`^show\s+tag\s+\S+\s+values\s+from\s+\S+(?: where .+)?(?: order by \w+)?(?: limit\s+\d+(,\s+\d+)?)?(?: offset \d+)?$`, // 4. show tag X values Y, X,Y not nil
+	`^show\s+tags(?: from ([^\s]+))?(?: where .+)?(?: limit\s+\d+(,\s+\d+)?)?$`,                                           // 5. show tags ...
+	`^show\s+tables(?: where .+)?$`,                                // 6. show tables
+	`^show\s+databases(?: where .+)?$`,                             // 7. show databases
+	`^show\s+tag-values(?: where .+)?(?: limit\s+\d+(,\s+\d+)?)?$`, // 8. show tag-values
+	`^show all_enum_tags$`,
+	`^show\s+enum\s+\S+\s+values`,
+}
+var res []*regexp.Regexp
+
+const (
+	TUPLE_ELEMENT_VALUES_INDEX = 1
+	TUPLE_ELEMENT_COUNTS_INDEX = 2
+	TOPK_PREFIX_ARRAY          = "array_"
+	TOPK_PREFIX_COUNTS         = "counts_"
+)
 
 type TargetLabelFilter struct {
 	OriginFilter string
@@ -81,122 +109,145 @@ type CHEngine struct {
 	NoPreWhere         bool
 	IsDerivative       bool
 	DerivativeGroupBy  []string
+	ORGID              string
+	Language           string
+	NativeField        map[string]*metrics.Metrics
+}
+
+func init() {
+	// init show patterns regexp
+	for _, pattern := range showPatterns {
+		res = append(res, regexp.MustCompile(pattern))
+	}
+}
+
+// createTopKColumn creates a column definition for TopK results
+// functionAs: the function alias (e.g., "array_TopK_10(ip_0)")
+// prefix: column prefix ("" for values, "counts_" for counts)
+// elementIndex: tuple element index (1 for values, 2 for counts)
+// argsLength: number of TopK function arguments
+func createTopKColumn(functionAs, prefix string, elementIndex, argsLength int) (string, string, error) {
+	if strings.TrimSpace(functionAs) == "" {
+		return "", "", fmt.Errorf("TopK function alias cannot be empty")
+	}
+	if elementIndex < 1 || elementIndex > 2 {
+		return "", "", fmt.Errorf("invalid tuple element index: %d, must be 1 or 2", elementIndex)
+	}
+	columnValue := "`" + strings.Trim(functionAs, "`") + "`"
+	if ctlcommon.CompareVersion(config.Cfg.Clickhouse.Version, ctlcommon.CLICK_HOUSE_VERSION) >= 0 {
+		columnValue = fmt.Sprintf("tupleElement(`%s`,%d)", strings.Trim(functionAs, "`"), elementIndex)
+	}
+
+	// if topk has one arg, need to concat array to string
+	if argsLength == 1 {
+		columnValue = fmt.Sprintf("arrayStringConcat(%s,',')", columnValue)
+	}
+	columnAlias := strings.Replace(functionAs, TOPK_PREFIX_ARRAY, prefix, 1)
+	return columnValue, columnAlias, nil
+}
+
+func ReplaceCustomBizServiceFilter(sql, orgID string) (string, error) {
+	//typePattern := `auto_service_type(_\d+)?\s*=\s*105\b`
+	typePattern := `(` + "`" + `?auto_service_type(_\d+)?` + "`" + `?)\s*=\s*105\b`
+	typeRegex := regexp.MustCompile(typePattern)
+	typeMatches := typeRegex.FindAllStringSubmatch(sql, -1)
+	suffixes := []string{}
+	if len(typeMatches) != 0 {
+		for _, match := range typeMatches {
+			suffix := match[2]
+			suffixes = append(suffixes, suffix)
+			sql = strings.ReplaceAll(sql, match[0], "1=1")
+		}
+
+		idPattern := `auto_service_id(_\d+)?\s*=\s*(\d+)`
+		idRegex := regexp.MustCompile(idPattern)
+		idMatches := idRegex.FindAllStringSubmatch(sql, -1)
+		for _, match := range idMatches {
+			suffix := match[1]
+			if slices.Contains(suffixes, suffix) {
+				transFilter, err := TransCustomBizFilter(match[0], orgID, match[2])
+				if err != nil {
+					return sql, err
+				}
+				if transFilter == "" {
+					transFilter = "1!=1"
+				}
+				sql = strings.ReplaceAll(sql, match[0], fmt.Sprintf("(%s)", transFilter))
+			}
+		}
+	}
+	return sql, nil
 }
 
 func (e *CHEngine) ExecuteQuery(args *common.QuerierParams) (*common.Result, map[string]interface{}, error) {
 	// 解析show开头的sql
 	// show metrics/tags from <table_name> 例：show metrics/tags from l4_flow_log
-	var sqlList []string
 	var err error
 	sql := args.Sql
 	e.Context = args.Context
 	e.NoPreWhere = args.NoPreWhere
+	e.Language = args.Language
+	e.ORGID = common.DEFAULT_ORG_ID
+	if args.ORGID != "" {
+		e.ORGID = args.ORGID
+	}
 	query_uuid := args.QueryUUID // FIXME: should be queryUUID
-	log.Debugf("query_uuid: %s | raw sql: %s", query_uuid, sql)
-
+	debug_info := &client.DebugInfo{}
+	// replace custom_biz_filter
+	fromMatch := fromRegexp.FindStringSubmatch(sql)
+	if len(fromMatch) > 1 {
+		table := fromMatch[1]
+		if table != "alert_event" {
+			sql, err = ReplaceCustomBizServiceFilter(sql, e.ORGID)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+	}
 	// Parse withSql
 	withResult, withDebug, err := e.QueryWithSql(sql, args)
 	if err != nil {
-		return nil, nil, err
+		if withDebug != nil {
+			debug_info.Debug = append(debug_info.Debug, *withDebug)
+		}
+		return nil, debug_info.Get(), err
 	}
 	if withResult != nil {
-		return withResult, withDebug, err
+		debug_info.Debug = append(debug_info.Debug, *withDebug)
+		return withResult, debug_info.Get(), err
 	}
-
 	// Parse slimitSql
 	slimitResult, slimitDebug, err := e.QuerySlimitSql(sql, args)
 	if err != nil {
-		return nil, nil, err
+		if slimitDebug != nil {
+			debug_info.Debug = append(debug_info.Debug, *slimitDebug)
+		}
+		return nil, debug_info.Get(), err
 	}
 	if slimitResult != nil {
-		return slimitResult, slimitDebug, err
+		debug_info.Debug = append(debug_info.Debug, *slimitDebug)
+		return slimitResult, debug_info.Get(), err
 	}
 	// Parse showSql
-	result, sqlList, isShow, err := e.ParseShowSql(sql, args)
+	debug := &client.Debug{
+		IP:        config.Cfg.Clickhouse.Host,
+		QueryUUID: query_uuid,
+	}
+	// For testing purposes, ParseShowSql requires the addition of the debug parameter
+	result, sqlList, isShow, err := e.ParseShowSql(sql, args, debug_info)
 	if isShow {
 		if err != nil {
 			return nil, nil, err
 		}
 		if len(sqlList) == 0 {
-			return result, nil, nil
+			return result, debug_info.Get(), nil
 		}
-	}
-	debug := &client.Debug{
-		IP:        config.Cfg.Clickhouse.Host,
-		QueryUUID: query_uuid,
-	}
-
-	if len(sqlList) > 0 {
 		e.DB = "flow_tag"
-		results := &common.Result{}
-		chClient := client.Client{
-			Host:     config.Cfg.Clickhouse.Host,
-			Port:     config.Cfg.Clickhouse.Port,
-			UserName: config.Cfg.Clickhouse.User,
-			Password: config.Cfg.Clickhouse.Password,
-			DB:       e.DB,
-			Debug:    debug,
-			Context:  e.Context,
-		}
-		ColumnSchemaMap := make(map[string]*common.ColumnSchema)
-		for _, ColumnSchema := range e.ColumnSchemas {
-			ColumnSchemaMap[ColumnSchema.Name] = ColumnSchema
-		}
-		for _, showSql := range sqlList {
-			showEngine := &CHEngine{DB: e.DB, DataSource: e.DataSource, Context: e.Context}
-			showEngine.Init()
-			showParser := parse.Parser{Engine: showEngine}
-			err = showParser.ParseSQL(showSql)
-			if err != nil {
-				errorMessage := fmt.Sprintf("sql: %s; parse error: %s", showSql, err.Error())
-				log.Error(errorMessage)
-				return nil, nil, err
-			}
-			for _, stmt := range showEngine.Statements {
-				stmt.Format(showEngine.Model)
-			}
-			FormatModel(showEngine.Model)
-			// 使用Model生成View
-			showEngine.View = view.NewView(showEngine.Model)
-			chSql := showEngine.ToSQLString()
-
-			debug.Sql = chSql
-			params := &client.QueryParams{
-				Sql:             chSql,
-				UseQueryCache:   args.UseQueryCache,
-				QueryCacheTTL:   args.QueryCacheTTL,
-				QueryUUID:       query_uuid,
-				ColumnSchemaMap: ColumnSchemaMap,
-			}
-			result, err := chClient.DoQuery(params)
-			if err != nil {
-				log.Error(err)
-				return nil, nil, err
-			}
-			if result != nil {
-				results.Values = append(results.Values, result.Values...)
-				results.Columns = result.Columns
-			}
-		}
-		return results, debug.Get(), nil
+	} else {
+		// Normal query, added to sqllist
+		sqlList = append(sqlList, sql)
 	}
-	parser := parse.Parser{Engine: e}
-	err = parser.ParseSQL(sql)
-	if err != nil {
-		errorMessage := fmt.Sprintf("sql: %s; parse error: %s", sql, err.Error())
-		log.Error(errorMessage)
-		return nil, nil, err
-	}
-	for _, stmt := range e.Statements {
-		stmt.Format(e.Model)
-	}
-	FormatModel(e.Model)
-	// 使用Model生成View
-	e.View = view.NewView(e.Model)
-	e.View.NoPreWhere = e.NoPreWhere
-	chSql := e.ToSQLString()
-	callbacks := e.View.GetCallbacks()
-	debug.Sql = chSql
+	results := &common.Result{}
 	chClient := client.Client{
 		Host:     config.Cfg.Clickhouse.Host,
 		Port:     config.Cfg.Clickhouse.Port,
@@ -207,51 +258,268 @@ func (e *CHEngine) ExecuteQuery(args *common.QuerierParams) (*common.Result, map
 		Context:  e.Context,
 	}
 	ColumnSchemaMap := make(map[string]*common.ColumnSchema)
-	for _, ColumnSchema := range e.ColumnSchemas {
-		ColumnSchemaMap[ColumnSchema.Name] = ColumnSchema
+	if isShow {
+		for _, ColumnSchema := range e.ColumnSchemas {
+			ColumnSchemaMap[ColumnSchema.Name] = ColumnSchema
+		}
 	}
-	params := &client.QueryParams{
-		Sql:             chSql,
-		UseQueryCache:   args.UseQueryCache,
-		QueryCacheTTL:   args.QueryCacheTTL,
-		Callbacks:       callbacks,
-		QueryUUID:       query_uuid,
-		ColumnSchemaMap: ColumnSchemaMap,
+	parser := parse.Parser{}
+	for _, sql1 := range sqlList {
+		usedEngine := &CHEngine{}
+		if isShow {
+			showEngine := &CHEngine{DB: e.DB, DataSource: e.DataSource, Context: e.Context, ORGID: e.ORGID}
+			showEngine.Init()
+			parser.Engine = showEngine
+			usedEngine = showEngine
+		} else {
+			parser.Engine = e
+			usedEngine = e
+		}
+		err = parser.ParseSQL(sql1)
+		if err != nil {
+			errorMessage := fmt.Sprintf("sql: %s; parse error: %s", sql1, err.Error())
+			log.Error(errorMessage)
+			return nil, nil, err
+		}
+		// To do
+		for _, stmt := range usedEngine.Statements {
+			stmt.Format(usedEngine.Model)
+		}
+		FormatModel(usedEngine.Model)
+		// 使用Model生成View
+		usedEngine.View = view.NewView(usedEngine.Model)
+		if !isShow {
+			usedEngine.View.NoPreWhere = usedEngine.NoPreWhere
+		}
+		chSql := usedEngine.ToSQLString()
+		callbacks := usedEngine.View.GetCallbacks()
+		debug.Sql = chSql
+		if !isShow {
+			for _, ColumnSchema := range usedEngine.ColumnSchemas {
+				ColumnSchemaMap[ColumnSchema.Name] = ColumnSchema
+			}
+		}
+		params := &client.QueryParams{
+			Sql:             chSql,
+			UseQueryCache:   args.UseQueryCache,
+			QueryCacheTTL:   args.QueryCacheTTL,
+			QueryUUID:       query_uuid,
+			ColumnSchemaMap: ColumnSchemaMap,
+			ORGID:           args.ORGID,
+		}
+		if !isShow {
+			params.Callbacks = callbacks
+		}
+		result, err := chClient.DoQuery(params)
+		if err != nil {
+			log.Error(err)
+			debug_info.Debug = append(debug_info.Debug, *debug)
+			return nil, debug_info.Get(), err
+		}
+		if result != nil {
+			results.Values = append(results.Values, result.Values...)
+			results.Columns = result.Columns
+			if !isShow {
+				results.Schemas = result.Schemas
+			}
+			debug_info.Debug = append(debug_info.Debug, *debug)
+		}
 	}
-	rst, err := chClient.DoQuery(params)
-	if err != nil {
-		return nil, debug.Get(), err
-	}
-	return rst, debug.Get(), err
+	return results, debug_info.Get(), nil
+
 }
 
-func (e *CHEngine) ParseShowSql(sql string, args *common.QuerierParams) (*common.Result, []string, bool, error) {
+func ShowTagTypeMetrics(tagDescriptions, result *common.Result, db, table string) {
+	for _, tagValue := range tagDescriptions.Values {
+		tagSlice := tagValue.([]interface{})
+		name := tagSlice[0].(string)
+		clientName := tagSlice[1].(string)
+		serverName := tagSlice[2].(string)
+		displayName := tagSlice[3].(string)
+		displayNameZH := tagSlice[4].(string)
+		displayNameEN := tagSlice[5].(string)
+		tagType := tagSlice[6].(string)
+		permissions := tagSlice[9].([]bool)
+		if slices.Contains([]string{"auto_custom_tag", "time", "id"}, tagType) {
+			continue
+		}
+		if db == chCommon.DB_NAME_FLOW_TAG {
+			continue
+		}
+		if name == "lb_listener" || name == "pod_ingress" {
+			continue
+		}
+		if len(tagSlice) >= 16 {
+			notSupportedOperators := tagSlice[15].([]string)
+			// not support select
+			if slices.Contains(notSupportedOperators, "select") {
+				continue
+			}
+		}
+		if slices.Contains([]string{"l4_flow_log", "l7_flow_log", "application_map", "network_map", "vtap_flow_edge_port", "vtap_app_edge_port"}, table) {
+			if serverName == clientName {
+				clientNameMetric := []interface{}{
+					clientName, true, displayName, displayNameZH, displayNameEN, "", "", "", metrics.METRICS_TYPE_NAME_MAP["tag"],
+					"Tag", metrics.METRICS_OPERATORS, permissions, table, "", "", "",
+				}
+				result.Values = append(result.Values, clientNameMetric)
+			} else {
+				var (
+					serverDisplayName   = displayName
+					clientDisplayName   = displayName
+					serverDisplayNameZH = chCommon.TAG_SERVER_CH_PREFIX + " " + displayName
+					serverDisplayNameEN = chCommon.TAG_SERVER_EN_PREFIX + " " + displayName
+					clientDisplayNameZH = chCommon.TAG_CLIENT_CH_PREFIX + " " + displayName
+					clientDisplayNameEN = chCommon.TAG_CLIENT_EN_PREFIX + " " + displayName
+				)
+				if config.Cfg.Language == "en" {
+					serverDisplayName = chCommon.TAG_SERVER_EN_PREFIX + " " + displayName
+					clientDisplayName = chCommon.TAG_CLIENT_EN_PREFIX + " " + displayName
+				} else if config.Cfg.Language == "ch" {
+					if letterRegexp.MatchString(serverName) {
+						serverDisplayName = chCommon.TAG_SERVER_CH_PREFIX + " " + displayName
+						clientDisplayName = chCommon.TAG_CLIENT_CH_PREFIX + " " + displayName
+					} else {
+						serverDisplayName = chCommon.TAG_SERVER_CH_PREFIX + displayName
+						clientDisplayName = chCommon.TAG_CLIENT_CH_PREFIX + displayName
+					}
+				}
+				serverNameMetric := []interface{}{
+					serverName, true, serverDisplayName, serverDisplayNameZH, serverDisplayNameEN, "", "", "", metrics.METRICS_TYPE_NAME_MAP["tag"],
+					"Tag", metrics.METRICS_OPERATORS, permissions, table, "", "", "",
+				}
+				clientNameMetric := []interface{}{
+					clientName, true, clientDisplayName, clientDisplayNameZH, clientDisplayNameEN, "", "", "", metrics.METRICS_TYPE_NAME_MAP["tag"],
+					"Tag", metrics.METRICS_OPERATORS, permissions, table, "", "", "",
+				}
+				result.Values = append(result.Values, serverNameMetric, clientNameMetric)
+			}
+		} else {
+			nameMetric := []interface{}{
+				name, true, displayName, displayNameZH, displayNameEN, "", "", "", metrics.METRICS_TYPE_NAME_MAP["tag"],
+				"Tag", metrics.METRICS_OPERATORS, permissions, table, "", "", "",
+			}
+			result.Values = append(result.Values, nameMetric)
+		}
+	}
+}
+
+// extractFromWhere extracts the first string after 'from' and all strings after 'where'.
+func ExtractFromWhereAndvisibilityFilter(s string) (table string, whereClause string, visibilityFilter string) {
+	// Regex to capture the first string after 'from' and all strings after 'where'
+	// Extract from part
+	fromMatch := fromRegexp.FindStringSubmatch(s)
+	if len(fromMatch) > 1 {
+		table = fromMatch[1]
+	}
+	// Extract where part
+	whereMatch := whereRegexp.FindStringSubmatch(s)
+	if len(whereMatch) > 1 {
+		whereClause = whereMatch[1]
+	}
+	visibilityFilterMatch := visibilityRegexp.FindStringSubmatch(s)
+	if len(visibilityFilterMatch) > 1 {
+		visibilityFilter = visibilityFilterMatch[1]
+	}
+	return
+}
+
+func MatchPattern(s string) (int, bool) {
+	for i, re := range res {
+		if re.MatchString(s) {
+			return i + 1, true
+		}
+	}
+	return 0, false
+}
+func dataVisibilityfiltering(visibilityFilterRegexp *regexp.Regexp, values []interface{}) []interface{} {
+	var visibilityFilterValues []interface{}
+	for _, value := range values {
+		name := value.([]interface{})[0].(string)
+		if !visibilityFilterRegexp.MatchString(name) {
+			visibilityFilterValues = append(visibilityFilterValues, value)
+		}
+	}
+	return visibilityFilterValues
+}
+
+func formatTagByLanguage(language string, values []interface{}) {
+	for _, value := range values {
+		displaynameZH := value.([]interface{})[4].(string)
+		displaynameEN := value.([]interface{})[5].(string)
+		descriptionZH := value.([]interface{})[11].(string)
+		descriptionEN := value.([]interface{})[12].(string)
+		if language == chCommon.LANGUAGE_EN {
+			value.([]interface{})[3] = displaynameEN
+			value.([]interface{})[10] = descriptionEN
+		} else {
+			value.([]interface{})[3] = displaynameZH
+			value.([]interface{})[10] = descriptionZH
+		}
+	}
+}
+
+func formatMetricByLanguage(language string, values []interface{}) {
+	for _, value := range values {
+		displaynameZH := value.([]interface{})[3].(string)
+		displaynameEN := value.([]interface{})[4].(string)
+		unitZH := value.([]interface{})[6].(string)
+		unitEN := value.([]interface{})[7].(string)
+		descriptionZH := value.([]interface{})[14].(string)
+		descriptionEN := value.([]interface{})[15].(string)
+		if language == chCommon.LANGUAGE_EN {
+			value.([]interface{})[2] = displaynameEN
+			value.([]interface{})[5] = unitEN
+			value.([]interface{})[13] = descriptionEN
+		} else {
+			value.([]interface{})[2] = displaynameZH
+			value.([]interface{})[5] = unitZH
+			value.([]interface{})[13] = descriptionZH
+		}
+	}
+}
+
+func formatEnumTagByLanguage(language string, values []interface{}) {
+	for _, value := range values {
+		displaynameZH := value.([]interface{})[4].(string)
+		displaynameEN := value.([]interface{})[5].(string)
+		descriptionZH := value.([]interface{})[11].(string)
+		descriptionEN := value.([]interface{})[12].(string)
+		if language == chCommon.LANGUAGE_EN {
+			value.([]interface{})[3] = displaynameEN
+			value.([]interface{})[10] = descriptionEN
+		} else {
+			value.([]interface{})[3] = displaynameZH
+			value.([]interface{})[10] = descriptionZH
+		}
+	}
+}
+
+func (e *CHEngine) ParseShowSql(sql string, args *common.QuerierParams, DebugInfo *client.DebugInfo) (*common.Result, []string, bool, error) {
+	var visibilityFilterRegexp *regexp.Regexp
 	sqlSplit := strings.Fields(sql)
+	// Not showSql, return
 	if strings.ToLower(sqlSplit[0]) != "show" {
 		return nil, []string{}, false, nil
 	}
 	sql = strings.Join(sqlSplit, " ")
-	if !showSqlRegexp.MatchString(strings.ToLower(sql)) {
+	index, flag := MatchPattern(strings.ToLower(sql))
+	if flag == false {
 		err := fmt.Errorf("not support sql: '%s', please check", sql)
 		return nil, []string{}, true, err
 	}
-	if strings.ToLower(sqlSplit[1]) == "language" {
-		result := &common.Result{}
-		result.Columns = []interface{}{"language"}
-		result.Values = []interface{}{[]string{config.Cfg.Language}}
-		return result, []string{}, true, nil
+	table, where, visibilityFilter := ExtractFromWhereAndvisibilityFilter(sql)
+	visibilityWhere := ""
+	visibilitySql := ""
+	if len(visibilityFilter) > 0 {
+		visibilitySql = notRegexp.ReplaceAllString(sql, "not match( $1 ,$2 )")
+		sql = notRegexp.ReplaceAllString(sql, " 1=1 ")
+		_, where, _ = ExtractFromWhereAndvisibilityFilter(sql)
+		_, visibilityWhere, _ = ExtractFromWhereAndvisibilityFilter(visibilitySql)
+		visibilityFilter = strings.Trim(visibilityFilter, "'")
+		visibilityFilterRegexp = regexp.MustCompile(visibilityFilter)
 	}
-	var table string
-	var where string
-	for i, item := range sqlSplit {
-		if strings.ToLower(item) == "from" {
-			table = sqlSplit[i+1]
-			break
-		}
-		if strings.ToLower(item) == "where" {
-			where = strings.Join(sqlSplit[i+1:], " ")
-		}
-	}
+
 	switch table {
 	case "vtap_app_port":
 		table = "application"
@@ -264,135 +532,89 @@ func (e *CHEngine) ParseShowSql(sql string, args *common.QuerierParams) (*common
 	case "vtap_acl":
 		table = "traffic_policy"
 	}
-	switch strings.ToLower(sqlSplit[1]) {
-	case "metrics":
-		if len(sqlSplit) > 2 && strings.ToLower(sqlSplit[2]) == "functions" {
-			funcs, err := metrics.GetFunctionDescriptions()
-			return funcs, []string{}, true, err
-		} else {
-			result, err := metrics.GetMetricsDescriptions(e.DB, table, where, args.QueryCacheTTL, args.UseQueryCache, e.Context)
-			if err != nil {
-				return nil, []string{}, true, err
-			}
+	// do the corresponding processing according to the matched pattern string
+	switch index {
+	case 1: // show language ...
+		result := &common.Result{}
+		result.Columns = []interface{}{"language"}
+		result.Values = []interface{}{[]string{config.Cfg.Language}}
+		return result, []string{}, true, nil
+	case 2: // show metrics functions ...
+		funcs, err := metrics.GetFunctionDescriptions()
+		return funcs, []string{}, true, err
+	case 3: // show metrics ...
+		if e.DB == chCommon.DB_NAME_DEEPFLOW_TENANT && len(visibilityFilter) > 0 {
+			where = visibilityWhere
+			sql = visibilitySql
+		}
+		result, err := metrics.GetMetricsDescriptions(e.DB, table, where, args.QueryCacheTTL, args.ORGID, args.UseQueryCache, e.Context)
+		if err != nil {
+			return nil, []string{}, true, err
+		}
 
-			// tag metrics
-			dbData, ok := metrics.DB_DESCRIPTIONS["clickhouse"]
-			if !ok {
-				return nil, []string{}, true, err
-			}
-			dbDataMap := dbData.(map[string]interface{})
-			if tagData, ok := dbDataMap["tag"]; ok {
-				dbTagMap := tagData.(map[string]interface{})
-				if dbTag, ok := dbTagMap[e.DB]; ok {
-					tableTagMap := dbTag.(map[string]interface{})
-					newTable := table
-					if e.DB == chCommon.DB_NAME_PROMETHEUS {
-						newTable = "samples"
-					} else if e.DB == chCommon.DB_NAME_EXT_METRICS {
-						newTable = "ext_common"
-					} else if e.DB == chCommon.DB_NAME_DEEPFLOW_SYSTEM {
-						newTable = "deepflow_system_common"
-					}
-					if tableTag, ok := tableTagMap[newTable]; ok {
-						tabletagSlice := tableTag.([][]interface{})
-						for i, tagSlice := range tabletagSlice {
-							tagType := tagSlice[3].(string)
-							if slices.Contains([]string{"auto_custom_tag", "time", "id"}, tagType) {
-								continue
-							}
-							if e.DB == chCommon.DB_NAME_FLOW_TAG {
-								continue
-							}
-							name := tagSlice[0].(string)
-							if name == "lb_listener" || name == "pod_ingress" {
-								continue
-							}
-							notSupportedOperators := []string{}
-							if len(tagSlice) >= 9 {
-								notSupportedOperators = chCommon.ParseNotSupportedOperator(tagSlice[8])
-								// not support select
-								if slices.Contains(notSupportedOperators, "select") {
-									continue
-								}
-							}
-							clientName := tagSlice[1].(string)
-							serverName := tagSlice[2].(string)
-							tagLanguage := tableTagMap[newTable+"."+config.Cfg.Language].([][]interface{})[i]
-							displayName := tagLanguage[1].(string)
-							permissions, err := chCommon.ParsePermission("111")
-							if err != nil {
-								return nil, []string{}, true, err
-							}
-							if slices.Contains([]string{"l4_flow_log", "l7_flow_log", "application_map", "network_map"}, table) {
-								if serverName == clientName {
-									clientNameMetric := []interface{}{
-										clientName, true, displayName, "", metrics.METRICS_TYPE_NAME_MAP["tag"],
-										"Tag", metrics.METRICS_OPERATORS, permissions, table, "",
-									}
-									result.Values = append(result.Values, clientNameMetric)
-								} else {
-									var (
-										serverDisplayName = displayName
-										clientDisplayName = displayName
-									)
-									if config.Cfg.Language == "en" {
-										serverDisplayName = chCommon.TagServerEnPrefix + " " + displayName
-										clientDisplayName = chCommon.TagClientEnPrefix + " " + displayName
-									} else if config.Cfg.Language == "ch" {
-										if letterRegexp.MatchString(serverName) {
-											serverDisplayName = chCommon.TagServerChPrefix + " " + displayName
-											clientDisplayName = chCommon.TagClientChPrefix + " " + displayName
-										} else {
-											serverDisplayName = chCommon.TagServerChPrefix + displayName
-											clientDisplayName = chCommon.TagClientChPrefix + displayName
-										}
-									}
-									serverNameMetric := []interface{}{
-										serverName, true, serverDisplayName, "", metrics.METRICS_TYPE_NAME_MAP["tag"],
-										"Tag", metrics.METRICS_OPERATORS, permissions, table, "",
-									}
-									clientNameMetric := []interface{}{
-										clientName, true, clientDisplayName, "", metrics.METRICS_TYPE_NAME_MAP["tag"],
-										"Tag", metrics.METRICS_OPERATORS, permissions, table, "",
-									}
-									result.Values = append(result.Values, serverNameMetric, clientNameMetric)
-								}
-							} else {
-								nameMetric := []interface{}{
-									name, true, displayName, "", metrics.METRICS_TYPE_NAME_MAP["tag"],
-									"Tag", metrics.METRICS_OPERATORS, permissions, table, "",
-								}
-								result.Values = append(result.Values, nameMetric)
-							}
-						}
-					}
-				}
-			}
-			return result, []string{}, true, err
+		// tag metrics
+		tagDescriptions, err := tag.GetTagDescriptions(e.DB, table, sql, args.QueryCacheTTL, e.ORGID, args.UseQueryCache, e.Context, DebugInfo)
+		if err != nil {
+			log.Error("Failed to get tag type metrics")
+			return nil, []string{}, true, err
 		}
-	case "tag":
-		// show tag {tag} values from table
-		if len(sqlSplit) < 6 {
-			return nil, []string{}, true, fmt.Errorf("parse show sql error, sql: '%s' not support", sql)
+		ShowTagTypeMetrics(tagDescriptions, result, e.DB, table)
+
+		if len(visibilityFilter) > 0 && e.DB != chCommon.DB_NAME_DEEPFLOW_TENANT {
+			result.Values = dataVisibilityfiltering(visibilityFilterRegexp, result.Values)
 		}
-		if strings.ToLower(sqlSplit[3]) == "values" {
-			result, sqlList, err := tagdescription.GetTagValues(e.DB, table, sql, args.QueryCacheTTL, args.UseQueryCache)
-			e.DB = "flow_tag"
-			return result, sqlList, true, err
+		if args.Language != "" {
+			formatMetricByLanguage(args.Language, result.Values)
 		}
-		return nil, []string{}, true, fmt.Errorf("parse show sql error, sql: '%s' not support", sql)
-	case "tags":
-		data, err := tagdescription.GetTagDescriptions(e.DB, table, sql, args.QueryCacheTTL, args.UseQueryCache, e.Context)
+		return result, []string{}, true, err
+	case 4: // show tag X values from Y; X, Y not nil
+		result, sqlList, err := tagdescription.GetTagValues(e.DB, table, sql, args.QueryCacheTTL, args.ORGID, args.Language, args.UseQueryCache)
+		e.DB = "flow_tag"
+		return result, sqlList, true, err
+	case 5: // show tags ...
+		if e.DB == chCommon.DB_NAME_DEEPFLOW_TENANT && len(visibilityFilter) > 0 {
+			sql = visibilitySql
+		}
+		data, err := tagdescription.GetTagDescriptions(e.DB, table, sql, args.QueryCacheTTL, args.ORGID, args.UseQueryCache, e.Context, DebugInfo)
+		if len(visibilityFilter) > 0 && e.DB != chCommon.DB_NAME_DEEPFLOW_TENANT {
+			data.Values = dataVisibilityfiltering(visibilityFilterRegexp, data.Values)
+		}
+		if args.Language != "" {
+			formatTagByLanguage(args.Language, data.Values)
+		}
 		return data, []string{}, true, err
-	case "tables":
-		return GetTables(e.DB, args.QueryCacheTTL, args.UseQueryCache, e.Context), []string{}, true, nil
-	case "databases":
-		return GetDatabases(), []string{}, true, nil
+	case 6: // show tables...
+		if e.DB == chCommon.DB_NAME_DEEPFLOW_TENANT && len(visibilityFilter) > 0 {
+			where = visibilityWhere
+		}
+		result := GetTables(e.DB, where, args.QueryCacheTTL, args.ORGID, args.UseQueryCache, e.Context, DebugInfo)
+		if len(visibilityFilter) > 0 && e.DB != chCommon.DB_NAME_DEEPFLOW_TENANT {
+			result.Values = dataVisibilityfiltering(visibilityFilterRegexp, result.Values)
+		}
+		return result, []string{}, true, nil
+	case 7: // show databases...
+		result := GetDatabases()
+		if len(visibilityFilter) > 0 {
+			result.Values = dataVisibilityfiltering(visibilityFilterRegexp, result.Values)
+		}
+		return result, []string{}, true, nil
+	case 8: // show tag-values...
+		sqlList, err := tagdescription.GetTagValuesDescriptions(e.DB, sql, args.QueryCacheTTL, args.ORGID, args.UseQueryCache, e.Context)
+		return nil, sqlList, true, err
+	case 9:
+		result, err := tagdescription.GetEnumTags(e.DB, table, sql)
+		if args.Language != "" {
+			formatTagByLanguage(args.Language, result.Values)
+		}
+		return result, []string{}, true, err
+	case 10:
+		sqlList, err := tagdescription.GetEnumTagAllValues(e.DB, table, sql, args.Language)
+		return nil, sqlList, true, err
 	}
 	return nil, []string{}, true, fmt.Errorf("parse show sql error, sql: '%s' not support", sql)
 }
 
-func (e *CHEngine) QuerySlimitSql(sql string, args *common.QuerierParams) (*common.Result, map[string]interface{}, error) {
+func (e *CHEngine) QuerySlimitSql(sql string, args *common.QuerierParams) (*common.Result, *client.Debug, error) {
 	sql, callbacks, columnSchemaMap, err := e.ParseSlimitSql(sql, args)
 	if err != nil {
 		log.Error(err)
@@ -423,13 +645,40 @@ func (e *CHEngine) QuerySlimitSql(sql string, args *common.QuerierParams) (*comm
 		Callbacks:       callbacks,
 		QueryUUID:       query_uuid,
 		ColumnSchemaMap: columnSchemaMap,
+		ORGID:           args.ORGID,
 	}
 	rst, err := chClient.DoQuery(params)
 	if err != nil {
 		log.Error(err)
-		return nil, debug.Get(), err
+		return nil, debug, err
 	}
-	return rst, debug.Get(), err
+	return rst, debug, err
+}
+
+func AddTypeTag(array []string, selectTag string) []string {
+	for _, suffix := range []string{"", "_0", "_1"} {
+		// auto
+		for _, resourceName := range []string{"auto_instance", "auto_service"} {
+			resourceTypeSuffix := resourceName + "_type" + suffix
+			if selectTag == resourceName+suffix {
+				array = append(array, resourceTypeSuffix)
+			}
+		}
+		// device
+		for resourceStr, _ := range tag.DEVICE_MAP {
+			if resourceStr == "pod_service" {
+				continue
+			} else if selectTag == resourceStr+suffix {
+				array = append(array, "device_type_"+selectTag)
+			}
+		}
+		for resource, _ := range tag.HOSTNAME_IP_DEVICE_MAP {
+			if slices.Contains([]string{common.CHOST_HOSTNAME, common.CHOST_IP}, resource) && selectTag == resource+suffix {
+				array = append(array, "device_type_"+selectTag)
+			}
+		}
+	}
+	return array
 }
 
 func (e *CHEngine) ParseSlimitSql(sql string, args *common.QuerierParams) (string, map[string]func(*common.Result) error, map[string]*common.ColumnSchema, error) {
@@ -510,9 +759,8 @@ func (e *CHEngine) ParseSlimitSql(sql string, args *common.QuerierParams) (strin
 			}
 		}
 	}
-
 	showTagsSql := "show tags from " + table
-	tags, _, _, err := e.ParseShowSql(showTagsSql, args)
+	tags, _, _, err := e.ParseShowSql(showTagsSql, args, nil)
 	if err != nil {
 		return "", nil, nil, err
 	} else if len(tags.Values) == 0 {
@@ -546,13 +794,14 @@ func (e *CHEngine) ParseSlimitSql(sql string, args *common.QuerierParams) (strin
 								for autoTagKey, _ := range autoTagMap {
 									autoTagSlice = append(autoTagSlice, autoTagKey)
 								}
-								sort.Strings(autoTagSlice)
+								slices.Sort(autoTagSlice)
 								for _, autoTagKey := range autoTagSlice {
 									outerWhereLeftSlice = append(outerWhereLeftSlice, "`"+autoTagKey+"`")
 								}
 							}
 						} else {
 							outerWhereLeftSlice = append(outerWhereLeftSlice, as)
+							outerWhereLeftSlice = AddTypeTag(outerWhereLeftSlice, sqlparser.String(colName))
 						}
 					} else {
 						innerSelectSlice = append(innerSelectSlice, sqlparser.String(colName))
@@ -564,24 +813,14 @@ func (e *CHEngine) ParseSlimitSql(sql string, args *common.QuerierParams) (strin
 								for autoTagKey, _ := range autoTagMap {
 									autoTagSlice = append(autoTagSlice, autoTagKey)
 								}
-								sort.Strings(autoTagSlice)
+								slices.Sort(autoTagSlice)
 								for _, autoTagKey := range autoTagSlice {
 									outerWhereLeftSlice = append(outerWhereLeftSlice, "`"+autoTagKey+"`")
 								}
 							}
 						} else {
 							outerWhereLeftSlice = append(outerWhereLeftSlice, sqlparser.String(colName))
-						}
-					}
-					for _, suffix := range []string{"", "_0", "_1"} {
-						for _, resourceName := range []string{"resource_gl0", "auto_instance", "resource_gl1", "resource_gl2", "auto_service"} {
-							resourceTypeSuffix := "auto_service_type" + suffix
-							if common.IsValueInSliceString(resourceName, []string{"resource_gl0", "auto_instance"}) {
-								resourceTypeSuffix = "auto_instance_type" + suffix
-							}
-							if sqlparser.String(colName) == resourceName+suffix {
-								outerWhereLeftAppendSlice = append(outerWhereLeftAppendSlice, resourceTypeSuffix)
-							}
+							outerWhereLeftSlice = AddTypeTag(outerWhereLeftSlice, sqlparser.String(colName))
 						}
 					}
 				}
@@ -673,7 +912,7 @@ func (e *CHEngine) ParseSlimitSql(sql string, args *common.QuerierParams) (strin
 				}
 			}
 		}
-		innerEngine := &CHEngine{DB: e.DB, DataSource: e.DataSource, Context: e.Context}
+		innerEngine := &CHEngine{DB: e.DB, DataSource: e.DataSource, Context: e.Context, ORGID: e.ORGID}
 		innerEngine.Init()
 		if strings.Contains(innerSql, "Derivative") {
 			innerEngine.IsDerivative = true
@@ -693,7 +932,7 @@ func (e *CHEngine) ParseSlimitSql(sql string, args *common.QuerierParams) (strin
 		innerEngine.View = view.NewView(innerEngine.Model)
 		innerTransSql = innerEngine.ToSQLString()
 	}
-	outerEngine := &CHEngine{DB: e.DB, DataSource: e.DataSource, Context: e.Context}
+	outerEngine := &CHEngine{DB: e.DB, DataSource: e.DataSource, Context: e.Context, ORGID: e.ORGID}
 	outerEngine.Init()
 	if strings.Contains(newSql, "Derivative") {
 		outerEngine.IsDerivative = true
@@ -721,7 +960,7 @@ func (e *CHEngine) ParseSlimitSql(sql string, args *common.QuerierParams) (strin
 			oldWhereSlice := strings.SplitN(outerTransSql, " PREWHERE ", 2)
 			outerSlice = append(outerSlice, oldWhereSlice[0])
 			if sorderByTag != "" {
-				outerSlice = append(outerSlice, " PREWHERE ("+outerWhereLeftSql+") IN (SELECT "+outerWhereLeftSql+" FROM ("+innerTransSql+")) AND ")
+				outerSlice = append(outerSlice, " PREWHERE ("+outerWhereLeftSql+") GLOBAL IN (SELECT "+outerWhereLeftSql+" FROM ("+innerTransSql+")) AND ")
 			} else {
 				outerSlice = append(outerSlice, " PREWHERE ("+outerWhereLeftSql+") IN ("+innerTransSql+") AND ")
 			}
@@ -731,7 +970,7 @@ func (e *CHEngine) ParseSlimitSql(sql string, args *common.QuerierParams) (strin
 			oldWhereSlice := strings.SplitN(outerTransSql, " WHERE ", 2)
 			outerSlice = append(outerSlice, oldWhereSlice[0])
 			if sorderByTag != "" {
-				outerSlice = append(outerSlice, " WHERE ("+outerWhereLeftSql+") IN (SELECT "+outerWhereLeftSql+" FROM ("+innerTransSql+")) AND ")
+				outerSlice = append(outerSlice, " WHERE ("+outerWhereLeftSql+") GLOBAL IN (SELECT "+outerWhereLeftSql+" FROM ("+innerTransSql+")) AND ")
 			} else {
 				outerSlice = append(outerSlice, " WHERE ("+outerWhereLeftSql+") IN ("+innerTransSql+") AND ")
 			}
@@ -752,7 +991,7 @@ func (e *CHEngine) ParseSlimitSql(sql string, args *common.QuerierParams) (strin
 	return outerSql, callbacks, columnSchemaMap, nil
 }
 
-func (e *CHEngine) QueryWithSql(sql string, args *common.QuerierParams) (*common.Result, map[string]interface{}, error) {
+func (e *CHEngine) QueryWithSql(sql string, args *common.QuerierParams) (*common.Result, *client.Debug, error) {
 	sql, callbacks, columnSchemaMap, err := e.ParseWithSql(sql)
 	if err != nil {
 		log.Error(err)
@@ -784,13 +1023,14 @@ func (e *CHEngine) QueryWithSql(sql string, args *common.QuerierParams) (*common
 		Callbacks:       callbacks,
 		QueryUUID:       query_uuid,
 		ColumnSchemaMap: columnSchemaMap,
+		ORGID:           args.ORGID,
 	}
 	rst, err := chClient.DoQuery(params)
 	if err != nil {
 		log.Error(err)
-		return nil, debug.Get(), err
+		return nil, debug, err
 	}
-	return rst, debug.Get(), err
+	return rst, debug, err
 }
 
 func (e *CHEngine) ParseWithSql(sql string) (string, map[string]func(*common.Result) error, map[string]*common.ColumnSchema, error) {
@@ -805,7 +1045,7 @@ func (e *CHEngine) ParseWithSql(sql string) (string, map[string]func(*common.Res
 	for _, match := range subMatches {
 		match = strings.TrimPrefix(match, "(")
 		match = strings.TrimSuffix(match, ")")
-		matchEngine := &CHEngine{DB: e.DB, DataSource: e.DataSource, Context: e.Context}
+		matchEngine := &CHEngine{DB: e.DB, DataSource: e.DataSource, Context: e.Context, ORGID: e.ORGID}
 		matchEngine.Init()
 		matchParser := parse.Parser{Engine: matchEngine}
 		err := matchParser.ParseSQL(match)
@@ -836,6 +1076,9 @@ func (e *CHEngine) ParseWithSql(sql string) (string, map[string]func(*common.Res
 func (e *CHEngine) Init() {
 	e.Model = view.NewModel()
 	e.Model.DB = e.DB
+	if e.ORGID == "" {
+		e.ORGID = common.DEFAULT_ORG_ID
+	}
 }
 
 func (e *CHEngine) TransSelect(tags sqlparser.SelectExprs) error {
@@ -850,11 +1093,14 @@ func (e *CHEngine) TransSelect(tags sqlparser.SelectExprs) error {
 			funcName, ok := item.Expr.(*sqlparser.FuncExpr)
 			if ok {
 				tagSlice = append(tagSlice, sqlparser.String(funcName))
-				if strings.Contains(sqlparser.String(funcName), "Derivative") && !e.IsDerivative {
-					e.IsDerivative = true
-					e.Model.IsDerivative = true
-					e.Model.DerivativeGroupBy = e.DerivativeGroupBy
-				}
+			}
+
+			// Determine whether there is a Derivative operator
+			exprStr := sqlparser.String(item)
+			if strings.Contains(exprStr, "Derivative") && !e.IsDerivative {
+				e.IsDerivative = true
+				e.Model.IsDerivative = true
+				e.Model.DerivativeGroupBy = e.DerivativeGroupBy
 			}
 		}
 	}
@@ -909,7 +1155,7 @@ func (e *CHEngine) TransSelect(tags sqlparser.SelectExprs) error {
 				if strings.HasPrefix(sqlparser.String(colName), "pod_ingress") || strings.HasPrefix(sqlparser.String(colName), "lb_listener") {
 					errStr := fmt.Sprintf("%s is not supported by select", sqlparser.String(colName))
 					return errors.New(errStr)
-				} else if sqlparser.String(colName) == "tags" || sqlparser.String(colName) == "metrics" || sqlparser.String(colName) == "attributes" || sqlparser.String(colName) == "packet_batch" {
+				} else if sqlparser.String(colName) == "tag" || sqlparser.String(colName) == "metrics" || sqlparser.String(colName) == "attribute" || sqlparser.String(colName) == "packet_batch" {
 					if as != "" {
 						errStr := fmt.Sprintf("%s does not support as", sqlparser.String(colName))
 						return errors.New(errStr)
@@ -959,7 +1205,8 @@ func (e *CHEngine) TransPrometheusTargetIDFilter(expr view.Node) (view.Node, err
 		}
 		targetOriginFilterStr := strings.Join(trgetOriginFilters, " AND ")
 		prometheusSubqueryCache := GetPrometheusSubqueryCache()
-		targetFilter, ok := prometheusSubqueryCache.PrometheusSubqueryCache.Get(targetOriginFilterStr)
+		entryKey := common.EntryKey{ORGID: e.ORGID, Filter: targetOriginFilterStr}
+		targetFilter, ok := prometheusSubqueryCache.Get(entryKey)
 		if ok {
 			filter := targetFilter.Filter
 			filterTime := targetFilter.Time
@@ -988,15 +1235,15 @@ func (e *CHEngine) TransPrometheusTargetIDFilter(expr view.Node) (view.Node, err
 			Password: config.Cfg.Clickhouse.Password,
 			DB:       "flow_tag",
 		}
-		targetLabelRst, err := chClient.DoQuery(&client.QueryParams{Sql: sql})
+		targetLabelRst, err := chClient.DoQuery(&client.QueryParams{Sql: sql, ORGID: e.ORGID})
 		if err != nil {
 			return expr, err
 		}
 		targetIDs := []string{}
 		for _, v := range targetLabelRst.Values {
 			targetID := v.([]interface{})[0]
-			targetIDInt := targetID.(int)
-			targetIDString := fmt.Sprintf("%d", targetIDInt)
+			targetIDUInt64 := targetID.(uint64)
+			targetIDString := fmt.Sprintf("%d", targetIDUInt64)
 			targetIDs = append(targetIDs, targetIDString)
 		}
 
@@ -1014,13 +1261,12 @@ func (e *CHEngine) TransPrometheusTargetIDFilter(expr view.Node) (view.Node, err
 			op := view.Operator{Type: view.AND}
 			expr = &view.BinaryExpr{Left: expr, Right: rightExpr, Op: &op}
 			entryValue := common.EntryValue{Time: time.Now(), Filter: targetFilter}
-			prometheusSubqueryCache.PrometheusSubqueryCache.Add(targetOriginFilterStr, entryValue)
+			prometheusSubqueryCache.Add(entryKey, entryValue)
 		} else if len(targetIDs) >= config.Cfg.MaxCacheableEntrySize {
 			// When you find that you can't join the cache,
 			// insert a special value into the cache so that the next time you check the cache, you will find
 			entryValue := common.EntryValue{Time: time.Now(), Filter: INVALID_PROMETHEUS_SUBQUERY_CACHE_ENTRY}
-			prometheusSubqueryCache.PrometheusSubqueryCache.Add(targetOriginFilterStr, entryValue)
-
+			prometheusSubqueryCache.Add(entryKey, entryValue)
 			targetFilter := fmt.Sprintf("toUInt64(target_id) IN (%s)", sql)
 			rightExpr := &view.Expr{Value: targetFilter}
 			op := view.Operator{Type: view.AND}
@@ -1081,33 +1327,79 @@ func (e *CHEngine) TransFrom(froms sqlparser.TableExprs) error {
 				table = strings.ReplaceAll(table, "vtap_acl", "traffic_policy")
 			}
 			e.Table = table
+			// native field
+			if config.ControllerCfg.DFWebService.Enabled && (slices.Contains([]string{chCommon.DB_NAME_DEEPFLOW_ADMIN, chCommon.DB_NAME_DEEPFLOW_TENANT, chCommon.DB_NAME_APPLICATION_LOG, chCommon.DB_NAME_EXT_METRICS}, e.DB) || slices.Contains([]string{chCommon.TABLE_NAME_L7_FLOW_LOG, chCommon.TABLE_NAME_EVENT, chCommon.TABLE_NAME_FILE_EVENT}, e.Table)) {
+				e.NativeField = map[string]*metrics.Metrics{}
+				getNativeUrl := fmt.Sprintf("http://localhost:%d/v1/native-fields/?db=%s&table_name=%s", config.ControllerCfg.ListenPort, e.DB, e.Table)
+				resp, err := ctlcommon.CURLPerform("GET", getNativeUrl, nil, ctlcommon.WithHeader(ctlcommon.HEADER_KEY_X_ORG_ID, e.ORGID))
+				if err != nil {
+					log.Errorf("request controller failed: %s, URL: %s", resp, getNativeUrl)
+				} else {
+					resultArray := resp.Get("DATA").MustArray()
+					for i := range resultArray {
+						nativeMetric := resp.Get("DATA").GetIndex(i).Get("NAME").MustString()
+						displayName := resp.Get("DATA").GetIndex(i).Get("DISPLAY_NAME").MustString()
+						description := resp.Get("DATA").GetIndex(i).Get("DESCRIPTION").MustString()
+						fieldType := resp.Get("DATA").GetIndex(i).Get("FIELD_TYPE").MustInt()
+						state := resp.Get("DATA").GetIndex(i).Get("STATE").MustInt()
+						if state != chCommon.NATIVE_FIELD_STATE_NORMAL {
+							continue
+						}
+						if fieldType == chCommon.NATIVE_FIELD_TYPE_METRIC {
+							metric := metrics.NewMetrics(
+								0, nativeMetric,
+								displayName, displayName, displayName, "", "", "", metrics.METRICS_TYPE_COUNTER,
+								chCommon.NATIVE_FIELD_CATEGORY_METRICS, []bool{true, true, true}, "", table, description, description, description, "", "",
+							)
+							e.NativeField[nativeMetric] = metric
+						} else {
+							metric := metrics.NewMetrics(
+								0, nativeMetric,
+								displayName, displayName, displayName, "", "", "", metrics.METRICS_TYPE_NAME_MAP["tag"],
+								chCommon.NATIVE_FIELD_CATEGORY_CUSTOM_TAG, []bool{true, true, true}, "", table, "", "", "", "", "",
+							)
+							e.NativeField[nativeMetric] = metric
+						}
+					}
+				}
+			}
 			// ext_metrics只有metrics表，使用virtual_table_name做过滤区分
 			if e.DB == "ext_metrics" {
 				table = "metrics"
-			} else if e.DB == "deepflow_system" {
-				// deepflow_system 只有 deepflow_system 表，使用 virtual_table_name 做过滤区分
-				table = "deepflow_system"
-			} else if e.DB == chCommon.DB_NAME_PROMETHEUS {
+			} else if slices.Contains([]string{chCommon.DB_NAME_DEEPFLOW_ADMIN, chCommon.DB_NAME_DEEPFLOW_TENANT, chCommon.DB_NAME_PROMETHEUS}, e.DB) {
+				table = chCommon.DB_TABLE_MAP[e.DB][0]
+			}
+			if e.DB == chCommon.DB_NAME_PROMETHEUS {
 				whereStmt := Where{}
-				metricIDFilter, err := GetMetricIDFilter(e.DB, e.Table)
+				metricIDFilter, err := GetMetricIDFilter(e)
 				if err != nil {
 					return err
 				}
 				filter := view.Filters{Expr: metricIDFilter}
 				whereStmt.filter = &filter
 				e.Statements = append(e.Statements, &whereStmt)
-				table = "samples"
 			}
-			interval, err := chCommon.GetDatasourceInterval(e.DB, e.Table, e.DataSource)
+			interval, err := chCommon.GetDatasourceInterval(e.DB, e.Table, e.DataSource, e.ORGID)
 			if err != nil {
 				log.Error(err)
 				return err
 			}
 			e.Model.Time.DatasourceInterval = interval
+			newDB := e.DB
+			if e.ORGID != common.DEFAULT_ORG_ID && e.ORGID != "" {
+				orgIDInt, err := strconv.Atoi(e.ORGID)
+				if err != nil {
+					log.Error(err)
+					return err
+				}
+				if e.DB != chCommon.DB_NAME_FLOW_TAG {
+					newDB = fmt.Sprintf("%04d_%s", orgIDInt, e.DB)
+				}
+			}
 			if e.DataSource != "" {
-				e.AddTable(fmt.Sprintf("%s.`%s.%s`", e.DB, table, e.DataSource))
+				e.AddTable(fmt.Sprintf("%s.`%s.%s`", newDB, table, e.DataSource))
 			} else {
-				e.AddTable(fmt.Sprintf("%s.`%s`", e.DB, table))
+				e.AddTable(fmt.Sprintf("%s.`%s`", newDB, table))
 			}
 			virtualTableFilter, ok := GetVirtualTableFilter(e.DB, e.Table)
 			if ok {
@@ -1177,7 +1469,7 @@ func (e *CHEngine) TransDerivativeGroupBy(groups sqlparser.GroupBy) error {
 		colName, ok := group.(*sqlparser.ColName)
 		if ok {
 			groupTag := sqlparser.String(colName)
-			if !strings.Contains(groupTag, "time") {
+			if !strings.Contains(groupTag, "time") && !strings.Contains(groupTag, "node_type") && !strings.Contains(groupTag, "icon_id") {
 				groupSlice = append(groupSlice, groupTag)
 			}
 		}
@@ -1270,15 +1562,20 @@ func (e *CHEngine) parseGroupBy(group sqlparser.Expr) error {
 				return errors.New(errStr)
 			}
 		}
-		// TODO: 特殊处理塞进group的fromat中
-		whereStmt := Where{}
-		notNullExpr, ok := GetNotNullFilter(groupTag, e.AsTagMap, e.DB, e.Table)
-		if !ok {
-			return nil
+		// vpc/l2_vpc not null filter
+		noSuffixGroupTag := strings.TrimSuffix(groupTag, "_0")
+		noSuffixGroupTag = strings.TrimSuffix(noSuffixGroupTag, "_1")
+		noSuffixGroupTag = strings.TrimSuffix(noSuffixGroupTag, "_id")
+		if slices.Contains([]string{"vpc", "l2_vpc", "chost", "router", "dhcpgw", "redis", "rds", "lb", "natgw", "chost_ip", "chost_hostname"}, noSuffixGroupTag) {
+			whereStmt := Where{}
+			notNullExpr, ok := GetNotNullFilter(groupTag, e)
+			if !ok {
+				return nil
+			}
+			filter := view.Filters{Expr: notNullExpr}
+			whereStmt.filter = &filter
+			e.Statements = append(e.Statements, &whereStmt)
 		}
-		filter := view.Filters{Expr: notNullExpr}
-		whereStmt.filter = &filter
-		e.Statements = append(e.Statements, &whereStmt)
 	// func(field)
 	case *sqlparser.FuncExpr:
 		/* name, args, err := e.parseFunction(expr)
@@ -1377,7 +1674,38 @@ func (e *CHEngine) parseSelectAlias(item *sqlparser.AliasedExpr) error {
 				functionAs = strings.ReplaceAll(chCommon.ParseAlias(item.Expr), "`", "")
 			}
 		}
-		function, levelFlag, unit, err := GetAggFunc(name, args, functionAs, e.DB, e.Table, e.Context, e.IsDerivative, e.DerivativeGroupBy, derivativeArgs)
+
+		// topk add counts column
+		if name == view.FUNCTION_TOPK {
+			argsLength := len(args)
+			if strings.HasPrefix(functionAs, "`") {
+				functionAs = strings.TrimPrefix(functionAs, "`")
+				functionAs = "`" + TOPK_PREFIX_ARRAY + functionAs
+			} else {
+				functionAs = TOPK_PREFIX_ARRAY + functionAs
+			}
+			e.ColumnSchemas[len(e.ColumnSchemas)-1].Name = strings.Trim(functionAs, "`")
+			// create topk string and counts column
+			topKStr, topKStrAs, err := createTopKColumn(functionAs, "", TUPLE_ELEMENT_VALUES_INDEX, argsLength-1)
+			if err != nil {
+				return err
+			}
+			topKCounts, topKCountsAs, err := createTopKColumn(functionAs, TOPK_PREFIX_COUNTS, TUPLE_ELEMENT_COUNTS_INDEX, argsLength-1)
+			if err != nil {
+				return err
+			}
+			// make sure topk string and counts is the first two select item
+			topkStrSchema := common.NewColumnSchema(topKStrAs, topKStr, "")
+			topkStrSchema.Type = common.COLUMN_SCHEMA_TYPE_METRICS
+			topkCountsSchema := common.NewColumnSchema(topKCountsAs, topKCounts, "")
+			topkCountsSchema.Type = common.COLUMN_SCHEMA_TYPE_METRICS
+			e.Statements = append([]Statement{&SelectTag{Value: topKCounts, Alias: topKCountsAs, Flag: view.NODE_FLAG_METRICS_OUTER}}, e.Statements...)
+			e.ColumnSchemas = append([]*common.ColumnSchema{topkCountsSchema}, e.ColumnSchemas...)
+			e.Statements = append([]Statement{&SelectTag{Value: topKStr, Alias: topKStrAs, Flag: view.NODE_FLAG_METRICS_OUTER}}, e.Statements...)
+			e.ColumnSchemas = append([]*common.ColumnSchema{topkStrSchema}, e.ColumnSchemas...)
+		}
+
+		function, levelFlag, unit, err := GetAggFunc(name, args, functionAs, derivativeArgs, e)
 		if err != nil {
 			return err
 		}
@@ -1392,7 +1720,7 @@ func (e *CHEngine) parseSelectAlias(item *sqlparser.AliasedExpr) error {
 			return nil
 		}
 		args[0] = strings.Trim(args[0], "`")
-		tagFunction, err := GetTagFunction(name, args, as, e.DB, e.Table)
+		tagFunction, err := GetTagFunction(name, args, as, e)
 		if err != nil {
 			return err
 		}
@@ -1444,7 +1772,7 @@ func (e *CHEngine) parseFunction(item *sqlparser.FuncExpr) (name string, args []
 						if !slices.Contains(e.DerivativeGroupBy, originArg) {
 							tagTranslatorStr := originArg
 							if strings.Contains(originArg, "tag") {
-								tagTranslatorStr = GetPrometheusGroup(originArg, e.Table, e.AsTagMap)
+								tagTranslatorStr = GetPrometheusGroup(originArg, e)
 							} else {
 								tagItem, ok := tag.GetTag(name, e.DB, e.Table, "default")
 								if ok {
@@ -1505,7 +1833,7 @@ func (e *CHEngine) parseSelectBinaryExpr(node sqlparser.Expr) (binary Function, 
 		if err != nil {
 			return nil, err
 		}
-		aggfunction, levelFlag, unit, err := GetAggFunc(name, args, "", e.DB, e.Table, e.Context, e.IsDerivative, e.DerivativeGroupBy, derivativeArgs)
+		aggfunction, levelFlag, unit, err := GetAggFunc(name, args, "", derivativeArgs, e)
 		if err != nil {
 			return nil, err
 		}
@@ -1518,7 +1846,7 @@ func (e *CHEngine) parseSelectBinaryExpr(node sqlparser.Expr) (binary Function, 
 			}
 			return aggfunction.(Function), nil
 		}
-		tagFunction, err := GetTagFunction(name, args, "", e.DB, e.Table)
+		tagFunction, err := GetTagFunction(name, args, "", e)
 		if err != nil {
 			return nil, err
 		}
@@ -1544,7 +1872,7 @@ func (e *CHEngine) parseSelectBinaryExpr(node sqlparser.Expr) (binary Function, 
 		if fieldFunc != nil {
 			return fieldFunc, nil
 		}
-		metricStruct, ok := metrics.GetAggMetrics(field, e.DB, e.Table, e.Context)
+		metricStruct, ok := metrics.GetAggMetrics(field, e.DB, e.Table, e.ORGID, e.NativeField)
 		if ok {
 			return &Field{Value: metricStruct.DBField}, nil
 		}
@@ -1556,7 +1884,7 @@ func (e *CHEngine) parseSelectBinaryExpr(node sqlparser.Expr) (binary Function, 
 }
 
 func (e *CHEngine) AddGroup(group string) error {
-	stmts, err := GetGroup(group, e.AsTagMap, e.DB, e.Table)
+	stmts, err := GetGroup(group, e)
 	if err != nil {
 		return err
 	}
@@ -1573,7 +1901,7 @@ func (e *CHEngine) AddTable(table string) {
 
 func (e *CHEngine) AddTag(tag string, alias string) (string, error) {
 
-	stmts, labelType, err := GetTagTranslator(tag, alias, e.DB, e.Table)
+	stmts, labelType, err := GetTagTranslator(tag, alias, e)
 
 	if err != nil {
 		return labelType, err
@@ -1582,7 +1910,7 @@ func (e *CHEngine) AddTag(tag string, alias string) (string, error) {
 		e.Statements = append(e.Statements, stmts...)
 		return labelType, nil
 	}
-	stmt, err := GetMetricsTag(tag, alias, e.DB, e.Table, e.Context)
+	stmt, err := GetMetricsTag(tag, alias, e)
 	if err != nil {
 		return labelType, err
 	}
@@ -1657,7 +1985,7 @@ func (e *CHEngine) parseWhere(node sqlparser.Expr, w *Where, isCheck bool) (view
 		switch comparExpr.(type) {
 		case *sqlparser.ColName, *sqlparser.SQLVal:
 			whereTag := chCommon.ParseAlias(node.Left)
-			metricStruct, ok := metrics.GetMetrics(whereTag, e.DB, e.Table, e.Context)
+			metricStruct, ok := metrics.GetMetrics(whereTag, e.DB, e.Table, e.ORGID, e.NativeField)
 			if ok && metricStruct.Type != metrics.METRICS_TYPE_TAG {
 				whereTag = metricStruct.DBField
 			}
@@ -1674,7 +2002,7 @@ func (e *CHEngine) parseWhere(node sqlparser.Expr, w *Where, isCheck bool) (view
 			}
 			outfunc := function.Trans(e.Model)
 			stmt := &WhereFunction{Function: outfunc, Value: sqlparser.String(node.Right)}
-			return stmt.Trans(node, w, e.AsTagMap, e.DB, e.Table)
+			return stmt.Trans(node, w, e)
 		}
 	case *sqlparser.FuncExpr:
 		args := []string{}
@@ -1685,7 +2013,7 @@ func (e *CHEngine) parseWhere(node sqlparser.Expr, w *Where, isCheck bool) (view
 				args = append(args, arg)
 			}
 		}
-		whereFilter := TransWhereTagFunction(e.DB, sqlparser.String(node.Name), args)
+		whereFilter := TransWhereTagFunction(e.DB, e.Table, sqlparser.String(node.Name), args)
 		if whereFilter == "" {
 			return nil, nil
 		}
@@ -1762,7 +2090,7 @@ func LoadDbDescriptions(dbDescriptions map[string]interface{}) error {
 	// 加载metric定义
 	if metricData, ok := dbDataMap["metrics"]; ok {
 		for db, tables := range chCommon.DB_TABLE_MAP {
-			if db == "ext_metrics" || db == "deepflow_system" {
+			if slices.Contains([]string{chCommon.DB_NAME_DEEPFLOW_ADMIN, chCommon.DB_NAME_EXT_METRICS, chCommon.DB_NAME_DEEPFLOW_TENANT}, db) {
 				continue
 			}
 			for _, table := range tables {

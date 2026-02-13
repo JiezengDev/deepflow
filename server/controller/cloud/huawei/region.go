@@ -18,10 +18,12 @@ package huawei
 
 import (
 	"fmt"
+	"slices"
 
 	cloudcommon "github.com/deepflowio/deepflow/server/controller/cloud/common"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (h *HuaWei) getRegions() ([]model.Region, error) {
@@ -41,13 +43,13 @@ func (h *HuaWei) getRegions() ([]model.Region, error) {
 			continue
 		}
 		id := jr.Get("id").MustString()
-		if len(includedRegionIDs) > 0 && !common.Contains(includedRegionIDs, id) {
-			log.Infof("exclude region: %s, not included", id)
+		if len(includedRegionIDs) > 0 && !slices.Contains(includedRegionIDs, id) {
+			log.Infof("exclude region: %s, not included", id, logger.NewORGPrefix(h.orgID))
 			continue
 		}
 
 		region := model.Region{
-			Lcuuid: common.GenerateUUID(id + "_" + h.lcuuidGenerate),
+			Lcuuid: common.GenerateUUIDByOrgID(h.orgID, id+"_"+h.lcuuidGenerate),
 		}
 		cn, ok := jr.Get("locales").CheckGet("zh-cn")
 		if ok && cn.MustString() != "" {

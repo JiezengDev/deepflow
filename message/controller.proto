@@ -3,12 +3,9 @@ syntax = "proto2";
 package controller;
 option go_package = "controller";
 
-import "common.proto";
-
 service Controller {
     rpc GenesisSharingK8S (GenesisSharingK8SRequest) returns (GenesisSharingK8SResponse) {}
     rpc GenesisSharingSync (GenesisSharingSyncRequest) returns (GenesisSharingSyncResponse) {}
-    rpc GenesisSharingPrometheus (GenesisSharingPrometheusRequest) returns (GenesisSharingPrometheusResponse) {}
     rpc GetEncryptKey (EncryptKeyRequest) returns (EncryptKeyResponse) {}
     rpc GetResourceID (GetResourceIDRequest) returns (GetResourceIDResponse) {}
     rpc ReleaseResourceID (ReleaseResourceIDRequest) returns (ReleaseResourceIDResponse) {}
@@ -16,23 +13,14 @@ service Controller {
 }
 
 message GenesisSharingK8SRequest {
-    optional string cluster_id = 1;
+    optional uint32 org_id = 1;
+    optional string cluster_id = 2;
 }
 
 message GenesisSharingK8SResponse {
     optional string epoch = 1;
     optional string error_msg = 2;
-    repeated common.KubernetesAPIInfo entries = 3;
-}
-
-message GenesisSharingPrometheusRequest {
-    optional string cluster_id = 1;
-}
-
-message GenesisSharingPrometheusResponse {
-    optional string epoch = 1;
-    optional string error_msg = 2;
-    optional bytes entries = 3;
+    optional bytes  entries = 3;
 }
 
 message GenesisSyncIP {
@@ -132,6 +120,7 @@ message GenesisSyncVinterface {
     optional string last_seen = 14;
     optional uint32 netns_id = 15;
     optional string if_type = 16;
+    optional uint32 team_id = 17;
 }
 
 message GenesisSyncProcess {
@@ -163,6 +152,7 @@ message GenesisSyncData{
 }
 
 message GenesisSharingSyncRequest {
+    optional uint32 org_id = 1;
 }
 
 message GenesisSharingSyncResponse {
@@ -282,6 +272,8 @@ message SyncPrometheusRequest {
     repeated PrometheusMetricLabelNameRequest metric_label_names = 6;
     repeated PrometheusMetricTargetRequest metric_targets = 7;
     repeated PrometheusTargetRequest targets = 8;
+
+    optional uint32 org_id = 11;
 }
 
 message SyncPrometheusResponse {
@@ -294,6 +286,8 @@ message SyncPrometheusResponse {
     repeated PrometheusMetricTarget metric_targets = 7;
     repeated PrometheusTarget targets = 8;
     repeated PrometheusMetricLabelName metric_label_names = 9;
+
+    optional uint32 org_id = 11;
 }
 
 service PrometheusDebug {

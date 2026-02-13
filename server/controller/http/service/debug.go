@@ -17,16 +17,24 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
 
-	kubernetes_gather_model "github.com/deepflowio/deepflow/server/controller/cloud/kubernetes_gather/model"
+	"github.com/bytedance/sonic"
+	"github.com/go-redis/redis/v9"
+
+	gathermodel "github.com/deepflowio/deepflow/server/controller/cloud/kubernetes_gather/model"
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	dbredis "github.com/deepflowio/deepflow/server/controller/db/redis"
 	"github.com/deepflowio/deepflow/server/controller/genesis"
+	gcommon "github.com/deepflowio/deepflow/server/controller/genesis/common"
+	"github.com/deepflowio/deepflow/server/controller/genesis/grpc"
 	httpcommon "github.com/deepflowio/deepflow/server/controller/http/common"
-	. "github.com/deepflowio/deepflow/server/controller/http/service/common"
+	"github.com/deepflowio/deepflow/server/controller/http/common/response"
 	"github.com/deepflowio/deepflow/server/controller/manager"
 	"github.com/deepflowio/deepflow/server/controller/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
@@ -53,29 +61,35 @@ func GetCloudResource(lcuuid string, m *manager.Manager) (resp cloudmodel.Resour
 	if c, err := m.GetCloudResource(lcuuid); err == nil {
 		return c, nil
 	} else {
-		return cloudmodel.Resource{}, NewError(httpcommon.RESOURCE_NOT_FOUND, fmt.Sprintf("domain (%s) not found", lcuuid))
+		return cloudmodel.Resource{}, response.ServiceError(httpcommon.RESOURCE_NOT_FOUND, fmt.Sprintf("domain (%s) not found", lcuuid))
 	}
+}
+
+func TriggerDomain(lcuuid string, m *manager.Manager) error {
+	return m.TriggerDomain(lcuuid)
 }
 
 func TriggerKubernetesRefresh(domainLcuuid, subDomainLcuuid string, version int, m *manager.Manager) error {
 	return m.TriggerKubernetesRefresh(domainLcuuid, subDomainLcuuid, version)
 }
 
-func GetKubernetesGatherBasicInfos(lcuuid string, m *manager.Manager) (resp []kubernetes_gather_model.KubernetesGatherBasicInfo, err error) {
-	response, err := m.GetKubernetesGatherBasicInfos(lcuuid)
-	return response, err
+func GetKubernetesGatherBasicInfos(lcuuid string, m *manager.Manager) (resp []gathermodel.KubernetesGatherBasicInfo, err error) {
+	return m.GetKubernetesGatherBasicInfos(lcuuid)
 }
 
-func GetKubernetesGatherResources(lcuuid string, m *manager.Manager) (resp []kubernetes_gather_model.KubernetesGatherResource, err error) {
-	response, err := m.GetKubernetesGatherResources(lcuuid)
-	return response, err
+func GetSubDomainResource(lcuuid, subDomainLcuuid string, m *manager.Manager) (resp cloudmodel.SubDomainResource, err error) {
+	return m.GetSubDomainResource(lcuuid, subDomainLcuuid)
+}
+
+func GetKubernetesGatherResource(lcuuid, subDomainLcuuid string, m *manager.Manager) (resp gathermodel.KubernetesGatherResource, err error) {
+	return m.GetKubernetesGatherResource(lcuuid, subDomainLcuuid)
 }
 
 func GetRecorderDomainCache(domainLcuuid, subDomainLcuuid string, m *manager.Manager) (resp cache.Cache, err error) {
 	if recorder, err := m.GetRecorder(domainLcuuid); err == nil {
 		return recorder.GetCache(domainLcuuid, subDomainLcuuid), nil
 	} else {
-		return cache.Cache{}, NewError(httpcommon.RESOURCE_NOT_FOUND, err.Error())
+		return cache.Cache{}, response.ServiceError(httpcommon.RESOURCE_NOT_FOUND, err.Error())
 	}
 }
 
@@ -83,7 +97,7 @@ func GetRecorderCacheDiffBaseDataSet(domainLcuuid, subDomainLcuuid string, m *ma
 	if recorder, err := m.GetRecorder(domainLcuuid); err == nil {
 		return *recorder.GetCache(domainLcuuid, subDomainLcuuid).DiffBaseDataSet, nil
 	} else {
-		return diffbase.DataSet{}, NewError(httpcommon.RESOURCE_NOT_FOUND, err.Error())
+		return diffbase.DataSet{}, response.ServiceError(httpcommon.RESOURCE_NOT_FOUND, err.Error())
 	}
 }
 
@@ -91,7 +105,7 @@ func GetRecorderCacheToolDataSet(domainLcuuid, subDomainLcuuid string, m *manage
 	if recorder, err := m.GetRecorder(domainLcuuid); err == nil {
 		return *recorder.GetCache(domainLcuuid, subDomainLcuuid).ToolDataSet, nil
 	} else {
-		return tool.DataSet{}, NewError(httpcommon.RESOURCE_NOT_FOUND, err.Error())
+		return tool.DataSet{}, response.ServiceError(httpcommon.RESOURCE_NOT_FOUND, err.Error())
 	}
 }
 
@@ -99,11 +113,11 @@ func GetRecorderDiffBaseDataSetByResourceType(domainLcuuid, subDomainLcuuid, res
 	if recorder, err := m.GetRecorder(domainLcuuid); err == nil {
 		resp = recorder.GetCacheDiffBaseDataSet(domainLcuuid, subDomainLcuuid, resourceType)
 		if resp == nil {
-			return nil, NewError(httpcommon.RESOURCE_NOT_FOUND, fmt.Sprintf("recorder cache diff base data set of %s not found", resourceType))
+			return nil, response.ServiceError(httpcommon.RESOURCE_NOT_FOUND, fmt.Sprintf("recorder cache diff base data set of %s not found", resourceType))
 		}
 		return resp, nil
 	} else {
-		return map[string]interface{}{}, NewError(httpcommon.RESOURCE_NOT_FOUND, err.Error())
+		return map[string]interface{}{}, response.ServiceError(httpcommon.RESOURCE_NOT_FOUND, err.Error())
 	}
 }
 
@@ -111,11 +125,11 @@ func GetRecorderDiffBaseByResourceLcuuid(domainLcuuid, subDomainLcuuid, resource
 	if recorder, err := m.GetRecorder(domainLcuuid); err == nil {
 		resp = recorder.GetCacheDiffBase(domainLcuuid, subDomainLcuuid, resourceType, resourceLcuuid)
 		if resp == nil {
-			return nil, NewError(httpcommon.RESOURCE_NOT_FOUND, fmt.Sprintf("recorder cache diff base of %s %s not found", resourceType, resourceLcuuid))
+			return nil, response.ServiceError(httpcommon.RESOURCE_NOT_FOUND, fmt.Sprintf("recorder cache diff base of %s %s not found", resourceType, resourceLcuuid))
 		}
 		return resp, nil
 	} else {
-		return map[string]interface{}{}, NewError(httpcommon.RESOURCE_NOT_FOUND, err.Error())
+		return map[string]interface{}{}, response.ServiceError(httpcommon.RESOURCE_NOT_FOUND, err.Error())
 	}
 }
 
@@ -123,40 +137,71 @@ func GetRecorderToolMapByField(domainLcuuid, subDomainLcuuid, field string, m *m
 	if recorder, err := m.GetRecorder(domainLcuuid); err == nil {
 		resp = recorder.GetToolMap(domainLcuuid, subDomainLcuuid, field)
 		if resp == nil {
-			return nil, NewError(httpcommon.RESOURCE_NOT_FOUND, fmt.Sprintf("recorder tool map %s not found", field))
+			return nil, response.ServiceError(httpcommon.RESOURCE_NOT_FOUND, fmt.Sprintf("recorder tool map %s not found", field))
 		}
 		return resp, nil
 	} else {
-		return map[interface{}]interface{}{}, NewError(httpcommon.RESOURCE_NOT_FOUND, err.Error())
+		return map[interface{}]interface{}{}, response.ServiceError(httpcommon.RESOURCE_NOT_FOUND, err.Error())
 	}
 }
 
-func GetGenesisData(g *genesis.Genesis) (genesis.GenesisSyncData, error) {
-	return g.GetGenesisSyncData(), nil
+func GetGenesisData(orgID int, g *genesis.Genesis) (gcommon.GenesisSyncDataResponse, error) {
+	return g.GetGenesisSyncData(orgID), nil
 }
 
-func GetGenesisSyncData(g *genesis.Genesis) (genesis.GenesisSyncData, error) {
-	return g.GetGenesisSyncResponse()
+func GetGenesisSyncData(orgID int, g *genesis.Genesis) (gcommon.GenesisSyncDataResponse, error) {
+	return g.GetGenesisSyncResponse(orgID)
 }
 
-func GetGenesisKubernetesData(g *genesis.Genesis, clusterID string) (map[string][]string, error) {
-	return g.GetKubernetesResponse(clusterID)
+func GetGenesisKubernetesData(g *genesis.Genesis, orgID int, clusterID string) (map[string][][]byte, error) {
+	return g.GetKubernetesResponse(orgID, clusterID)
 }
 
-func GetGenesisPrometheusData(g *genesis.Genesis, clusterID string) ([]cloudmodel.PrometheusTarget, error) {
-	return g.GetPrometheusResponse(clusterID)
+func GetAgentStats(g *genesis.Genesis, orgID, vtapID string) (grpc.AgentStats, error) {
+	return genesis.GenesisService.Synchronizer.GetAgentStats(orgID, vtapID)
 }
 
-func GetAgentStats(g *genesis.Genesis, param string) ([]genesis.TridentStats, error) {
-	return genesis.Synchronizer.GetAgentStats(param), nil
-}
-
-func GetGenesisAgentStorage(vtapIDString string) (model.GenesisStorage, error) {
+func GetGenesisAgentStorage(redisStoreEnabled bool, vtapIDString string, orgDB *metadb.DB) (model.GenesisStorage, error) {
 	var gStorage model.GenesisStorage
 	vtapID, err := strconv.Atoi(vtapIDString)
 	if err != nil {
-		return gStorage, errors.New(fmt.Sprintf("invalid vtap id (%s)", vtapIDString))
+		return gStorage, fmt.Errorf("invalid vtap id (%s)", vtapIDString)
 	}
-	err = mysql.Db.Where("vtap_id = ?", vtapID).First(&gStorage).Error
+
+	if redisStoreEnabled {
+		redisCli := dbredis.GetClient()
+		if redisCli == nil {
+			return gStorage, errors.New("get redis client failed")
+		}
+		var vtap metadbmodel.VTap
+		err = orgDB.Select("ctrl_ip", "ctrl_mac").Where("id = ?", vtapID).First(&vtap).Error
+		if err != nil {
+			return gStorage, fmt.Errorf("get vtap id (%d) failed:%s", vtapID, err.Error())
+		}
+		key := fmt.Sprintf(gcommon.SYNC_TYPE_FORMAT, orgDB.ORGID, "vinterface", vtap.CtrlIP+"-"+vtap.CtrlMac)
+		val, err := redisCli.GenesisSync.Get(context.Background(), key).Result()
+		if err != nil {
+			if err == redis.Nil {
+				return gStorage, fmt.Errorf("not found resource of vtap id (%d)", vtapID)
+			}
+			return gStorage, err
+		}
+		items := []model.GenesisVinterface{}
+		err = sonic.Unmarshal([]byte(val), &items)
+		if err != nil {
+			return gStorage, err
+		}
+		for _, item := range items {
+			if item.NodeIP == "" {
+				continue
+			}
+			return model.GenesisStorage{
+				NodeIP: item.NodeIP,
+				VtapID: uint32(vtapID),
+			}, nil
+		}
+	} else {
+		err = orgDB.Where("vtap_id = ?", vtapID).First(&gStorage).Error
+	}
 	return gStorage, err
 }

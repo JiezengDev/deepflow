@@ -19,68 +19,71 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
+
+// NATRuleMessageFactory NATRule资源的消息工厂
+type NATRuleMessageFactory struct{}
+
+func (f *NATRuleMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedNATRules{}
+}
+
+func (f *NATRuleMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedNATRule{}
+}
+
+func (f *NATRuleMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedNATRules{}
+}
+
+func (f *NATRuleMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedNATRuleFields{}
+}
 
 type NATRule struct {
 	UpdaterBase[
 		cloudmodel.NATRule,
-		mysql.NATRule,
 		*diffbase.NATRule,
-		*message.NATRuleAdd,
-		message.NATRuleAdd,
-		*message.NATRuleUpdate,
-		message.NATRuleUpdate,
-		*message.NATRuleFieldsUpdate,
-		message.NATRuleFieldsUpdate,
-		*message.NATRuleDelete,
-		message.NATRuleDelete]
+		*metadbmodel.NATRule,
+		metadbmodel.NATRule,
+	]
 }
 
 func NewNATRule(wholeCache *cache.Cache, cloudData []cloudmodel.NATRule) *NATRule {
 	updater := &NATRule{
-		newUpdaterBase[
-			cloudmodel.NATRule,
-			mysql.NATRule,
-			*diffbase.NATRule,
-			*message.NATRuleAdd,
-			message.NATRuleAdd,
-			*message.NATRuleUpdate,
-			message.NATRuleUpdate,
-			*message.NATRuleFieldsUpdate,
-			message.NATRuleFieldsUpdate,
-			*message.NATRuleDelete,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_NAT_RULE_EN,
 			wholeCache,
-			db.NewNATRule().SetORG(wholeCache.GetORG()),
+			db.NewNATRule().SetMetadata(wholeCache.GetMetadata()),
 			wholeCache.DiffBaseDataSet.NATRules,
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
+	updater.setDataGenerator(updater)
+
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &NATRuleMessageFactory{})
+	}
+
 	return updater
 }
 
-func (r *NATRule) getDiffBaseByCloudItem(cloudItem *cloudmodel.NATRule) (diffBase *diffbase.NATRule, exists bool) {
-	diffBase, exists = r.diffBaseData[cloudItem.Lcuuid]
-	return
-}
-
-func (r *NATRule) generateDBItemToAdd(cloudItem *cloudmodel.NATRule) (*mysql.NATRule, bool) {
+func (r *NATRule) generateDBItemToAdd(cloudItem *cloudmodel.NATRule) (*metadbmodel.NATRule, bool) {
 	var natGatewayID int
 	var exists bool
 	if cloudItem.NATGatewayLcuuid != "" {
 		natGatewayID, exists = r.cache.ToolDataSet.GetNATGatewayIDByLcuuid(cloudItem.NATGatewayLcuuid)
 		if !exists {
-			log.Error(r.org.LogPre(resourceAForResourceBNotFound(
+			log.Error(resourceAForResourceBNotFound(
 				ctrlrcommon.RESOURCE_TYPE_NAT_GATEWAY_EN, cloudItem.NATGatewayLcuuid,
 				ctrlrcommon.RESOURCE_TYPE_NAT_RULE_EN, cloudItem.Lcuuid,
-			)))
+			), r.metadata.LogPrefixes)
 			return nil, false
 		}
 	}
@@ -88,15 +91,15 @@ func (r *NATRule) generateDBItemToAdd(cloudItem *cloudmodel.NATRule) (*mysql.NAT
 	if cloudItem.VInterfaceLcuuid != "" {
 		vinterfaceID, exists = r.cache.ToolDataSet.GetVInterfaceIDByLcuuid(cloudItem.VInterfaceLcuuid)
 		if !exists {
-			log.Error(r.org.LogPre(resourceAForResourceBNotFound(
+			log.Error(resourceAForResourceBNotFound(
 				ctrlrcommon.RESOURCE_TYPE_VINTERFACE_EN, cloudItem.VInterfaceLcuuid,
 				ctrlrcommon.RESOURCE_TYPE_NAT_RULE_EN, cloudItem.Lcuuid,
-			)))
+			), r.metadata.LogPrefixes)
 			return nil, false
 		}
 	}
 
-	dbItem := &mysql.NATRule{
+	dbItem := &metadbmodel.NATRule{
 		NATGatewayID:   natGatewayID,
 		VInterfaceID:   vinterfaceID,
 		Type:           cloudItem.Type,
@@ -105,13 +108,13 @@ func (r *NATRule) generateDBItemToAdd(cloudItem *cloudmodel.NATRule) (*mysql.NAT
 		FloatingIPPort: cloudItem.FloatingIPPort,
 		FixedIP:        cloudItem.FixedIP,
 		FixedIPPort:    cloudItem.FixedIPPort,
-		Domain:         r.cache.DomainLcuuid,
+		Domain:         r.metadata.GetDomainLcuuid(),
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true
 }
 
 // 保留接口
-func (r *NATRule) generateUpdateInfo(diffBase *diffbase.NATRule, cloudItem *cloudmodel.NATRule) (*message.NATRuleFieldsUpdate, map[string]interface{}, bool) {
+func (r *NATRule) generateUpdateInfo(diffBase *diffbase.NATRule, cloudItem *cloudmodel.NATRule) (types.UpdatedFields, map[string]interface{}, bool) {
 	return nil, nil, false
 }

@@ -17,7 +17,6 @@
 package config
 
 import (
-	"io/ioutil"
 	"os"
 
 	"github.com/deepflowio/deepflow/server/ingester/config"
@@ -28,12 +27,13 @@ import (
 var log = logging.MustGetLogger("profile.config")
 
 type Config struct {
-	Base                 *config.Config
-	CKWriterConfig       config.CKWriterConfig `yaml:"profile-ck-writer"`
-	ProfileTTL           int                   `yaml:"profile-ttl-hour"`
-	DecoderQueueCount    int                   `yaml:"profile-decoder-queue-count"`
-	DecoderQueueSize     int                   `yaml:"profile-decoder-queue-size"`
-	CompressionAlgorithm *string               `yaml:"profile-compression-algorithm"`
+	Base                       *config.Config
+	CKWriterConfig             config.CKWriterConfig `yaml:"profile-ck-writer"`
+	ProfileTTL                 int                   `yaml:"profile-ttl-hour"`
+	DecoderQueueCount          int                   `yaml:"profile-decoder-queue-count"`
+	DecoderQueueSize           int                   `yaml:"profile-decoder-queue-size"`
+	CompressionAlgorithm       *string               `yaml:"profile-compression-algorithm"`
+	OffCpuSplittingGranularity int                   `yaml:"profile-off-cpu-splitting-granularity"`
 }
 
 type ProfileConfig struct {
@@ -41,9 +41,10 @@ type ProfileConfig struct {
 }
 
 const (
-	DefaultProfileTTL        = 72 // hour
-	DefaultDecoderQueueCount = 2
-	DefaultDecoderQueueSize  = 1 << 14
+	DefaultProfileTTL                 = 72 // hour
+	DefaultDecoderQueueCount          = 2
+	DefaultDecoderQueueSize           = 4096
+	DefaultOffCpuSplittingGranularity = 1
 )
 
 func (c *Config) Validate() error {
@@ -72,18 +73,19 @@ func (c *Config) Validate() error {
 func Load(base *config.Config, path string) *Config {
 	config := &ProfileConfig{
 		Profile: Config{
-			Base:              base,
-			CKWriterConfig:    config.CKWriterConfig{QueueCount: 1, QueueSize: 100000, BatchSize: 51200, FlushTimeout: 5},
-			ProfileTTL:        DefaultProfileTTL,
-			DecoderQueueCount: DefaultDecoderQueueCount,
-			DecoderQueueSize:  DefaultDecoderQueueSize,
+			Base:                       base,
+			CKWriterConfig:             config.CKWriterConfig{QueueCount: 2, QueueSize: 100000, BatchSize: 51200, FlushTimeout: 5},
+			ProfileTTL:                 DefaultProfileTTL,
+			DecoderQueueCount:          DefaultDecoderQueueCount,
+			DecoderQueueSize:           DefaultDecoderQueueSize,
+			OffCpuSplittingGranularity: DefaultOffCpuSplittingGranularity,
 		},
 	}
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		log.Info("no config file, use defaults")
 		return &config.Profile
 	}
-	configBytes, err := ioutil.ReadFile(path)
+	configBytes, err := os.ReadFile(path)
 	if err != nil {
 		log.Warning("Read config file error:", err)
 		config.Profile.Validate()

@@ -17,15 +17,18 @@
 package config
 
 import (
-	"io/ioutil"
+	"fmt"
 	"os"
 	"strconv"
 
 	logging "github.com/op/go-logging"
 	yaml "gopkg.in/yaml.v2"
 
+	shared_common "github.com/deepflowio/deepflow/server/common"
+	"github.com/deepflowio/deepflow/server/controller/common"
+	configs "github.com/deepflowio/deepflow/server/controller/config/common"
 	"github.com/deepflowio/deepflow/server/controller/db/clickhouse"
-	mysql "github.com/deepflowio/deepflow/server/controller/db/mysql/config"
+	metadb "github.com/deepflowio/deepflow/server/controller/db/metadb/config"
 	"github.com/deepflowio/deepflow/server/controller/db/redis"
 	genesis "github.com/deepflowio/deepflow/server/controller/genesis/config"
 	http "github.com/deepflowio/deepflow/server/controller/http/config"
@@ -39,19 +42,39 @@ import (
 
 var log = logging.MustGetLogger("config")
 
-type IngesterApi struct {
-	Port    int `default:"30106" yaml:"port"`
-	Timeout int `default:"60" yaml:"timeout"`
-}
-
 type Specification struct {
-	VTapGroupMax                 int `default:"1000" yaml:"vtap_group_max"`
-	VTapMaxPerGroup              int `default:"10000" yaml:"vtap_max_per_group"`
-	AZMaxPerServer               int `default:"10" yaml:"az_max_per_server"`
+	VTapGroupMax    int `default:"1000" yaml:"vtap_group_max"`
+	VTapMaxPerGroup int `default:"10000" yaml:"vtap_max_per_group"`
+	AZMaxPerServer  int `default:"10" yaml:"az_max_per_server"`
+
 	DataSourceMax                int `default:"25" yaml:"data_source_max"`
 	DataSourceRetentionTimeMax   int `default:"24000" yaml:"data_source_retention_time_max"`
 	DataSourceExtMetricsInterval int `default:"10" yaml:"data_source_ext_metrics_interval"`
 	DataSourcePrometheusInterval int `default:"10" yaml:"data_source_prometheus_interval"`
+
+	BizDecodePolicyMax           int `default:"100" yaml:"biz_decode_policy_max"`
+	BizDecodePolicyFieldMax      int `default:"200" yaml:"biz_decode_policy_field_max"`
+	BizDecodeDictionaryMax       int `default:"1000" yaml:"biz_decode_dictionary_max"`
+	BizDecodeCustomProtocolMax   int `default:"200" yaml:"biz_decode_custom_protocol_max"`
+	MaxBizPolicyPcapFileSize     int `default:"50" yaml:"max-biz-policy-pcap-file-size"` // unit: MB
+	MaxPerBizPolicyPcapFileCount int `default:"5" yaml:"max-per-biz-policy-pcap-file-count"`
+
+	PcapPolicyMax                 int `default:"1000" yaml:"pcap_policy_max"`
+	PcapPolicyComplexityThreshold int `default:"1000" yaml:"pcap_policy_complexity_threshold"`
+}
+
+type ACLController struct {
+	Enabled bool   `default:"false" yaml:"enabled"`
+	Host    string `default:"acl-controller" yaml:"host"`
+	Port    int    `default:"20408" yaml:"port"`
+	Timeout int    `default:"30" yaml:"timeout"`
+}
+
+type FUser struct {
+	Enabled bool   `default:"false" yaml:"enabled"`
+	Host    string `default:"fuser" yaml:"host"`
+	Port    int    `default:"20824" yaml:"port"`
+	Timeout int    `default:"30" yaml:"timeout"`
 }
 
 type DFWebService struct {
@@ -61,10 +84,10 @@ type DFWebService struct {
 	Timeout int    `default:"30" yaml:"timeout"`
 }
 
-type FPermit struct {
+type QuerierJSService struct {
 	Enabled bool   `default:"false" yaml:"enabled"`
-	Host    string `default:"fpermit" yaml:"host"`
-	Port    int    `default:"20823" yaml:"port"`
+	Host    string `default:"querier-js" yaml:"host"`
+	Port    int    `default:"30420" yaml:"port"`
 	Timeout int    `default:"30" yaml:"timeout"`
 }
 
@@ -86,17 +109,28 @@ type ControllerConfig struct {
 	ReportingDisabled              bool   `default:"false" yaml:"reporting-disabled"`
 	BillingMethod                  string `default:"license" yaml:"billing-method"`
 	PodClusterInternalIPToIngester int    `default:"0" yaml:"pod-cluster-internal-ip-to-ingester"`
+	NoTeamIDRefused                bool   `default:"false" yaml:"no-teamid-refused"`
+	AllAgentConnectToNatIP         bool   `default:"false" yaml:"all-agent-connect-to-nat-ip"`
+	NoIPOverlapping                bool   `default:"false" yaml:"no-ip-overlapping"`
+	AgentCommandTimeout            int    `default:"30" yaml:"agent-cmd-timeout"`
 
-	DFWebService DFWebService `yaml:"df-web-service"`
-	FPermit      FPermit      `yaml:"fpermit"`
+	ACLController    ACLController      `yaml:"acl-controller"`
+	FUser            FUser              `yaml:"fuser"`
+	DFWebService     DFWebService       `yaml:"df-web-service"`
+	QuerierJSService QuerierJSService   `yaml:"querier-js-service"`
+	FPermit          common.FPermit     `yaml:"fpermit"`
+	IngesterApi      common.IngesterApi `yaml:"ingester-api"`
 
-	MySqlCfg      mysql.MySqlConfig           `yaml:"mysql"`
+	MetadbCfg     metadb.Config
+	PostgreSQLCfg metadb.PostgreSQLConfig     `yaml:"postgresql"`
+	MySqlCfg      metadb.MySQLConfig          `yaml:"mysql"`
+	DMCfg         metadb.DMConfig             `yaml:"dm"`
 	RedisCfg      redis.Config                `yaml:"redis"`
 	ClickHouseCfg clickhouse.ClickHouseConfig `yaml:"clickhouse"`
 
-	IngesterApi IngesterApi   `yaml:"ingester-api"`
-	Spec        Specification `yaml:"spec"`
+	Spec Specification `yaml:"spec"`
 
+	Pcap           configs.Pcap                  `yaml:"pcap"`
 	MonitorCfg     monitor.MonitorConfig         `yaml:"monitor"`
 	ManagerCfg     manager.ManagerConfig         `yaml:"manager"`
 	GenesisCfg     genesis.GenesisConfig         `yaml:"genesis"`
@@ -105,6 +139,7 @@ type ControllerConfig struct {
 	TagRecorderCfg tagrecorder.TagRecorderConfig `yaml:"tagrecorder"`
 	PrometheusCfg  prometheus.Config             `yaml:"prometheus"`
 	HTTPCfg        http.Config                   `yaml:"http"`
+	SwaggerCfg     configs.Swagger               `yaml:"swagger"`
 }
 
 type Config struct {
@@ -112,11 +147,27 @@ type Config struct {
 }
 
 func (c *Config) Validate() error {
+	if !c.exactlyOneMetadbEnabled() {
+		return fmt.Errorf("only one metadb can be enabled at the same time")
+	}
 	return nil
 }
 
+func (c *Config) exactlyOneMetadbEnabled() bool {
+	count := 0
+	for _, enabled := range []bool{c.ControllerConfig.MySqlCfg.Enabled, c.ControllerConfig.PostgreSQLCfg.Enabled, c.ControllerConfig.DMCfg.Enabled} {
+		if enabled {
+			count++
+			if count > 1 {
+				return false
+			}
+		}
+	}
+	return count == 1
+}
+
 func (c *Config) Load(path string) {
-	configBytes, err := ioutil.ReadFile(path)
+	configBytes, err := os.ReadFile(path)
 	if err != nil {
 		log.Error("Read config file error:", err, path)
 		os.Exit(1)
@@ -135,6 +186,11 @@ func (c *Config) Load(path string) {
 	c.ControllerConfig.TrisolarisCfg.SetBillingMethod(c.ControllerConfig.BillingMethod)
 	c.ControllerConfig.TrisolarisCfg.SetPodClusterInternalIPToIngester(c.ControllerConfig.PodClusterInternalIPToIngester)
 	c.ControllerConfig.TrisolarisCfg.SetGrpcMaxMessageLength(c.ControllerConfig.GrpcMaxMessageLength)
+	c.ControllerConfig.TrisolarisCfg.SetNoTeamIDRefused(c.ControllerConfig.NoTeamIDRefused)
+	c.ControllerConfig.TrisolarisCfg.SetFPermitConfig(c.ControllerConfig.FPermit)
+	c.ControllerConfig.TrisolarisCfg.SetIngesterAPI(c.ControllerConfig.IngesterApi) // for data source
+	c.ControllerConfig.TrisolarisCfg.SetAllAgentConnectToNatIP(c.ControllerConfig.AllAgentConnectToNatIP)
+	c.ControllerConfig.TrisolarisCfg.SetNoIPOverlapping(c.ControllerConfig.NoIPOverlapping)
 	grpcPort, err := strconv.Atoi(c.ControllerConfig.GrpcPort)
 	if err == nil {
 		c.ControllerConfig.TrisolarisCfg.SetGrpcPort(grpcPort)
@@ -143,6 +199,12 @@ func (c *Config) Load(path string) {
 	if err == nil {
 		c.ControllerConfig.TrisolarisCfg.SetIngesterPort(ingesterPort)
 	}
+	// from ingester exporter setting
+	c.ControllerConfig.TrisolarisCfg.SetExportersEnabled(shared_common.ExportersEnabled(path))
+
+	c.ControllerConfig.MetadbCfg.InitFromMySQL(c.ControllerConfig.MySqlCfg)
+	c.ControllerConfig.MetadbCfg.InitFromPostgreSQL(c.ControllerConfig.PostgreSQLCfg)
+	c.ControllerConfig.MetadbCfg.InitFromDaMeng(c.ControllerConfig.DMCfg)
 }
 
 func DefaultConfig() *Config {

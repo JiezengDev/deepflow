@@ -27,12 +27,16 @@ import (
 	logging "github.com/op/go-logging"
 	yaml "gopkg.in/yaml.v2"
 
+	servercommon "github.com/deepflowio/deepflow/server/common"
 	"github.com/deepflowio/deepflow/server/libs/logger"
 	"github.com/deepflowio/deepflow/server/libs/stats"
+	distributed_tracing "github.com/deepflowio/deepflow/server/querier/app/distributed_tracing/router"
+	"github.com/deepflowio/deepflow/server/querier/app/distributed_tracing/service/tracemap"
 	prometheus_router "github.com/deepflowio/deepflow/server/querier/app/prometheus/router"
 	tracing_adapter "github.com/deepflowio/deepflow/server/querier/app/tracing-adapter/router"
 	"github.com/deepflowio/deepflow/server/querier/common"
 	"github.com/deepflowio/deepflow/server/querier/config"
+	"github.com/deepflowio/deepflow/server/querier/engine/clickhouse/client"
 	"github.com/deepflowio/deepflow/server/querier/engine/clickhouse/trans_prometheus"
 	profile_router "github.com/deepflowio/deepflow/server/querier/profile/router"
 	"github.com/deepflowio/deepflow/server/querier/router"
@@ -42,22 +46,37 @@ import (
 
 var log = logging.MustGetLogger("querier")
 
-func Start(configPath, serverLogFile string) {
+func Start(configPath, serverLogFile string, shared *servercommon.ControllerIngesterShared) {
 	ServerCfg := config.DefaultConfig()
 	ServerCfg.Load(configPath)
 	config.Cfg = &ServerCfg.QuerierConfig
 	config.TraceConfig = &ServerCfg.TraceIdWithIndex
+	config.ControllerCfg = &ServerCfg.ControllerConfig
 	cfg := ServerCfg.QuerierConfig
 	bytes, _ := yaml.Marshal(cfg)
 	log.Info("==================== Launching DeepFlow-Server-Querier ====================")
 	log.Infof("querier config:\n%s", string(bytes))
+
+	// get ck version
+	ckClient := client.Client{
+		Host:     cfg.Clickhouse.Host,
+		Port:     cfg.Clickhouse.Port,
+		UserName: cfg.Clickhouse.User,
+		Password: cfg.Clickhouse.Password,
+	}
+	err := ckClient.Init("")
+	if err != nil {
+		log.Error(err)
+		os.Exit(0)
+	}
+	config.Cfg.Clickhouse.Version = ckClient.Version
 
 	// statsd
 	statsd.QuerierCounter = statsd.NewCounter()
 	statsd.RegisterCountableForIngester("querier_count", statsd.QuerierCounter)
 
 	// engine加载数据库tag/metric等信息
-	err := Load()
+	err = Load()
 	if err != nil {
 		log.Error(err)
 		os.Exit(0)
@@ -74,6 +93,8 @@ func Start(configPath, serverLogFile string) {
 
 	ginLogFile, _ := os.OpenFile(serverLogFile, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 	gin.DefaultWriter = io.MultiWriter(ginLogFile, os.Stdout)
+	tracemap_generator := tracemap.NewTraceMapGenerator(shared.TraceTreeQueue, &cfg)
+	tracemap_generator.Start()
 
 	// 注册router
 	r := gin.New()
@@ -86,6 +107,7 @@ func Start(configPath, serverLogFile string) {
 	profile_router.ProfileRouter(r, &cfg)
 	prometheus_router.PrometheusRouter(r)
 	tracing_adapter.TracingAdapterRouter(r)
+	distributed_tracing.TraceMapRouter(r, &cfg, tracemap_generator)
 	registerRouterCounter(r.Routes())
 	// TODO: 增加router
 	if err := r.Run(fmt.Sprintf(":%d", cfg.ListenPort)); err != nil {

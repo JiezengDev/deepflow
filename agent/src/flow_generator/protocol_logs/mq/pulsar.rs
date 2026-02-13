@@ -1,4 +1,5 @@
 #[path = "pulsar.proto.rs"]
+#[rustfmt::skip]
 mod pulsar_proto;
 
 use prost::Message;
@@ -6,27 +7,84 @@ use pulsar_proto::{
     base_command::Type as CommandType, BaseCommand, BrokerEntryMetadata, MessageMetadata,
 };
 use serde::Serialize;
+use std::collections::HashMap;
 
 use crate::{
     common::{
         enums::IpProtocol,
-        flow::{L7PerfStats, L7Protocol, PacketDirection},
+        flow::{L7PerfStats, L7Protocol},
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
-        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
-        meta_packet::EbpfFlags,
+        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, LogCache, ParseParam},
+        meta_packet::ApplicationFlags,
     },
+    config::handler::LogParserConfig,
     flow_generator::{
         error::Result,
         protocol_logs::{
             pb_adapter::{ExtendedInfo, L7ProtocolSendLog, L7Request, L7Response, TraceInfo},
-            AppProtoHead, L7ResponseStatus, LogMessageType,
+            set_captured_byte, value_is_default, AppProtoHead, L7ResponseStatus, PrioFields,
+            BASE_FIELD_PRIORITY,
         },
     },
     utils::bytes::read_u32_be,
 };
 
+use public::l7_protocol::LogMessageType;
+
 // ProtocolVersion in PulsarApi.proto
 const MAX_PROTOCOL_VERSION: i32 = 21;
+
+struct TopicMap<K, V, const N: usize>
+where
+    K: Eq + std::hash::Hash,
+{
+    kv: HashMap<K, V>,
+    list: Vec<(K, V)>,
+    use_map: bool,
+}
+
+impl<K, V, const N: usize> TopicMap<K, V, N>
+where
+    K: Eq + std::hash::Hash,
+{
+    fn insert(&mut self, id: K, topic: V) {
+        if self.use_map {
+            self.kv.insert(id, topic);
+        } else {
+            for (k, v) in self.list.iter_mut() {
+                if *k == id {
+                    *v = topic;
+                    return;
+                }
+            }
+            if self.list.len() == N {
+                self.use_map = true;
+                self.kv = self.list.drain(..).collect();
+                self.kv.insert(id, topic);
+            } else {
+                self.list.push((id, topic));
+            }
+        }
+    }
+
+    fn get(&self, id: &K) -> Option<&V> {
+        if self.use_map {
+            self.kv.get(id)
+        } else {
+            self.list.iter().find(|(k, _)| k == id).map(|(_, v)| v)
+        }
+    }
+
+    fn new() -> Self {
+        Self {
+            kv: HashMap::new(),
+            list: Vec::new(),
+            use_map: false,
+        }
+    }
+}
+
+type PulsarTopicMap = TopicMap<u64, String, 16>;
 
 #[derive(Serialize, Debug, Default, Clone)]
 pub struct PulsarInfo {
@@ -56,8 +114,8 @@ pub struct PulsarInfo {
     // ledgerId:entryId:partitionIndex:batchIndex
     #[serde(skip_serializing_if = "Option::is_none")]
     x_request_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    trace_id: Option<String>,
+    #[serde(skip_serializing_if = "value_is_default")]
+    trace_ids: PrioFields,
     #[serde(skip_serializing_if = "Option::is_none")]
     span_id: Option<String>,
 
@@ -65,31 +123,48 @@ pub struct PulsarInfo {
     req_len: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     resp_len: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    resp_status: Option<L7ResponseStatus>,
+    #[serde(skip)]
+    resp_status: L7ResponseStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     resp_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     resp_exception: Option<String>,
+
+    captured_request_byte: u32,
+    captured_response_byte: u32,
+
+    #[serde(skip)]
+    is_on_blacklist: bool,
 }
 
 pub struct PulsarLog {
-    perf_stats: Option<L7PerfStats>,
+    perf_stats: Vec<L7PerfStats>,
 
     version: i32,
-    topic: Option<String>,
     domain: Option<String>,
+
+    producer_topic: PulsarTopicMap,
+    consumer_topic: PulsarTopicMap,
 }
 
 impl Default for PulsarLog {
     fn default() -> Self {
         Self {
-            perf_stats: None,
+            perf_stats: vec![],
             version: MAX_PROTOCOL_VERSION,
-            topic: None,
             domain: None,
+            producer_topic: PulsarTopicMap::new(),
+            consumer_topic: PulsarTopicMap::new(),
         }
     }
+}
+
+macro_rules! check_exists {
+    ($command:expr, $field:ident) => {
+        if $command.$field.is_none() {
+            return None;
+        }
+    };
 }
 
 macro_rules! check {
@@ -101,24 +176,156 @@ macro_rules! check {
     };
 }
 
+macro_rules! get_req {
+    ($command:expr, $x:ident) => {{
+        let obj = $command.$x.as_ref()?;
+        Some(obj.request_id as u64)
+    }};
+}
+
+macro_rules! get_msg_req {
+    ($command:expr, $x:ident) => {{
+        let obj = $command.$x.as_ref()?;
+        let producer_id = obj.producer_id as u16 as u64;
+        let sequence_id = obj.sequence_id as u16 as u64;
+        Some((producer_id << 16) | sequence_id)
+    }};
+}
+
+macro_rules! update_topic {
+    ($self:expr, $topic_map:expr, $id:ident, $x:ident) => {{
+        let id = $self.command.$x.as_ref()?.$id;
+        $self.topic = $topic_map.get(&id).cloned();
+    }};
+}
+
 impl PulsarInfo {
-    fn parse_trace_span(&self, param: &ParseParam) -> (Option<String>, Option<String>) {
+    fn get_request_id(&self) -> Option<u64> {
+        let command = self.command.as_ref();
+        match command.r#type() {
+            CommandType::Ack => None,
+            CommandType::Flow => None,
+            CommandType::Message => None,
+            CommandType::RedeliverUnacknowledgedMessages => None,
+            CommandType::ReachedEndOfTopic => None,
+            CommandType::ActiveConsumerChange => None,
+            CommandType::AckResponse => None,
+            CommandType::WatchTopicList => None,
+            CommandType::WatchTopicListSuccess => None,
+            CommandType::WatchTopicUpdate => None,
+            CommandType::WatchTopicListClose => None,
+            CommandType::TopicMigrated => None,
+
+            CommandType::Connect => None,
+            CommandType::Connected => None,
+
+            CommandType::Producer => get_req!(command, producer),
+            CommandType::ProducerSuccess => get_req!(command, producer_success),
+
+            CommandType::Send => get_msg_req!(command, send),
+            CommandType::SendReceipt => get_msg_req!(command, send_receipt),
+            CommandType::SendError => get_msg_req!(command, send_error),
+
+            CommandType::Ping => None,
+            CommandType::Pong => None,
+
+            CommandType::Lookup => get_req!(command, lookup_topic),
+            CommandType::LookupResponse => get_req!(command, lookup_topic_response),
+
+            CommandType::PartitionedMetadata => get_req!(command, partition_metadata),
+            CommandType::PartitionedMetadataResponse => {
+                get_req!(command, partition_metadata_response)
+            }
+
+            CommandType::GetSchema => get_req!(command, get_schema),
+            CommandType::GetSchemaResponse => get_req!(command, get_schema_response),
+
+            CommandType::ConsumerStats => get_req!(command, consumer_stats),
+            CommandType::ConsumerStatsResponse => get_req!(command, consumer_stats_response),
+
+            CommandType::GetLastMessageId => get_req!(command, get_last_message_id),
+            CommandType::GetLastMessageIdResponse => {
+                get_req!(command, get_last_message_id_response)
+            }
+
+            CommandType::GetTopicsOfNamespace => get_req!(command, get_topics_of_namespace),
+            CommandType::GetTopicsOfNamespaceResponse => {
+                get_req!(command, get_topics_of_namespace_response)
+            }
+
+            CommandType::AuthChallenge => None,
+            CommandType::AuthResponse => None,
+
+            CommandType::GetOrCreateSchema => get_req!(command, get_or_create_schema),
+            CommandType::GetOrCreateSchemaResponse => {
+                get_req!(command, get_or_create_schema_response)
+            }
+
+            CommandType::NewTxn => get_req!(command, new_txn),
+            CommandType::NewTxnResponse => get_req!(command, new_txn_response),
+
+            CommandType::AddPartitionToTxn => get_req!(command, add_partition_to_txn),
+            CommandType::AddPartitionToTxnResponse => {
+                get_req!(command, add_partition_to_txn_response)
+            }
+
+            CommandType::AddSubscriptionToTxn => get_req!(command, add_subscription_to_txn),
+            CommandType::AddSubscriptionToTxnResponse => {
+                get_req!(command, add_partition_to_txn_response)
+            }
+
+            CommandType::EndTxn => get_req!(command, end_txn),
+            CommandType::EndTxnResponse => get_req!(command, end_txn_response),
+
+            CommandType::EndTxnOnPartition => get_req!(command, end_txn_on_partition),
+            CommandType::EndTxnOnPartitionResponse => {
+                get_req!(command, end_txn_on_partition_response)
+            }
+
+            CommandType::EndTxnOnSubscription => get_req!(command, end_txn_on_subscription),
+            CommandType::EndTxnOnSubscriptionResponse => {
+                get_req!(command, end_txn_on_subscription_response)
+            }
+
+            CommandType::TcClientConnectRequest => get_req!(command, tc_client_connect_request),
+            CommandType::TcClientConnectResponse => get_req!(command, tc_client_connect_response),
+
+            CommandType::Subscribe => get_req!(command, subscribe),
+            CommandType::Unsubscribe => get_req!(command, unsubscribe),
+            CommandType::CloseProducer => get_req!(command, close_producer),
+            CommandType::CloseConsumer => get_req!(command, close_consumer),
+            CommandType::Seek => get_req!(command, seek),
+            CommandType::Error => get_req!(command, error),
+            CommandType::Success => get_req!(command, success),
+        }
+    }
+
+    fn parse_trace_span(&self, param: &ParseParam) -> (PrioFields, Option<String>) {
         let Some(config) = param.parse_config.map(|x| &x.l7_log_dynamic) else {
-            return (None, None);
+            return (PrioFields::new(), None);
         };
         let Some(metadata) = self.message_metadata.as_ref() else {
-            return (None, None);
+            return (PrioFields::new(), None);
         };
 
-        let mut trace_id = None;
+        let multiple_trace_id_collection = if let Some(config) = param.parse_config {
+            config.l7_log_dynamic.multiple_trace_id_collection
+        } else {
+            true
+        };
+        let mut trace_ids = PrioFields::new();
         let mut span_id = None;
         for kv in metadata.properties.iter() {
             let k = kv.key.as_str();
             let v = kv.value.as_str();
             for tt in config.trace_types.iter() {
                 if tt.check(k) {
-                    trace_id = tt.decode_trace_id(v).map(|x| x.to_string());
-                    break;
+                    if let Some(trace_id) = tt.decode_trace_id(v) {
+                        trace_ids.merge_field(BASE_FIELD_PRIORITY, trace_id.to_string());
+                    }
+                    if !multiple_trace_id_collection && !trace_ids.is_empty() {
+                        break;
+                    }
                 }
             }
             for st in config.span_types.iter() {
@@ -129,10 +336,10 @@ impl PulsarInfo {
             }
         }
 
-        (trace_id, span_id)
+        (trace_ids, span_id)
     }
 
-    fn parse_request_id(&self) -> Option<u32> {
+    fn parse_sequence_id(&self) -> Option<u32> {
         let metadata = self.message_metadata.as_ref().as_ref()?;
         Some(metadata.sequence_id as u32)
     }
@@ -168,7 +375,7 @@ impl PulsarInfo {
         }
     }
 
-    fn parse_topic(&self) -> Option<String> {
+    fn get_topic(&self) -> Option<String> {
         let topic = if let Some(producer) = &self.command.producer {
             producer.topic.clone()
         } else if let Some(subscribe) = &self.command.subscribe {
@@ -177,6 +384,69 @@ impl PulsarInfo {
             return None;
         };
         topic.split('/').last().map(|x| x.to_string())
+    }
+
+    fn update_topic(
+        &mut self,
+        producer_topic: &mut PulsarTopicMap,
+        consumer_topic: &mut PulsarTopicMap,
+    ) -> Option<()> {
+        let command = self.command.as_ref();
+        match command.r#type() {
+            CommandType::Subscribe => {
+                let consumer_id = command.subscribe.as_ref()?.consumer_id;
+                let topic = self.get_topic()?;
+                consumer_topic.insert(consumer_id, topic.clone());
+                self.topic = Some(topic);
+            }
+            CommandType::Producer => {
+                let producer_id = command.producer.as_ref()?.producer_id;
+                let topic = self.get_topic()?;
+                producer_topic.insert(producer_id, topic.clone());
+                self.topic = Some(topic);
+            }
+
+            CommandType::Send => update_topic!(self, producer_topic, producer_id, send),
+            CommandType::SendReceipt => {
+                update_topic!(self, producer_topic, producer_id, send_receipt)
+            }
+            CommandType::SendError => update_topic!(self, producer_topic, producer_id, send_error),
+            CommandType::CloseProducer => {
+                update_topic!(self, producer_topic, producer_id, close_producer)
+            }
+
+            CommandType::Message => update_topic!(self, consumer_topic, consumer_id, message),
+            CommandType::Ack => update_topic!(self, consumer_topic, consumer_id, ack),
+            CommandType::AckResponse => {
+                update_topic!(self, consumer_topic, consumer_id, ack_response)
+            }
+            CommandType::ActiveConsumerChange => {
+                update_topic!(self, consumer_topic, consumer_id, active_consumer_change)
+            }
+            CommandType::Flow => update_topic!(self, consumer_topic, consumer_id, flow),
+            CommandType::Unsubscribe => {
+                update_topic!(self, consumer_topic, consumer_id, unsubscribe)
+            }
+            CommandType::Seek => update_topic!(self, consumer_topic, consumer_id, seek),
+            CommandType::ReachedEndOfTopic => {
+                update_topic!(self, consumer_topic, consumer_id, reached_end_of_topic)
+            }
+            CommandType::CloseConsumer => {
+                update_topic!(self, consumer_topic, consumer_id, close_consumer)
+            }
+            CommandType::RedeliverUnacknowledgedMessages => update_topic!(
+                self,
+                consumer_topic,
+                consumer_id,
+                redeliver_unacknowledged_messages
+            ),
+            CommandType::ConsumerStats => {
+                update_topic!(self, consumer_topic, consumer_id, consumer_stats)
+            }
+
+            _ => {}
+        }
+        Some(())
     }
 
     fn get_message_type(&self) -> LogMessageType {
@@ -315,11 +585,11 @@ impl PulsarInfo {
         check!(self.command.tc_client_connect_response, code, msg);
         is_success |= code.is_none();
         if is_success {
-            self.resp_status = Some(L7ResponseStatus::Ok);
+            self.resp_status = L7ResponseStatus::Ok;
             self.resp_code = None;
             self.resp_exception = None;
         } else {
-            self.resp_status = Some(L7ResponseStatus::Error);
+            self.resp_status = L7ResponseStatus::ServerError;
             self.resp_code = code;
             self.resp_exception = msg;
         }
@@ -334,6 +604,109 @@ impl PulsarInfo {
         }
         let buf = payload.get(8..8 + command_size as usize)?;
         info.command = Box::new(BaseCommand::decode(buf).ok()?);
+        let command = &info.command;
+        match command.r#type() {
+            CommandType::Ack => check_exists!(command, ack),
+            CommandType::Flow => check_exists!(command, flow),
+            CommandType::Message => check_exists!(command, message),
+            CommandType::RedeliverUnacknowledgedMessages => {
+                check_exists!(command, redeliver_unacknowledged_messages)
+            }
+            CommandType::ReachedEndOfTopic => check_exists!(command, reached_end_of_topic),
+            CommandType::ActiveConsumerChange => check_exists!(command, active_consumer_change),
+            CommandType::AckResponse => check_exists!(command, ack_response),
+            CommandType::WatchTopicList => check_exists!(command, watch_topic_list),
+            CommandType::WatchTopicListSuccess => check_exists!(command, watch_topic_list_success),
+            CommandType::WatchTopicUpdate => check_exists!(command, watch_topic_update),
+            CommandType::WatchTopicListClose => check_exists!(command, watch_topic_list_close),
+            CommandType::TopicMigrated => check_exists!(command, topic_migrated),
+
+            CommandType::Connect => check_exists!(command, connect),
+            CommandType::Connected => check_exists!(command, connected),
+
+            CommandType::Producer => check_exists!(command, producer),
+            CommandType::ProducerSuccess => check_exists!(command, producer_success),
+
+            CommandType::Send => check_exists!(command, send),
+            CommandType::SendReceipt => check_exists!(command, send_receipt),
+            CommandType::SendError => check_exists!(command, send_error),
+
+            CommandType::Ping => check_exists!(command, ping),
+            CommandType::Pong => check_exists!(command, pong),
+
+            CommandType::Lookup => check_exists!(command, lookup_topic),
+            CommandType::LookupResponse => check_exists!(command, lookup_topic_response),
+
+            CommandType::PartitionedMetadata => check_exists!(command, partition_metadata),
+            CommandType::PartitionedMetadataResponse => {
+                check_exists!(command, partition_metadata_response)
+            }
+
+            CommandType::GetSchema => check_exists!(command, get_schema),
+            CommandType::GetSchemaResponse => check_exists!(command, get_schema_response),
+
+            CommandType::ConsumerStats => check_exists!(command, consumer_stats),
+            CommandType::ConsumerStatsResponse => check_exists!(command, consumer_stats_response),
+
+            CommandType::GetLastMessageId => check_exists!(command, get_last_message_id),
+            CommandType::GetLastMessageIdResponse => {
+                check_exists!(command, get_last_message_id_response)
+            }
+
+            CommandType::GetTopicsOfNamespace => check_exists!(command, get_topics_of_namespace),
+            CommandType::GetTopicsOfNamespaceResponse => {
+                check_exists!(command, get_topics_of_namespace_response)
+            }
+
+            CommandType::AuthChallenge => check_exists!(command, auth_challenge),
+            CommandType::AuthResponse => check_exists!(command, auth_response),
+
+            CommandType::GetOrCreateSchema => check_exists!(command, get_or_create_schema),
+            CommandType::GetOrCreateSchemaResponse => {
+                check_exists!(command, get_or_create_schema_response)
+            }
+
+            CommandType::NewTxn => check_exists!(command, new_txn),
+            CommandType::NewTxnResponse => check_exists!(command, new_txn_response),
+
+            CommandType::AddPartitionToTxn => check_exists!(command, add_partition_to_txn),
+            CommandType::AddPartitionToTxnResponse => {
+                check_exists!(command, add_partition_to_txn_response)
+            }
+
+            CommandType::AddSubscriptionToTxn => check_exists!(command, add_subscription_to_txn),
+            CommandType::AddSubscriptionToTxnResponse => {
+                check_exists!(command, add_partition_to_txn_response)
+            }
+
+            CommandType::EndTxn => check_exists!(command, end_txn),
+            CommandType::EndTxnResponse => check_exists!(command, end_txn_response),
+
+            CommandType::EndTxnOnPartition => check_exists!(command, end_txn_on_partition),
+            CommandType::EndTxnOnPartitionResponse => {
+                check_exists!(command, end_txn_on_partition_response)
+            }
+
+            CommandType::EndTxnOnSubscription => check_exists!(command, end_txn_on_subscription),
+            CommandType::EndTxnOnSubscriptionResponse => {
+                check_exists!(command, end_txn_on_subscription_response)
+            }
+
+            CommandType::TcClientConnectRequest => {
+                check_exists!(command, tc_client_connect_request)
+            }
+            CommandType::TcClientConnectResponse => {
+                check_exists!(command, tc_client_connect_response)
+            }
+
+            CommandType::Subscribe => check_exists!(command, subscribe),
+            CommandType::Unsubscribe => check_exists!(command, unsubscribe),
+            CommandType::CloseProducer => check_exists!(command, close_producer),
+            CommandType::CloseConsumer => check_exists!(command, close_consumer),
+            CommandType::Seek => check_exists!(command, seek),
+            CommandType::Error => check_exists!(command, error),
+            CommandType::Success => check_exists!(command, success),
+        }
         let mut extra = payload.get(8 + command_size..4 + total_size)?;
         let payload = payload.get(4 + total_size..)?;
         if extra.len() > 0 {
@@ -354,12 +727,11 @@ impl PulsarInfo {
             info.message_metadata = Box::new(Some(MessageMetadata::decode(buf).ok()?));
             let _payload = extra.get(10 + metadata_size..)?;
         }
-        (info.trace_id, info.span_id) = info.parse_trace_span(param);
+        (info.trace_ids, info.span_id) = info.parse_trace_span(param);
         info.x_request_id = info.parse_x_request_id();
-        info.request_id = info.parse_request_id();
+        info.request_id = info.get_request_id().map(|x| x as u32);
         info.domain = info.parse_domain();
         info.version = info.parse_version();
-        info.topic = info.parse_topic();
         info.msg_type = info.get_message_type();
         match info.msg_type {
             LogMessageType::Response => {
@@ -370,13 +742,31 @@ impl PulsarInfo {
         }
         Some((payload, info))
     }
+
+    fn set_is_on_blacklist(&mut self, config: &LogParserConfig) {
+        if let Some(t) = config.l7_log_blacklist_trie.get(&L7Protocol::Pulsar) {
+            self.is_on_blacklist = t
+                .request_type
+                .is_on_blacklist(self.command.r#type().as_str_name())
+                || self
+                    .topic
+                    .as_ref()
+                    .map(|p| t.request_resource.is_on_blacklist(p) || t.endpoint.is_on_blacklist(p))
+                    .unwrap_or_default()
+                || self
+                    .domain
+                    .as_ref()
+                    .map(|p| t.request_domain.is_on_blacklist(p))
+                    .unwrap_or_default();
+        }
+    }
 }
 
 impl From<PulsarInfo> for L7ProtocolSendLog {
     fn from(info: PulsarInfo) -> Self {
         let flags = match info.is_tls {
-            true => EbpfFlags::TLS.bits(),
-            false => EbpfFlags::NONE.bits(),
+            true => ApplicationFlags::TLS.bits(),
+            false => ApplicationFlags::NONE.bits(),
         };
 
         let log = L7ProtocolSendLog {
@@ -384,6 +774,8 @@ impl From<PulsarInfo> for L7ProtocolSendLog {
             version: info.version.map(|x| x.to_string()),
             req_len: info.req_len,
             resp_len: info.resp_len,
+            captured_request_byte: info.captured_request_byte,
+            captured_response_byte: info.captured_response_byte,
             req: L7Request {
                 req_type: info.command.r#type().as_str_name().to_string(),
                 domain: info.domain.unwrap_or_default(),
@@ -392,13 +784,13 @@ impl From<PulsarInfo> for L7ProtocolSendLog {
                 ..Default::default()
             },
             resp: L7Response {
-                status: info.resp_status.unwrap_or_default(),
+                status: info.resp_status,
                 code: info.resp_code,
                 exception: info.resp_exception.unwrap_or_default(),
                 ..Default::default()
             },
             trace_info: Some(TraceInfo {
-                trace_id: info.trace_id,
+                trace_ids: info.trace_ids.into_strings_top3(),
                 span_id: info.span_id,
                 ..Default::default()
             }),
@@ -413,22 +805,40 @@ impl From<PulsarInfo> for L7ProtocolSendLog {
     }
 }
 
+impl From<&PulsarInfo> for LogCache {
+    fn from(info: &PulsarInfo) -> Self {
+        LogCache {
+            msg_type: info.msg_type,
+            resp_status: info.resp_status,
+            on_blacklist: info.is_on_blacklist,
+            endpoint: info.get_endpoint(),
+            ..Default::default()
+        }
+    }
+}
+
 impl L7ProtocolInfoInterface for PulsarInfo {
     fn is_tls(&self) -> bool {
         self.is_tls
     }
 
     fn session_id(&self) -> Option<u32> {
-        None
+        self.get_request_id().map(|x| x as u32)
     }
 
     fn merge_log(&mut self, other: &mut L7ProtocolInfo) -> Result<()> {
         if let (req, L7ProtocolInfo::PulsarInfo(rsp)) = (self, other) {
             req.resp_len = req.resp_len.or(rsp.resp_len);
-            req.resp_status = req.resp_status.or(rsp.resp_status);
+            if rsp.resp_status != L7ResponseStatus::Ok {
+                req.resp_status = rsp.resp_status;
+            }
             req.resp_code = req.resp_code.or(rsp.resp_code);
             if req.resp_exception.is_none() {
                 req.resp_exception = rsp.resp_exception.clone();
+            }
+            req.captured_response_byte = rsp.captured_response_byte;
+            if rsp.is_on_blacklist {
+                req.is_on_blacklist = rsp.is_on_blacklist;
             }
         }
         Ok(())
@@ -449,61 +859,67 @@ impl L7ProtocolInfoInterface for PulsarInfo {
     fn get_request_domain(&self) -> String {
         self.domain.clone().unwrap_or_default()
     }
+
+    fn is_on_blacklist(&self) -> bool {
+        self.is_on_blacklist
+    }
 }
 
 impl L7ProtocolParserInterface for PulsarLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
         if !param.ebpf_type.is_raw_protocol() {
-            return false;
+            return None;
         }
         if param.l4_protocol != IpProtocol::TCP {
-            return false;
+            return None;
         }
         if payload.len() < 8 {
-            return false;
+            return None;
         }
-        PulsarInfo::parse(payload, param).is_some()
+        if PulsarInfo::parse(payload, param).is_some() {
+            Some(LogMessageType::Request)
+        } else {
+            None
+        }
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
-        if self.perf_stats.is_none() && param.parse_perf {
-            self.perf_stats = Some(L7PerfStats::default())
-        };
-
         let mut vec = Vec::new();
         let mut payload = payload;
 
+        self.perf_stats.clear();
         while let Some((tmp, mut info)) = PulsarInfo::parse(payload, param) {
             payload = tmp;
             self.version = self
                 .version
                 .min(info.version.unwrap_or(MAX_PROTOCOL_VERSION));
-            self.topic = info.topic.clone().or(self.topic.clone());
             self.domain = info.domain.clone().or(self.domain.clone());
+            info.update_topic(&mut self.producer_topic, &mut self.consumer_topic);
             info.version = Some(self.version);
-            info.topic = self.topic.clone();
             info.domain = self.domain.clone();
             vec.push(L7ProtocolInfo::PulsarInfo(info));
         }
 
         for info in &mut vec {
             if let L7ProtocolInfo::PulsarInfo(info) = info {
-                if info.msg_type != LogMessageType::Session {
-                    info.cal_rrt(param, None).map(|rtt| {
-                        info.rtt = rtt;
-                        self.perf_stats.as_mut().map(|p| p.update_rrt(rtt));
-                    });
+                info.is_tls = param.is_tls();
+                set_captured_byte!(info, param);
+                if let Some(config) = param.parse_config {
+                    info.set_is_on_blacklist(config);
                 }
 
-                info.is_tls = param.is_tls();
-
-                match param.direction {
-                    PacketDirection::ClientToServer => {
-                        self.perf_stats.as_mut().map(|p| p.inc_req());
+                if param.parse_perf {
+                    let mut perf_stat = L7PerfStats::default();
+                    if info.msg_type == LogMessageType::Response {
+                        if let Some(endpoint) = info.load_endpoint_from_cache(param, false) {
+                            info.topic = Some(endpoint.to_string());
+                        }
                     }
-                    PacketDirection::ServerToClient => {
-                        self.perf_stats.as_mut().map(|p| p.inc_resp());
+                    if let Some(stats) = info.perf_stats(param) {
+                        info.rtt = stats.rrt_sum;
+                        perf_stat.sequential_merge(&stats);
                     }
+                    self.perf_stats.push(perf_stat);
                 }
             }
         }
@@ -519,8 +935,8 @@ impl L7ProtocolParserInterface for PulsarLog {
         }
     }
 
-    fn perf_stats(&mut self) -> Option<L7PerfStats> {
-        self.perf_stats.take()
+    fn perf_stats(&mut self) -> Vec<L7PerfStats> {
+        std::mem::take(&mut self.perf_stats)
     }
 
     fn protocol(&self) -> L7Protocol {
@@ -529,15 +945,6 @@ impl L7ProtocolParserInterface for PulsarLog {
 
     fn parsable_on_udp(&self) -> bool {
         false
-    }
-
-    fn reset(&mut self) {
-        let mut s = Self::default();
-        s.perf_stats = self.perf_stats.take();
-        s.version = self.version;
-        s.topic = self.topic.take();
-        s.domain = self.domain.take();
-        *self = s;
     }
 }
 
@@ -552,10 +959,7 @@ mod tests {
 
     use crate::{
         common::{flow::PacketDirection, l7_protocol_log::L7PerfCache, MetaPacket},
-        config::{
-            handler::{L7LogDynamicConfig, LogParserConfig, TraceType},
-            ExtraLogFields,
-        },
+        config::handler::{L7LogDynamicConfigBuilder, LogParserConfig, TraceType},
         flow_generator::L7_RRT_CACHE_CAPACITY,
         utils::test::Capture,
     };
@@ -563,9 +967,9 @@ mod tests {
     const FILE_DIR: &str = "resources/test/flow_generator/pulsar";
 
     fn run(name: &str) -> String {
-        let capture = Capture::load_pcap(Path::new(FILE_DIR).join(name), None);
+        let capture = Capture::load_pcap(Path::new(FILE_DIR).join(name));
         let log_cache = Rc::new(RefCell::new(L7PerfCache::new(L7_RRT_CACHE_CAPACITY)));
-        let mut packets = capture.as_meta_packets();
+        let mut packets = capture.collect::<Vec<_>>();
         if packets.is_empty() {
             return "".to_string();
         }
@@ -585,29 +989,30 @@ mod tests {
             };
             let param = &mut ParseParam::new(
                 packet as &MetaPacket,
-                log_cache.clone(),
+                Some(log_cache.clone()),
                 Default::default(),
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 Default::default(),
                 true,
                 true,
             );
+            param.set_captured_byte(payload.len());
 
-            let config = L7LogDynamicConfig::new(
-                "".to_owned(),
-                vec![],
-                vec![TraceType::Sw8, TraceType::TraceParent],
-                vec![TraceType::Sw8, TraceType::TraceParent],
-                ExtraLogFields::default(),
-            );
+            let config = L7LogDynamicConfigBuilder {
+                proxy_client: vec![],
+                x_request_id: vec![],
+                trace_types: vec![TraceType::Sw8, TraceType::TraceParent],
+                span_types: vec![TraceType::Sw8, TraceType::TraceParent],
+                ..Default::default()
+            };
             let parse_config = &LogParserConfig {
-                l7_log_dynamic: config.clone(),
+                l7_log_dynamic: config.into(),
                 ..Default::default()
             };
 
-            param.set_log_parse_config(parse_config);
+            param.set_log_parser_config(parse_config);
 
-            if !pulsar.check_payload(payload, param) {
+            if pulsar.check_payload(payload, param).is_none() {
                 output.push_str("not pulsar\n");
                 continue;
             }
@@ -657,6 +1062,33 @@ mod tests {
                     output_path
                 );
             }
+        }
+    }
+
+    #[test]
+    fn check_topicmap() {
+        let mut map1: TopicMap<u64, u64, 16> = TopicMap::new();
+        let mut map2: HashMap<u64, u64> = HashMap::new();
+        for i in 0..5 {
+            map1.insert(i, i);
+            map2.insert(i, i);
+        }
+        for i in 0..32 {
+            assert_eq!(map1.get(&i), map2.get(&i));
+        }
+        for i in 0..11 {
+            map1.insert(i, i + 64);
+            map2.insert(i, i + 64);
+        }
+        for i in 0..32 {
+            assert_eq!(map1.get(&i), map2.get(&i));
+        }
+        for i in 0..32 {
+            map1.insert(i, i + 128);
+            map2.insert(i, i + 128);
+        }
+        for i in 0..32 {
+            assert_eq!(map1.get(&i), map2.get(&i));
         }
     }
 }

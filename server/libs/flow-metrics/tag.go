@@ -166,6 +166,19 @@ func (d DirectionEnum) IsGateway() bool {
 	return SideType(d&_SIDE_TYPE_MASK)&(GatewaySide|GatewayHypervisorSide) != 0
 }
 
+func (d DirectionEnum) ToRole() uint8 {
+	switch d & _CLIENT_SERVER_MASK {
+	case ClientToServer:
+		return ROLE_CLIENT
+	case ServerToClient:
+		return ROLE_SERVER
+	case LocalToLocal:
+		return ROLE_LOCAL
+	default:
+		return ROLE_REST
+	}
+}
+
 type TAPSideEnum uint8
 
 const (
@@ -186,6 +199,13 @@ const (
 	ServerApp               = Server | TAPSideEnum(AppSide)
 	App                     = TAPSideEnum(AppSide)
 	Rest                    = 0
+)
+
+const (
+	ROLE_CLIENT = 0
+	ROLE_SERVER = 1
+	ROLE_LOCAL  = 2
+	ROLE_REST   = 3
 )
 
 var TAPSideEnumsString = []string{
@@ -240,8 +260,10 @@ const (
 	PodId                       // use vtapId + podId to match first
 	Mac                         // if vtapId + podId cannot be matched, finally use Mac/EpcIP to match resources
 	EpcIP
-	Peer           // Multicast, filled with peer information
-	None TagSource = 0
+	Peer                // Multicast, filled with peer information
+	Agent               // traffic on the 'lo' port uses the Agent's IP and Epc to match resource information.
+	ProcessId           // If ProcessId exists and GpId does not exist, get GpId through ProcessId
+	None      TagSource = 0
 )
 
 type Field struct {
@@ -250,81 +272,91 @@ type Field struct {
 	// 用于区分不同的trident及其不同的pipeline，用于如下场景：
 	//   - agent和ingester之间的数据传输
 	//   - ingester写入clickhouse，作用类似_id，序列化为_tid
-	GlobalThreadID uint8
+	GlobalThreadID uint8 `json:"thread_id" category:"$tag"`
 
-	IP6              net.IP // FIXME: 合并IP6和IP
+	// structTag  "datasource":"n|nm|a|am" means datasource: network, network_map, application, application_map
+	IP6              net.IP `json:"ip6" map_json:"ip6_0" category:"$tag" sub:"network_layer" to_string:"IPv6String" ` // FIXME: 合并IP6和IP
 	MAC              uint64
-	IP               uint32
-	L3EpcID          int32 // (8B)
-	L3DeviceID       uint32
-	L3DeviceType     DeviceType
-	RegionID         uint16
-	SubnetID         uint16
-	HostID           uint16
-	PodNodeID        uint32
-	AZID             uint16
-	PodGroupID       uint32
-	PodNSID          uint16
-	PodID            uint32
-	PodClusterID     uint16
-	ServiceID        uint32
-	AutoInstanceID   uint32
-	AutoInstanceType uint8
-	AutoServiceID    uint32
-	AutoServiceType  uint8
-	GPID             uint32
+	IP               uint32     `json:"ip4" map_json:"ip4_0" category:"$tag" sub:"network_layer" to_string:"IPv4String"`
+	L3EpcID          int32      `json:"l3_epc_id" map_json:"l3_epc_id_0" category:"$tag" sub:"universal_tag"`
+	L3DeviceID       uint32     `json:"l3_device_id" map_json:"l3_device_id_0" category:"$tag" sub:"universal_tag"`
+	L3DeviceType     DeviceType `json:"l3_device_type" map_json:"l3_device_type_0" category:"$tag" sub:"universal_tag"`
+	RegionID         uint16     `json:"region_id" map_json:"region_id_0" category:"$tag" sub:"universal_tag"`
+	SubnetID         uint16     `json:"subnet_id" map_json:"subnet_id_0" category:"$tag" sub:"universal_tag"`
+	HostID           uint16     `json:"host_id" map_json:"host_id_0" category:"$tag" sub:"universal_tag"`
+	PodNodeID        uint32     `json:"pod_node_id" map_json:"pod_node_id_0" category:"$tag" sub:"universal_tag"`
+	AZID             uint16     `json:"az_id" map_json:"az_id_0" category:"$tag" sub:"universal_tag"`
+	PodGroupID       uint32     `json:"pod_group_id" map_json:"pod_group_id_0" category:"$tag" sub:"universal_tag"`
+	PodNSID          uint16     `json:"pod_ns_id" map_json:"pod_ns_id_0" category:"$tag" sub:"universal_tag"`
+	PodID            uint32     `json:"pod_id" map_json:"pod_id_0" category:"$tag" sub:"universal_tag"`
+	PodClusterID     uint16     `json:"pod_cluster_id" map_json:"pod_cluster_id_0" category:"$tag" sub:"universal_tag"`
+	ServiceID        uint32     `json:"service_id" map_json:"service_id_0" category:"$tag" sub:"universal_tag"`
+	AutoInstanceID   uint32     `json:"auto_instance_id" map_json:"auto_instance_id_0" category:"$tag" sub:"universal_tag"`
+	AutoInstanceType uint8      `json:"auto_instance_type" map_json:"auto_instance_type_0" category:"$tag" sub:"universal_tag"`
+	AutoServiceID    uint32     `json:"auto_service_id" map_json:"auto_service_id_0" category:"$tag" sub:"universal_tag"`
+	AutoServiceType  uint8      `json:"auto_service_type" map_json:"auto_service_type_0" category:"$tag" sub:"universal_tag"`
+	GPID             uint32     `json:"gprocess_id" map_json:"gprocess_id_0" category:"$tag" sub:"universal_tag"`
 
 	MAC1              uint64
-	IP61              net.IP // FIXME: 合并IP61和IP1
-	IP1               uint32
-	L3EpcID1          int32 // (8B)
-	L3DeviceID1       uint32
-	L3DeviceType1     DeviceType // (+1B=8B)
-	RegionID1         uint16
-	SubnetID1         uint16 // (8B)
-	HostID1           uint16
-	PodNodeID1        uint32
-	AZID1             uint16
-	PodGroupID1       uint32
-	PodNSID1          uint16
-	PodID1            uint32
-	PodClusterID1     uint16
-	ServiceID1        uint32
-	AutoInstanceID1   uint32
-	AutoInstanceType1 uint8
-	AutoServiceID1    uint32
-	AutoServiceType1  uint8
-	GPID1             uint32
+	IP61              net.IP     `json:"ip6_1" category:"$tag" sub:"network_layer" to_string:"IPv6String" datasource:"nm|am"` // FIXME: 合并IP61和IP1
+	IP1               uint32     `json:"ip4_1" category:"$tag" sub:"network_layer" to_string:"IPv4String" datasource:"nm|am"`
+	L3EpcID1          int32      `json:"l3_epc_id_1" category:"$tag" sub:"universal_tag" datasource:"nm|am"`
+	L3DeviceID1       uint32     `json:"l3_device_id_1" category:"$tag" sub:"universal_tag" datasource:"nm|am"`
+	L3DeviceType1     DeviceType `json:"l3_device_type_1" category:"$tag" sub:"universal_tag" datasource:"nm|am"`
+	RegionID1         uint16     `json:"region_id_1" category:"$tag" sub:"universal_tag" datasource:"nm|am"`
+	SubnetID1         uint16     `json:"subnet_id_1" category:"$tag" sub:"universal_tag" datasource:"nm|am"`
+	HostID1           uint16     `json:"host_id_1" category:"$tag" sub:"universal_tag" datasource:"nm|am"`
+	PodNodeID1        uint32     `json:"pod_node_id_1" category:"$tag" sub:"universal_tag" datasource:"nm|am"`
+	AZID1             uint16     `json:"az_id_1" category:"$tag" sub:"universal_tag" datasource:"nm|am"`
+	PodGroupID1       uint32     `json:"pod_group_id_1" category:"$tag" sub:"universal_tag" datasource:"nm|am"`
+	PodNSID1          uint16     `json:"pod_ns_id_1" category:"$tag" sub:"universal_tag" datasource:"nm|am"`
+	PodID1            uint32     `json:"pod_id_1" category:"$tag" sub:"universal_tag" datasource:"nm|am"`
+	PodClusterID1     uint16     `json:"pod_cluster_id_1" category:"$tag" sub:"universal_tag" datasource:"nm|am"`
+	ServiceID1        uint32     `json:"service_id_1" category:"$tag" sub:"universal_tag" datasource:"nm|am"`
+	AutoInstanceID1   uint32     `json:"auto_instance_id_1" category:"$tag" sub:"universal_tag" datasource:"nm|am"`
+	AutoInstanceType1 uint8      `json:"auto_instance_type_1" category:"$tag" sub:"universal_tag" datasource:"nm|am"`
+	AutoServiceID1    uint32     `json:"auto_service_id_1" category:"$tag" sub:"universal_tag" datasource:"nm|am"`
+	AutoServiceType1  uint8      `json:"auto_service_type_1" category:"$tag" sub:"universal_tag" datasource:"nm|am"`
+	GPID1             uint32     `json:"gprocess_id_1" category:"$tag" sub:"universal_tag" datasource:"nm|am"`
 
 	ACLGID     uint16
-	Direction  DirectionEnum
-	Protocol   layers.IPProtocol
-	ServerPort uint16
-	VTAPID     uint16
+	Role       uint8             `json:"role" category:"$tag" sub:"capture_info" enumfile:"role" datasource:"n|a"`
+	Protocol   layers.IPProtocol `json:"protocol" category:"$tag" sub:"network_layer" enumfile:"protocol"`
+	ServerPort uint16            `json:"server_port" category:"$tag" sub:"transport_layer"`
+	VTAPID     uint16            `json:"agent_id" category:"$tag" sub:"capture_info"`
 	// Not stored, only determines which database to store in.
 	// When Orgid is 0 or 1, it is stored in database 'flow_metrics', otherwise stored in '<OrgId>_flow_metrics'.
-	OrgId        uint16
-	TeamID       uint16
-	TAPPort      datatype.TapPort
-	TAPSide      TAPSideEnum
-	TAPType      TAPTypeEnum
-	IsIPv6       uint8 // (8B) 与IP/IP6是共生字段
+	OrgId   uint16 `json:"org_id" category:"$tag"`
+	TeamID  uint16 `json:"team_id" category:"$tag"`
+	TAPPort datatype.TapPort
+	// caculate from TAPPort
+	TapPort     uint32              `json:"capture_nic" category:"$tag" sub:"capture_info" datasource:"nm|am"`
+	TapPortType uint8               `json:"capture_nic_type" category:"$tag" sub:"capture_info" enumfile:"capture_nic_type" datasource:"nm|am"`
+	NatSource   datatype.NATSource  `json:"nat_source" category:"$tag" sub:"capture_info" enumfile:"nat_source" datasource:"nm|am"`
+	TunnelType  datatype.TunnelType `json:"tunnel_type" category:"$tag" sub:"tunnel_info" enumfile:"tunnel_type" datasource:"nm|am"`
+
+	TAPSide TAPSideEnum
+	// only for exporters
+	TAPSideStr   string      `json:"observation_point" category:"$tag" sub:"capture_info" enumfile:"observation_point" datasource:"nm|am"`
+	TAPType      TAPTypeEnum `json:"capture_network_type_id" category:"$tag" sub:"capture_info"`
+	IsIPv4       uint8       `json:"is_ipv4" category:"$tag" sub:"network_layer"` // (8B) 与IP/IP6是共生字段
 	IsKeyService uint8
-	L7Protocol   datatype.L7Protocol
-	AppService   string
-	AppInstance  string
-	Endpoint     string
-	BizType      uint8
-	SignalSource uint16
+	L7Protocol   datatype.L7Protocol `json:"l7_protocol" category:"$tag" sub:"application_layer" enumfile:"l7_protocol" datasource:"a|am"`
+	AppService   string              `json:"app_service" category:"$tag" sub:"service_info" datasource:"a|am"`
+	AppInstance  string              `json:"app_instance" category:"$tag" sub:"service_info" datasource:"a|am"`
+	Endpoint     string              `json:"endpoint" category:"$tag" sub:"service_info" datasource:"a|am"`
+	BizType      uint8               `json:"biz_type" category:"$tag" sub:"capture_info" datasource:"a|am"`
+	SignalSource uint16              `json:"signal_source" category:"$tag" sub:"capture_info" enumfile:"l7_signal_source"` // FIXME: network,network_1m should use l4_signal_source for translate
 
 	TagSource, TagSource1 uint8
 
 	TunnelIPID uint16
 }
 
-func newMetricsMinuteTable(id MetricsTableID, engine ckdb.EngineType, version, cluster, storagePolicy string, ttl int, coldStorage *ckdb.ColdStorage) *ckdb.Table {
+func newMetricsMinuteTable(id MetricsTableID, engine ckdb.EngineType, version, cluster, storagePolicy, ckdbType string, ttl int, coldStorage *ckdb.ColdStorage) *ckdb.Table {
 	timeKey := "time"
 
+	aggr1H1DTable := true
 	var orderKeys []string
 	code := metricsTableCodes[id]
 	if code&L3EpcID != 0 {
@@ -333,6 +365,7 @@ func newMetricsMinuteTable(id MetricsTableID, engine ckdb.EngineType, version, c
 		orderKeys = []string{timeKey, "l3_epc_id_1", "ip4_1", "ip6_1", "l3_epc_id_0", "ip4_0", "ip6_0"}
 	} else if code&ACLGID != 0 {
 		orderKeys = []string{timeKey, "acl_gid"}
+		aggr1H1DTable = false
 	}
 	if code&ServerPort != 0 {
 		orderKeys = append(orderKeys, "server_port")
@@ -352,6 +385,7 @@ func newMetricsMinuteTable(id MetricsTableID, engine ckdb.EngineType, version, c
 		Version:         version,
 		ID:              uint8(id),
 		Database:        ckdb.METRICS_DB,
+		DBType:          ckdbType,
 		LocalName:       id.TableName() + ckdb.LOCAL_SUBFFIX,
 		GlobalName:      id.TableName(),
 		Columns:         append(GenTagColumns(metricsTableCodes[id]), meterColumns...),
@@ -364,6 +398,7 @@ func newMetricsMinuteTable(id MetricsTableID, engine ckdb.EngineType, version, c
 		ColdStorage:     *coldStorage,
 		OrderKeys:       orderKeys,
 		PrimaryKeyCount: len(orderKeys),
+		Aggr1H1D:        aggr1H1DTable,
 	}
 }
 
@@ -377,21 +412,22 @@ func newMetricsSecondTable(minuteTable *ckdb.Table, ttl int, coldStorages *ckdb.
 	t.ColdStorage = *coldStorages
 	t.PartitionFunc = ckdb.TimeFuncFourHour
 	t.Engine = ckdb.MergeTree // 秒级数据不用支持使用replica
+	t.Aggr1H1D = false
 
 	return &t
 }
 
-func GetMetricsTables(engine ckdb.EngineType, version, cluster, storagePolicy string, flowMinuteTtl, flowSecondTtl, appMinuteTtl, appSecondTtl int, coldStorages map[string]*ckdb.ColdStorage) []*ckdb.Table {
+func GetMetricsTables(engine ckdb.EngineType, version, cluster, storagePolicy, ckdbType string, flowMinuteTtl, flowSecondTtl, appMinuteTtl, appSecondTtl int, coldStorages map[string]*ckdb.ColdStorage) []*ckdb.Table {
 	var metricsTables []*ckdb.Table
 
 	minuteTables := []*ckdb.Table{}
 	for i := NETWORK_1M; i <= NETWORK_MAP_1M; i++ {
-		minuteTables = append(minuteTables, newMetricsMinuteTable(i, engine, version, cluster, storagePolicy, flowMinuteTtl, ckdb.GetColdStorage(coldStorages, ckdb.METRICS_DB, i.TableName())))
+		minuteTables = append(minuteTables, newMetricsMinuteTable(i, engine, version, cluster, storagePolicy, ckdbType, flowMinuteTtl, ckdb.GetColdStorage(coldStorages, ckdb.METRICS_DB, i.TableName())))
 	}
 	for i := APPLICATION_1M; i <= APPLICATION_MAP_1M; i++ {
-		minuteTables = append(minuteTables, newMetricsMinuteTable(i, engine, version, cluster, storagePolicy, appMinuteTtl, ckdb.GetColdStorage(coldStorages, ckdb.METRICS_DB, i.TableName())))
+		minuteTables = append(minuteTables, newMetricsMinuteTable(i, engine, version, cluster, storagePolicy, ckdbType, appMinuteTtl, ckdb.GetColdStorage(coldStorages, ckdb.METRICS_DB, i.TableName())))
 	}
-	minuteTables = append(minuteTables, newMetricsMinuteTable(TRAFFIC_POLICY_1M, engine, version, cluster, storagePolicy, 3*24, ckdb.GetColdStorage(coldStorages, ckdb.METRICS_DB, TRAFFIC_POLICY_1M.TableName()))) // traffic_policy ttl is 3 day default
+	minuteTables = append(minuteTables, newMetricsMinuteTable(TRAFFIC_POLICY_1M, engine, version, cluster, storagePolicy, ckdbType, 3*24, ckdb.GetColdStorage(coldStorages, ckdb.METRICS_DB, TRAFFIC_POLICY_1M.TableName()))) // traffic_policy ttl is 3 day default
 
 	secondTables := []*ckdb.Table{}
 	for i := NETWORK_1S; i <= NETWORK_MAP_1S; i++ {
@@ -487,7 +523,7 @@ var metricsTableCodes = []Code{
 }
 
 type Tag struct {
-	*Field
+	Field
 	Code
 	id string
 }
@@ -582,10 +618,14 @@ func (t *Tag) MarshalTo(b []byte) int {
 	}
 
 	if t.Code&Direction != 0 {
-		if t.Direction.IsClientToServer() {
-			offset += copy(b[offset:], ",direction=c2s")
-		} else if t.Direction.IsServerToClient() {
-			offset += copy(b[offset:], ",direction=s2c")
+		if t.Role == ROLE_CLIENT {
+			offset += copy(b[offset:], ",role=c2s")
+		} else if t.Role == ROLE_SERVER {
+			offset += copy(b[offset:], ",role=s2c")
+		} else if t.Role == ROLE_LOCAL {
+			offset += copy(b[offset:], ",role=local")
+		} else {
+			offset += copy(b[offset:], ",role=rest")
 		}
 	}
 	if t.Code&GPID != 0 {
@@ -609,7 +649,7 @@ func (t *Tag) MarshalTo(b []byte) int {
 		offset += copy(b[offset:], strconv.FormatUint(uint64(t.HostID1), 10))
 	}
 	if t.Code&IP != 0 {
-		if t.IsIPv6 != 0 {
+		if t.IsIPv4 == 0 {
 			offset += copy(b[offset:], ",ip=")
 			offset += copy(b[offset:], t.IP6.String())
 			offset += copy(b[offset:], ",ip_version=6")
@@ -620,7 +660,7 @@ func (t *Tag) MarshalTo(b []byte) int {
 		}
 	}
 	if t.Code&IPPath != 0 {
-		if t.IsIPv6 != 0 {
+		if t.IsIPv4 == 0 {
 			offset += copy(b[offset:], ",ip_0=")
 			offset += copy(b[offset:], t.IP6.String())
 			offset += copy(b[offset:], ",ip_1=")
@@ -890,7 +930,6 @@ func (t *Tag) TableID(isSecond bool) (uint8, error) {
 	return 0, fmt.Errorf("not match table, tag code is 0x%x is second %v", t.Code, isSecond)
 }
 
-// 顺序需要和WriteBlock中一致, 目前time排第一位，其他按字段名字典排序
 func GenTagColumns(code Code) []*ckdb.Column {
 	columns := []*ckdb.Column{}
 	columns = append(columns, ckdb.NewColumnWithGroupBy("time", ckdb.DateTime))
@@ -907,7 +946,7 @@ func GenTagColumns(code Code) []*ckdb.Column {
 	}
 
 	if code&Direction != 0 {
-		columns = append(columns, ckdb.NewColumnWithGroupBy("role", ckdb.UInt8).SetComment("统计量对应的流方向. 0: ip为客户端, 1: ip为服务端"))
+		columns = append(columns, ckdb.NewColumnWithGroupBy("role", ckdb.UInt8).SetComment("统计量对应的流方向. 0: ip为客户端, 1: ip为服务端, 2: ip为本地，3: 其他"))
 	}
 
 	if code&GPID != 0 {
@@ -966,7 +1005,7 @@ func GenTagColumns(code Code) []*ckdb.Column {
 	if code&L7Protocol != 0 {
 		columns = append(columns, ckdb.NewColumnWithGroupBy("l7_protocol", ckdb.UInt8).SetComment("应用协议0: unknown, 1: http, 2: dns, 3: mysql, 4: redis, 5: dubbo, 6: kafka"))
 		columns = append(columns, ckdb.NewColumnWithGroupBy("app_service", ckdb.LowCardinalityString))
-		columns = append(columns, ckdb.NewColumnWithGroupBy("app_instance", ckdb.String))
+		columns = append(columns, ckdb.NewColumnWithGroupBy("app_instance", ckdb.LowCardinalityString))
 		columns = append(columns, ckdb.NewColumnWithGroupBy("endpoint", ckdb.String))
 		columns = append(columns, ckdb.NewColumnWithGroupBy("biz_type", ckdb.UInt8).SetComment("Business Type"))
 	}
@@ -1101,203 +1140,6 @@ func GenTagColumns(code Code) []*ckdb.Column {
 	return columns
 }
 
-// 顺序需要和GenTagColumns的一致
-func (t *Tag) WriteBlock(block *ckdb.Block, time uint32) {
-	code := t.Code
-
-	block.WriteDateTime(time)
-	block.Write(t.GlobalThreadID)
-
-	if code&ACLGID != 0 {
-		block.Write(t.ACLGID)
-	}
-	if code&AZID != 0 {
-		block.Write(t.AZID)
-	}
-
-	if code&AZIDPath != 0 {
-		block.Write(t.AZID, t.AZID1)
-	}
-
-	if code&Direction != 0 {
-		if t.Direction.IsClientToServer() {
-			// 0: client, 1: server
-			block.Write(uint8(0))
-		} else {
-			block.Write(uint8(1))
-		}
-	}
-
-	if code&GPID != 0 {
-		block.Write(t.GPID)
-	}
-	if code&GPIDPath != 0 {
-		block.Write(t.GPID, t.GPID1)
-	}
-	if code&HostID != 0 {
-		block.Write(t.HostID)
-	}
-	if code&HostIDPath != 0 {
-		block.Write(t.HostID, t.HostID1)
-	}
-	if code&IP != 0 {
-		block.WriteIPv4(t.IP)
-		block.WriteIPv6(t.IP6)
-		block.Write(1 - t.IsIPv6)
-		block.Write(t.TagSource)
-	}
-	if code&IPPath != 0 {
-		block.WriteIPv4(t.IP)
-		block.WriteIPv4(t.IP1)
-		block.WriteIPv6(t.IP6)
-		block.WriteIPv6(t.IP61)
-		block.Write(1 - t.IsIPv6)
-		block.Write(t.TagSource)
-		block.Write(t.TagSource1)
-	}
-
-	if code&IsKeyService != 0 {
-		block.Write(t.IsKeyService)
-	}
-
-	if code&L3Device != 0 {
-		block.Write(t.L3DeviceID, uint8(t.L3DeviceType))
-	}
-	if code&L3DevicePath != 0 {
-		block.Write(t.L3DeviceID, t.L3DeviceID1, uint8(t.L3DeviceType), uint8(t.L3DeviceType1))
-	}
-
-	if code&L3EpcID != 0 {
-		block.Write(t.L3EpcID)
-	}
-	if code&L3EpcIDPath != 0 {
-		block.Write(t.L3EpcID, t.L3EpcID1)
-	}
-
-	if code&L7Protocol != 0 {
-		block.Write(uint8(t.L7Protocol))
-		block.Write(t.AppService)
-		block.Write(t.AppInstance)
-		block.Write(t.Endpoint)
-		block.Write(t.BizType)
-	}
-
-	if code&MAC != 0 {
-		// 不存
-		// block.Write(t.MAC)
-	}
-	if code&MACPath != 0 {
-		// 不存
-		// block.Writes(t.MAC, t.MAC1)
-	}
-
-	if code&PodClusterID != 0 {
-		block.Write(t.PodClusterID)
-	}
-
-	if code&PodClusterIDPath != 0 {
-		block.Write(t.PodClusterID, t.PodClusterID1)
-	}
-
-	if code&PodGroupID != 0 {
-		block.Write(t.PodGroupID)
-	}
-
-	if code&PodGroupIDPath != 0 {
-		block.Write(t.PodGroupID, t.PodGroupID1)
-	}
-
-	if code&PodID != 0 {
-		block.Write(t.PodID)
-	}
-
-	if code&PodIDPath != 0 {
-		block.Write(t.PodID, t.PodID1)
-	}
-
-	if code&PodNodeID != 0 {
-		block.Write(t.PodNodeID)
-	}
-
-	if code&PodNodeIDPath != 0 {
-		block.Write(t.PodNodeID, t.PodNodeID1)
-	}
-
-	if code&PodNSID != 0 {
-		block.Write(t.PodNSID)
-	}
-	if code&PodNSIDPath != 0 {
-		block.Write(t.PodNSID, t.PodNSID1)
-	}
-	if code&Protocol != 0 {
-		block.Write(uint8(t.Protocol))
-	}
-
-	if code&RegionID != 0 {
-		block.Write(t.RegionID)
-	}
-	if code&RegionIDPath != 0 {
-		block.Write(t.RegionID, t.RegionID1)
-	}
-
-	if code&Resource != 0 || code&ResourcePath != 0 {
-		block.Write(
-			t.AutoInstanceID,
-			t.AutoInstanceType,
-			t.AutoServiceID,
-			t.AutoServiceType,
-		)
-	}
-
-	if code&ResourcePath != 0 {
-		block.Write(
-			t.AutoInstanceID1,
-			t.AutoInstanceType1,
-			t.AutoServiceID1,
-			t.AutoServiceType1,
-		)
-	}
-
-	if code&SignalSource != 0 {
-		block.Write(t.SignalSource)
-	}
-
-	if code&ServiceID != 0 {
-		block.Write(t.ServiceID)
-	}
-	if code&ServiceIDPath != 0 {
-		block.Write(t.ServiceID, t.ServiceID1)
-	}
-
-	if code&ServerPort != 0 {
-		block.Write(t.ServerPort)
-	}
-
-	if code&SubnetID != 0 {
-		block.Write(t.SubnetID)
-	}
-	if code&SubnetIDPath != 0 {
-		block.Write(t.SubnetID, t.SubnetID1)
-	}
-	if code&TunnelIPID != 0 {
-		block.Write(t.TunnelIPID)
-	}
-	if code&TAPPort != 0 {
-		tapPort, tapPortType, natSource, tunnelType := t.TAPPort.SplitToPortTypeTunnel()
-		block.Write(tapPortType, uint8(tunnelType), tapPort, uint8(natSource))
-	}
-	if code&TAPSide != 0 {
-		block.Write(t.TAPSide.String())
-	}
-	if code&TAPType != 0 {
-		block.Write(uint8(t.TAPType))
-	}
-	if code&VTAPID != 0 {
-		block.Write(t.VTAPID)
-		block.Write(t.TeamID)
-	}
-}
-
 const TAP_PORT_STR_LEN = 8
 
 func putTAPPort(bs []byte, tapPort uint64) int {
@@ -1333,8 +1175,9 @@ func (t *Tag) String() string {
 
 func (t *Tag) ReadFromPB(p *pb.MiniTag) {
 	t.Code = Code(p.Code)
-	t.IsIPv6 = uint8(p.Field.IsIpv6)
-	if t.IsIPv6 != 0 {
+	t.GlobalThreadID = uint8(p.Field.GlobalThreadId)
+	t.IsIPv4 = 1 - uint8(p.Field.IsIpv6)
+	if t.IsIPv4 == 0 {
 		if t.IP6 == nil {
 			t.IP6 = make([]byte, 16)
 		}
@@ -1356,13 +1199,16 @@ func (t *Tag) ReadFromPB(p *pb.MiniTag) {
 	// The range of EPC ID is [-2,65533], if EPC ID < -2 needs to be transformed into the range.
 	t.L3EpcID = MarshalInt32WithSpecialID(p.Field.L3EpcId)
 	t.L3EpcID1 = MarshalInt32WithSpecialID(p.Field.L3EpcId1)
-	t.Direction = DirectionEnum(p.Field.Direction)
+	direction := DirectionEnum(p.Field.Direction)
+	t.Role = direction.ToRole()
 	t.TAPSide = TAPSideEnum(p.Field.TapSide)
+	t.TAPSideStr = TAPSideEnum(p.Field.TapSide).String()
 	t.Protocol = layers.IPProtocol(p.Field.Protocol)
 	t.ACLGID = uint16(p.Field.AclGid)
 	t.ServerPort = uint16(p.Field.ServerPort)
 	t.VTAPID = uint16(p.Field.VtapId)
 	t.TAPPort = datatype.TapPort(p.Field.TapPort)
+	t.TapPort, t.TapPortType, t.NatSource, t.TunnelType = t.TAPPort.SplitToPortTypeTunnel()
 	t.TAPType = TAPTypeEnum(p.Field.TapType)
 	t.L7Protocol = datatype.L7Protocol(p.Field.L7Protocol)
 	t.AppService = p.Field.AppService
@@ -1381,7 +1227,7 @@ func (t *Tag) ReadFromPB(p *pb.MiniTag) {
 	t.GPID1 = p.Field.Gpid1
 
 	if p.Field.PodId != 0 {
-		if t.Code&IPPath != 0 && t.Direction.IsServerToClient() {
+		if t.Code&IPPath != 0 && t.Role == ROLE_SERVER {
 			t.PodID1 = p.Field.PodId
 		} else {
 			t.PodID = p.Field.PodId
@@ -1452,12 +1298,12 @@ func (t *Tag) DatabaseSuffix() string {
 	return DatabaseSuffix[t.DatabaseSuffixID()]
 }
 
-var fieldPool = pool.NewLockFreePool(func() interface{} {
+var fieldPool = pool.NewLockFreePool(func() *Field {
 	return &Field{}
 })
 
 func AcquireField() *Field {
-	return fieldPool.Get().(*Field)
+	return fieldPool.Get()
 }
 
 func ReleaseField(field *Field) {
@@ -1482,21 +1328,18 @@ func CloneField(field *Field) *Field {
 	return newField
 }
 
-var tagPool = pool.NewLockFreePool(func() interface{} {
+var tagPool = pool.NewLockFreePool(func() *Tag {
 	return &Tag{}
 })
 
 func AcquireTag() *Tag {
-	return tagPool.Get().(*Tag)
+	return tagPool.Get()
 }
 
 // ReleaseTag 需要释放Tag拥有的Field
 func ReleaseTag(tag *Tag) {
 	if tag == nil {
 		return
-	}
-	if tag.Field != nil {
-		ReleaseField(tag.Field)
 	}
 	*tag = Tag{}
 	tagPool.Put(tag)
@@ -1505,7 +1348,7 @@ func ReleaseTag(tag *Tag) {
 // CloneTag 需要复制Tag拥有的Field
 func CloneTag(tag *Tag) *Tag {
 	newTag := AcquireTag()
-	newTag.Field = CloneField(tag.Field)
+	newTag.Field = tag.Field
 	newTag.Code = tag.Code
 	newTag.id = tag.id
 	return newTag
@@ -1521,7 +1364,7 @@ func (t *Tag) Release() {
 
 func (f *Field) NewTag(c Code) *Tag {
 	tag := AcquireTag()
-	tag.Field = CloneField(f)
+	tag.Field = *f
 	tag.Code = c
 	tag.id = ""
 	return tag

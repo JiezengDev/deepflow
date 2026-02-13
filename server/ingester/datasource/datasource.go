@@ -19,55 +19,66 @@ package datasource
 import (
 	"context"
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/deepflowio/deepflow/server/ingester/common"
 	"github.com/deepflowio/deepflow/server/ingester/config"
 	"github.com/deepflowio/deepflow/server/libs/ckdb"
+	"github.com/deepflowio/deepflow/server/libs/utils"
 	"github.com/gorilla/mux"
 	logging "github.com/op/go-logging"
 )
 
-var log = logging.MustGetLogger("datasource")
+var log = logging.MustGetLogger("data_source")
 
 const (
-	DATASOURCE_PORT      = 20106
 	MAX_DATASOURCE_COUNT = 64
 )
 
 type DatasourceManager struct {
-	ckAddrs          []string // 需要修改数据源的clickhouse地址, 支持多个
+	ckAddrs          *[]string // 需要修改数据源的clickhouse地址, 支持多个
+	currentCkAddrs   []string
 	user             string
 	password         string
 	readTimeout      int
 	replicaEnabled   bool
 	ckdbColdStorages map[string]*ckdb.ColdStorage
-	isModifyingFlags []bool
+	isModifyingFlags [ckdb.MAX_ORG_ID + 1][MAX_DATASOURCE_COUNT]bool
+	cks              common.DBs
 
 	ckdbCluster       string
 	ckdbStoragePolicy string
+	ckdbType          string
 
 	server *http.Server
 }
 
 func NewDatasourceManager(cfg *config.Config, readTimeout int) *DatasourceManager {
-	return &DatasourceManager{
+	m := &DatasourceManager{
 		ckAddrs:           cfg.CKDB.ActualAddrs,
+		currentCkAddrs:    utils.CloneStringSlice(*cfg.CKDB.ActualAddrs),
 		user:              cfg.CKDBAuth.Username,
 		password:          cfg.CKDBAuth.Password,
 		readTimeout:       readTimeout,
 		ckdbCluster:       cfg.CKDB.ClusterName,
 		ckdbStoragePolicy: cfg.CKDB.StoragePolicy,
+		ckdbType:          cfg.CKDB.Type,
 		ckdbColdStorages:  cfg.GetCKDBColdStorages(),
-		isModifyingFlags:  make([]bool, MAX_DATASOURCE_COUNT),
 		server: &http.Server{
-			Addr:    ":" + strconv.Itoa(DATASOURCE_PORT),
+			Addr:    ":" + strconv.Itoa(int(cfg.DatasourceListenPort)),
 			Handler: mux.NewRouter(),
 		},
 	}
+	cks, err := common.NewCKConnections(m.currentCkAddrs, m.user, m.password)
+	if err != nil {
+		log.Fatalf("create clickhouse connections failed: %s", err)
+	}
+	m.cks = cks
+	return m
 }
 
 type JsonResp struct {
@@ -126,7 +137,7 @@ type DelBody struct {
 }
 
 func (m *DatasourceManager) rpAdd(w http.ResponseWriter, r *http.Request) {
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Errorf("read body err, %v", err)
 		respFailed(w, err.Error())
@@ -149,7 +160,7 @@ func (m *DatasourceManager) rpAdd(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *DatasourceManager) rpMod(w http.ResponseWriter, r *http.Request) {
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Errorf("read body err, %v", err)
 		respFailed(w, err.Error())
@@ -177,7 +188,7 @@ func (m *DatasourceManager) rpMod(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *DatasourceManager) rpDel(w http.ResponseWriter, r *http.Request) {
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Errorf("read body err, %v", err)
 		respFailed(w, err.Error())
@@ -214,20 +225,21 @@ func (m *DatasourceManager) Start() {
 			log.Fatalf("ListenAndServe() failed: %v", err)
 		}
 	}()
-	log.Info("datasource manager started")
+	log.Info("data_source manager started")
 }
 
 func (m *DatasourceManager) Close() error {
 	if m.server == nil {
 		return nil
 	}
+	m.cks.Close()
 	ctx, cancel := context.WithTimeout(context.TODO(), 5*time.Second)
 
 	err := m.server.Shutdown(ctx)
 	if err != nil {
 		log.Warningf("shutdown failed: %v", err)
 	} else {
-		log.Info("datasource manager stopped")
+		log.Info("data_source manager stopped")
 	}
 	cancel()
 

@@ -23,9 +23,10 @@ import (
 
 	"github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/config"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql/migrator"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb/migrator"
 	"github.com/deepflowio/deepflow/server/controller/election"
 	"github.com/deepflowio/deepflow/server/controller/http"
+	"github.com/deepflowio/deepflow/server/controller/http/service"
 	resoureservice "github.com/deepflowio/deepflow/server/controller/http/service/resource"
 	"github.com/deepflowio/deepflow/server/controller/monitor"
 	"github.com/deepflowio/deepflow/server/controller/monitor/license"
@@ -33,7 +34,6 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/prometheus"
 	"github.com/deepflowio/deepflow/server/controller/recorder"
 	"github.com/deepflowio/deepflow/server/controller/tagrecorder"
-	tagrecordercheck "github.com/deepflowio/deepflow/server/controller/tagrecorder/check"
 )
 
 func IsMasterRegion(cfg *config.ControllerConfig) bool {
@@ -63,10 +63,10 @@ func IsMasterController(cfg *config.ControllerConfig) bool {
 }
 
 // migrate db by master region master controller
-func migrateMySQL(cfg *config.ControllerConfig) {
-	err := migrator.Migrate(cfg.MySqlCfg)
+func migrateMetadb(cfg *config.ControllerConfig) {
+	err := migrator.Migrate(cfg.MetadbCfg)
 	if err != nil {
-		log.Errorf("migrate mysql failed: %s", err.Error())
+		log.Errorf("migrate metadb failed: %s", err.Error())
 		time.Sleep(time.Second)
 		os.Exit(0)
 	}
@@ -100,11 +100,12 @@ func checkAndStartMasterFunctions(
 	domainChecker := resoureservice.NewDomainCheck(ctx)
 	prometheus := prometheus.GetSingleton()
 	tagRecorder := tagrecorder.GetSingleton()
+	deletedORGChecker := service.GetDeletedORGChecker(ctx, cfg.FPermit)
 
 	httpService := http.GetSingleton()
 
-	tagrecordercheck.GetSingleton().Init(ctx, *cfg)
-	tr := tagrecordercheck.GetSingleton()
+	var sCtx context.Context
+	var sCancel context.CancelFunc
 
 	masterController := ""
 	thisIsMasterController := false
@@ -118,10 +119,12 @@ func checkAndStartMasterFunctions(
 				thisIsMasterController = true
 				log.Infof("I am the master controller now, previous master controller is %s", masterController)
 
-				migrateMySQL(cfg)
+				sCtx, sCancel = context.WithCancel(ctx)
+
+				migrateMetadb(cfg)
 
 				// 启动资源ID管理器
-				err := recorderResource.IDManagers.Start()
+				err := recorderResource.IDManagers.Start(sCtx)
 				if err != nil {
 					log.Errorf("resource id manager start failed: %s", err.Error())
 					time.Sleep(time.Second)
@@ -129,73 +132,59 @@ func checkAndStartMasterFunctions(
 				}
 
 				// 启动tagrecorder
-				tagRecorder.UpdaterManager.Start()
-				tr.Check()
-				// tagRecorder.SubscriberManager.HealthCheck()
+				tagRecorder.UpdaterManager.Start(sCtx)
 
 				// 控制器检查
-				controllerCheck.Start()
+				controllerCheck.Start(sCtx)
 
 				// 数据节点检查
-				analyzerCheck.Start()
+				analyzerCheck.Start(sCtx)
 
 				// vtap check
-				vtapCheck.Start()
+				vtapCheck.Start(sCtx)
 
 				// rebalance vtap check
-				vtapRebalanceCheck.Start()
+				vtapRebalanceCheck.Start(sCtx)
 
 				// license分配和检查
 				if cfg.BillingMethod == common.BILLING_METHOD_LICENSE {
-					vtapLicenseAllocation.Start()
+					vtapLicenseAllocation.Start(sCtx)
 				}
 
 				// 资源数据清理
-				recorderResource.Cleaners.Start()
+				recorderResource.Cleaners.Start(sCtx)
 
 				// domain检查及自愈
-				domainChecker.Start()
+				domainChecker.Start(sCtx)
 
-				prometheus.Encoder.Start()
-				prometheus.APPLabelLayoutUpdater.Start()
-				prometheus.Clear.Start()
+				prometheus.Encoders.Start(sCtx)
+				// prometheus.APPLabelLayoutUpdater.Start()
+				prometheus.Clear.Start(sCtx)
 
 				if cfg.DFWebService.Enabled {
-					httpService.TaskManager.Start(ctx, cfg.FPermit, cfg.RedisCfg)
+					httpService.TaskManager.Start(sCtx, cfg.FPermit, cfg.RedisCfg)
+					deletedORGChecker.Start(sCtx)
 				}
 			} else if thisIsMasterController {
 				thisIsMasterController = false
 				log.Infof("I am not the master controller anymore, new master controller is %s", newMasterController)
 
 				// stop tagrecorder
-				tagRecorder.UpdaterManager.Stop()
-				tr.Stop()
-
 				// stop controller check
-				controllerCheck.Stop()
-
 				// stop analyzer check
-				analyzerCheck.Stop()
-
 				// stop vtap check
-				vtapCheck.Stop()
-
 				// stop vtap license allocation and check
-				vtapLicenseAllocation.Stop()
-
-				recorderResource.Cleaners.Stop()
-
-				domainChecker.Stop()
+				// stop domain checker
+				// stop prometheus related
+				// stop http task mananger
+				// stop resource cleaner
+				// stop delete org checker
+				if sCancel != nil {
+					sCancel()
+				}
 
 				recorderResource.IDManagers.Stop()
-
-				prometheus.Encoder.Stop()
-				prometheus.APPLabelLayoutUpdater.Stop()
-				prometheus.Clear.Stop()
-
-				if cfg.DFWebService.Enabled {
-					httpService.TaskManager.Stop()
-				}
+				prometheus.Encoders.Stop()
 			} else {
 				log.Infof(
 					"current master controller is %s, previous master controller is %s",
@@ -207,7 +196,10 @@ func checkAndStartMasterFunctions(
 	}
 }
 
-func checkAndStartAllRegionMasterFunctions() {
+func checkAndStartAllRegionMasterFunctions(ctx context.Context) {
+	var sCtx context.Context
+	var sCancel context.CancelFunc
+
 	tr := tagrecorder.GetSingleton()
 	masterController := ""
 	thisIsMasterController := false
@@ -218,9 +210,10 @@ func checkAndStartAllRegionMasterFunctions() {
 		}
 		if masterController != newMasterController {
 			if newThisIsMasterController {
+				sCtx, sCancel = context.WithCancel(ctx)
 				thisIsMasterController = true
 				log.Infof("I am the master controller now, previous master controller is %s", masterController)
-				go tr.Dictionary.Start()
+				go tr.Dictionary.Start(sCtx)
 			} else if thisIsMasterController {
 				thisIsMasterController = false
 				log.Infof("I am not the master controller anymore, new master controller is %s", newMasterController)
@@ -229,6 +222,9 @@ func checkAndStartAllRegionMasterFunctions() {
 					"current master controller is %s, previous master controller is %s",
 					newMasterController, masterController,
 				)
+				if sCancel != nil {
+					sCancel()
+				}
 			}
 		}
 		masterController = newMasterController

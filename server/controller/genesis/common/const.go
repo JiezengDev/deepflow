@@ -16,10 +16,32 @@
 
 package common
 
+var IGNORE_VINTERFACE_NAME = []string{
+	"lo",
+	"kube-ipvs0",
+}
+
+var VALID_SCOPE_NAME = []string{
+	"host",
+	"global",
+}
+
 const (
-	TYPE_UPDATE                  = 1
-	TYPE_RENEW                   = 2
-	TYPE_EXIT                    = 3
+	SYNC_TYPE_FORMAT = "%d-%s-%s" // orgID-type-vtapKey
+)
+
+const (
+	CONFIG_DB_MYSQL = "mysql"
+	CONFIG_DB_REDIS = "redis"
+)
+
+const (
+	TYPE_UPDATE = 1
+	TYPE_RENEW  = 2
+	TYPE_EXIT   = 3
+)
+
+const (
 	DEVICE_TYPE_KVM_HOST         = "kvm-host"
 	DEVICE_TYPE_KVM_VM           = "kvm-vm"
 	DEVICE_TYPE_DOCKER_HOST      = "docker-host"

@@ -26,9 +26,6 @@
 #include <math.h>
 #include "utils.h"
 
-#define NSEC_PER_SEC	1000000000L
-#define USER_HZ		100
-
 static __inline void *get_socket_file_addr_with_check(struct task_struct *task,
 						      int fd_num,
 						      int files_off,
@@ -89,13 +86,14 @@ static __inline void *infer_and_get_socket_from_fd(int fd_num, struct member_fie
 #ifdef LINUX_VER_5_2_PLUS
 	// 0xa48 for 5.10.0-60.18.0.50.h322_1.hce2.aarch64
 	// 0xc60 for 5.10.0-106.18.0.68.oe2209.x86_64
+	// 0x730 for TENCENT64.site 5.4.119-19-0008 aarch64
 	int files_offset_array[] = {
 		0x790, 0xa80, 0xa88, 0xa90, 0xa98, 0xaa0, 0xaa8, 0xab0, 0xab8, 0xac0,
 		0xac8, 0xad0, 0xad8, 0xae0, 0xae8, 0xaf0, 0xaf8, 0xb00, 0xb08, 0xb10,
 		0xb18, 0xb20, 0xb28, 0xb48, 0xb50, 0xb58, 0xb60, 0xb68, 0xb70, 0xb78,
 		0xb80, 0xb88, 0xb90, 0xb98, 0xba0, 0xba8, 0xbb0, 0xbb8, 0xbc0, 0xbc8,
 		0xbd0, 0xbd8, 0xbe0, 0xbe8, 0xbf0, 0xbf8, 0xc00, 0xc08, 0xc10, 0xc18,
-		0xcc8, 0xa48, 0xc60
+		0xcc8, 0xa48, 0xc60, 0x730
 	};
 #elif defined LINUX_VER_3_10_0
 	// 0x758 for 3.10.0-957, 3.10.0-1160 
@@ -110,12 +108,17 @@ static __inline void *infer_and_get_socket_from_fd(int fd_num, struct member_fie
 	// 0xbb0 for 4.19.91-25.6.al7.x86_64
 	// 0x6b8 for 4.19.117.business.1-amd64
 	// 0xb88 for 4.19.0-91.77.112.uelc20.x86_64, 4.19.0-91.82.65.uelc20.x86_64
+	// 0xcd8 for 4.14.105-1-tlinux3-0023.1
+	// 0x7c8 for 4.19.90-25.24.v2101.ky10.aarch64
+	// 0xa98 for 4.14.105-19-0019 tlinux
+	// 0xa90 for 4.15.0 ubuntu 
 	int files_offset_array[] = {
 		0x6c0, 0x790, 0x7b0, 0xa80, 0xa88, 0xaa0, 0xaa8, 0xab0, 0xab8, 0xac0,
 		0xac8, 0xad0, 0xad8, 0xae0, 0xae8, 0xaf0, 0xaf8, 0xb00, 0xb08, 0xb10,
 		0xb18, 0xb20, 0xb48, 0xb50, 0xb58, 0xb60, 0xb68, 0xb70, 0xb78, 0xb90,
 		0xb98, 0xba0, 0xbb0, 0x740, 0xbc0, 0xbc8, 0xbd0, 0xbd8, 0xbe0, 0xbe8,
-		0xbf0, 0xbf8, 0xc00, 0xc08, 0xcc8, 0xd08, 0x6b8, 0xb88
+		0xbf0, 0xbf8, 0xc00, 0xc08, 0xcc8, 0xd08, 0x6b8, 0xb88, 0xcd8, 0x7c8,
+		0xa98, 0xa90
 	};
 #endif
 /* *INDENT-ON* */
@@ -125,14 +128,16 @@ static __inline void *infer_and_get_socket_from_fd(int fd_num, struct member_fie
 		for (i = 0; i < ARRAY_SIZE(files_offset_array); i++) {
 			file =
 			    retry_get_socket_file_addr(task, fd_num,
-						       offset->struct_files_struct_fdt_offset,
+						       offset->
+						       struct_files_struct_fdt_offset,
 						       files_offset_array[i]);
 
 			if (file) {
 				bpf_probe_read_kernel(&private_data,
 						      sizeof(private_data),
 						      file +
-						      offset->struct_files_private_data_offset);
+						      offset->
+						      struct_file_private_data_offset);
 				if (private_data != NULL) {
 					socket = private_data;
 					bpf_probe_read_kernel(&__socket,
@@ -150,7 +155,8 @@ static __inline void *infer_and_get_socket_from_fd(int fd_num, struct member_fie
 	} else {
 		file =
 		    retry_get_socket_file_addr(task, fd_num,
-					       offset->struct_files_struct_fdt_offset,
+					       offset->
+					       struct_files_struct_fdt_offset,
 					       offset->task__files_offset);
 	}
 
@@ -159,7 +165,7 @@ static __inline void *infer_and_get_socket_from_fd(int fd_num, struct member_fie
 	}
 
 	bpf_probe_read_kernel(&private_data, sizeof(private_data),
-			      file + offset->struct_files_private_data_offset);
+			      file + offset->struct_file_private_data_offset);
 
 	if (private_data == NULL) {
 		return NULL;
@@ -192,17 +198,35 @@ static __inline void *get_socket_from_fd(int fd_num,
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	void *file = NULL;
+#ifdef LINUX_VER_KFUNC
+	int files_off, fdt_off;
+	files_off = (int)((uintptr_t)
+			  __builtin_preserve_access_index
+			  (&((struct task_struct *)0)->files));
+	fdt_off = (int)((uintptr_t)
+			__builtin_preserve_access_index
+			(&((struct files_struct *)0)->fdt));
+	file = get_socket_file_addr_with_check(task, fd_num, files_off, fdt_off);
+#else
 	file =
 	    get_socket_file_addr_with_check(task, fd_num,
 					    offset->task__files_offset,
 					    offset->
 					    struct_files_struct_fdt_offset);
+#endif
 	if (file == NULL)
 		return NULL;
 	void *private_data = NULL;
-
+#ifdef LINUX_VER_KFUNC
+	int data_off = (int)((uintptr_t)
+			 __builtin_preserve_access_index(&((struct file *)
+							   0)->private_data));
 	bpf_probe_read_kernel(&private_data, sizeof(private_data),
-			      file + offset->struct_files_private_data_offset);
+			      file + data_off);
+#else
+	bpf_probe_read_kernel(&private_data, sizeof(private_data),
+			      file + offset->struct_file_private_data_offset);
+#endif
 	if (private_data == NULL) {
 		return NULL;
 	}
@@ -238,11 +262,9 @@ static __inline void *fd_to_file(int fd_num,
 	}
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-	void *file =
-	    get_socket_file_addr_with_check(task, fd_num,
-					    offset->task__files_offset,
-					    offset->
-					    struct_files_struct_fdt_offset);
+	void *file = get_socket_file_addr_with_check(task, fd_num,
+						     offset->task__files_offset,
+						     offset->struct_files_struct_fdt_offset);
 	return file;
 }
 

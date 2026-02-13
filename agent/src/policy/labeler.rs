@@ -15,6 +15,7 @@
  */
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::AtomicBool;
 use std::sync::{
     atomic::{AtomicI32, Ordering},
     Arc, RwLock,
@@ -77,6 +78,7 @@ impl EpcNetIpKey {
 }
 
 pub struct Labeler {
+    running_in_single_epc: AtomicBool,
     local_epc: AtomicI32,
     // Interface表
     mac_table: RwLock<AHashMap<u64, Arc<PlatformData>>>,
@@ -97,6 +99,7 @@ pub struct Labeler {
 impl Default for Labeler {
     fn default() -> Self {
         Self {
+            running_in_single_epc: AtomicBool::new(false),
             local_epc: AtomicI32::new(EPC_INTERNET),
             mac_table: RwLock::new(AHashMap::new()),
             epc_ip_table: RwLock::new(AHashMap::new()),
@@ -116,8 +119,10 @@ fn is_unicast_mac(mac: u64) -> bool {
 }
 
 impl Labeler {
-    pub fn update_local_epc(&mut self, local_epc: i32) {
+    pub fn update_local_epc(&mut self, local_epc: i32, running_in_single_epc: bool) {
         self.local_epc.store(local_epc, Ordering::Relaxed);
+        self.running_in_single_epc
+            .store(running_in_single_epc, Ordering::Relaxed);
     }
 
     fn update_mac_table(&mut self, interfaces: &Vec<Arc<PlatformData>>) {
@@ -136,6 +141,7 @@ impl Labeler {
         *self.mac_table.write().unwrap() = mac_table;
     }
 
+    #[inline]
     fn get_real_ip_by_mac(&self, mac: u64, is_ipv6: bool) -> IpAddr {
         if let Some(interface) = self.mac_table.read().unwrap().get(&mac) {
             for ip in &(interface.ips) {
@@ -151,6 +157,7 @@ impl Labeler {
         }
     }
 
+    #[inline]
     fn get_interface_by_mac(&self, mac: u64) -> Option<PlatformData> {
         if let Some(platform) = self.mac_table.read().unwrap().get(&mac) {
             return Some(platform.as_ref().clone());
@@ -184,6 +191,7 @@ impl Labeler {
         *self.epc_ip_table.write().unwrap() = epc_ip_table;
     }
 
+    #[inline]
     fn get_interface_by_epc_ip(&self, ip: IpAddr, epc_id: i32) -> Option<PlatformData> {
         match ip {
             IpAddr::V4(ip) => {
@@ -225,6 +233,7 @@ impl Labeler {
         *self.peer_table.write().unwrap() = peer_table;
     }
 
+    #[inline]
     fn get_epc_by_peer(&self, ip: IpAddr, epc_id: i32, endpoint: &mut EndpointInfo) {
         if let Some(list) = self.peer_table.read().unwrap().get(&epc_id) {
             for peer_epc in list {
@@ -242,6 +251,7 @@ impl Labeler {
         }
     }
 
+    #[inline]
     fn get_cidr_masklen_range(&self, epc_id: i32) -> (usize, usize) {
         if let Some((min, max)) = self.epc_cidr_masklen_table.read().unwrap().get(&epc_id) {
             return (*min as usize, *max as usize);
@@ -249,10 +259,16 @@ impl Labeler {
         return (0, 0);
     }
 
-    pub fn update_cidr_table(&mut self, cidrs: &Vec<Arc<Cidr>>) {
+    pub fn update_cidr_table(
+        &mut self,
+        cidrs: &Vec<Arc<Cidr>>,
+        enabled_invalid_log: bool,
+        has_invalid_log: &mut bool,
+    ) {
         let mut masklen_table: AHashMap<i32, (u8, u8)> = AHashMap::new();
         let mut epc_table: AHashMap<EpcNetIpKey, Arc<Cidr>> = AHashMap::new();
         let mut tunnel_table: AHashMap<u32, Vec<Arc<Cidr>>> = AHashMap::new();
+        let mut invalid_cidr = Vec::new();
 
         for item in cidrs {
             let mut epc_id = item.epc_id;
@@ -262,13 +278,11 @@ impl Labeler {
             let key = EpcNetIpKey::new(&item.ip.network(), item.ip.prefix_len(), epc_id);
 
             if let Some(old) = epc_table.insert(key, item.clone()) {
-                if (item.cidr_type == CidrType::Wan && item.epc_id != old.epc_id)
-                    || item.is_vip != old.is_vip
+                if enabled_invalid_log
+                    && ((item.cidr_type == CidrType::Wan && item.epc_id != old.epc_id)
+                        || item.is_vip != old.is_vip)
                 {
-                    warn!(
-                        "Found the same cidr, please check {:?} and {:?}.",
-                        item, old
-                    );
+                    invalid_cidr.push(item.ip)
                 }
             }
             masklen_table
@@ -289,6 +303,11 @@ impl Labeler {
                     .or_default()
                     .push(Arc::clone(item));
             }
+        }
+
+        if enabled_invalid_log && !invalid_cidr.is_empty() {
+            warn!("Invalid same cidr: {:?}", invalid_cidr);
+            *has_invalid_log = true;
         }
 
         // 排序使用降序是为了CIDR的最长前缀匹配
@@ -313,7 +332,8 @@ impl Labeler {
         *self.container_table.write().unwrap() = table;
     }
 
-    pub fn lookup_pod_id(&self, container_id: &String) -> u32 {
+    #[inline]
+    pub fn lookup_pod_id(&self, container_id: &str) -> u32 {
         if let Some(pod_id) = self.container_table.read().unwrap().get(container_id) {
             return *pod_id;
         }
@@ -341,6 +361,7 @@ impl Labeler {
 
     // 函数通过EPC+IP查询对应的CIDR，获取EPC和VIP标记
     // 注意当查询外网时必须给epc参数传递EPC_DEEPFLOW值，表示在所有WAN CIDR范围内搜索，并返回该CIDR的真实EPC
+    #[inline]
     fn set_epc_vip_by_tunnel(
         &self,
         ip: IpAddr,
@@ -370,6 +391,7 @@ impl Labeler {
         false
     }
 
+    #[inline]
     fn set_vip_by_cidr(&self, ip: IpAddr, epc_id: i32, info: &mut EndpointInfo) -> bool {
         let (min, max) = self.get_cidr_masklen_range(epc_id);
         let cidr_key = EpcNetIpKey::new(&ip, max as u8, epc_id);
@@ -473,6 +495,7 @@ impl Labeler {
         self.update_ip_table(interfaces);
     }
 
+    #[inline]
     fn get_endpoint_info(
         &self,
         mac: u64,
@@ -531,6 +554,14 @@ impl Labeler {
                 is_wan = interface.if_type == IfType::WAN;
                 return (info, is_wan);
             }
+        } else if l2_end && self.running_in_single_epc.load(Ordering::Relaxed) {
+            info.l2_epc_id = self.local_epc.load(Ordering::Relaxed);
+            info.is_local_mac = true;
+            if l3_end || ip.is_unspecified() || ip.is_loopback() {
+                info.l3_epc_id = info.l2_epc_id;
+                info.is_local_ip = true;
+                return (info, is_wan);
+            }
         }
 
         // step 2: 使用L2EpcId + IP查询L3，如果L2EpcId为0，会查询到DEEPFLOW添加的监控IP
@@ -541,6 +572,7 @@ impl Labeler {
         return (info, is_wan);
     }
 
+    #[inline]
     fn modify_endpoint_data(&self, endpoint: &mut EndpointData, key: &LookupKey) {
         let mut src_data = &mut endpoint.src_info;
         let mut dst_data = &mut endpoint.dst_info;
@@ -580,6 +612,7 @@ impl Labeler {
         }
     }
 
+    #[inline]
     fn get_l3_by_peer(&self, src: IpAddr, dst: IpAddr, endpoint: &mut EndpointData) {
         let src_data = &mut endpoint.src_info;
         let dst_data = &mut endpoint.dst_info;
@@ -590,6 +623,7 @@ impl Labeler {
         }
     }
 
+    #[inline]
     fn get_l3_by_wan(&self, src: IpAddr, dst: IpAddr, endpoint: &mut EndpointData) -> (bool, bool) {
         let src_data = &mut endpoint.src_info;
         let dst_data = &mut endpoint.dst_info;
@@ -620,6 +654,7 @@ impl Labeler {
         return (found_src, fount_dst);
     }
 
+    #[inline]
     fn get_vip(
         &self,
         key: &LookupKey,
@@ -655,16 +690,43 @@ impl Labeler {
         }
     }
 
-    fn is_intranet_address(ip: &IpAddr) -> bool {
+    #[inline]
+    fn is_multicast(ip: &IpAddr) -> bool {
         match ip {
-            IpAddr::V4(a) => a.is_link_local() || a.is_private(),
-            IpAddr::V6(a) => is_unicast_link_local(a),
+            IpAddr::V4(a) => a.is_broadcast() || a.is_multicast(),
+            IpAddr::V6(a) => a.is_multicast(),
         }
     }
 
+    #[inline]
+    fn is_private(ip: &Ipv4Addr) -> bool {
+        match ip.octets() {
+            // The Shared Address Space address range is 100.64.0.0/10.
+            // Defined in https://www.rfc-editor.org/rfc/rfc6598.html
+            [100, b, ..] if b >= 64 && b <= 127 => true,
+            _ => ip.is_private(),
+        }
+    }
+
+    #[inline]
+    fn is_intranet_address(ip: &IpAddr) -> bool {
+        let is_multicast = Self::is_multicast(ip);
+        match ip {
+            IpAddr::V4(a) => a.is_link_local() || Self::is_private(a) || is_multicast,
+            IpAddr::V6(a) => is_unicast_link_local(a) || is_multicast,
+        }
+    }
+
+    #[inline]
     fn modify_internet_epc(&self, ip_src: &IpAddr, ip_dst: &IpAddr, endpoint: &mut EndpointData) {
         let src_data = &mut endpoint.src_info;
         let dst_data = &mut endpoint.dst_info;
+
+        if src_data.l3_epc_id == 0 && dst_data.l3_epc_id > 0 && Self::is_multicast(ip_src) {
+            src_data.l3_epc_id = dst_data.l3_epc_id;
+        } else if src_data.l3_epc_id > 0 && dst_data.l3_epc_id == 0 && Self::is_multicast(ip_dst) {
+            dst_data.l3_epc_id = src_data.l3_epc_id;
+        }
 
         if src_data.l3_epc_id == 0 && !Self::is_intranet_address(ip_src) {
             src_data.l3_epc_id = EPC_INTERNET;
@@ -674,6 +736,7 @@ impl Labeler {
         }
     }
 
+    #[inline]
     pub fn get_endpoint_data(&self, key: &LookupKey) -> EndpointData {
         let is_loopback = key.src_mac == key.dst_mac;
         // l2: mac查询
@@ -722,25 +785,29 @@ impl Labeler {
         return endpoint;
     }
 
+    #[inline]
     pub fn get_endpoint_data_by_epc(
         &self,
         src: IpAddr,
         dst: IpAddr,
         l3_epc_id_src: i32,
         l3_epc_id_dst: i32,
+        l2_end_0: bool,
     ) -> EndpointData {
+        // One end of the ebpf data l2end and l3end must be true, so only one parameter is needed here
+        // l2_end_0.
         let src_info = EndpointInfo {
             is_device: l3_epc_id_src > 0,
             l3_epc_id: l3_epc_id_src,
-            l2_end: l3_epc_id_src > 0,
-            l3_end: l3_epc_id_src > 0,
+            l2_end: l2_end_0,
+            l3_end: l2_end_0,
             ..Default::default()
         };
         let dst_info = EndpointInfo {
             is_device: l3_epc_id_dst > 0,
             l3_epc_id: l3_epc_id_dst,
-            l2_end: l3_epc_id_dst > 0,
-            l3_end: l3_epc_id_dst > 0,
+            l2_end: !l2_end_0,
+            l3_end: !l2_end_0,
             ..Default::default()
         };
         let mut endpoint = EndpointData::new(src_info, dst_info);
@@ -1037,7 +1104,7 @@ mod tests {
         let cidrs = vec![Arc::new(cidr1), Arc::new(cidr2), Arc::new(cidr3)];
         let mut endpoint: EndpointInfo = Default::default();
 
-        labeler.update_cidr_table(&cidrs);
+        labeler.update_cidr_table(&cidrs, false, &mut false);
 
         labeler.set_epc_by_cidr("192.168.10.100".parse().unwrap(), 10, &mut endpoint);
         assert_eq!(endpoint.is_vip, true);
@@ -1059,7 +1126,7 @@ mod tests {
             ..Default::default()
         };
         let cidrs = vec![Arc::new(cidr1), Arc::new(cidr2)];
-        labeler.update_cidr_table(&cidrs);
+        labeler.update_cidr_table(&cidrs, false, &mut false);
 
         let mut endpoint: EndpointInfo = Default::default();
         labeler.set_epc_by_cidr("10.1.2.3".parse().unwrap(), 10, &mut endpoint);
@@ -1078,7 +1145,7 @@ mod tests {
 
         let mut endpoint: EndpointInfo = Default::default();
 
-        labeler.update_cidr_table(&vec![Arc::new(cidr1)]);
+        labeler.update_cidr_table(&vec![Arc::new(cidr1)], false, &mut false);
         labeler.set_epc_by_cidr("192.168.10.100".parse().unwrap(), 10, &mut endpoint);
         assert_eq!(endpoint.l3_epc_id, 0);
 
@@ -1102,7 +1169,7 @@ mod tests {
 
         let mut endpoint: EndpointInfo = Default::default();
 
-        labeler.update_cidr_table(&vec![Arc::new(cidr1)]);
+        labeler.update_cidr_table(&vec![Arc::new(cidr1)], false, &mut false);
 
         labeler.set_epc_vip_by_tunnel("192.168.10.100".parse().unwrap(), 10, &mut endpoint);
         assert_eq!(endpoint.l3_epc_id, 10);
@@ -1120,7 +1187,7 @@ mod tests {
 
         let mut endpoint: EndpointInfo = Default::default();
 
-        labeler.update_cidr_table(&vec![Arc::new(cidr1)]);
+        labeler.update_cidr_table(&vec![Arc::new(cidr1)], false, &mut false);
 
         labeler.set_vip_by_cidr("192.168.10.100".parse().unwrap(), 10, &mut endpoint);
         assert_eq!(endpoint.is_vip, true);
@@ -1162,7 +1229,7 @@ mod tests {
 
         labeler.update_mac_table(&list);
         labeler.update_epc_ip_table(&list);
-        labeler.update_cidr_table(&vec![Arc::new(cidr1)]);
+        labeler.update_cidr_table(&vec![Arc::new(cidr1)], false, &mut false);
 
         let key: LookupKey = LookupKey {
             src_mac: MacAddr::from_str("11:22:33:44:55:66").unwrap(),
@@ -1202,7 +1269,7 @@ mod tests {
             ..Default::default()
         };
         labeler.update_mac_table(&vec![Arc::new(interface)]);
-        labeler.update_cidr_table(&vec![Arc::new(cidr)]);
+        labeler.update_cidr_table(&vec![Arc::new(cidr)], false, &mut false);
         let mut endpoints: EndpointData = Default::default();
         endpoints.src_info.l3_epc_id = 1;
 
@@ -1228,6 +1295,24 @@ mod tests {
         labeler.modify_internet_epc(&ip, &ip, &mut endpoints);
         assert_eq!(endpoints.dst_info.l3_epc_id, 0);
         assert_eq!(endpoints.src_info.l3_epc_id, 0);
+
+        endpoints.src_info.l3_epc_id = 10;
+        endpoints.dst_info.l3_epc_id = 0;
+        let multicast_ip = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 10));
+        labeler.modify_internet_epc(&ip, &multicast_ip, &mut endpoints);
+        assert_eq!(endpoints.dst_info.l3_epc_id, 10);
+
+        endpoints.src_info.l3_epc_id = 10;
+        endpoints.dst_info.l3_epc_id = 0;
+        let multicast_ip = IpAddr::V4(Ipv4Addr::new(123, 0, 0, 10));
+        labeler.modify_internet_epc(&ip, &multicast_ip, &mut endpoints);
+        assert_eq!(endpoints.dst_info.l3_epc_id, -2);
+
+        endpoints.src_info.l3_epc_id = 0;
+        endpoints.dst_info.l3_epc_id = 0;
+        let multicast_ip = IpAddr::V6(Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 1));
+        labeler.modify_internet_epc(&multicast_ip, &ip, &mut endpoints);
+        assert_eq!(endpoints.src_info.l3_epc_id, 0);
     }
 
     #[test]
@@ -1239,7 +1324,7 @@ mod tests {
             is_vip: true,
             ..Default::default()
         };
-        labeler.update_cidr_table(&vec![Arc::new(cidr)]);
+        labeler.update_cidr_table(&vec![Arc::new(cidr)], false, &mut false);
 
         let mut endpoints: EndpointData = Default::default();
         endpoints.dst_info.l3_epc_id = 1;
@@ -1251,5 +1336,36 @@ mod tests {
         };
         labeler.get_vip(&key, false, false, &mut endpoints);
         assert_eq!(endpoints.dst_info.is_vip, true);
+    }
+
+    #[test]
+    fn test_local_epc() {
+        let mut labeler: Labeler = Default::default();
+
+        labeler.update_local_epc(10, true);
+
+        let mut key: LookupKey = LookupKey {
+            src_mac: MacAddr::from_str("11:22:33:44:55:66").unwrap(),
+            src_ip: "192.168.10.100".parse().unwrap(),
+            dst_ip: "172.29.20.200".parse().unwrap(),
+            l2_end_0: true,
+            ..Default::default()
+        };
+        let endpoints = labeler.get_endpoint_data(&key);
+        assert_eq!(endpoints.src_info.l2_end, true);
+        assert_eq!(endpoints.src_info.is_local_mac, true);
+        assert_eq!(endpoints.src_info.l3_end, false);
+        assert_eq!(endpoints.src_info.is_local_ip, false);
+        assert_eq!(endpoints.src_info.l2_epc_id, 10);
+        assert_eq!(endpoints.src_info.l3_epc_id, 0);
+
+        key.l3_end_0 = true;
+        let endpoints = labeler.get_endpoint_data(&key);
+        assert_eq!(endpoints.src_info.l2_end, true);
+        assert_eq!(endpoints.src_info.is_local_mac, true);
+        assert_eq!(endpoints.src_info.l3_end, true);
+        assert_eq!(endpoints.src_info.is_local_ip, true);
+        assert_eq!(endpoints.src_info.l2_epc_id, 10);
+        assert_eq!(endpoints.src_info.l3_epc_id, 10);
     }
 }

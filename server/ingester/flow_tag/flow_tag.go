@@ -17,6 +17,7 @@
 package flow_tag
 
 import (
+	"github.com/deepflowio/deepflow/server/ingester/common"
 	"github.com/deepflowio/deepflow/server/libs/ckdb"
 	"github.com/deepflowio/deepflow/server/libs/pool"
 )
@@ -62,13 +63,36 @@ func (t FieldType) String() string {
 	}
 }
 
+type FieldValueType uint8
+
+const (
+	FieldValueTypeAuto FieldValueType = iota
+	FieldValueTypeString
+	FieldValueTypeFloat
+	FieldValueTypeInt
+)
+
+func (t FieldValueType) String() string {
+	switch t {
+	case FieldValueTypeString:
+		return "string"
+	case FieldValueTypeFloat:
+		return "float"
+	case FieldValueTypeInt:
+		return "int"
+	default:
+		return "invalid"
+	}
+}
+
 // This structure will be used as a map key, and it is hoped to be as compact as possible in terms of memory layout.
 // In addition, in order to distinguish as early as possible when comparing two values, put the highly distinguishable fields at the front.
 type FlowTagInfo struct {
-	Table      string // Represents virtual_table_name in ext_metrics
-	FieldName  string
-	FieldValue string
-	VtapId     uint16
+	Table          string // Represents virtual_table_name in ext_metrics
+	FieldName      string
+	FieldValue     string
+	FieldValueType FieldValueType
+	VtapId         uint16
 
 	// IDs only for prometheus
 	TableId      uint32
@@ -93,24 +117,8 @@ type FlowTag struct {
 	FlowTagInfo
 }
 
-func (t *FlowTag) WriteBlock(block *ckdb.Block) {
-	block.WriteDateTime(t.Timestamp)
-	fieldValueType := "string"
-	if len(t.FieldValue) == 0 && t.FieldType != FieldTag {
-		fieldValueType = "float"
-	}
-	block.Write(
-		t.Table,
-		t.VpcId,
-		t.PodNsId,
-		t.FieldType.String(),
-		t.FieldName,
-		fieldValueType,
-		t.TeamID,
-	)
-	if t.TagType == TagFieldValue {
-		block.Write(t.FieldValue, uint64(1)) // count is 1
-	}
+func (t *FlowTag) NativeTagVersion() uint32 {
+	return 0
 }
 
 func (t *FlowTag) OrgID() uint16 {
@@ -126,7 +134,7 @@ func (t *FlowTag) Columns() []*ckdb.Column {
 		ckdb.NewColumn("pod_ns_id", ckdb.UInt16),
 		ckdb.NewColumn("field_type", ckdb.LowCardinalityString).SetComment("value: tag, metrics"),
 		ckdb.NewColumn("field_name", ckdb.LowCardinalityString),
-		ckdb.NewColumn("field_value_type", ckdb.LowCardinalityString).SetComment("value: string, float"),
+		ckdb.NewColumn("field_value_type", ckdb.LowCardinalityString).SetComment("value: string, float, int"),
 		ckdb.NewColumn("team_id", ckdb.UInt16),
 	)
 	if t.TagType == TagFieldValue {
@@ -137,12 +145,12 @@ func (t *FlowTag) Columns() []*ckdb.Column {
 	return columns
 }
 
-func (t *FlowTag) GenCKTable(cluster, storagePolicy, tableName string, ttl int, partition ckdb.TimeFuncType) *ckdb.Table {
+func (t *FlowTag) GenCKTable(cluster, storagePolicy, tableName, ckdbType string, ttl int, partition ckdb.TimeFuncType) *ckdb.Table {
 	timeKey := "time"
 	engine := ckdb.ReplacingMergeTree
 
 	orderKeys := []string{
-		"table", "vpc_id", "pod_ns_id", "field_type", "field_name", "field_value_type",
+		"table", "field_type", "field_name", "field_value_type",
 	}
 	if t.TagType == TagFieldValue {
 		orderKeys = append(orderKeys, "field_value")
@@ -150,7 +158,9 @@ func (t *FlowTag) GenCKTable(cluster, storagePolicy, tableName string, ttl int, 
 	}
 
 	return &ckdb.Table{
+		Version:         common.CK_VERSION,
 		Database:        FLOW_TAG_DB,
+		DBType:          ckdbType,
 		LocalName:       tableName + ckdb.LOCAL_SUBFFIX,
 		GlobalName:      tableName,
 		Columns:         t.Columns(),
@@ -170,12 +180,12 @@ func (t *FlowTag) Release() {
 	ReleaseFlowTag(t)
 }
 
-var flowTagPool = pool.NewLockFreePool(func() interface{} {
+var flowTagPool = pool.NewLockFreePool(func() *FlowTag {
 	return &FlowTag{}
 })
 
 func AcquireFlowTag(tagType TagType) *FlowTag {
-	f := flowTagPool.Get().(*FlowTag)
+	f := flowTagPool.Get()
 	f.ReferenceCount.Reset()
 	f.TagType = tagType
 	return f

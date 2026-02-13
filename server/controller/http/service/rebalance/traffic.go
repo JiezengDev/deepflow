@@ -26,76 +26,46 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/bitly/go-simplejson"
-	"github.com/op/go-logging"
 
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/grpc/statsd"
 	"github.com/deepflowio/deepflow/server/controller/model"
-	"github.com/deepflowio/deepflow/server/libs/stats"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 	"github.com/deepflowio/deepflow/server/querier/config"
 )
 
-var log = logging.MustGetLogger("service.rebalance")
+var log = logger.MustGetLogger("service.rebalance")
 
-func (r *AnalyzerInfo) RebalanceAnalyzerByTraffic(ifCheckout bool, dataDuration int) (*model.VTapRebalanceResult, error) {
-	if r.dbInfo == nil {
-		r.dbInfo = &DBInfo{}
-		err := r.dbInfo.Get()
-		if err != nil {
-			return nil, err
-		}
-	}
-	info := r.dbInfo
-
-	regionToAZLcuuids := make(map[string][]string)
-	azToRegion := make(map[string]string, len(info.AZs))
-	for _, az := range info.AZs {
-		regionToAZLcuuids[az.Region] = append(regionToAZLcuuids[az.Region], az.Lcuuid)
-		azToRegion[az.Lcuuid] = az.Region
-	}
-	azToVTaps := make(map[string][]*mysql.VTap)
-	for i, vtap := range info.VTaps {
-		azToVTaps[vtap.AZ] = append(azToVTaps[vtap.AZ], &info.VTaps[i])
-	}
-	ipToAnalyzer := make(map[string]*mysql.Analyzer)
-	for i, analyzer := range info.Analyzers {
-		ipToAnalyzer[analyzer.IP] = &info.Analyzers[i]
-	}
-	azToAnalyzers := GetAZToAnalyzers(info.AZAnalyzerConns, regionToAZLcuuids, ipToAnalyzer)
-
-	if r.regionToVTapNameToTraffic == nil {
-		regionToVTapNameToTraffic, err := r.getVTapTraffic(dataDuration, regionToAZLcuuids)
-		if err != nil {
-			return nil, fmt.Errorf("get traffic data failed: %v", err)
-		}
-		b, _ := json.Marshal(regionToVTapNameToTraffic)
-		log.Infof("region to vtap name to traffic: %v", string(b))
-		r.regionToVTapNameToTraffic = regionToVTapNameToTraffic
+func (r *AnalyzerInfo) RebalanceAnalyzerByTraffic(db *metadb.DB, ifCheckout bool, dataDuration int) (*model.VTapRebalanceResult, error) {
+	if err := r.generateRebalanceData(db, dataDuration); err != nil {
+		return nil, err
 	}
 
 	response := &model.VTapRebalanceResult{}
-	for _, az := range info.AZs {
-		azVTaps, ok := azToVTaps[az.Lcuuid]
+	for _, az := range r.dbInfo.AZs {
+		azVTaps, ok := r.AZToVTaps[az.Lcuuid]
 		if !ok {
 			continue
 		}
-		azAnalyzers, ok := azToAnalyzers[az.Lcuuid]
+		azAnalyzers, ok := r.AZToAnalyzers[az.Lcuuid]
 		if !ok {
 			continue
 		}
 		vtapNameToID := make(map[string]int, len(azVTaps))
-		vTapIDToVTap := make(map[int]*mysql.VTap, len(azVTaps))
+		vTapIDToVTap := make(map[int]*metadbmodel.VTap, len(azVTaps))
 		vTapIDToTraffic := make(map[int]int64)
 		for _, vtap := range azVTaps {
 			vtapNameToID[vtap.Name] = vtap.ID
 			vTapIDToTraffic[vtap.ID] = 0
 			vTapIDToVTap[vtap.ID] = vtap
 		}
-		for vtapName, traffic := range r.regionToVTapNameToTraffic[az.Region] {
+		for vtapName, traffic := range r.RegionToVTapNameToTraffic[az.Region] {
 			vtapID, ok := vtapNameToID[vtapName]
 			if !ok {
 				continue
@@ -103,47 +73,264 @@ func (r *AnalyzerInfo) RebalanceAnalyzerByTraffic(ifCheckout bool, dataDuration 
 			vTapIDToTraffic[vtapID] = traffic
 		}
 		if len(vTapIDToTraffic) == 0 {
-			log.Warningf("no vtaps to balance, region(%s)", az.Region)
+			log.Warningf("no vtaps to balance, region(%s)", az.Region, db.LogPrefixORGID, db.LogPrefixName)
 			continue
 		}
 		p := &AZInfo{
 			lcuuid:          az.Lcuuid,
 			vTapIDToTraffic: vTapIDToTraffic,
-			vtaps:           azVTaps,
+			vtapIDToVTap:    vTapIDToVTap,
 			analyzers:       azAnalyzers,
 		}
-		vTapIDToChangeInfo, azVTapRebalanceResult := p.rebalanceAnalyzer(ifCheckout)
+		vTapIDToChangeInfo, azVTapRebalanceResult := p.rebalanceAnalyzer(db, ifCheckout)
 		if azVTapRebalanceResult != nil {
 			response.TotalSwitchVTapNum += azVTapRebalanceResult.TotalSwitchVTapNum
 			response.Details = append(response.Details, azVTapRebalanceResult.Details...)
 		}
-		if azVTapRebalanceResult != nil && azVTapRebalanceResult.TotalSwitchVTapNum != 0 {
+		if !r.reportWeightOnly && azVTapRebalanceResult != nil &&
+			azVTapRebalanceResult.TotalSwitchVTapNum != 0 {
 			for vtapID, changeInfo := range vTapIDToChangeInfo {
-				if changeInfo.OldIP != changeInfo.NewIP {
-					log.Infof("az(%s) vtap(%v) analyzer ip changed: %s -> %s", az.Lcuuid, vtapID, changeInfo.OldIP, changeInfo.NewIP)
+				if !ifCheckout && changeInfo.OldIP != changeInfo.NewIP {
+					var vtapName string
+					if vtap, ok := vTapIDToVTap[vtapID]; ok {
+						vtapName = vtap.Name
+					}
+					log.Infof("az(%s) vtap(%v) analyzer ip changed: %s -> %s",
+						az.Lcuuid, vtapName, changeInfo.OldIP, changeInfo.NewIP, db.LogPrefixORGID, db.LogPrefixName)
 				}
+			}
+			for _, detail := range azVTapRebalanceResult.Details {
+				log.Infof("analyzer rebalance result az(%v) ip(%v) state(%v) before_vtap_num(%v) after_vtap_num(%v), "+
+					"switch_vtap_num(%v) before_vtap_weight(%v) after_vtap_weight(%v)",
+					detail.AZ, detail.IP, detail.State, detail.BeforeVTapNum, detail.AfterVTapNum,
+					detail.SwitchVTapNum, detail.BeforeVTapWeights, detail.AfterVTapWeights, db.LogPrefixORGID, db.LogPrefixName)
+				log.Infof("analyzer rebalance result az(%v) ip(%v) before vtap traffic(%v), after vtap traffic(%v)",
+					detail.AZ, detail.IP, detail.BeforeVTapTraffic, detail.AfterVTapTraffic, db.LogPrefixORGID, db.LogPrefixName)
+				if len(detail.NewVTapToTraffic) > 0 {
+					b, _ := json.Marshal(detail.NewVTapToTraffic)
+					log.Infof("analyzer rebalance result az(%v) ip(%v) vtap(to add) name to traffic: %s",
+						detail.AZ, detail.IP, string(b), db.LogPrefixORGID, db.LogPrefixName)
+				}
+				if len(detail.DelVTapToTraffic) > 0 {
+					b, _ := json.Marshal(detail.DelVTapToTraffic)
+					log.Infof("analyzer rebalance result az(%v) ip(%v) vtap(to delete) name to traffic: %s",
+						detail.AZ, detail.IP, string(b), db.LogPrefixORGID, db.LogPrefixName)
+				}
+
 			}
 		}
 
-		// update counter
-		updateCounter(vTapIDToVTap, vtapNameToID, vTapIDToChangeInfo)
-	}
-	if response.TotalSwitchVTapNum != 0 {
-		log.Infof("vtap rebalance result switch_total_num(%v)", response.TotalSwitchVTapNum)
-		for _, detail := range response.Details {
-			log.Infof("vtap rebalance result az(%v) ip(%v) state(%v) before_vtap_num(%v) after_vtap_num(%v), switch_vtap_num(%v) before_vtap_weight(%v) after_vtap_weight(%v)",
-				detail.AZ, detail.IP, detail.State, detail.BeforeVTapNum, detail.AfterVTapNum, detail.SwitchVTapNum, detail.BeforeVTapWeights, detail.AfterVTapWeights)
+		if r.reportWeightOnly {
+			r.updateCounter(db, vTapIDToVTap, vtapNameToID, vTapIDToChangeInfo)
 		}
+	}
+
+	allVTapNameToID := make(map[string]int, len(r.dbInfo.VTaps))
+	allVTapIDToVTap := make(map[int]*metadbmodel.VTap, len(r.dbInfo.VTaps))
+	for _, vtap := range r.dbInfo.VTaps {
+		allVTapNameToID[vtap.Name] = vtap.ID
+		allVTapIDToVTap[vtap.ID] = &vtap
+	}
+	vtapCounter := statsd.GetVTapCounter()
+	for name := range vtapCounter.GetVtapNameCounter(db.ORGID) {
+		vtapID, ok := allVTapNameToID[name]
+		// set weight to 0 if vtap losed
+		if !ok {
+			vtapCounter.SetNull(db.ORGID, name)
+			log.Infof("agent(name: %s) set null when agent losed", name, db.LogPrefixORGID)
+			continue
+		}
+		// set weight to 0 if vtap not normal
+		if vtap, ok := allVTapIDToVTap[vtapID]; ok && vtap.State != common.VTAP_STATE_NORMAL {
+			vtapCounter.SetNull(db.ORGID, name)
+			log.Infof("agent(name: %s) set null when agent not normal", name, db.LogPrefixORGID)
+			continue
+		}
+	}
+
+	if !ifCheckout && response.TotalSwitchVTapNum != 0 {
+		log.Infof("analyzer rebalance vtap switch_total_num(%v)", response.TotalSwitchVTapNum, db.LogPrefixORGID, db.LogPrefixName)
 	}
 
 	return response, nil
 }
 
+func (r *AnalyzerInfo) RebalanceAnalyzerByTrafficDebug(db *metadb.DB, dataDuration int) (map[string]interface{}, error) {
+	data := make(map[string]interface{})
+	if err := r.generateRebalanceData(db, dataDuration); err != nil {
+		return nil, err
+	}
+
+	data = r.trafficAZDebug(data)
+	data = r.trafficAnalyzerDebug(db.ORGID, data)
+	return data, nil
+}
+
+func (r *AnalyzerInfo) trafficAZDebug(data map[string]interface{}) map[string]interface{} {
+	var trafficResult []map[string]interface{}
+	regionToName := make(map[string]string, len(r.dbInfo.Regions))
+	for _, region := range r.dbInfo.Regions {
+		regionToName[region.Lcuuid] = region.Name
+	}
+	for _, az := range r.dbInfo.AZs {
+		azVTaps, ok := r.AZToVTaps[az.Lcuuid]
+		if !ok {
+			continue
+		}
+		azAnalyzers, ok := r.AZToAnalyzers[az.Lcuuid]
+		if !ok {
+			continue
+		}
+		analyzerIPToVTaps := make(map[string][]metadbmodel.VTap, len(azAnalyzers))
+		for _, vtap := range azVTaps {
+			analyzerIPToVTaps[vtap.AnalyzerIP] = append(analyzerIPToVTaps[vtap.AnalyzerIP], *vtap)
+		}
+		vTapNameToTraffic := make(map[string]int64)
+		for vtapName, traffic := range r.RegionToVTapNameToTraffic[az.Region] {
+			vTapNameToTraffic[vtapName] = traffic
+		}
+
+		results := make([]map[string]interface{}, len(azAnalyzers))
+		azTraffic := int64(0)
+		for i, analyzer := range azAnalyzers {
+			results[i] = map[string]interface{}{
+				"REGION":         fmt.Sprintf("%s(%s)", az.Region, regionToName[az.Region]),
+				"AZ":             fmt.Sprintf("%s(%s)", az.Lcuuid, az.Name),
+				"ANALYZER_IP":    analyzer.IP,
+				"ANALYZER_STATE": analyzer.State,
+				"AGENT_COUNT":    len(analyzerIPToVTaps[analyzer.IP]),
+			}
+			trafficData := int64(0)
+			for _, vtap := range analyzerIPToVTaps[analyzer.IP] {
+				trafficData += vTapNameToTraffic[vtap.Name]
+				azTraffic += vTapNameToTraffic[vtap.Name]
+			}
+			results[i]["ANALYZER_TRAFFIC"] = trafficData
+		}
+		for _, result := range results {
+			result["AZ_TRAFFIC"] = azTraffic
+		}
+		trafficResult = append(trafficResult, results...)
+	}
+	data["TRAFFIC_AZ"] = trafficResult
+
+	return data
+}
+
+func (r *AnalyzerInfo) trafficAnalyzerDebug(orgID int, data map[string]interface{}) map[string]interface{} {
+	regionToName := make(map[string]string, len(r.dbInfo.Regions))
+	for _, region := range r.dbInfo.Regions {
+		regionToName[region.Lcuuid] = region.Name
+	}
+	lcuuidToAz := make(map[string]*metadbmodel.AZ)
+	for i, az := range r.dbInfo.AZs {
+		lcuuidToAz[az.Lcuuid] = &r.dbInfo.AZs[i]
+	}
+	ipToAzAnalyzerCon := make(map[string][]*metadbmodel.AZAnalyzerConnection)
+	for i, conn := range r.dbInfo.AZAnalyzerConns {
+		ipToAzAnalyzerCon[conn.AnalyzerIP] = append(
+			ipToAzAnalyzerCon[conn.AnalyzerIP],
+			&r.dbInfo.AZAnalyzerConns[i],
+		)
+	}
+	analyzerIPToVTaps := make(map[string][]metadbmodel.VTap, len(r.dbInfo.VTaps))
+	for _, vtap := range r.dbInfo.VTaps {
+		analyzerIPToVTaps[vtap.AnalyzerIP] = append(analyzerIPToVTaps[vtap.AnalyzerIP], vtap)
+	}
+	vtapNameToTraffic := make(map[string]int64)
+	for _, item := range r.RegionToVTapNameToTraffic {
+		for vtapName, traffic := range item {
+			vtapNameToTraffic[vtapName] = traffic
+		}
+	}
+
+	results := make([]map[string]interface{}, len(r.dbInfo.Analyzers))
+	for i, analyzer := range r.dbInfo.Analyzers {
+		results[i] = map[string]interface{}{
+			"ANALYZER_IP":    analyzer.IP,
+			"ANALYZER_STATE": analyzer.State,
+			"AGENT_COUNT":    len(analyzerIPToVTaps[analyzer.IP]),
+		}
+
+		trafficData := int64(0)
+		for _, vtap := range analyzerIPToVTaps[analyzer.IP] {
+			trafficData += vtapNameToTraffic[vtap.Name]
+		}
+		results[i]["ANALYZER_TRAFFIC"] = trafficData
+
+		azConns, ok := ipToAzAnalyzerCon[analyzer.IP]
+		if ok && len(azConns) > 0 {
+			if regionName, ok := regionToName[azConns[0].Region]; ok {
+				results[i]["REGION"] = fmt.Sprintf("%s(%s)", azConns[0].Region, regionName)
+			}
+		}
+		var azStr string
+		for _, azConn := range azConns {
+			if azConn.AZ == "ALL" {
+				azStr = "ALL"
+				break
+			} else {
+				if azStr == "" {
+					azStr = fmt.Sprintf("%s(%s)", azConn.AZ, lcuuidToAz[azConn.AZ].Name)
+				} else {
+					azStr += fmt.Sprintf(", %s(%s)", azConn.AZ, lcuuidToAz[azConn.AZ].Name)
+				}
+			}
+		}
+		results[i]["AZ"] = azStr
+	}
+	data["TRAFFIC_ANALYZER"] = results
+	return data
+}
+
+func (r *AnalyzerInfo) generateRebalanceData(db *metadb.DB, dataDuration int) error {
+	// In automatic balancing, data is not obtained when ifCheckout = false.
+	if len(r.dbInfo.Analyzers) == 0 {
+		err := r.dbInfo.Get(db)
+		if err != nil {
+			return err
+		}
+	}
+	info := r.dbInfo
+	if len(info.VTaps) == 0 || len(info.Analyzers) == 0 {
+		return nil
+	}
+
+	r.RegionToAZLcuuids = make(map[string][]string)
+	r.AZToRegion = make(map[string]string, len(info.AZs))
+	for _, az := range info.AZs {
+		r.RegionToAZLcuuids[az.Region] = append(r.RegionToAZLcuuids[az.Region], az.Lcuuid)
+		r.AZToRegion[az.Lcuuid] = az.Region
+	}
+	r.AZToVTaps = make(map[string][]*metadbmodel.VTap)
+	for i, vtap := range info.VTaps {
+		r.AZToVTaps[vtap.AZ] = append(r.AZToVTaps[vtap.AZ], &info.VTaps[i])
+	}
+	ipToAnalyzer := make(map[string]*metadbmodel.Analyzer)
+	for i, analyzer := range info.Analyzers {
+		ipToAnalyzer[analyzer.IP] = &info.Analyzers[i]
+	}
+	r.AZToAnalyzers = GetAZToAnalyzers(info.AZAnalyzerConns, r.RegionToAZLcuuids, ipToAnalyzer)
+
+	if r.RegionToVTapNameToTraffic == nil {
+		regionToVTapNameToTraffic, err := r.getVTapTraffic(db, dataDuration, r.RegionToAZLcuuids)
+		if err != nil {
+			return fmt.Errorf("get traffic data failed: %v", err)
+		}
+		for region, vtapNameToTraffic := range r.RegionToVTapNameToTraffic {
+			log.Infof("region(%s) agent traffic: %#v", region, vtapNameToTraffic, db.LogPrefixORGID, db.LogPrefixName)
+		}
+		r.RegionToVTapNameToTraffic = regionToVTapNameToTraffic
+	}
+	r.dbInfo.AZs = r.dbInfo.AZs
+	return nil
+}
+
 type AZInfo struct {
 	lcuuid          string
 	vTapIDToTraffic map[int]int64
-	vtaps           []*mysql.VTap
-	analyzers       []*mysql.Analyzer
+	vtapIDToVTap    map[int]*metadbmodel.VTap
+	analyzers       []*metadbmodel.Analyzer
 }
 
 type ChangeInfo struct {
@@ -204,15 +391,14 @@ type ChangeInfo struct {
 //   - 采集器权重 = 采集器发送流量 / 所有采集器发送的流量
 //   - 数据节点的平均权重 = 采集器权重之和 / 正常数据节点个数
 //   - 数据节点权重 = 数据节点上的采集器权重之和 / 数据节点的平均权重
-func (p *AZInfo) rebalanceAnalyzer(ifCheckout bool) (map[int]*ChangeInfo, *model.AZVTapRebalanceResult) {
-
+func (p *AZInfo) rebalanceAnalyzer(db *metadb.DB, ifCheckout bool) (map[int]*ChangeInfo, *model.AZVTapRebalanceResult) {
 	var beforeTraffic, afterTraffic int64
 	for _, dataSize := range p.vTapIDToTraffic {
 		afterTraffic += dataSize
 	}
 	beforeTraffic = afterTraffic
 	var vtapWithAnalyzerSum int
-	for _, vtap := range p.vtaps {
+	for _, vtap := range p.vtapIDToVTap {
 		if vtap.AnalyzerIP != "" {
 			vtapWithAnalyzerSum++
 		}
@@ -251,22 +437,24 @@ func (p *AZInfo) rebalanceAnalyzer(ifCheckout bool) (map[int]*ChangeInfo, *model
 			completeAnalyzerNum++
 		}
 		detail := &model.HostVTapRebalanceResult{
-			IP:    analyzer.IP,
-			AZ:    p.lcuuid,
-			State: analyzer.State,
+			IP:               analyzer.IP,
+			AZ:               p.lcuuid,
+			State:            analyzer.State,
+			NewVTapToTraffic: make(map[string]int64),
+			DelVTapToTraffic: make(map[string]int64),
 		}
 		analyzerIPToInfo[analyzer.IP] = &Info{State: analyzer.State}
 		azVTapRebalanceResult.Details = append(azVTapRebalanceResult.Details, detail)
 	}
 
 	var allocVTaps []VTapInfo
-	vTapIDToChangeInfo := make(map[int]*ChangeInfo, len(p.vtaps))
-	if len(p.vtaps) == 0 {
-		log.Warningf("no vtaps to alloc analyzer")
+	vTapIDToChangeInfo := make(map[int]*ChangeInfo, len(p.vtapIDToVTap))
+	if len(p.vtapIDToVTap) == 0 {
+		log.Warningf("no vtaps to alloc analyzer", db.LogPrefixORGID, db.LogPrefixName)
 		return nil, nil
 	}
-	vtapaAerageTraffic := float64(afterTraffic) / float64(len(p.vtaps))
-	for _, vtap := range p.vtaps {
+	vtapaAerageTraffic := float64(afterTraffic) / float64(len(p.vtapIDToVTap))
+	for _, vtap := range p.vtapIDToVTap {
 		w, _ := strconv.ParseFloat(fmt.Sprintf("%.2f", float64(p.vTapIDToTraffic[vtap.ID])/vtapaAerageTraffic), 64)
 		if vtap.AnalyzerIP == "" {
 			vTapIDToChangeInfo[vtap.ID] = &ChangeInfo{OldIP: "", NewWeight: w}
@@ -278,7 +466,8 @@ func (p *AZInfo) rebalanceAnalyzer(ifCheckout bool) (map[int]*ChangeInfo, *model
 		// the analyzer ip in getting vtap traffic data is not in the analyzer table
 		if _, ok := analyzerIPToInfo[vtap.AnalyzerIP]; !ok {
 			allocVTaps = append(allocVTaps, VTapInfo{VtapID: vtap.ID, Traffic: p.vTapIDToTraffic[vtap.ID]})
-			log.Infof("vtap(%v) analyzer ip(%v) is not in analyzer table", vtap.Name, vtap.AnalyzerIP)
+			log.Infof("vtap(%v) analyzer ip(%v) is not in analyzer table",
+				vtap.Name, vtap.AnalyzerIP, db.LogPrefixORGID, db.LogPrefixName)
 			continue
 		}
 		analyzerIPToInfo[vtap.AnalyzerIP].SumTraffic += p.vTapIDToTraffic[vtap.ID]
@@ -289,6 +478,9 @@ func (p *AZInfo) rebalanceAnalyzer(ifCheckout bool) (map[int]*ChangeInfo, *model
 
 		// beforeWeight counts the actual allocated vtap weight before balancing
 		beforeWeight, _ := strconv.ParseFloat(fmt.Sprintf("%.2f", float64(p.vTapIDToTraffic[vtap.ID])/float64(beforeTraffic)), 64)
+		if beforeTraffic == 0 {
+			beforeWeight = 0
+		}
 		for _, detail := range azVTapRebalanceResult.Details {
 			if detail.IP != vtap.AnalyzerIP {
 				continue
@@ -296,6 +488,7 @@ func (p *AZInfo) rebalanceAnalyzer(ifCheckout bool) (map[int]*ChangeInfo, *model
 			detail.BeforeVTapNum++
 			detail.AfterVTapNum = detail.BeforeVTapNum
 			detail.BeforeVTapWeights += beforeWeight
+			detail.BeforeVTapTraffic += p.vTapIDToTraffic[vtap.ID]
 		}
 	}
 
@@ -321,6 +514,14 @@ func (p *AZInfo) rebalanceAnalyzer(ifCheckout bool) (map[int]*ChangeInfo, *model
 			allocVTaps = append(allocVTaps, info.VTapInfos[i])
 			info.SumTraffic -= info.VTapInfos[i].Traffic
 			analyzerIPToInfo[ip].AfterVTapNum--
+			for _, detail := range azVTapRebalanceResult.Details {
+				if ip != detail.IP {
+					continue
+				}
+				if vtap, ok := p.vtapIDToVTap[info.VTapInfos[i].VtapID]; ok {
+					detail.DelVTapToTraffic[vtap.Name] = info.VTapInfos[i].Traffic
+				}
+			}
 		}
 	}
 
@@ -348,15 +549,23 @@ func (p *AZInfo) rebalanceAnalyzer(ifCheckout bool) (map[int]*ChangeInfo, *model
 			}
 		}
 		if !ifCheckout {
-			mysql.Db.Model(mysql.VTap{}).Where("id = ?", allocVTap.VtapID).Update("analyzer_ip", allocIP)
+			db.Model(metadbmodel.VTap{}).Where("id = ?", allocVTap.VtapID).Update("analyzer_ip", allocIP)
 		}
 		if _, ok := analyzerIPToInfo[allocIP]; !ok {
-			log.Warningf("allocate vtap(%d) failed, wanted analyzer ip", allocVTap.VtapID, allocIP)
+			log.Warningf("allocate vtap(%d) failed, wanted analyzer ip(%s)", allocVTap.VtapID, allocIP, db.LogPrefixORGID, db.LogPrefixName)
 			continue
 		}
 		analyzerIPToInfo[allocIP].SumTraffic += allocVTap.Traffic
 		analyzerIPToInfo[allocIP].AfterVTapNum++
 		vTapIDToChangeInfo[allocVTap.VtapID].NewIP = allocIP
+		for _, detail := range azVTapRebalanceResult.Details {
+			if allocIP != detail.IP {
+				continue
+			}
+			if vtap, ok := p.vtapIDToVTap[allocVTap.VtapID]; ok {
+				detail.NewVTapToTraffic[vtap.Name] += allocVTap.Traffic
+			}
+		}
 	}
 
 	var totalSwitchVTapNum int
@@ -364,21 +573,21 @@ func (p *AZInfo) rebalanceAnalyzer(ifCheckout bool) (map[int]*ChangeInfo, *model
 	for _, detail := range azVTapRebalanceResult.Details {
 		info, ok := analyzerIPToInfo[detail.IP]
 		if !ok {
-			log.Errorf("can not find response data(analyzer ip: %s)", detail.IP)
+			log.Errorf("can not find response data(analyzer ip: %s)", detail.IP, db.LogPrefixORGID, db.LogPrefixName)
 			continue
 		}
 		detail.AfterVTapNum = info.AfterVTapNum
 		detail.SwitchVTapNum = int(math.Abs(float64(detail.AfterVTapNum - detail.BeforeVTapNum)))
 		w, _ := strconv.ParseFloat(fmt.Sprintf("%.2f", float64(info.SumTraffic)/float64(afterTraffic)), 64)
 		detail.AfterVTapWeights = w
+		detail.AfterVTapTraffic = info.SumTraffic
 		w, _ = strconv.ParseFloat(fmt.Sprintf("%.2f", detail.BeforeVTapWeights), 64)
 		detail.BeforeVTapWeights = w
-
 		totalSwitchVTapNum += detail.SwitchVTapNum
 		beforeWeight += detail.BeforeVTapWeights
 		afterWeight += detail.AfterVTapWeights
 	}
-	azVTapRebalanceResult.TotalSwitchVTapNum = totalSwitchVTapNum
+	azVTapRebalanceResult.TotalSwitchVTapNum = totalSwitchVTapNum / 2
 
 	avgBeforeWeight := beforeWeight / float64(completeAnalyzerNum)
 	avgAfterWeight := afterWeight / float64(completeAnalyzerNum)
@@ -395,28 +604,10 @@ func (p *AZInfo) rebalanceAnalyzer(ifCheckout bool) (map[int]*ChangeInfo, *model
 	return vTapIDToChangeInfo, azVTapRebalanceResult
 }
 
-func (r *AnalyzerInfo) getVTapTraffic(dataDuration int, regionToAZLcuuids map[string][]string) (map[string]map[string]int64, error) {
-	ipToController := make(map[string]*mysql.Controller)
+func (r *AnalyzerInfo) getVTapTraffic(db *metadb.DB, dataDuration int, regionToAZLcuuids map[string][]string) (map[string]map[string]int64, error) {
+	ipToController := make(map[string]*metadbmodel.Controller)
 	for i, controller := range r.dbInfo.Controllers {
 		ipToController[controller.IP] = &r.dbInfo.Controllers[i]
-	}
-
-	azToControllers := make(map[string][]*mysql.Controller)
-	for _, conn := range r.dbInfo.AZControllerConns {
-		if conn.AZ == "ALL" {
-			if azLcuuids, ok := regionToAZLcuuids[conn.Region]; ok {
-				for _, azLcuuid := range azLcuuids {
-					if controller, ok := ipToController[conn.ControllerIP]; ok {
-						azToControllers[azLcuuid] = append(
-							azToControllers[azLcuuid], controller)
-					}
-				}
-			}
-		} else {
-			if controller, ok := ipToController[conn.ControllerIP]; ok {
-				azToControllers[conn.AZ] = append(azToControllers[conn.AZ], controller)
-			}
-		}
 	}
 
 	regionToRegionDomainPrefix := make(map[string]string)
@@ -430,9 +621,9 @@ func (r *AnalyzerInfo) getVTapTraffic(dataDuration int, regionToAZLcuuids map[st
 	}
 	regionToVTapNameToTraffic := make(map[string]map[string]int64)
 	for region, domainPrefix := range regionToRegionDomainPrefix {
-		vtapNameToTraffic, err := r.query.GetAgentDispatcher(domainPrefix, dataDuration)
+		vtapNameToTraffic, err := r.query.GetAgentDispatcher(db, domainPrefix, dataDuration)
 		if err != nil {
-			log.Errorf("get query data failed, region(%s), err: %s", region, err)
+			log.Errorf("get query data failed, region(%s), err: %s", region, err, db.LogPrefixORGID, db.LogPrefixName)
 			continue
 		}
 
@@ -444,28 +635,41 @@ func (r *AnalyzerInfo) getVTapTraffic(dataDuration int, regionToAZLcuuids map[st
 	return regionToVTapNameToTraffic, nil
 }
 
-type Query struct{}
+type Query struct {
+	reportWeightOnly bool
+}
 
-func (q *Query) GetAgentDispatcher(domainPrefix string, dataDuration int) (map[string]int64, error) {
+func (q *Query) GetAgentDispatcher(orgDB *metadb.DB, domainPrefix string, dataDuration int) (map[string]int64, error) {
 	if domainPrefix == "master-" {
 		domainPrefix = ""
 	}
 	queryURL := fmt.Sprintf("http://%sdeepflow-server:%d/v1/query", domainPrefix, config.Cfg.ListenPort)
 	values := url.Values{}
-	db := "deepflow_system"
+	db := "deepflow_tenant"
 	now := time.Now()
 	before := now.UTC().Add(time.Second * -1 * time.Duration(dataDuration))
 	sql := fmt.Sprintf("SELECT `tag.host`, Sum(`metrics.tx-bytes`) AS `tx-bps` FROM deepflow_agent_collect_sender"+
 		" WHERE `time`>%d AND `time`<%d GROUP BY tag.host", before.Unix(), now.Unix())
 	values.Add("db", db)
 	values.Add("sql", sql)
+
 	t := time.Now()
-	resp, err := http.PostForm(queryURL, values)
+	req, err := http.NewRequest("POST", queryURL, strings.NewReader(values.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set(common.HEADER_KEY_X_ORG_ID, strconv.Itoa(orgDB.ORGID))
+	client := &http.Client{}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("curl (%s) failed, db (%s), sql: %s, err: %s", queryURL, db, sql, err)
 	}
 	defer resp.Body.Close()
-	log.Infof("curl(%s) query data time since(%v)", queryURL, time.Since(t))
+	if !q.reportWeightOnly {
+		log.Infof("curl(%s) query data time since(%v), db(%s) sql(%s)",
+			queryURL, time.Since(t), db, sql, orgDB.LogPrefixORGID, orgDB.LogPrefixName)
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -515,62 +719,20 @@ func parseBody(data []byte) (map[string]int64, error) {
 	return vtapNameToTraffic, nil
 }
 
-func updateCounter(vtapIDToVTap map[int]*mysql.VTap, vtapNameToID map[string]int, vtapIDToChangeInfo map[int]*ChangeInfo) {
-	setNullFunc := func(name string, vtapNameToCounter map[string]*statsd.GetVTapWeightCounter) {
-		if _, ok := statsd.VTapNameToCounter[name]; ok {
-			statsd.VTapNameToCounter[name].VTapWeightCounter = &statsd.VTapWeightCounter{}
-		}
-	}
-
-	for name := range statsd.VTapNameToCounter {
-		vtapID, ok := vtapNameToID[name]
-		if !ok {
-			setNullFunc(name, statsd.VTapNameToCounter)
-			continue
-		}
-		if vtap, ok := vtapIDToVTap[vtapID]; ok && vtap.State != common.VTAP_STATE_NORMAL {
-			setNullFunc(name, statsd.VTapNameToCounter)
-			continue
-		}
-	}
-
+func (r *AnalyzerInfo) updateCounter(db *metadb.DB, vtapIDToVTap map[int]*metadbmodel.VTap, vtapNameToID map[string]int, vtapIDToChangeInfo map[int]*ChangeInfo) {
+	vtapCounter := statsd.GetVTapCounter()
 	for vtapID, changeInfo := range vtapIDToChangeInfo {
 		vtap, ok := vtapIDToVTap[vtapID]
 		if !ok {
-			log.Info("vtap(%d) not found, change info: %#v", vtapID, changeInfo)
+			log.Info("vtap(%d) not found, change info: %#v", vtapID, changeInfo, db.LogPrefixORGID, db.LogPrefixName)
 			continue
 		}
-		name := vtap.Name
-		if vtap.State != common.VTAP_STATE_NORMAL {
-			setNullFunc(name, statsd.VTapNameToCounter)
-			continue
-		}
-
 		isAnalyzerChanged := uint64(0)
-		if changeInfo.OldIP != changeInfo.NewIP {
-			isAnalyzerChanged = uint64(1)
-		}
-		counter, ok := statsd.VTapNameToCounter[name]
-		if !ok {
-			counter := &statsd.GetVTapWeightCounter{
-				Name: name,
-				VTapWeightCounter: &statsd.VTapWeightCounter{
-					Weight:            changeInfo.NewWeight,
-					IsAnalyzerChanged: isAnalyzerChanged,
-				},
+		if !r.reportWeightOnly {
+			if changeInfo.OldIP != changeInfo.NewIP {
+				isAnalyzerChanged = uint64(1)
 			}
-			statsd.VTapNameToCounter[name] = counter
-			b, _ := json.Marshal(counter)
-			log.Infof("agent(%v) register counter: %v", name, string(b))
-			err := stats.RegisterCountableWithModulePrefix("controller_", "analyzer_alloc", counter, stats.OptionStatTags{"host": name})
-			if err != nil {
-				log.Error(err)
-			}
-		} else {
-			log.Debugf("agent(%v) update weight: %v -> %v", name, counter.VTapWeightCounter.Weight, changeInfo.NewWeight)
-			log.Debugf("agent(%v) update is_analyzer_changed: %v -> %v", name, counter.VTapWeightCounter.IsAnalyzerChanged, isAnalyzerChanged)
-			counter.VTapWeightCounter.Weight = changeInfo.NewWeight
-			counter.VTapWeightCounter.IsAnalyzerChanged = isAnalyzerChanged
 		}
+		vtapCounter.SetCounter(db, vtap.TeamID, vtap.Name, changeInfo.NewWeight, isAnalyzerChanged)
 	}
 }

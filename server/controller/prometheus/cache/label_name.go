@@ -22,16 +22,20 @@ import (
 	"github.com/cornelk/hashmap"
 
 	"github.com/deepflowio/deepflow/message/controller"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/prometheus/common"
 )
 
 type labelName struct {
+	org *common.ORG
+
 	nameToID sync.Map
 	idToName *hashmap.Map[int, string]
 }
 
-func newLabelName() *labelName {
+func newLabelName(org *common.ORG) *labelName {
 	return &labelName{
+		org:      org,
 		idToName: hashmap.New[int, string](),
 	}
 }
@@ -69,8 +73,8 @@ func (ln *labelName) refresh(args ...interface{}) error {
 	return nil
 }
 
-func (ln *labelName) load() ([]*mysql.PrometheusLabelName, error) {
-	var labelNames []*mysql.PrometheusLabelName
-	err := mysql.Db.Find(&labelNames).Error
+func (ln *labelName) load() ([]*metadbmodel.PrometheusLabelName, error) {
+	var labelNames []*metadbmodel.PrometheusLabelName
+	err := ln.org.DB.Find(&labelNames).Error
 	return labelNames, err
 }

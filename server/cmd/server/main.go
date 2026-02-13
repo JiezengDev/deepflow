@@ -36,6 +36,7 @@ import (
 	"github.com/deepflowio/deepflow/server/ingester/ingesterctl"
 	"github.com/deepflowio/deepflow/server/libs/debug"
 	"github.com/deepflowio/deepflow/server/libs/logger"
+	"github.com/deepflowio/deepflow/server/mcp"
 	"github.com/deepflowio/deepflow/server/querier/querier"
 
 	logging "github.com/op/go-logging"
@@ -93,7 +94,8 @@ func main() {
 		runtime.GOMAXPROCS(cfg.MaxCPUs)
 	}
 
-	startContinuousProfile(&cfg.ContinuousProfile)
+	NewContinuousProfiler(&cfg.ContinuousProfile).Start(false)
+	NewFreeOSMemoryHandler(&cfg.FreeOSMemoryManager).Start(false)
 
 	ctx, cancel := utils.NewWaitGroupCtx()
 	defer func() {
@@ -105,9 +107,11 @@ func main() {
 
 	shared := common.NewControllerIngesterShared()
 
+	go mcp.NewMCPServer(*configPath).Start()
+
 	go controller.Start(ctx, *configPath, cfg.LogFile, shared)
 
-	go querier.Start(*configPath, cfg.LogFile)
+	go querier.Start(*configPath, cfg.LogFile, shared)
 	closers := ingester.Start(*configPath, shared)
 
 	common.NewMonitor(cfg.MonitorPaths)

@@ -19,7 +19,7 @@ use std::sync::{
     Arc,
 };
 
-use public::proto::trident::Exception;
+use public::proto::agent::Exception;
 
 #[derive(Clone, Debug, Default)]
 pub struct ExceptionHandler(Arc<AtomicU64>);
@@ -34,7 +34,9 @@ impl ExceptionHandler {
         | Exception::LogFileExceeded as u64
         | Exception::ControllerSocketError as u64
         | Exception::AnalyzerSocketError as u64
-        | Exception::NpbSocketError as u64;
+        | Exception::IntegrationSocketError as u64
+        | Exception::NpbSocketError as u64
+        | Exception::DataBpsThresholdExceeded as u64;
 
     pub fn set(&self, e: Exception) {
         self.0.fetch_or(e as u64, Ordering::SeqCst);

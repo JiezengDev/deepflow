@@ -20,62 +20,66 @@ import (
 	"strings"
 
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
+	"github.com/deepflowio/deepflow/server/controller/common"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
+
+// VInterfaceMessageFactory VInterface资源的消息工厂
+type VInterfaceMessageFactory struct{}
+
+func (f *VInterfaceMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedVInterfaces{}
+}
+
+func (f *VInterfaceMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedVInterface{}
+}
+
+func (f *VInterfaceMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedVInterfaces{}
+}
+
+func (f *VInterfaceMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedVInterfaceFields{}
+}
 
 type VInterface struct {
 	UpdaterBase[
 		cloudmodel.VInterface,
-		mysql.VInterface,
 		*diffbase.VInterface,
-		*message.VInterfaceAdd,
-		message.VInterfaceAdd,
-		*message.VInterfaceUpdate,
-		message.VInterfaceUpdate,
-		*message.VInterfaceFieldsUpdate,
-		message.VInterfaceFieldsUpdate,
-		*message.VInterfaceDelete,
-		message.VInterfaceDelete]
+		*metadbmodel.VInterface,
+		metadbmodel.VInterface,
+	]
 }
 
 func NewVInterface(wholeCache *cache.Cache, cloudData []cloudmodel.VInterface, domainToolDataSet *tool.DataSet) *VInterface {
 	updater := &VInterface{
-		newUpdaterBase[
-			cloudmodel.VInterface,
-			mysql.VInterface,
-			*diffbase.VInterface,
-			*message.VInterfaceAdd,
-			message.VInterfaceAdd,
-			*message.VInterfaceUpdate,
-			message.VInterfaceUpdate,
-			*message.VInterfaceFieldsUpdate,
-			message.VInterfaceFieldsUpdate,
-			*message.VInterfaceDelete,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_VINTERFACE_EN,
 			wholeCache,
-			db.NewVInterface().SetORG(wholeCache.GetORG()),
+			db.NewVInterface().SetMetadata(wholeCache.GetMetadata()),
 			wholeCache.DiffBaseDataSet.VInterfaces,
 			cloudData,
 		),
 	}
+	updater.setDataGenerator(updater)
 	updater.setDomainToolDataSet(domainToolDataSet)
-	updater.dataGenerator = updater
+
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &VInterfaceMessageFactory{})
+	}
+
 	return updater
 }
 
-func (i *VInterface) getDiffBaseByCloudItem(cloudItem *cloudmodel.VInterface) (diffBase *diffbase.VInterface, exists bool) {
-	diffBase, exists = i.diffBaseData[cloudItem.Lcuuid]
-	return
-}
-
-func (i *VInterface) generateDBItemToAdd(cloudItem *cloudmodel.VInterface) (*mysql.VInterface, bool) {
+func (i *VInterface) generateDBItemToAdd(cloudItem *cloudmodel.VInterface) (*metadbmodel.VInterface, bool) {
 	var networkID int
 	if cloudItem.NetworkLcuuid != "" {
 		var exists bool
@@ -85,25 +89,45 @@ func (i *VInterface) generateDBItemToAdd(cloudItem *cloudmodel.VInterface) (*mys
 				networkID, exists = i.domainToolDataSet.GetNetworkIDByLcuuid(cloudItem.NetworkLcuuid)
 			}
 			if !exists {
-				log.Error(i.org.LogPre(resourceAForResourceBNotFound(
+				log.Error(resourceAForResourceBNotFound(
 					ctrlrcommon.RESOURCE_TYPE_NETWORK_EN, cloudItem.NetworkLcuuid,
 					ctrlrcommon.RESOURCE_TYPE_VINTERFACE_EN, cloudItem.Lcuuid,
-				)))
+				), i.metadata.LogPrefixes)
 				return nil, false
 			}
 		}
 	}
 	deviceID, exists := i.cache.ToolDataSet.GetDeviceIDByDeviceLcuuid(cloudItem.DeviceType, cloudItem.DeviceLcuuid)
 	if !exists {
-		log.Error(i.org.LogPre(
+		log.Errorf(
 			"device (type: %d, lcuuid: %s) for %s (lcuuid: %s) not found",
 			cloudItem.DeviceType, cloudItem.DeviceLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_VINTERFACE_EN, cloudItem.Lcuuid,
-		))
+			i.metadata.LogPrefixes)
 		return nil, false
 	}
-
-	dbItem := &mysql.VInterface{
+	var vpcID int
+	if cloudItem.DeviceType != common.VIF_DEVICE_TYPE_HOST {
+		vpcID, exists = i.cache.ToolDataSet.GetDeviceVPCIDByID(cloudItem.DeviceType, deviceID)
+		if !exists {
+			log.Errorf(
+				"vpc for device (type: %d, lcuuid: %s) for %s (lcuuid: %s) not found",
+				cloudItem.DeviceType, cloudItem.DeviceLcuuid,
+				ctrlrcommon.RESOURCE_TYPE_VINTERFACE_EN, cloudItem.Lcuuid,
+				i.metadata.LogPrefixes)
+		}
+	}
+	if vpcID == 0 {
+		vpcID, exists = i.cache.ToolDataSet.GetNetworkVPCIDByID(networkID)
+		if !exists {
+			log.Error(
+				"vpc for network (id: %d) for %s (lcuuid: %s) not found",
+				networkID, ctrlrcommon.RESOURCE_TYPE_VINTERFACE_EN, cloudItem.Lcuuid,
+				i.metadata.LogPrefixes)
+			return nil, false
+		}
+	}
+	dbItem := &metadbmodel.VInterface{
 		Name:       cloudItem.Name,
 		Type:       cloudItem.Type,
 		State:      1,
@@ -113,8 +137,9 @@ func (i *VInterface) generateDBItemToAdd(cloudItem *cloudmodel.VInterface) (*mys
 		DeviceType: cloudItem.DeviceType,
 		DeviceID:   deviceID,
 		VlanTag:    0,
+		VPCID:      vpcID,
 		SubDomain:  cloudItem.SubDomainLcuuid,
-		Domain:     i.cache.DomainLcuuid,
+		Domain:     i.metadata.GetDomainLcuuid(),
 		Region:     cloudItem.RegionLcuuid,
 		NetnsID:    cloudItem.NetnsID,
 		VtapID:     cloudItem.VTapID,
@@ -123,8 +148,8 @@ func (i *VInterface) generateDBItemToAdd(cloudItem *cloudmodel.VInterface) (*mys
 	return dbItem, true
 }
 
-func (i *VInterface) generateUpdateInfo(diffBase *diffbase.VInterface, cloudItem *cloudmodel.VInterface) (*message.VInterfaceFieldsUpdate, map[string]interface{}, bool) {
-	structInfo := new(message.VInterfaceFieldsUpdate)
+func (i *VInterface) generateUpdateInfo(diffBase *diffbase.VInterface, cloudItem *cloudmodel.VInterface) (types.UpdatedFields, map[string]interface{}, bool) {
+	structInfo := new(message.UpdatedVInterfaceFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.NetworkLcuuid != cloudItem.NetworkLcuuid {
 		if cloudItem.NetworkLcuuid == "" {
@@ -136,10 +161,10 @@ func (i *VInterface) generateUpdateInfo(diffBase *diffbase.VInterface, cloudItem
 					networkID, exists = i.domainToolDataSet.GetNetworkIDByLcuuid(cloudItem.NetworkLcuuid)
 				}
 				if !exists {
-					log.Error(i.org.LogPre(resourceAForResourceBNotFound(
+					log.Error(resourceAForResourceBNotFound(
 						ctrlrcommon.RESOURCE_TYPE_NETWORK_EN, cloudItem.NetworkLcuuid,
 						ctrlrcommon.RESOURCE_TYPE_VINTERFACE_EN, cloudItem.Lcuuid,
-					)))
+					), i.metadata.LogPrefixes)
 					return nil, nil, false
 				}
 			}
@@ -147,6 +172,17 @@ func (i *VInterface) generateUpdateInfo(diffBase *diffbase.VInterface, cloudItem
 		}
 		structInfo.NetworkID.SetNew(mapInfo["subnetid"].(int))
 		structInfo.NetworkLcuuid.Set(diffBase.NetworkLcuuid, cloudItem.NetworkLcuuid)
+	}
+	if diffBase.DeviceLcuuid != cloudItem.DeviceLcuuid {
+		deviceID, exists := i.cache.ToolDataSet.GetDeviceIDByDeviceLcuuid(cloudItem.DeviceType, cloudItem.DeviceLcuuid)
+		if !exists {
+			log.Errorf(resourceAForResourceBNotFound(
+				common.VIF_DEVICE_TYPE_TO_RESOURCE_TYPE[cloudItem.DeviceType], cloudItem.DeviceLcuuid,
+				common.RESOURCE_TYPE_VINTERFACE_EN, cloudItem.Lcuuid,
+			), i.metadata.LogPrefixes)
+			return nil, nil, false
+		}
+		mapInfo["deviceid"] = deviceID
 	}
 	if diffBase.Name != cloudItem.Name {
 		mapInfo["name"] = cloudItem.Name
@@ -172,5 +208,32 @@ func (i *VInterface) generateUpdateInfo(diffBase *diffbase.VInterface, cloudItem
 		mapInfo["vtap_id"] = cloudItem.VTapID
 		structInfo.VTapID.Set(diffBase.VtapID, cloudItem.VTapID)
 	}
+
+	var vpcID int
+	var exists bool
+	if cloudItem.DeviceType != common.VIF_DEVICE_TYPE_HOST {
+		vpcID, exists = i.cache.ToolDataSet.GetDeviceVPCIDByLcuuid(cloudItem.DeviceType, cloudItem.DeviceLcuuid)
+		if !exists {
+			log.Errorf(
+				"vpc for device (type: %d, lcuuid: %s) for %s (lcuuid: %s) not found",
+				cloudItem.DeviceType, cloudItem.DeviceLcuuid,
+				ctrlrcommon.RESOURCE_TYPE_VINTERFACE_EN, cloudItem.Lcuuid,
+				i.metadata.LogPrefixes)
+		}
+	}
+	if vpcID == 0 {
+		vpcID, exists = i.cache.ToolDataSet.GetNetworkVPCIDByLcuuid(cloudItem.NetworkLcuuid)
+		if !exists {
+			log.Error(
+				"vpc for network (lcuuid: %d) for %s (lcuuid: %s) not found",
+				cloudItem.NetworkLcuuid, ctrlrcommon.RESOURCE_TYPE_VINTERFACE_EN, cloudItem.Lcuuid,
+				i.metadata.LogPrefixes)
+		}
+	}
+	cloudItem.VPCID = vpcID
+	if exists && diffBase.VPCID != cloudItem.VPCID {
+		mapInfo["epc_id"] = vpcID
+	}
+
 	return structInfo, mapInfo, len(mapInfo) > 0
 }

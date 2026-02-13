@@ -29,12 +29,12 @@ struct http2_tcp_seq_key {
 
 /* *INDENT-OFF* */
 /*
- * In uprobe_go_tls_read_exit()
+ * In uprobe go_tls_read_exit()
  * Save the TCP sequence number before the syscall(read())
- * 
+ *
  * In uprobe http2 read() (after syscall read()), lookup TCP sequence number recorded previously on the map.
- * e.g.: In uprobe_go_http2serverConn_processHeaders(), get TCP sequence before syscall read(). 
- * 
+ * e.g.: In go_http2serverConn_processHeaders(), get TCP sequence before syscall read().
+ *
  * Note:  Use for after uprobe read() only.
  */
 struct bpf_map_def SEC("maps") http2_tcp_seq_map = {
@@ -42,6 +42,7 @@ struct bpf_map_def SEC("maps") http2_tcp_seq_map = {
 	.key_size = sizeof(struct http2_tcp_seq_key),
 	.value_size = sizeof(__u32),
 	.max_entries = HASH_ENTRIES_MAX,
+	.feat_flags = FEATURE_FLAG_UPROBE_GOLANG,
 };
 
 /*
@@ -54,6 +55,7 @@ struct bpf_map_def SEC("maps") proc_info_map = {
 	.key_size = sizeof(int),
 	.value_size = sizeof(struct ebpf_proc_info),
 	.max_entries = HASH_ENTRIES_MAX,
+	.feat_flags = FEATURE_FLAG_UPROBE_GOLANG,
 };
 
 // Process ID and coroutine ID, marking the coroutine in the system
@@ -71,6 +73,7 @@ struct bpf_map_def SEC("maps") go_ancerstor_map = {
 	.key_size = sizeof(struct go_key),
 	.value_size = sizeof(__u64),
 	.max_entries = HASH_ENTRIES_MAX,
+	.feat_flags = FEATURE_FLAG_UPROBE_GOLANG,
 };
 
 // Used to determine the timeout, as a termination condition for finding
@@ -82,6 +85,7 @@ struct bpf_map_def SEC("maps") go_rw_ts_map = {
 	.key_size = sizeof(struct go_key),
 	.value_size = sizeof(__u64),
 	.max_entries = HASH_ENTRIES_MAX,
+	.feat_flags = FEATURE_FLAG_UPROBE_GOLANG,
 };
 
 // Pass data between coroutine entry and exit functions
@@ -95,6 +99,7 @@ struct bpf_map_def SEC("maps") pid_tgid_callerid_map = {
 	.key_size = sizeof(__u64),
 	.value_size = sizeof(struct go_newproc_caller),
 	.max_entries = HASH_ENTRIES_MAX,
+	.feat_flags = FEATURE_FLAG_UPROBE_GOLANG,
 };
 
 /*
@@ -107,6 +112,7 @@ struct bpf_map_def SEC("maps") goroutines_map = {
 	.key_size = sizeof(__u64),
 	.value_size = sizeof(__u64),
 	.max_entries = MAX_SYSTEM_THREADS,
+	.feat_flags = FEATURE_FLAG_UPROBE_GOLANG,
 };
 /* *INDENT-ON* */
 
@@ -147,7 +153,7 @@ struct __http2_stack {
 				union {
 					struct __http2_buffer http2_buffer;
 					struct __http2_dataframe
-					    http2_dataframe;
+					 http2_dataframe;
 				};
 			} __attribute__ ((packed));
 		};
@@ -160,7 +166,7 @@ struct __http2_stack {
 	bool tls;
 } __attribute__ ((packed));
 
-MAP_PERARRAY(http2_stack, __u32, struct __http2_stack, 1)
+MAP_PERARRAY(http2_stack, __u32, struct __http2_stack, 1, FEATURE_FLAG_UPROBE_GOLANG)
 
 static __inline struct __http2_stack *get_http2_stack()
 {
@@ -333,14 +339,14 @@ static __inline int get_fd_from_tls_conn_struct(void *conn,
 static __inline int
 get_fd_from_go_proxyproto_interface(void *conn, struct ebpf_proc_info *info)
 {
-	/* conn = {tab = 0x770a10 
+	/* conn = {tab = 0x770a10
 	 * <go:itab.*github.com/armon/go-proxyproto.Conn,net.Conn>, data = 0xc0001963c0}
 	 * (gdb) x/16xg 0xc0001963c0
 	 * 0xc0001963c0:   0x000000c0001947e0      0x0000000000770ac0
 	 * 0xc0001963d0:   0x000000c0001bc090      0x0000000000000000
 	 *
 	 * struct github.com/armon/go-proxyproto.Conn {
-	 *       bufio.Reader *             bufReader; (0x000000c0001947e0)         
+	 *       bufio.Reader *             bufReader; (0x000000c0001947e0)
 	 *       net.Conn                   conn; (tab net.TCPConn,net.Conn,
 	 *                                         data 0x000000c0001bc090)
 	 */
@@ -378,16 +384,15 @@ static __inline int get_fd_from_tls_conn_interface(void *conn,
 	return -1;
 }
 
-static __inline int get_fd_from_h2c_rwConn_interface(void *conn,
-						     struct ebpf_proc_info
+static __inline int get_fd_from_h2c_rwConn_interface(void *conn, struct ebpf_proc_info
 						     *info)
 {
 	/*
 	 * The process of inferring the file descriptor (0x0000000000000004)
 	 * through the 'conn':
-	 * +(gdb) p conn          
+	 * +(gdb) p conn
 	 * +$3 = {tab = 0x70e270 <rwConn,net.Conn>, data = 0xc0000abe90}
-	 * +(gdb) x/16xg 0xc0000abe90 
+	 * +(gdb) x/16xg 0xc0000abe90
 	 * +0xc0000abe90:   0x000000000070e320      0x000000c000110020
 	 * +(gdb) x/16xg 0x000000c000110020
 	 * +0xc000110020:   0x000000c000128280      0x0000000000000000
@@ -432,7 +437,7 @@ get_fd_from_tcp_or_tls_conn_interface(void *conn, struct ebpf_proc_info *info)
 	return -1;
 }
 
-// Go implements a new way of passing function arguments and results using 
+// Go implements a new way of passing function arguments and results using
 // registers instead of the stack. We need the go version and the computer
 // architecture to determine the parameter locations
 static __inline bool is_register_based_call(struct ebpf_proc_info *info)
@@ -448,8 +453,7 @@ static __inline bool is_register_based_call(struct ebpf_proc_info *info)
 #endif
 }
 
-SEC("uprobe/runtime.execute")
-int runtime_execute(struct pt_regs *ctx)
+UPROG(runtime_execute) (struct pt_regs *ctx)
 {
 	struct member_fields_offset *offset = retrieve_ready_kern_offset();
 	if (offset == NULL)
@@ -484,14 +488,13 @@ int runtime_execute(struct pt_regs *ctx)
 	return 0;
 }
 
-// This function creates a new go coroutine, and the parent and child 
-// coroutine numbers are in the parameters and return values ​​respectively.
+// This function creates a new go coroutine, and the parent and child
+// coroutine numbers are in the parameters and return values respectively.
 // Pass the function parameters through pid_tgid_callerid_map
 //
 // go 1.15 ~ 1.17: func newproc1(fn *funcval, argp unsafe.Pointer, narg int32, callergp *g, callerpc uintptr) *g
 // go1.18+ :func newproc1(fn *funcval, callergp *g, callerpc uintptr) *g
-SEC("uprobe/enter_runtime.newproc1")
-int enter_runtime_newproc1(struct pt_regs *ctx)
+UPROG(enter_runtime_newproc1) (struct pt_regs *ctx)
 {
 	struct member_fields_offset *offset = retrieve_ready_kern_offset();
 	if (offset == NULL)
@@ -553,8 +556,7 @@ int enter_runtime_newproc1(struct pt_regs *ctx)
 //
 // go 1.15 ~ 1.17: func newproc1(fn *funcval, argp unsafe.Pointer, narg int32, callergp *g, callerpc uintptr) *g
 // go1.18+ :func newproc1(fn *funcval, callergp *g, callerpc uintptr) *g
-SEC("uprobe/exit_runtime.newproc1")
-int exit_runtime_newproc1(struct pt_regs *ctx)
+UPROG(exit_runtime_newproc1) (struct pt_regs *ctx)
 {
 	struct member_fields_offset *offset = retrieve_ready_kern_offset();
 	if (offset == NULL)
@@ -612,9 +614,7 @@ int exit_runtime_newproc1(struct pt_regs *ctx)
 	return 0;
 }
 
-// /sys/kernel/debug/tracing/events/sched/sched_process_exit/format
-SEC("tracepoint/sched/sched_process_exit")
-int bpf_func_sched_process_exit(struct sched_comm_exit_ctx *ctx)
+static __inline int do_process_exit(void *ctx)
 {
 	struct member_fields_offset *offset = retrieve_ready_kern_offset();
 	if (offset == NULL)
@@ -642,20 +642,135 @@ int bpf_func_sched_process_exit(struct sched_comm_exit_ctx *ctx)
 	return 0;
 }
 
-// /sys/kernel/debug/tracing/events/sched/sched_process_fork/format
-SEC("tracepoint/sched/sched_process_fork")
-int bpf_func_sched_process_fork(struct sched_comm_fork_ctx *ctx)
+KPROG(do_exit) (struct pt_regs *ctx) {
+	return do_process_exit((void *)ctx);
+}
+
+// /sys/kernel/debug/tracing/events/sched/sched_process_exit/format
+TP_SCHED_PROG(process_exit) (struct sched_comm_exit_ctx *ctx) {
+	return do_process_exit((void *)ctx);
+}
+
+static inline int kernel_clone_exit(bool is_kprobe, bool maybe_thread,
+				    long ret, void *ctx)
 {
+	// For tracepoint: error or parent process
+	if (ret != 0 && !is_kprobe)
+		return 0;
+
+	__u64 id = bpf_get_current_pid_tgid();
+	int pid = (int)id;
+	int tgid = (int)(id >> 32);
+	// filter threads
+	if (pid != tgid)
+		return 0;
+
 	struct member_fields_offset *offset = retrieve_ready_kern_offset();
 	if (offset == NULL)
 		return 0;
 
 	struct process_event_t data;
 	data.meta.event_type = EVENT_TYPE_PROC_EXEC;
-	data.pid = ctx->child_pid;
+	/*
+	 * For kprobe type, it was found that the return value is never 0, which
+	 * indicates that the current process is the parent process rather than
+	 * the child process. In this case, we take the return value (since the
+	 * return value is the child process ID).
+	 */
+	if (ret > 0)
+		data.pid = ret;
+	else
+		data.pid = pid;
+	data.maybe_thread = maybe_thread;
 	bpf_get_current_comm(data.name, sizeof(data.name));
 	bpf_perf_event_output(ctx, &NAME(socket_data),
 			      BPF_F_CURRENT_CPU, &data, sizeof(data));
+	return 0;
+}
+
+/*
+ * In order to handle older kernels, such as Linux 4.14 and 3.10.0-957.el7,
+ * which lack '/sys/kernel/debug/tracing/events/syscalls/sys_exit_fork' and
+ * '/sys/kernel/debug/tracing/events/syscalls/sys_exit_clone', we use
+ * kretprobe as a substitute for tracepoint type.
+ */
+KRETPROG(sys_fork) (struct pt_regs* ctx) {
+	return kernel_clone_exit(true, false, (long)PT_REGS_RC(ctx), ctx);
+}
+
+KRETPROG(__x64_sys_fork) (struct pt_regs* ctx) {
+	return kernel_clone_exit(true, false, (long)PT_REGS_RC(ctx), ctx);
+}
+
+KRETPROG(__arm64_sys_fork) (struct pt_regs* ctx) {
+	return kernel_clone_exit(true, false, (long)PT_REGS_RC(ctx), ctx);
+}
+
+KRETPROG(sys_clone) (struct pt_regs* ctx) {
+	return kernel_clone_exit(true, true, (long)PT_REGS_RC(ctx), ctx);
+}
+
+KRETPROG(__x64_sys_clone) (struct pt_regs* ctx) {
+	return kernel_clone_exit(true, true, (long)PT_REGS_RC(ctx), ctx);
+}
+
+KRETPROG(__arm64_sys_clone) (struct pt_regs* ctx) {
+	return kernel_clone_exit(true, true, (long)PT_REGS_RC(ctx), ctx);
+}
+
+// /sys/kernel/debug/tracing/events/syscalls/sys_exit_fork/format
+TP_SYSCALL_PROG(exit_fork) (struct syscall_comm_exit_ctx * ctx) {
+	return kernel_clone_exit(false, false, (long)ctx->ret, ctx);
+}
+
+// /sys/kernel/debug/tracing/events/syscalls/sys_exit_clone/format
+TP_SYSCALL_PROG(exit_clone) (struct syscall_comm_exit_ctx * ctx) {
+	return kernel_clone_exit(false, false, (long)ctx->ret, ctx);
+}
+
+static __inline int __process_exec(void *ctx)
+{
+	struct member_fields_offset *offset = retrieve_ready_kern_offset();
+	if (offset == NULL)
+		return 0;
+
+	struct process_event_t data;
+	__u64 id = bpf_get_current_pid_tgid();
+	pid_t pid = id >> 32;
+	pid_t tid = (__u32) id;
+
+	if (pid == tid) {
+		data.meta.event_type = EVENT_TYPE_PROC_EXEC;
+		data.pid = pid;
+		data.maybe_thread = false;
+		bpf_get_current_comm(data.name, sizeof(data.name));
+		bpf_perf_event_output(ctx, &NAME(socket_data),
+				      BPF_F_CURRENT_CPU, &data, sizeof(data));
+	}
 
 	return 0;
+}
+
+#if defined(__x86_64__)
+KRETPROG(__x64_sys_execve) (struct pt_regs *ctx) {
+	return __process_exec((void *)ctx);
+}
+
+KRETPROG(__x64_sys_execveat) (struct pt_regs *ctx) {
+	return __process_exec((void *)ctx);
+}
+#else
+KRETPROG(__arm64_sys_execve) (struct pt_regs *ctx) {
+	return __process_exec((void *)ctx);
+}
+
+KRETPROG(__arm64_sys_execveat) (struct pt_regs *ctx) {
+	return __process_exec((void *)ctx);
+}
+#endif
+
+// /sys/kernel/debug/tracing/events/sched/sched_process_exec/format
+TP_SCHED_PROG(process_exec) (struct sched_comm_exec_ctx *ctx)
+{
+	return __process_exec((void *)ctx);
 }

@@ -22,6 +22,7 @@
 #include "symbol.h"
 #include "tracer.h"
 #include "load.h"
+#include "socket.h"
 
 extern bool *cpu_online;
 extern int sys_cpus_count;
@@ -32,8 +33,13 @@ int bpf_get_program_fd(void *obj, const char *name, void **p)
 	struct ebpf_prog *prog;
 
 	/*
-	 * tracepoint: prog->name:bpf_func_sys_exit_recvfrom
-	 * kprobe: prog->name:kprobe____sys_sendmsg
+	 * Possible parameter name values:
+	 *   tracepoint(syscall): "prog->name:df_T_exit_recvfrom"
+	 *   tracepoint(sched): "prog->name:df_T_process_exec"
+	 *   kprobe: "prog->name:df_K_sys_sendmsg"
+	 *   kretprobe: "prog->name:df_KR_sys_sendmsg"
+	 *   kfunc: "fentry/do_unlinkat"
+	 *   kretfunc: "fexit/do_unlinkat"
 	 */
 	char prog_name[PROBE_NAME_SZ];
 	int res;
@@ -42,7 +48,7 @@ int bpf_get_program_fd(void *obj, const char *name, void **p)
 	if (strstr(__name, "kprobe/")) {
 		__name += (sizeof("kprobe/") - 1);
 		res =
-		    snprintf((char *)prog_name, sizeof(prog_name), "kprobe__%s",
+		    snprintf((char *)prog_name, sizeof(prog_name), "df_K_%s",
 			     __name);
 		if (res < 0 || res >= sizeof(prog_name)) {
 			ebpf_warning("name (%s) snprintf() failed.\n", __name);
@@ -52,7 +58,7 @@ int bpf_get_program_fd(void *obj, const char *name, void **p)
 		__name += (sizeof("kretprobe/") - 1);
 		res =
 		    snprintf((char *)prog_name, sizeof(prog_name),
-			     "kretprobe__%s", __name);
+			     "df_KR_%s", __name);
 		if (res < 0 || res >= sizeof(prog_name)) {
 			ebpf_warning("name (%s) snprintf() failed.\n", __name);
 			return -1;
@@ -62,15 +68,50 @@ int bpf_get_program_fd(void *obj, const char *name, void **p)
 		while (*p != '\0')
 			if (*p++ == '/')
 				__name = p;
+
+		if (strncmp(__name, "sys_", 4) == 0) {
+			__name += 4;
+		} else if (strncmp(__name, "sched_", 6) == 0) {
+			__name += 6;
+		}
+
 		res =
 		    snprintf((char *)prog_name, sizeof(prog_name),
-			     "bpf_func_%s", __name);
+			     "df_T_%s", __name);
+		if (res < 0 || res >= sizeof(prog_name)) {
+			ebpf_warning("name (%s) snprintf() failed.\n", __name);
+			return -1;
+		}
+	} else if (strstr(__name, "fentry/")) {
+		__name += (sizeof("fentry/") - 1);
+		res =
+		    snprintf((char *)prog_name, sizeof(prog_name), "kfunc__%s",
+			     __name);
+		if (res < 0 || res >= sizeof(prog_name)) {
+			ebpf_warning("name (%s) snprintf() failed.\n", __name);
+			return -1;
+		}
+	} else if (strstr(__name, "fexit/")) {
+		__name += (sizeof("fexit/") - 1);
+		res =
+		    snprintf((char *)prog_name, sizeof(prog_name),
+			     "kretfunc__%s", __name);
+		if (res < 0 || res >= sizeof(prog_name)) {
+			ebpf_warning("name (%s) snprintf() failed.\n", __name);
+			return -1;
+		}
+	} else if (strstr(__name, "socket/")) {
+		__name += (sizeof("socket/") - 1);
+		res =
+		    snprintf((char *)prog_name, sizeof(prog_name),
+			     "df_S_%s", __name);
 		if (res < 0 || res >= sizeof(prog_name)) {
 			ebpf_warning("name (%s) snprintf() failed.\n", __name);
 			return -1;
 		}
 	} else
-		safe_buf_copy(prog_name, sizeof(prog_name), __name, strlen(__name));
+		safe_buf_copy(prog_name, sizeof(prog_name), __name,
+			      strlen(__name));
 
 	prog = ebpf_obj__get_prog_by_name((struct ebpf_object *)obj, prog_name);
 	if (prog == NULL) {
@@ -91,8 +132,111 @@ static int ebpf_link__detach_perf_event(struct ebpf_link *link)
 	if (err)
 		err = -errno;
 
-	close(link->fd);
+	if (close(link->fd) == -1)
+		ebpf_warning("detach perf event failed, with %s(%d)\n",
+			     strerror(errno), errno);
+
 	return err;
+}
+
+static int ebpf_link__detach_kfunc(struct ebpf_link *link)
+{
+	int ret = close(link->fd);
+	if (ret == -1)
+		ebpf_warning("kfunc detach failed, with %s(%d)\n",
+			     strerror(errno), errno);
+	return ret;
+}
+
+static int bpf_find_uprobe_type(void)
+{
+	const char *path = "/sys/bus/event_source/devices/uprobe/type";
+	char buf[32];
+	int fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return -1;
+
+	ssize_t n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return -1;
+
+	buf[n] = '\0';
+	return atoi(buf);
+}
+
+static int bpf_get_uretprobe_bit(void)
+{
+	const char *path =
+	    "/sys/bus/event_source/devices/uprobe/format/retprobe";
+	const char prefix[] = "config:";
+	char buf[64];
+	int fd;
+	ssize_t n;
+	char *endptr;
+	long val;
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+
+	n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return -1;
+
+	buf[n] = '\0';
+
+	if (strncmp(buf, prefix, sizeof(prefix) - 1) != 0)
+		return -1;
+
+	errno = 0;
+	val = strtol(buf + sizeof(prefix) - 1, &endptr, 10);
+	if (errno != 0 || endptr == buf + sizeof(prefix) - 1)
+		return -1;
+
+	return (int)val;
+}
+
+static int uprobe_try_perf_event_open(const char *name, uint64_t offs,
+				      int pid, int is_return,
+				      uint64_t ref_ctr_offset)
+{
+#define PERF_UPROBE_REF_CTR_OFFSET_SHIFT 32
+
+	struct perf_event_attr attr = {};
+	int type = bpf_find_uprobe_type();
+	int is_return_bit = bpf_get_uretprobe_bit();
+	int cpu = 0, pfd = 0;
+	if (type < 0 || is_return_bit < 0)
+		return -1;
+	if (is_return)
+		attr.config |= 1 << is_return_bit;
+	attr.config |= (ref_ctr_offset << PERF_UPROBE_REF_CTR_OFFSET_SHIFT);
+	attr.config2 = offs;	/* config2 here is kprobe_addr or probe_offset */
+	attr.size = sizeof(attr);
+	attr.type = type;
+	attr.config1 = (uint64_t) (unsigned long)((void *)name);
+
+	/*
+	 * PID filtering is only supported for uprobe events.
+	 * If pid < 0, set it to -1.
+	 * perf_event_open() does not allow both pid and cpu to be -1,
+	 * so cpu is set to -1 only when pid != -1.
+	 */
+	if (pid < 0)
+		pid = -1;
+	if (pid != -1)
+		cpu = -1;
+
+	pfd = syscall(__NR_perf_event_open, &attr, pid, cpu, -1 /* group_fd */ ,
+		      PERF_FLAG_FD_CLOEXEC);
+	if (pfd > 0) {
+		close(pfd);
+		return 0;
+	}
+
+	return -1;
 }
 
 /*
@@ -127,6 +271,32 @@ static int program__attach_probe(const struct ebpf_prog *prog, bool retprobe,
 		pfd = bpf_attach_kprobe(progfd, attach_type, ev_name,
 					config1, offset, maxactive);
 	} else {
+		/*
+		 * In uprobe, we attempt to call the perf_event_open() system call.
+		 * If the call fails, we exit immediately to avoid writing to tracefs.
+		 * On kernels older than 3.10.0-1160.76, such write operations may
+		 * trigger a kernel crash. The Oops call path:
+		 *     vfs_write -> probes_write -> traceprobe_probes_write -> create_trace_uprobe
+		 * clearly shows that the write targets the tracing probe interface,
+		 * i.e., files under /sys/kernel/debug/tracing/ files.
+ 		 *  
+		 * Example of uprobe parameters:
+		 * attach_type: BPF_PROBE_ENTRY or BPF_PROBE_RETURN
+		 * ev_name: p__proc_9418_root_app_mem_leak_0xa8560
+		 * pid: 9418
+		 * config1: /proc/9418/root/app/mem-leak
+		 * progfd: 202
+		 * offset: 0xaf
+		 */
+		if (uprobe_try_perf_event_open
+		    (config1, offset, pid, attach_type != BPF_PROBE_ENTRY,
+		     0) != 0) {
+			ebpf_warning
+			    ("Uprobe for process %d disabled due to 'perf_event_open()' failure (%s).",
+			     pid, strerror(errno));
+			return -1;
+		}
+
 		// ref_ctr_offset Appear in linux 4.20, set 0
 		// https://lore.kernel.org/lkml/20180606083344.31320-3-ravi.bangoria@linux.ibm.com/
 		pfd = bpf_attach_uprobe(progfd, attach_type, ev_name, config1,
@@ -189,9 +359,17 @@ int program__attach_kprobe(void *prog,
 			   char *ev_name, void **ret_link)
 {
 	int maxactive = 0;
-	if (retprobe) {
+
+	/*
+	 * Setting the maxactive value (maxactive > 0) means attaching kretprobe-type
+	 * eBPF programs using the ftrace method. However, this method fails on the
+	 * 3.10.0-957 version of the kernel. Therefore, we use the perf_event_open()
+	 * system call to perform attach/detach operations.
+	 */
+	if (retprobe && is_pure_kprobe_ebpf()) {
 		maxactive = KRETPROBE_MAXACTIVE_MAX;
 	}
+
 	return program__attach_probe((const struct ebpf_prog *)prog,
 				     retprobe, (const char *)ev_name, func_name,
 				     "kprobe", 0, pid, maxactive, ret_link);
@@ -201,7 +379,7 @@ struct ebpf_link *program__attach_tracepoint(void *prog)
 {
 	// e.g.:
 	// sec_name:  "tracepoint/syscalls/sys_enter_write"
-	// prog name: "bpf_func_sys_enter_write"
+	// prog name: "df_T_enter_write"
 
 	char *sec_name, *category, *name;
 	int len, pfd;
@@ -255,6 +433,52 @@ struct ebpf_link *program__attach_tracepoint(void *prog)
 	return link;
 }
 
+struct ebpf_link *program__attach_kfunc(void *prog)
+{
+	// e.g.:
+	// sec_name:  "fentry/do_unlinkat"
+	// prog name: "kfunc__do_unlinkat"
+
+	int pfd;
+	struct ebpf_prog *ebpf_prog;
+	struct ebpf_link *link = NULL;
+
+	if (prog == NULL) {
+		ebpf_warning("prog is NULL.\n");
+		return NULL;
+	}
+
+	ebpf_prog = prog;
+	/*
+	 * bpf_attach_kfunc()
+	 * Return: A new file descriptor (a nonnegative integer), or -1 if an
+	 *         error occurred (in which case, *errno* is set appropriately).
+	 *
+	 * Internally, it actually calls the syscall bpf(), using the attribute
+	 * parameter type 'BPF_RAW_TRACEPOINT_OPEN'.
+	 * ref: https://github.com/iovisor/bcc/blob/052022b0d128f56405b0c4fab818b7479fd0eacc/src/cc/libbpf.c#L1568
+	 *      https://docs.kernel.org/userspace-api/ebpf/syscall.html
+	 */
+	pfd = bpf_attach_kfunc(ebpf_prog->prog_fd);
+	if (pfd < 0) {
+		ebpf_warning("kfunc attach failed, with %s(%d)\n",
+			     strerror(errno), errno);
+		return NULL;
+	}
+
+	link = calloc(1, sizeof(*link));
+	if (!link) {
+		close(pfd);
+		ebpf_warning("Call calloc() is failed.\n");
+		return NULL;
+	}
+
+	link->detach = ebpf_link__detach_kfunc;
+	link->fd = pfd;
+
+	return link;
+}
+
 /**
  * attach perf event
  *
@@ -290,10 +514,9 @@ int program__attach_perf_event(int prog_fd, uint32_t ev_type,
 			       uint32_t ev_config, uint64_t sample_period,
 			       uint64_t sample_freq, pid_t pid,
 			       int cpu, int group_fd,
-			       int *attach_fds,
-			       int fds_len)
+			       int *attach_fds, int fds_len)
 {
-	int i,j;
+	int i, j;
 	int fds[fds_len];
 	memset(fds, 0, sizeof(fds));
 	for (i = 0; i < sys_cpus_count && i < fds_len; i++) {
@@ -312,8 +535,9 @@ int program__attach_perf_event(int prog_fd, uint32_t ev_type,
 		}
 
 		fds[i] = fd;
-		ebpf_info("attach perf event sample_freq %d pid %d cpu %d done\n",
-			  sample_freq, pid, i);
+		ebpf_debug
+		    ("attach perf event sample_freq %d pid %d cpu %d done\n",
+		     sample_freq, pid, i);
 	}
 
 	memcpy((void *)attach_fds, (void *)fds, sizeof(fds));
@@ -337,8 +561,8 @@ int program__detach_perf_event(int *attach_fds, int len)
 	for (i = 0; i < len; i++) {
 		if (attach_fds[i] > 0) {
 			close(attach_fds[i]);
-			ebpf_info("detach cpu %d close fd %d\n",
-				  i, attach_fds[i]);
+			ebpf_debug("detach cpu %d close fd %d\n",
+				   i, attach_fds[i]);
 			attach_fds[i] = 0;
 		}
 	}

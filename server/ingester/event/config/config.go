@@ -17,7 +17,6 @@
 package config
 
 import (
-	"io/ioutil"
 	"os"
 
 	"github.com/deepflowio/deepflow/server/ingester/config"
@@ -29,26 +28,29 @@ import (
 var log = logging.MustGetLogger("event.config")
 
 const (
-	DefaultDecoderQueueCount     = 1
-	DefaultDecoderQueueSize      = 10000
-	DefaultPerfDecoderQueueCount = 1
-	DefaultPerfDecoderQueueSize  = 100000
-	DefaultEventTTL              = 720 // hour
-	DefaultPerfEventTTL          = 168 // hour
-	DefaultAlarmEventTTL         = 720 // hour
+	DefaultDecoderQueueCount          = 1
+	DefaultDecoderQueueSize           = 4096
+	DefaultFileEventDecoderQueueCount = 2
+	DefaultFileEventDecoderQueueSize  = 4096
+	DefaultEventTTL                   = 720 // hour
+	DefaultFileEventTTL               = 168 // hour
+	DefaultAlertEventTTL              = 720 // hour
 )
 
 type Config struct {
-	Base                  *config.Config
-	CKWriterConfig        config.CKWriterConfig `yaml:"event-ck-writer"`
-	DecoderQueueCount     int                   `yaml:"event-decoder-queue-count"`
-	DecoderQueueSize      int                   `yaml:"event-decoder-queue-size"`
-	TTL                   int                   `yaml:"event-ttl"`
-	PerfCKWriterConfig    config.CKWriterConfig `yaml:"perf-event-ck-writer"`
-	PerfDecoderQueueCount int                   `yaml:"perf-event-decoder-queue-count"`
-	PerfDecoderQueueSize  int                   `yaml:"perf-event-decoder-queue-size"`
-	PerfTTL               int                   `yaml:"perf-event-ttl"`
-	AlarmTTL              int                   `yaml:"alarm-event-ttl"`
+	Base                       *config.Config
+	CKWriterConfig             config.CKWriterConfig `yaml:"event-ck-writer"`
+	DecoderQueueCount          int                   `yaml:"event-decoder-queue-count"`
+	DecoderQueueSize           int                   `yaml:"event-decoder-queue-size"`
+	EventTTL                   int                   `yaml:"event-ttl"`
+	FileEventCKWriterConfig    config.CKWriterConfig `yaml:"file-event-ck-writer"`
+	FileEventDecoderQueueCount int                   `yaml:"file-event-decoder-queue-count"`
+	FileEventDecoderQueueSize  int                   `yaml:"file-event-decoder-queue-size"`
+	FileEventTTL               int                   `yaml:"file-event-ttl"`
+	AlertEventTTL              int                   `yaml:"alert-event-ttl"`
+	K8sCKWriterConfig          config.CKWriterConfig `yaml:"k8s-event-ck-writer"`
+	K8sDecoderQueueCount       int                   `yaml:"k8s-event-decoder-queue-count"`
+	K8sDecoderQueueSize        int                   `yaml:"k8s-event-decoder-queue-size"`
 }
 
 type EventConfig struct {
@@ -62,20 +64,26 @@ func (c *Config) Validate() error {
 	if c.DecoderQueueSize == 0 {
 		c.DecoderQueueSize = DefaultDecoderQueueSize
 	}
-	if c.TTL <= 0 {
-		c.TTL = DefaultEventTTL
+	if c.EventTTL <= 0 {
+		c.EventTTL = DefaultEventTTL
 	}
-	if c.PerfDecoderQueueCount == 0 {
-		c.PerfDecoderQueueCount = DefaultPerfDecoderQueueCount
+	if c.FileEventDecoderQueueCount == 0 {
+		c.FileEventDecoderQueueCount = DefaultFileEventDecoderQueueCount
 	}
-	if c.PerfDecoderQueueSize == 0 {
-		c.PerfDecoderQueueSize = DefaultPerfDecoderQueueSize
+	if c.FileEventDecoderQueueSize == 0 {
+		c.FileEventDecoderQueueSize = DefaultFileEventDecoderQueueSize
 	}
-	if c.PerfTTL <= 0 {
-		c.TTL = DefaultPerfEventTTL
+	if c.FileEventTTL <= 0 {
+		c.FileEventTTL = DefaultFileEventTTL
 	}
-	if c.AlarmTTL <= 0 {
-		c.TTL = DefaultAlarmEventTTL
+	if c.AlertEventTTL <= 0 {
+		c.AlertEventTTL = DefaultAlertEventTTL
+	}
+	if c.K8sDecoderQueueCount == 0 {
+		c.K8sDecoderQueueCount = DefaultDecoderQueueCount
+	}
+	if c.K8sDecoderQueueSize == 0 {
+		c.K8sDecoderQueueSize = DefaultDecoderQueueSize
 	}
 
 	return nil
@@ -88,20 +96,23 @@ func Load(base *config.Config, path string) *Config {
 			CKWriterConfig:    config.CKWriterConfig{QueueCount: 1, QueueSize: 50000, BatchSize: 25600, FlushTimeout: 5},
 			DecoderQueueCount: DefaultDecoderQueueCount,
 			DecoderQueueSize:  DefaultDecoderQueueSize,
-			TTL:               DefaultEventTTL,
+			EventTTL:          DefaultEventTTL,
 
-			PerfCKWriterConfig:    config.CKWriterConfig{QueueCount: 1, QueueSize: 50000, BatchSize: 25600, FlushTimeout: 5},
-			PerfDecoderQueueCount: DefaultPerfDecoderQueueCount,
-			PerfDecoderQueueSize:  DefaultPerfDecoderQueueSize,
-			PerfTTL:               DefaultPerfEventTTL,
-			AlarmTTL:              DefaultAlarmEventTTL,
+			FileEventCKWriterConfig:    config.CKWriterConfig{QueueCount: 1, QueueSize: 50000, BatchSize: 25600, FlushTimeout: 5},
+			FileEventDecoderQueueCount: DefaultFileEventDecoderQueueCount,
+			FileEventDecoderQueueSize:  DefaultFileEventDecoderQueueSize,
+			FileEventTTL:               DefaultFileEventTTL,
+			AlertEventTTL:              DefaultAlertEventTTL,
+			K8sCKWriterConfig:          config.CKWriterConfig{QueueCount: 1, QueueSize: 50000, BatchSize: 25600, FlushTimeout: 5},
+			K8sDecoderQueueCount:       DefaultDecoderQueueCount,
+			K8sDecoderQueueSize:        DefaultDecoderQueueSize,
 		},
 	}
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		log.Info("no config file, use defaults")
 		return &config.Event
 	}
-	configBytes, err := ioutil.ReadFile(path)
+	configBytes, err := os.ReadFile(path)
 	if err != nil {
 		log.Warning("Read config file error:", err)
 		config.Event.Validate()

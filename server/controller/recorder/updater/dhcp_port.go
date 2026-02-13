@@ -19,70 +19,73 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
+
+// DHCPPortMessageFactory DHCPPort资源的消息工厂
+type DHCPPortMessageFactory struct{}
+
+func (f *DHCPPortMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedDHCPPorts{}
+}
+
+func (f *DHCPPortMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedDHCPPort{}
+}
+
+func (f *DHCPPortMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedDHCPPorts{}
+}
+
+func (f *DHCPPortMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedDHCPPortFields{}
+}
 
 type DHCPPort struct {
 	UpdaterBase[
 		cloudmodel.DHCPPort,
-		mysql.DHCPPort,
 		*diffbase.DHCPPort,
-		*message.DHCPPortAdd,
-		message.DHCPPortAdd,
-		*message.DHCPPortUpdate,
-		message.DHCPPortUpdate,
-		*message.DHCPPortFieldsUpdate,
-		message.DHCPPortFieldsUpdate,
-		*message.DHCPPortDelete,
-		message.DHCPPortDelete]
+		*metadbmodel.DHCPPort,
+		metadbmodel.DHCPPort,
+	]
 }
 
 func NewDHCPPort(wholeCache *cache.Cache, cloudData []cloudmodel.DHCPPort) *DHCPPort {
 	updater := &DHCPPort{
-		newUpdaterBase[
-			cloudmodel.DHCPPort,
-			mysql.DHCPPort,
-			*diffbase.DHCPPort,
-			*message.DHCPPortAdd,
-			message.DHCPPortAdd,
-			*message.DHCPPortUpdate,
-			message.DHCPPortUpdate,
-			*message.DHCPPortFieldsUpdate,
-			message.DHCPPortFieldsUpdate,
-			*message.DHCPPortDelete,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_DHCP_PORT_EN,
 			wholeCache,
-			db.NewDHCPPort().SetORG(wholeCache.GetORG()),
+			db.NewDHCPPort().SetMetadata(wholeCache.GetMetadata()),
 			wholeCache.DiffBaseDataSet.DHCPPorts,
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
+	updater.setDataGenerator(updater)
+
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &DHCPPortMessageFactory{})
+	}
+
 	return updater
 }
 
-func (p *DHCPPort) getDiffBaseByCloudItem(cloudItem *cloudmodel.DHCPPort) (diffBase *diffbase.DHCPPort, exists bool) {
-	diffBase, exists = p.diffBaseData[cloudItem.Lcuuid]
-	return
-}
-
-func (p *DHCPPort) generateDBItemToAdd(cloudItem *cloudmodel.DHCPPort) (*mysql.DHCPPort, bool) {
+func (p *DHCPPort) generateDBItemToAdd(cloudItem *cloudmodel.DHCPPort) (*metadbmodel.DHCPPort, bool) {
 	vpcID, exists := p.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)
 	if !exists {
-		log.Error(p.org.LogPre(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_VPC_EN, cloudItem.VPCLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_DHCP_PORT_EN, cloudItem.Lcuuid,
-		)))
+		), p.metadata.LogPrefixes)
 		return nil, false
 	}
-	dbItem := &mysql.DHCPPort{
+	dbItem := &metadbmodel.DHCPPort{
 		Name:   cloudItem.Name,
-		Domain: p.cache.DomainLcuuid,
+		Domain: p.metadata.GetDomainLcuuid(),
 		Region: cloudItem.RegionLcuuid,
 		AZ:     cloudItem.AZLcuuid,
 		VPCID:  vpcID,
@@ -91,16 +94,16 @@ func (p *DHCPPort) generateDBItemToAdd(cloudItem *cloudmodel.DHCPPort) (*mysql.D
 	return dbItem, true
 }
 
-func (p *DHCPPort) generateUpdateInfo(diffBase *diffbase.DHCPPort, cloudItem *cloudmodel.DHCPPort) (*message.DHCPPortFieldsUpdate, map[string]interface{}, bool) {
-	structInfo := new(message.DHCPPortFieldsUpdate)
+func (p *DHCPPort) generateUpdateInfo(diffBase *diffbase.DHCPPort, cloudItem *cloudmodel.DHCPPort) (types.UpdatedFields, map[string]interface{}, bool) {
+	structInfo := new(message.UpdatedDHCPPortFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.VPCLcuuid != cloudItem.VPCLcuuid {
 		vpcID, exists := p.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)
 		if !exists {
-			log.Error(p.org.LogPre(resourceAForResourceBNotFound(
+			log.Error(resourceAForResourceBNotFound(
 				ctrlrcommon.RESOURCE_TYPE_VPC_EN, cloudItem.VPCLcuuid,
 				ctrlrcommon.RESOURCE_TYPE_DHCP_PORT_EN, cloudItem.Lcuuid,
-			)))
+			), p.metadata.LogPrefixes)
 			return nil, nil, false
 		}
 		mapInfo["epc_id"] = vpcID

@@ -25,15 +25,18 @@ use std::time::Duration;
 
 use flate2::read::GzDecoder;
 use public::enums::IpProtocol;
-use public::l7_protocol::CustomProtocol;
+use public::l7_protocol::{CustomProtocol, LogMessageType};
 
 use crate::common::ebpf::EbpfType;
 use crate::common::flow::PacketDirection;
 use crate::common::l7_protocol_info::L7ProtocolInfo;
-use crate::common::l7_protocol_log::{EbpfParam, L7PerfCache};
+use crate::common::l7_protocol_log::L7PerfCache;
 
 use crate::config::handler::LogParserConfig;
-use crate::config::OracleParseConfig;
+use crate::config::{
+    config::{Iso8583ParseConfig, WebSphereMqParseConfig},
+    OracleConfig,
+};
 use crate::flow_generator::protocol_logs::pb_adapter::L7ProtocolSendLog;
 use crate::flow_generator::protocol_logs::{get_wasm_parser, L7ResponseStatus, WasmLog};
 use crate::{
@@ -56,25 +59,31 @@ fn get_req_param<'a>(
         flow_id: 1234567,
         direction: PacketDirection::ClientToServer,
         ebpf_type: EbpfType::TracePoint,
-        ebpf_param: Some(EbpfParam {
+        #[cfg(feature = "libtrace")]
+        ebpf_param: Some(crate::common::l7_protocol_log::EbpfParam {
             is_tls: false,
             is_req_end: false,
             is_resp_end: false,
             process_kname: "test_wasm",
         }),
-        packet_seq: 9999999,
+        packet_start_seq: 9999999,
+        packet_end_seq: 9999999,
         time: 12345678,
         parse_perf: true,
         parse_log: true,
         parse_config: None,
-        l7_perf_cache: rrt_cache.clone(),
+        l7_perf_cache: Some(rrt_cache.clone()),
         wasm_vm: vm,
         #[cfg(any(target_os = "linux", target_os = "android"))]
         so_func: Default::default(),
         stats_counter: None,
         rrt_timeout: Duration::from_secs(10).as_micros() as usize,
         buf_size: 999,
-        oracle_parse_conf: OracleParseConfig::default(),
+        captured_byte: 999,
+        oracle_parse_conf: OracleConfig::default(),
+        iso8583_parse_conf: Iso8583ParseConfig::default(),
+        web_sphere_mq_parse_conf: WebSphereMqParseConfig::default(),
+        icmp_data: None,
     }
 }
 
@@ -91,26 +100,31 @@ fn get_resq_param<'a>(
         flow_id: 1234567,
         direction: PacketDirection::ServerToClient,
         ebpf_type: EbpfType::TracePoint,
-
-        ebpf_param: Some(EbpfParam {
+        #[cfg(feature = "libtrace")]
+        ebpf_param: Some(crate::common::l7_protocol_log::EbpfParam {
             is_tls: false,
             is_req_end: false,
             is_resp_end: false,
             process_kname: "test_wasm",
         }),
-        packet_seq: 9999999,
+        packet_start_seq: 9999999,
+        packet_end_seq: 9999999,
         time: 12345678,
         parse_perf: true,
         parse_log: true,
         parse_config: None,
-        l7_perf_cache: rrt_cache.clone(),
+        l7_perf_cache: Some(rrt_cache.clone()),
         wasm_vm: vm,
         #[cfg(any(target_os = "linux", target_os = "android"))]
         so_func: Default::default(),
         stats_counter: None,
         rrt_timeout: Duration::from_secs(10).as_micros() as usize,
         buf_size: 999,
-        oracle_parse_conf: OracleParseConfig::default(),
+        captured_byte: 999,
+        oracle_parse_conf: OracleConfig::default(),
+        iso8583_parse_conf: Iso8583ParseConfig::default(),
+        web_sphere_mq_parse_conf: WebSphereMqParseConfig::default(),
+        icmp_data: None,
     }
 }
 
@@ -148,8 +162,8 @@ fn test_wasm_http_req() {
             i.trace_info
                 .as_ref()
                 .unwrap()
-                .trace_id
-                .as_ref()
+                .trace_ids
+                .first()
                 .unwrap()
                 .as_str(),
             "aaa"
@@ -206,8 +220,8 @@ fn test_wasm_http_resp() {
             i.trace_info
                 .as_ref()
                 .unwrap()
-                .trace_id
-                .as_ref()
+                .trace_ids
+                .first()
                 .unwrap()
                 .as_str(),
             ""
@@ -255,7 +269,10 @@ fn test_check_payload() {
         10, 6, 100, 111, 109, 97, 105, 110, 18, 8, 114, 101, 115, 111, 117, 114, 99, 101, 26, 4,
         116, 121, 112, 101, 34, 8, 101, 110, 100, 112, 111, 105, 110, 116,
     ];
-    assert_eq!(wasm_log.check_payload(&payload[..], &param), true);
+    assert_eq!(
+        wasm_log.check_payload(&payload[..], &param),
+        Some(LogMessageType::Request)
+    );
     assert_eq!(
         wasm_log.custom_protocol().unwrap(),
         CustomProtocol::Wasm(1, "test".to_string())
@@ -289,7 +306,7 @@ fn test_wasm_parse_payload_req() {
         assert_eq!(ci.req.resource.as_str(), "resource");
         assert_eq!(ci.req.endpoint.as_str(), "endpoint");
 
-        assert_eq!(ci.trace.trace_id.unwrap(), "11111");
+        assert_eq!(ci.trace.trace_ids.first().unwrap(), "11111");
         assert_eq!(ci.trace.span_id.unwrap(), "22222");
         assert_eq!(ci.trace.parent_span_id.unwrap(), "33333");
 
@@ -322,7 +339,7 @@ fn test_wasm_parse_payload_req() {
         assert_eq!(ci.req.resource.as_str(), "resource");
         assert_eq!(ci.req.endpoint.as_str(), "endpoint");
 
-        assert_eq!(ci.trace.trace_id.unwrap(), "11111");
+        assert_eq!(ci.trace.trace_ids.first().unwrap(), "11111");
         assert_eq!(ci.trace.span_id.unwrap(), "22222");
         assert_eq!(ci.trace.parent_span_id.unwrap(), "33333");
 
@@ -364,7 +381,7 @@ fn test_wasm_parse_payload_resp() {
         assert_eq!(ci.resp.result, "result");
         assert_eq!(ci.resp.exception, "exception");
 
-        assert_eq!(ci.trace.trace_id.unwrap(), "11111");
+        assert_eq!(ci.trace.trace_ids.first().unwrap(), "11111");
         assert_eq!(ci.trace.span_id.unwrap(), "22222");
         assert_eq!(ci.trace.parent_span_id.unwrap(), "33333");
 
@@ -393,7 +410,7 @@ fn test_wasm_parse_payload_resp() {
         assert_eq!(ci.resp.result, "result");
         assert_eq!(ci.resp.exception, "exception");
 
-        assert_eq!(ci.trace.trace_id.unwrap(), "11111");
+        assert_eq!(ci.trace.trace_ids.first().unwrap(), "11111");
         assert_eq!(ci.trace.span_id.unwrap(), "22222");
         assert_eq!(ci.trace.parent_span_id.unwrap(), "33333");
 

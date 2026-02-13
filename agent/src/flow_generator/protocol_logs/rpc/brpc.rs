@@ -1,21 +1,25 @@
 #[path = "brpc/brpc.policy.rs"]
+#[rustfmt::skip]
 mod brpc_policy;
 
 use brpc_policy::RpcMeta;
+use public::l7_protocol::LogMessageType;
 
 use crate::{
     common::{
         enums::IpProtocol,
-        flow::{L7PerfStats, L7Protocol, PacketDirection},
+        flow::{L7PerfStats, L7Protocol},
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
-        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
-        meta_packet::EbpfFlags,
+        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, LogCache, ParseParam},
+        meta_packet::ApplicationFlags,
     },
+    config::handler::LogParserConfig,
     flow_generator::{
         error::Result,
         protocol_logs::{
             pb_adapter::{ExtendedInfo, L7ProtocolSendLog, L7Request, L7Response, TraceInfo},
-            AppProtoHead, L7ResponseStatus, LogMessageType,
+            set_captured_byte, swap_if, AppProtoHead, L7ResponseStatus, PrioFields,
+            BASE_FIELD_PRIORITY,
         },
     },
     utils::bytes::read_u32_be,
@@ -39,21 +43,39 @@ pub struct BrpcInfo {
     req_len: Option<u32>,
     req_log_id: Option<i64>,
 
-    resp_status: Option<L7ResponseStatus>,
+    resp_status: L7ResponseStatus,
     resp_code: Option<i32>,
     resp_exception: Option<String>,
     resp_len: Option<u32>,
 
-    trace_id: Option<String>,
+    trace_ids: PrioFields,
     span_id: Option<String>,
+
+    captured_request_byte: u32,
+    captured_response_byte: u32,
+
+    #[serde(skip)]
+    is_on_blacklist: bool,
+    #[serde(skip)]
+    endpoint: Option<String>,
 }
 
 #[derive(Default)]
 pub struct BrpcLog {
-    perf_stats: Option<L7PerfStats>,
+    perf_stats: Vec<L7PerfStats>,
+    last_is_on_blacklist: bool,
 }
 
 impl BrpcInfo {
+    fn generate_endpoint(&self) -> Option<String> {
+        format!(
+            "{}/{}",
+            self.req_service_name.as_ref()?,
+            self.req_method_name.as_ref()?
+        )
+        .into()
+    }
+
     fn parse<'a>(payload: &'a [u8], param: &ParseParam) -> Option<(&'a [u8], Self)> {
         let mut info = BrpcInfo::default();
 
@@ -76,13 +98,14 @@ impl BrpcInfo {
             info.req_method_name = Some(req.method_name);
             info.req_log_id = req.log_id;
             info.req_len = Some(body_size as u32 + 12);
+            info.endpoint = info.generate_endpoint();
             info.msg_type = LogMessageType::Request;
         } else if let Some(resp) = meta.response {
             info.resp_code = resp.error_code;
             info.resp_exception = resp.error_text;
             info.resp_status = match resp.error_code {
-                Some(x) if x != 0 => Some(L7ResponseStatus::Error),
-                _ => Some(L7ResponseStatus::Ok),
+                Some(x) if x != 0 => L7ResponseStatus::ServerError,
+                _ => L7ResponseStatus::Ok,
             };
             info.resp_len = Some(body_size as u32 + 12);
             info.msg_type = LogMessageType::Response;
@@ -90,41 +113,33 @@ impl BrpcInfo {
             return None;
         }
 
-        (info.trace_id, info.span_id) = {
-            let mut trace_id = None;
-            let mut span_id = None;
-            if let Some(config) = param.parse_config.map(|x| &x.l7_log_dynamic) {
-                for (k, v) in meta.user_fields.iter() {
-                    for tt in config.trace_types.iter() {
-                        if tt.check(k) {
-                            trace_id = tt.decode_trace_id(v).map(|x| x.to_string());
-                            break;
-                        }
-                    }
-                    for st in config.span_types.iter() {
-                        if st.check(k) {
-                            span_id = st.decode_span_id(v).map(|x| x.to_string());
-                            break;
+        if let Some(config) = param.parse_config.map(|x| &x.l7_log_dynamic) {
+            for (k, v) in meta.user_fields.iter() {
+                for (index, tt) in config.trace_types.iter().enumerate() {
+                    let prio = index as u8 + BASE_FIELD_PRIORITY;
+                    if tt.check(k) {
+                        if info.trace_ids.highest_priority() <= prio
+                            || !config.multiple_trace_id_collection
+                        {
+                            if let Some(trace_id) = tt.decode_trace_id(v) {
+                                info.trace_ids.merge_field(prio, trace_id.to_string())
+                            }
                         }
                     }
                 }
+                for st in config.span_types.iter() {
+                    if st.check(k) {
+                        info.span_id = st.decode_span_id(v).map(|x| x.to_string());
+                        break;
+                    }
+                }
             }
-            (trace_id, span_id)
-        };
+        }
 
         Some((payload, info))
     }
-}
 
-impl From<BrpcInfo> for L7ProtocolSendLog {
-    fn from(info: BrpcInfo) -> Self {
-        let flags = match info.is_tls {
-            true => EbpfFlags::TLS.bits(),
-            false => EbpfFlags::NONE.bits(),
-        };
-
-        let endpoint = info.get_endpoint();
-
+    fn get_request_id(&self) -> Option<u32> {
         /*
         file: brpc/src/bthread/id.cpp
 
@@ -134,26 +149,59 @@ impl From<BrpcInfo> for L7ProtocolSendLog {
             return tmp;
         }
         */
-        let request_id = info.correlation_id.map(|x| (x >> 32) as u32);
+        self.correlation_id.map(|x| (x >> 32) as u32)
+    }
+
+    fn set_is_on_blacklist(&mut self, config: &LogParserConfig) {
+        if let Some(t) = config.l7_log_blacklist_trie.get(&L7Protocol::Brpc) {
+            self.is_on_blacklist = self
+                .req_method_name
+                .as_ref()
+                .map(|p| t.request_type.is_on_blacklist(p))
+                .unwrap_or_default()
+                || self
+                    .req_service_name
+                    .as_ref()
+                    .map(|p| t.request_resource.is_on_blacklist(p))
+                    .unwrap_or_default()
+                || self
+                    .endpoint
+                    .as_ref()
+                    .map(|p| t.endpoint.is_on_blacklist(p))
+                    .unwrap_or_default();
+        }
+    }
+}
+
+impl From<BrpcInfo> for L7ProtocolSendLog {
+    fn from(info: BrpcInfo) -> Self {
+        let flags = match info.is_tls {
+            true => ApplicationFlags::TLS.bits(),
+            false => ApplicationFlags::NONE.bits(),
+        };
+
+        let request_id = info.get_request_id();
 
         let log = L7ProtocolSendLog {
+            captured_request_byte: info.captured_request_byte,
+            captured_response_byte: info.captured_response_byte,
             flags,
             req_len: info.req_len,
             resp_len: info.resp_len,
             req: L7Request {
                 req_type: info.req_method_name.unwrap_or_default(),
                 resource: info.req_service_name.unwrap_or_default(),
-                endpoint: endpoint.unwrap_or_default(),
+                endpoint: info.endpoint.unwrap_or_default(),
                 ..Default::default()
             },
             resp: L7Response {
-                status: info.resp_status.unwrap_or_default(),
+                status: info.resp_status,
                 code: info.resp_code,
                 exception: info.resp_exception.unwrap_or_default(),
                 ..Default::default()
             },
             trace_info: Some(TraceInfo {
-                trace_id: info.trace_id,
+                trace_ids: info.trace_ids.into_strings_top3(),
                 span_id: info.span_id,
                 ..Default::default()
             }),
@@ -168,23 +216,41 @@ impl From<BrpcInfo> for L7ProtocolSendLog {
     }
 }
 
+impl From<&BrpcInfo> for LogCache {
+    fn from(info: &BrpcInfo) -> Self {
+        LogCache {
+            msg_type: info.msg_type,
+            resp_status: info.resp_status,
+            on_blacklist: info.is_on_blacklist,
+            endpoint: info.get_endpoint(),
+            ..Default::default()
+        }
+    }
+}
+
 impl L7ProtocolInfoInterface for BrpcInfo {
     fn is_tls(&self) -> bool {
         self.is_tls
     }
 
     fn session_id(&self) -> Option<u32> {
-        None
+        self.get_request_id()
     }
 
     fn merge_log(&mut self, other: &mut L7ProtocolInfo) -> Result<()> {
         if let (req, L7ProtocolInfo::BrpcInfo(rsp)) = (self, other) {
             req.resp_len = req.resp_len.or(rsp.resp_len);
-            req.resp_status = req.resp_status.or(rsp.resp_status);
+            if rsp.resp_status != L7ResponseStatus::Ok {
+                req.resp_status = rsp.resp_status;
+            }
             req.resp_code = req.resp_code.or(rsp.resp_code);
             if req.resp_exception.is_none() {
                 req.resp_exception = rsp.resp_exception.clone();
             }
+            if rsp.is_on_blacklist {
+                req.is_on_blacklist = rsp.is_on_blacklist;
+            }
+            swap_if!(req, endpoint, is_none, rsp);
         }
         Ok(())
     }
@@ -198,34 +264,33 @@ impl L7ProtocolInfoInterface for BrpcInfo {
     }
 
     fn get_endpoint(&self) -> Option<String> {
-        format!(
-            "{}/{}",
-            self.req_service_name.as_ref()?,
-            self.req_method_name.as_ref()?
-        )
-        .into()
+        self.endpoint.clone()
+    }
+
+    fn is_on_blacklist(&self) -> bool {
+        self.is_on_blacklist
     }
 }
 
 impl L7ProtocolParserInterface for BrpcLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
         if !param.ebpf_type.is_raw_protocol() {
-            return false;
+            return None;
         }
         if param.l4_protocol != IpProtocol::TCP {
-            return false;
+            return None;
         }
         if payload.len() < 12 {
-            return false;
+            return None;
         }
-        BrpcInfo::parse(payload, param).is_some()
+        if BrpcInfo::parse(payload, param).is_some() {
+            Some(LogMessageType::Request)
+        } else {
+            None
+        }
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
-        if self.perf_stats.is_none() && param.parse_perf {
-            self.perf_stats = Some(L7PerfStats::default())
-        };
-
         let mut vec = Vec::new();
         let mut payload = payload;
 
@@ -233,25 +298,28 @@ impl L7ProtocolParserInterface for BrpcLog {
             payload = tmp;
             vec.push(L7ProtocolInfo::BrpcInfo(info));
         }
-
+        self.perf_stats.clear();
         for info in &mut vec {
             if let L7ProtocolInfo::BrpcInfo(info) = info {
-                if info.msg_type != LogMessageType::Session {
-                    info.cal_rrt(param, None).map(|rtt| {
-                        info.rtt = rtt;
-                        self.perf_stats.as_mut().map(|p| p.update_rrt(rtt));
-                    });
+                info.is_tls = param.is_tls();
+                set_captured_byte!(info, param);
+
+                if let Some(config) = param.parse_config {
+                    info.set_is_on_blacklist(config);
                 }
 
-                info.is_tls = param.is_tls();
-
-                match param.direction {
-                    PacketDirection::ClientToServer => {
-                        self.perf_stats.as_mut().map(|p| p.inc_req());
+                if param.parse_perf {
+                    let mut perf_stat = L7PerfStats::default();
+                    if info.msg_type == LogMessageType::Response {
+                        if let Some(endpoint) = info.load_endpoint_from_cache(param, false) {
+                            info.endpoint = Some(endpoint.to_string());
+                        }
                     }
-                    PacketDirection::ServerToClient => {
-                        self.perf_stats.as_mut().map(|p| p.inc_resp());
+                    if let Some(stats) = info.perf_stats(param) {
+                        info.rtt = stats.rrt_sum;
+                        perf_stat.sequential_merge(&stats);
                     }
+                    self.perf_stats.push(perf_stat);
                 }
             }
         }
@@ -267,8 +335,8 @@ impl L7ProtocolParserInterface for BrpcLog {
         }
     }
 
-    fn perf_stats(&mut self) -> Option<L7PerfStats> {
-        self.perf_stats.take()
+    fn perf_stats(&mut self) -> Vec<L7PerfStats> {
+        std::mem::take(&mut self.perf_stats)
     }
 
     fn protocol(&self) -> L7Protocol {
@@ -281,7 +349,8 @@ impl L7ProtocolParserInterface for BrpcLog {
 
     fn reset(&mut self) {
         let mut s = Self::default();
-        s.perf_stats = self.perf_stats.take();
+        s.last_is_on_blacklist = self.last_is_on_blacklist;
+        s.perf_stats = self.perf_stats();
         *self = s;
     }
 }
@@ -297,10 +366,7 @@ mod tests {
 
     use crate::{
         common::{flow::PacketDirection, l7_protocol_log::L7PerfCache, MetaPacket},
-        config::{
-            handler::{L7LogDynamicConfig, LogParserConfig, TraceType},
-            ExtraLogFields,
-        },
+        config::handler::{L7LogDynamicConfigBuilder, LogParserConfig, TraceType},
         flow_generator::L7_RRT_CACHE_CAPACITY,
         utils::test::Capture,
     };
@@ -308,9 +374,9 @@ mod tests {
     const FILE_DIR: &str = "resources/test/flow_generator/brpc";
 
     fn run(name: &str) -> String {
-        let capture = Capture::load_pcap(Path::new(FILE_DIR).join(name), None);
+        let capture = Capture::load_pcap(Path::new(FILE_DIR).join(name));
         let log_cache = Rc::new(RefCell::new(L7PerfCache::new(L7_RRT_CACHE_CAPACITY)));
-        let mut packets = capture.as_meta_packets();
+        let mut packets = capture.collect::<Vec<_>>();
         if packets.is_empty() {
             return "".to_string();
         }
@@ -330,29 +396,30 @@ mod tests {
             };
             let param = &mut ParseParam::new(
                 packet as &MetaPacket,
-                log_cache.clone(),
+                Some(log_cache.clone()),
                 Default::default(),
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 Default::default(),
                 true,
                 true,
             );
+            param.set_captured_byte(payload.len());
 
-            let config = L7LogDynamicConfig::new(
-                "".to_owned(),
-                vec![],
-                vec![TraceType::Sw8, TraceType::TraceParent],
-                vec![TraceType::Sw8, TraceType::TraceParent],
-                ExtraLogFields::default(),
-            );
+            let config = L7LogDynamicConfigBuilder {
+                proxy_client: vec![],
+                x_request_id: vec![],
+                trace_types: vec![TraceType::Sw8, TraceType::TraceParent],
+                span_types: vec![TraceType::Sw8, TraceType::TraceParent],
+                ..Default::default()
+            };
             let parse_config = &LogParserConfig {
-                l7_log_dynamic: config.clone(),
+                l7_log_dynamic: config.into(),
                 ..Default::default()
             };
 
-            param.set_log_parse_config(parse_config);
+            param.set_log_parser_config(parse_config);
 
-            if !brpc.check_payload(payload, param) {
+            if brpc.check_payload(payload, param).is_none() {
                 output.push_str("not brpc\n");
                 continue;
             }

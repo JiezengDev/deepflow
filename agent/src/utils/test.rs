@@ -14,58 +14,85 @@
  * limitations under the License.
  */
 
-use std::path::Path;
-use std::time::Duration;
+use std::{fmt, path::Path, time::Duration};
 
-use pcap::{self, PacketHeader};
+use pcap::{self, Linktype};
 
-use crate::common::meta_packet::MetaPacket;
+use crate::common::meta_packet::{MetaPacket, PcapData};
 
-pub struct Capture(Vec<(PacketHeader, Vec<u8>)>);
+pub struct Capture {
+    cap: pcap::Capture<pcap::Offline>,
+    dl_type: Linktype,
+}
 
 impl Capture {
-    pub fn load_pcap<P: AsRef<Path>>(path: P, parse_len: Option<usize>) -> Self {
-        let parse_len = parse_len.unwrap_or(1500);
-        let mut packets = vec![];
-        let mut capture = pcap::Capture::from_file(path).unwrap();
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        while let Ok(packet) = capture.next() {
-            packets.push((
-                packet.header.clone(),
-                Vec::from(&packet.data[..packet.data.len().min(parse_len)]),
-            ));
-        }
-        #[cfg(target_os = "windows")]
-        while let Ok(packet) = capture.next_packet() {
-            packets.push((
-                packet.header.clone(),
-                Vec::from(&packet.data[..packet.data.len().min(parse_len)]),
-            ));
-        }
-        Self(packets)
+    pub fn load_pcap<P: AsRef<Path>>(path: P) -> Self {
+        let cap = pcap::Capture::from_file(path).unwrap();
+        let dl_type = cap.get_datalink();
+        Self { cap, dl_type }
     }
+}
 
-    pub fn as_meta_packets(&self) -> Vec<MetaPacket<'_>> {
-        self.0
-            .iter()
-            .map(|(h, p)| {
-                let mut meta = MetaPacket::empty();
-                meta.update(
-                    p.as_ref(),
-                    true,
-                    true,
-                    Duration::new(h.ts.tv_sec as u64, h.ts.tv_usec as u32 * 1000),
-                    0,
-                )
-                .unwrap();
-                meta
-            })
-            .collect()
+impl Iterator for Capture {
+    type Item = MetaPacket<'static>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.cap.next_packet().ok().and_then(|packet| {
+            let pcap_data = PcapData {
+                link_type: self.dl_type,
+                timestamp: Duration::new(
+                    packet.header.ts.tv_sec as u64,
+                    packet.header.ts.tv_usec as u32 * 1000,
+                ),
+                data: packet.data,
+            };
+            MetaPacket::try_from(pcap_data).ok().map(|p| p.into_owned())
+        })
     }
 }
 
 impl From<Capture> for Vec<Vec<u8>> {
-    fn from(c: Capture) -> Self {
-        c.0.into_iter().map(|(_, p)| p).collect()
+    fn from(mut c: Capture) -> Self {
+        let mut vec = Vec::new();
+        while let Ok(p) = c.cap.next_packet() {
+            vec.push(p.data.to_vec());
+        }
+        vec
+    }
+}
+
+pub struct WrappedDebugStruct<'a, 'b: 'a>(fmt::DebugStruct<'a, 'b>);
+
+impl<'a, 'b> From<fmt::DebugStruct<'a, 'b>> for WrappedDebugStruct<'a, 'b> {
+    fn from(ds: fmt::DebugStruct<'a, 'b>) -> Self {
+        Self(ds)
+    }
+}
+
+impl<'a, 'b: 'a> WrappedDebugStruct<'a, 'b> {
+    pub fn field_skip_default<F>(
+        &mut self,
+        field: &str,
+        value: &F,
+    ) -> &mut WrappedDebugStruct<'a, 'b>
+    where
+        F: fmt::Debug + Default + PartialEq,
+    {
+        if value != &F::default() {
+            self.0.field(field, value);
+        }
+        self
+    }
+
+    pub fn field<F>(&mut self, field: &str, value: &F) -> &mut WrappedDebugStruct<'a, 'b>
+    where
+        F: fmt::Debug,
+    {
+        self.0.field(field, value);
+        self
+    }
+
+    pub fn finish(&mut self) -> fmt::Result {
+        self.0.finish()
     }
 }

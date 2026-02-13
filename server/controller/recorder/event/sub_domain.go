@@ -18,66 +18,83 @@ package event
 
 import (
 	"encoding/json"
+	"slices"
 
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 	"github.com/deepflowio/deepflow/server/libs/eventapi"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 )
 
-type SubDomain struct {
-	domainLcuuid    string
-	subDomainLcuuid string
-	EventManagerBase
+type WholeSubDomain struct {
+	ManagerComponent
+	ChangedSubscriberComponent
 	tool *IPTool
 }
 
-func NewSubDomain(domainLcuuid, subDomainLcuuid string, toolDS *tool.DataSet, eq *queue.OverwriteQueue) *SubDomain {
-	return &SubDomain{
-		domainLcuuid,
-		subDomainLcuuid,
-		newEventManagerBase(
-			common.RESOURCE_TYPE_SUB_DOMAIN_EN,
-			toolDS,
-			eq,
-		),
-		newTool(toolDS),
+func NewWholeSubDomain(q *queue.OverwriteQueue) *WholeSubDomain {
+	mng := &WholeSubDomain{
+		newManagerComponent(common.RESOURCE_TYPE_SUB_DOMAIN_EN, q),
+		newChangedSubscriberComponent(pubsub.PubSubTypeWholeSubDomain),
+		newTool(),
 	}
+	mng.SetSubscriberSelf(mng)
+	return mng
 }
 
 // After all updaters are processed, fill the information of resource events stored in the db and put them to the queue.
 // If the population fails, incomplete resource events are also written to the queue.
-func (r *SubDomain) ProduceFromMySQL() {
-	var dbItems []mysql.ResourceEvent
-	err := r.org.DB.Where("domain = ? AND sub_domain = ?", r.domainLcuuid, r.subDomainLcuuid).Find(&dbItems).Error
+func (r *WholeSubDomain) OnAnyChanged(md *message.Metadata) {
+	var dbItems []metadbmodel.ResourceEvent // TODO use domain_id, sub_domain_id
+	err := md.GetDB().Where(map[string]interface{}{"domain": md.GetDomainLcuuid(), "sub_domain": md.GetSubDomainLcuuid()}).Find(&dbItems).Error
 	if err != nil {
-		log.Error(r.org.LogPre("db query resource_event failed:%s", err.Error()))
+		log.Errorf("db query resource_event failed: %s", err.Error(), md.LogPrefixes)
 		return
 	}
 	for _, item := range dbItems {
 		var event *eventapi.ResourceEvent
 		err = json.Unmarshal([]byte(item.Content), &event)
 		if err != nil {
-			log.Error(r.org.LogPre("json marshal event (detail: %#v) failed: %s", item, err.Error()))
-			r.org.DB.Delete(&item)
+			log.Errorf("json marshal event (detail: %#v) failed: %s", item, err, md.LogPrefixes)
+			md.GetDB().Delete(&item)
 			continue
 		}
 
 		if event.Type == eventapi.RESOURCE_EVENT_TYPE_RECREATE {
-			r.fillRecreatePodEvent(event)
-		} else if common.Contains([]string{eventapi.RESOURCE_EVENT_TYPE_CREATE, eventapi.RESOURCE_EVENT_TYPE_ADD_IP}, event.Type) {
-			r.fillL3DeviceInfo(event)
+			r.fillRecreatePodEvent(md, event)
+			r.convertAndEnqueue(md, item.ResourceLcuuid, event)
+		} else if slices.Contains([]string{eventapi.RESOURCE_EVENT_TYPE_CREATE, eventapi.RESOURCE_EVENT_TYPE_ATTACH_IP}, event.Type) {
+			r.fillL3DeviceInfo(md, event)
+			r.convertAndEnqueue(md, item.ResourceLcuuid, event)
+		} else if slices.Contains([]string{
+			eventapi.RESOURCE_EVENT_TYPE_ATTACH_CONFIG_MAP,
+			eventapi.RESOURCE_EVENT_TYPE_MODIFY_CONFIG_MAP,
+			eventapi.RESOURCE_EVENT_TYPE_DETACH_CONFIG_MAP}, event.Type) {
+			podGroupIDs := md.GetToolDataSet().GetPodGroupIDsByConfigMapID(int(event.ConfigMapID))
+			if len(podGroupIDs) != 0 {
+				log.Infof("pod group ids: %v connected to config map (id: %d)", podGroupIDs, event.ConfigMapID, md.LogPrefixes)
+			}
+			for _, podGroupID := range podGroupIDs {
+				gtype, ok := md.GetToolDataSet().GetPodGroupTypeByID(podGroupID)
+				if !ok {
+					log.Errorf("get pod group (id: %d) type failed", podGroupID, md.LogPrefixes)
+				}
+				event.PodGroupType = uint8(common.RESOURCE_POD_GROUP_TYPE_MAP[gtype])
+				event.PodGroupID = uint32(podGroupID)
+				event.InstanceType = uint32(common.VIF_DEVICE_TYPE_POD) // 此处如此赋值原因同 RESOURCE_EVENT_TYPE_MODIFY 类型变更事件
+				r.convertAndEnqueue(md, item.ResourceLcuuid, event)
+			}
 		}
-		r.convertAndEnqueue(item.ResourceLcuuid, event)
-		r.org.DB.Delete(&item)
+		md.GetDB().Delete(&item)
 	}
 }
 
-func (r *SubDomain) fillRecreatePodEvent(event *eventapi.ResourceEvent) {
+func (r *WholeSubDomain) fillRecreatePodEvent(md *message.Metadata, event *eventapi.ResourceEvent) {
 	var networkIDs []uint32
 	var ips []string
-	ipNetworkMap, _ := r.ToolDataSet.EventDataSet.GetPodIPNetworkMapByID(int(event.InstanceID))
+	ipNetworkMap, _ := md.GetToolDataSet().EventDataSet.GetPodIPNetworkMapByID(int(event.InstanceID))
 	for ip, nID := range ipNetworkMap {
 		networkIDs = append(networkIDs, uint32(nID))
 		ips = append(ips, ip.IP)
@@ -86,19 +103,19 @@ func (r *SubDomain) fillRecreatePodEvent(event *eventapi.ResourceEvent) {
 	event.AttributeIPs = ips
 }
 
-func (r *SubDomain) fillL3DeviceInfo(event *eventapi.ResourceEvent) bool {
+func (r *WholeSubDomain) fillL3DeviceInfo(md *message.Metadata, event *eventapi.ResourceEvent) bool {
 	var podNodeID int
 	if event.InstanceType == common.VIF_DEVICE_TYPE_POD_NODE {
 		podNodeID = int(event.InstanceID)
 	} else if event.InstanceType == common.VIF_DEVICE_TYPE_POD {
-		podInfo, err := r.ToolDataSet.GetPodInfoByID(int(event.InstanceID))
+		podInfo, err := md.GetToolDataSet().GetPodInfoByID(int(event.InstanceID))
 		if err != nil {
-			log.Error(r.org.LogPre("get pod (id: %d) pod node ID failed: %s", event.InstanceID, err.Error()))
+			log.Errorf("get pod (id: %d) pod node ID failed: %s", event.InstanceID, err.Error(), md.LogPrefixes)
 			return false
 		}
 		podNodeID = podInfo.PodNodeID
 	}
-	l3DeviceOpts, ok := r.tool.getL3DeviceOptionsByPodNodeID(podNodeID)
+	l3DeviceOpts, ok := r.tool.getL3DeviceOptionsByPodNodeID(md, podNodeID)
 	if ok {
 		for _, option := range l3DeviceOpts {
 			option(event)

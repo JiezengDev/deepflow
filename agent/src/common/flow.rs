@@ -15,23 +15,19 @@
  */
 
 use std::{
-    fmt::{self, Display},
+    fmt,
     mem::swap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    process,
     sync::Arc,
-    thread,
     time::Duration,
 };
 
 use log::{error, warn};
 use serde::{Serialize, Serializer};
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use super::super::ebpf::{MSG_REQUEST, MSG_REQUEST_END, MSG_RESPONSE, MSG_RESPONSE_END};
 use super::{
     decapsulate::TunnelType,
-    enums::{EthernetType, IpProtocol, TapType, TcpFlags},
+    enums::{CaptureNetworkType, EthernetType, IpProtocol, TcpFlags},
     tap_port::TapPort,
     TaggedFlow,
 };
@@ -50,7 +46,7 @@ use public::utils::net::MacAddr;
 use public::{
     buffer::BatchedBox,
     packet::SECONDS_IN_MINUTE,
-    proto::{common::TridentType, flow_log},
+    proto::{agent::AgentType, flow_log},
 };
 
 pub use public::enums::L4Protocol;
@@ -62,7 +58,7 @@ const COUNTER_FLOW_ID_MASK: u64 = 0x00FFFFFF;
 #[repr(u8)]
 pub enum CloseType {
     Unknown = 0,
-    TcpFin = 1,                 //  1: 正常结束
+    Finish = 1,                 //  1: 正常结束
     TcpServerRst = 2,           //  2: 传输-服务端重置
     Timeout = 3,                //  3: 连接超时
     ForcedReport = 5,           //  5: 周期性上报
@@ -108,8 +104,8 @@ impl Default for CloseType {
 
 #[derive(Serialize, PartialEq, Eq, PartialOrd, Ord, Debug, Clone)]
 pub struct FlowKey {
-    pub vtap_id: u16,
-    pub tap_type: TapType,
+    pub agent_id: u16,
+    pub tap_type: CaptureNetworkType,
     #[serde(serialize_with = "to_string_format")]
     pub tap_port: TapPort,
     /* L2 */
@@ -140,8 +136,8 @@ impl Default for FlowKey {
         FlowKey {
             ip_src: Ipv4Addr::UNSPECIFIED.into(),
             ip_dst: Ipv4Addr::UNSPECIFIED.into(),
-            vtap_id: 0,
-            tap_type: TapType::default(),
+            agent_id: 0,
+            tap_type: CaptureNetworkType::default(),
             tap_port: TapPort::default(),
             mac_src: MacAddr::default(),
             mac_dst: MacAddr::default(),
@@ -156,8 +152,8 @@ impl fmt::Display for FlowKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "vtap_id:{} tap_type:{} tap_port:{} mac_src:{} mac_dst:{} ip_src:{} ip_dst:{} proto:{:?} port_src:{} port_dst:{}",
-            self.vtap_id,
+            "agent_id:{} tap_type:{} tap_port:{} mac_src:{} mac_dst:{} ip_src:{} ip_dst:{} proto:{:?} port_src:{} port_dst:{}",
+            self.agent_id,
             self.tap_type,
             self.tap_port,
             self.mac_src,
@@ -183,7 +179,7 @@ impl From<FlowKey> for flow_log::FlowKey {
             _ => panic!("FlowKey({:?}) ip_src,ip_dst type mismatch", &f),
         };
         flow_log::FlowKey {
-            vtap_id: f.vtap_id as u32,
+            vtap_id: f.agent_id as u32,
             tap_type: u16::from(f.tap_type) as u32,
             tap_port: f.tap_port.0,
             mac_src: f.mac_src.into(),
@@ -323,12 +319,14 @@ impl From<TunnelField> for flow_log::TunnelField {
 pub struct TcpPerfCountsPeer {
     pub retrans_count: u32,
     pub zero_win_count: u32,
+    pub ooo_count: u32,
 }
 
 impl TcpPerfCountsPeer {
     pub fn sequential_merge(&mut self, other: &TcpPerfCountsPeer) {
         self.retrans_count += other.retrans_count;
         self.zero_win_count += other.zero_win_count;
+        self.ooo_count += other.ooo_count;
     }
 }
 
@@ -337,6 +335,7 @@ impl From<TcpPerfCountsPeer> for flow_log::TcpPerfCountsPeer {
         flow_log::TcpPerfCountsPeer {
             retrans_count: p.retrans_count,
             zero_win_count: p.zero_win_count,
+            ooo_count: p.ooo_count,
         }
     }
 }
@@ -371,6 +370,8 @@ pub struct TcpPerfStats {
     pub retrans_syn_count: u32,
     #[serde(rename = "retrans_synack")]
     pub retrans_synack_count: u32,
+
+    pub fin_count: u32,
 
     #[serde(flatten, serialize_with = "serialize_tcp_perf_counts")]
     pub counts_peers: [TcpPerfCountsPeer; 2],
@@ -440,6 +441,7 @@ impl TcpPerfStats {
         self.counts_peers[0].sequential_merge(&other.counts_peers[0]);
         self.counts_peers[1].sequential_merge(&other.counts_peers[1]);
         self.total_retrans_count += other.total_retrans_count;
+        self.fin_count += other.fin_count;
     }
 
     pub fn reverse(&mut self) {
@@ -469,6 +471,7 @@ impl From<TcpPerfStats> for flow_log::TcpPerfStats {
             cit_max: p.cit_max,
             syn_count: p.syn_count,
             synack_count: p.synack_count,
+            fin_count: p.fin_count,
             ..Default::default()
         }
     }
@@ -545,7 +548,10 @@ pub struct L7Stats {
     pub l7_protocol: L7Protocol,
     pub signal_source: SignalSource,
     pub time_in_second: Duration,
+    // request-reponse time span
+    pub time_span: u32,
     pub biz_type: u8,
+    pub is_reversed: bool,
 }
 
 #[derive(Serialize, Debug, Default, Clone, PartialEq, Eq)]
@@ -803,7 +809,6 @@ impl FlowMetricsPeer {
         self.l3_byte_count += other.l3_byte_count;
         self.l4_byte_count += other.l4_byte_count;
         self.packet_count += other.packet_count;
-
         self.total_byte_count = other.total_byte_count;
         self.total_packet_count = other.total_packet_count;
         self.first = other.first;
@@ -824,6 +829,17 @@ impl FlowMetricsPeer {
         if other.gpid > 0 {
             self.gpid = other.gpid;
         }
+    }
+
+    // The aggregation of heartbeat flow is a secondary aggregation of different flows. The `total_
+    // byte_count` and `total_packet_count` are the total number of bytes of a flow and need to be
+    // accumulated and aggregated.
+    pub fn heartbeat_sequential_merge(&mut self, other: &FlowMetricsPeer) {
+        let total_byte_count = self.total_byte_count;
+        let total_packet_count = self.total_packet_count;
+        self.sequential_merge(other);
+        self.total_byte_count += total_byte_count;
+        self.total_packet_count += total_packet_count;
     }
 }
 
@@ -859,46 +875,14 @@ impl From<FlowMetricsPeer> for flow_log::FlowMetricsPeer {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum PacketDirection {
-    ClientToServer = FlowMetricsPeer::SRC,
-    ServerToClient = FlowMetricsPeer::DST,
-}
+pub use public::enums::PacketDirection;
 
-impl PacketDirection {
-    pub fn reversed(&self) -> Self {
-        match self {
-            PacketDirection::ClientToServer => PacketDirection::ServerToClient,
-            PacketDirection::ServerToClient => PacketDirection::ClientToServer,
-        }
-    }
-}
-
-impl Default for PacketDirection {
-    fn default() -> PacketDirection {
-        PacketDirection::ClientToServer
-    }
-}
-
-impl Display for PacketDirection {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ClientToServer => write!(f, "c2s"),
-            Self::ServerToClient => write!(f, "s2c"),
-        }
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-impl From<u8> for PacketDirection {
-    fn from(msg_type: u8) -> Self {
-        match msg_type {
-            MSG_REQUEST | MSG_REQUEST_END => Self::ClientToServer,
-            MSG_RESPONSE | MSG_RESPONSE_END => Self::ServerToClient,
-            _ => panic!("ebpf direction({}) unknown.", msg_type),
-        }
-    }
+#[derive(PartialEq, Eq, Debug, Clone, Hash, Copy)]
+pub struct HeartbeatAggrKey {
+    tap_side: TapSide,
+    port_dst: u16,
+    ip_src: IpAddr,
+    ip_dst: IpAddr,
 }
 
 #[derive(Serialize, Default, Clone, Debug)]
@@ -912,6 +896,7 @@ pub struct Flow {
     pub tunnel: TunnelField,
 
     pub flow_id: u64,
+    pub aggregated_flow_ids: Vec<u64>,
 
     /* TCP Seq */
     pub syn_seq: u32,
@@ -919,6 +904,8 @@ pub struct Flow {
     pub synack_seq: u32,
     pub last_keepalive_seq: u32,
     pub last_keepalive_ack: u32,
+
+    pub init_ipid: u32,
 
     #[serde(serialize_with = "timestamp_to_micros")]
     pub start_time: Timestamp,
@@ -956,13 +943,10 @@ pub struct Flow {
     pub otel_service: Option<String>,
     #[serde(skip)]
     pub otel_instance: Option<String>,
-    #[serde(skip)]
-    pub last_endpoint: Option<String>,
-    #[serde(skip)]
-    pub last_biz_type: u8,
     pub direction_score: u8,
     pub pod_id: u32,
     pub request_domain: String,
+    pub need_to_store: bool,
 }
 
 fn tunnel_is_none(t: &TunnelField) -> bool {
@@ -987,8 +971,20 @@ impl Flow {
     }
 
     pub fn sequential_merge(&mut self, other: &Flow) {
-        self.flow_metrics_peers[0].sequential_merge(&other.flow_metrics_peers[0]);
-        self.flow_metrics_peers[1].sequential_merge(&other.flow_metrics_peers[1]);
+        if self.flow_id != other.flow_id {
+            self.flow_metrics_peers[0].heartbeat_sequential_merge(&other.flow_metrics_peers[0]);
+            self.flow_metrics_peers[1].heartbeat_sequential_merge(&other.flow_metrics_peers[1]);
+            self.aggregated_flow_ids.push(other.flow_id);
+            if other.syn_seq != 0 {
+                self.syn_seq = other.syn_seq;
+            }
+            if other.synack_seq != 0 {
+                self.synack_seq = other.synack_seq;
+            }
+        } else {
+            self.flow_metrics_peers[0].sequential_merge(&other.flow_metrics_peers[0]);
+            self.flow_metrics_peers[1].sequential_merge(&other.flow_metrics_peers[1]);
+        }
 
         self.end_time = other.end_time;
         self.duration = other.duration;
@@ -1073,10 +1069,16 @@ impl Flow {
             FlowState::Exception => CloseType::Unknown,
             FlowState::Opening1 => CloseType::ClientSynRepeat,
             FlowState::Opening2 => CloseType::ServerSynAckRepeat,
-            FlowState::Established => CloseType::Timeout,
+            FlowState::Established => {
+                if self.flow_key.proto == IpProtocol::TCP {
+                    CloseType::Timeout
+                } else {
+                    CloseType::Finish
+                }
+            }
             FlowState::ClosingTx1 => CloseType::ServerHalfClose,
             FlowState::ClosingRx1 => CloseType::ClientHalfClose,
-            FlowState::ClosingTx2 | FlowState::ClosingRx2 | FlowState::Closed => CloseType::TcpFin,
+            FlowState::ClosingTx2 | FlowState::ClosingRx2 | FlowState::Closed => CloseType::Finish,
             FlowState::Reset => {
                 if self.is_heartbeat() {
                     CloseType::TcpFinClientRst
@@ -1136,25 +1138,29 @@ impl Flow {
 
     pub fn set_tap_side(
         &mut self,
-        trident_type: TridentType,
+        agent_type: AgentType,
         cloud_gateway_traffic: bool, // 从static config 获取
     ) {
         if self.tap_side != TapSide::Rest {
             return;
         }
         // 链路追踪统计位置
-        self.directions = get_direction(&*self, trident_type, cloud_gateway_traffic);
-
-        if self.directions[0] != Direction::None && self.directions[1] == Direction::None {
-            self.tap_side = self.directions[0].into();
-        } else if self.directions[0] == Direction::None && self.directions[1] != Direction::None {
-            self.tap_side = self.directions[1].into();
-        }
+        self.directions = get_direction(&*self, agent_type, cloud_gateway_traffic);
+        self.tap_side = Direction::from(&self.directions).into();
     }
 
     // Currently acl_gids only saves the policy ID of pcap, but does not save the policy ID of NPB
     pub fn hit_pcap_policy(&self) -> bool {
         self.acl_gids.len() > 0
+    }
+
+    pub fn get_heartbeat_aggr_key(&self) -> HeartbeatAggrKey {
+        HeartbeatAggrKey {
+            tap_side: self.tap_side,
+            port_dst: self.flow_key.port_dst,
+            ip_src: self.flow_key.ip_src,
+            ip_dst: self.flow_key.ip_dst,
+        }
     }
 }
 
@@ -1197,6 +1203,7 @@ impl From<Flow> for flow_log::Flow {
                 }
             },
             flow_id: f.flow_id,
+            aggregated_flow_ids: f.aggregated_flow_ids,
             start_time: f.start_time.as_nanos() as u64,
             end_time: f.end_time.as_nanos() as u64,
             duration: f.duration.as_nanos() as u64,
@@ -1217,13 +1224,14 @@ impl From<Flow> for flow_log::Flow {
             acl_gids: f.acl_gids.into_iter().map(|g| g as u32).collect(),
             direction_score: f.direction_score as u32,
             request_domain: f.request_domain,
+            init_ipid: f.init_ipid,
         }
     }
 }
 
-pub fn get_direction(
+fn get_direction(
     flow: &Flow,
-    trident_type: TridentType,
+    agent_type: AgentType,
     cloud_gateway_traffic: bool, // 从static config 获取
 ) -> [Direction; 2] {
     let src_ep = &flow.flow_metrics_peers[FLOW_METRICS_PEER_SRC];
@@ -1251,7 +1259,7 @@ pub fn get_direction(
         _ => {
             // workload and container collector need to collect loopback port flow
             if flow.flow_key.mac_src == flow.flow_key.mac_dst
-                && (is_tt_pod(trident_type) || is_tt_workload(trident_type))
+                && (is_tt_pod(agent_type) || is_tt_workload(agent_type))
             {
                 return [Direction::None, Direction::LocalToLocal];
             }
@@ -1262,7 +1270,7 @@ pub fn get_direction(
     // 云MUX场景中，云内和云外通过VIP通信，在MUX和宿主机中采集到的流量IP地址为VIP，添加追
     // 踪数据后会将VIP替换为实际虚拟机的IP。
     fn inner(
-        tap_type: TapType,
+        tap_type: CaptureNetworkType,
         tunnel: &TunnelField,
         l2_end: bool,
         l3_end: bool,
@@ -1271,15 +1279,15 @@ pub fn get_direction(
         is_local_ip: bool,
         l3_epc_id: i32,
         cloud_gateway_traffic: bool, // 从static config 获取
-        trident_type: TridentType,
+        agent_type: AgentType,
     ) -> (Direction, Direction) {
         let is_ep = l2_end && l3_end;
         let tunnel_tier = tunnel.tier;
 
-        match trident_type {
-            TridentType::TtDedicatedPhysicalMachine => {
+        match agent_type {
+            AgentType::TtDedicatedPhysicalMachine => {
                 //  接入网络
-                if tap_type != TapType::Cloud {
+                if tap_type != CaptureNetworkType::Cloud {
                     if l3_epc_id != EPC_INTERNET {
                         return (Direction::ClientToServer, Direction::ServerToClient);
                     }
@@ -1317,7 +1325,7 @@ pub fn get_direction(
                     }
                 }
             }
-            TridentType::TtHyperVCompute => {
+            AgentType::TtHyperVCompute => {
                 // 仅采集宿主机物理口
                 if l2_end {
                     // SNAT、LB Backend
@@ -1328,7 +1336,7 @@ pub fn get_direction(
                     );
                 }
             }
-            TridentType::TtHyperVNetwork => {
+            AgentType::TtHyperVNetwork => {
                 // 仅采集宿主机物理口
                 if is_ep {
                     return (
@@ -1347,7 +1355,7 @@ pub fn get_direction(
                     );
                 }
             }
-            TridentType::TtPublicCloud | TridentType::TtPhysicalMachine => {
+            AgentType::TtPublicCloud | AgentType::TtPhysicalMachine => {
                 // 该采集器类型中统计位置为客户端网关/服务端网关或存在VIP时，会使用VIP创建Doc和Log.
                 // VIP：
                 //     微软ACS云内SLB通信场景，在VM内采集的流量无隧道IP地址使用VIP,
@@ -1363,7 +1371,7 @@ pub fn get_direction(
                     }
                 }
             }
-            TridentType::TtHostPod | TridentType::TtVmPod | TridentType::TtK8sSidecar => {
+            AgentType::TtHostPod | AgentType::TtVmPod | AgentType::TtK8sSidecar => {
                 if is_ep {
                     if tunnel_tier == 0 {
                         return (Direction::ClientToServer, Direction::ServerToClient);
@@ -1406,7 +1414,18 @@ pub fn get_direction(
                     }
                 }
             }
-            TridentType::TtProcess => {
+            AgentType::TtProcess => {
+                if cloud_gateway_traffic {
+                    if l2_end {
+                        // 云网关镜像（腾讯TCE等）
+                        // 注意c/s方向与0/1相反
+                        return (
+                            Direction::ServerGatewayToClient,
+                            Direction::ClientGatewayToServer,
+                        );
+                    }
+                    return (Direction::None, Direction::None);
+                }
                 if is_ep {
                     if tunnel_tier == 0 {
                         return (Direction::ClientToServer, Direction::ServerToClient);
@@ -1511,16 +1530,15 @@ pub fn get_direction(
                     //其他情况: BUM流量
                 }
             }
-            TridentType::TtVm => {
+            AgentType::TtVm => {
                 if tunnel_tier == 0 && is_ep {
                     return (Direction::ClientToServer, Direction::ServerToClient);
                 }
             }
             _ => {
                 // 采集器类型不正确，不应该发生
-                error!("invalid trident type, deepflow-agent restart...");
-                thread::sleep(Duration::from_secs(1));
-                process::exit(1)
+                error!("invalid agent type, deepflow-agent restart...");
+                crate::utils::clean_and_exit(1);
             }
         }
         (Direction::None, Direction::None)
@@ -1543,7 +1561,7 @@ pub fn get_direction(
         src_ep.is_local_ip,
         src_ep.l3_epc_id,
         cloud_gateway_traffic,
-        trident_type,
+        agent_type,
     );
     let (_, mut dst_direct) = inner(
         flow_key.tap_type,
@@ -1555,16 +1573,15 @@ pub fn get_direction(
         dst_ep.is_local_ip,
         dst_ep.l3_epc_id,
         cloud_gateway_traffic,
-        trident_type,
+        agent_type,
     );
     // 双方向都有统计位置优先级为：client/server侧 > L2End侧 > IsLocalMac侧 > 其他
     if src_direct != Direction::None && dst_direct != Direction::None {
-        if let TapType::Idc(_) = flow_key.tap_type {
+        if let CaptureNetworkType::Idc(_) = flow_key.tap_type {
             // When the IDC traffic collected by the dedicated deepflow-agent cannot distinguish between Directions,
-            // the Direction is set to None and Doc data to count a Rest record.
+            // L4FlowLog and Doc data to count a Rest record.
             // ======================================================================================================
-            // 当专属采集器采集的 IDC 流量无法区分 Direction 时，Direction设置为None Doc数据中统计一份 Rest 记录。
-            return [Direction::None, Direction::None];
+            // 当专属采集器采集的 IDC 流量无法区分 Direction 时，L4FlowLog 和 Doc数据中统计一份 Rest 记录。
         } else if (src_direct == Direction::ClientToServer || src_ep.is_l2_end)
             && dst_direct != Direction::ServerToClient
         {
@@ -1581,10 +1598,4 @@ pub fn get_direction(
     }
 
     [src_direct, dst_direct]
-}
-
-// 生成32位flowID,确保在1分钟内1个thread的flowID不重复
-pub fn get_uniq_flow_id_in_one_minute(flow_id: u64) -> u64 {
-    // flowID中时间低8位可保证1分钟内时间的唯一，counter可保证一秒内流的唯一性（假设fps < 2^24）
-    (flow_id >> 32 & 0xff << 24) | (flow_id & COUNTER_FLOW_ID_MASK)
 }

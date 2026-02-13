@@ -21,20 +21,39 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
+#include <strings.h>
 #include <libgen.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <limits.h>
-#include "common.h"
+#include <pthread.h>
+#include "config.h"
+#include "utils.h"
 #include "log.h"
 #include "elf.h"
 #include <bcc/linux/bpf.h>
 #include <bcc/linux/bpf_common.h>
+#include <bcc/linux/btf.h>
 #include <bcc/libbpf.h>
 #include "load.h"
-#include "btf_vmlinux.h"
+#include "btf_core.h"
 #include "../kernel/include/bpf_base.h"
+#include "../kernel/include/common.h"
+#include "tracer.h"
+#include "symbol.h"
+#include "proc.h"
+#include "go_tracer.h"
+#include "ssl_tracer.h"
+#include "profile/perf_profiler.h"
+#include "unwind_tracer.h"
 
+/*
+ * When full map preallocation is too expensive, the 'BPF_F_NO_PREALLOC'
+ * flag can be used to define a map without preallocated memory. By
+ * default, bpf_map_no_prealloc is set to false, meaning memory preallocation
+ * is enabled.
+ */
+static bool bpf_map_no_prealloc;
 extern struct btf_ext *btf_ext__new(const uint8_t * data, uint32_t size);
 extern struct btf *btf__new(const void *data, uint32_t size);
 extern void btf__free(struct btf *btf);
@@ -46,9 +65,12 @@ extern int btf__set_pointer_size(struct btf *btf, size_t ptr_sz);
 #define KERN_FEAT_SUP		1
 #define KERN_FEAT_NOTSUP        2
 
+#define VERIFIER_LOG_TAIL_BYTES	(2 * 1024)
+#define VERIFIER_LOG_ENV	"DF_EBPF_VERIFIER_LOG_TO_FILE"
+
 static int probe_read_kernel_feat;
 
-static int suspend_stderr()
+int suspend_stderr()
 {
 	fflush(stderr);
 
@@ -70,13 +92,182 @@ static int suspend_stderr()
 	return ret;
 }
 
-static void resume_stderr(int fd)
+void resume_stderr(int fd)
 {
 	fflush(stderr);
 	if (fd < 0)
 		return;
 	dup2(fd, STDERR_FILENO);
 	close(fd);
+}
+
+static inline bool str_is_empty(const char *s)
+{
+	return !s || !s[0];
+}
+
+static bool env_flag_enabled(const char *name)
+{
+	const char *val = getenv(name);
+
+	if (str_is_empty(val)) {
+		return false;
+	}
+
+	return !strcasecmp(val, "1") || !strcasecmp(val, "true") ||
+	    !strcasecmp(val, "yes") || !strcasecmp(val, "on");
+}
+
+struct log_drain_ctx {
+	int read_fd;
+	int copy_fd;
+	char *tail_buf;
+	size_t tail_buf_sz;
+	size_t tail_len;
+	bool copy_failed;
+};
+
+static void append_tail(char *dst, size_t *dst_len, size_t dst_sz,
+			const char *src, size_t src_len)
+{
+	if (src_len >= dst_sz) {
+		memcpy(dst, src + src_len - dst_sz, dst_sz);
+		*dst_len = dst_sz;
+		return;
+	}
+
+	if (*dst_len + src_len <= dst_sz) {
+		memcpy(dst + *dst_len, src, src_len);
+		*dst_len += src_len;
+		return;
+	}
+
+	size_t drop = *dst_len + src_len - dst_sz;
+
+	memmove(dst, dst + drop, *dst_len - drop);
+	*dst_len -= drop;
+
+	memcpy(dst + *dst_len, src, src_len);
+	*dst_len += src_len;
+}
+
+static void *drain_log_pipe(void *arg)
+{
+	struct log_drain_ctx *ctx = (struct log_drain_ctx *)arg;
+	char buf[256];
+
+	while (1) {
+		ssize_t n = read(ctx->read_fd, buf, sizeof(buf));
+
+		if (n == 0) {
+			break;
+		}
+
+		if (n < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			break;
+		}
+
+		append_tail(ctx->tail_buf, &ctx->tail_len, ctx->tail_buf_sz, buf, n);
+
+		if (ctx->copy_fd < 0 || ctx->copy_failed) {
+			continue;
+		}
+
+		ssize_t written = 0;
+
+		while (written < n) {
+			ssize_t w = write(ctx->copy_fd, buf + written, n - written);
+
+			if (w < 0) {
+				if (errno == EINTR)
+					continue;
+				ebpf_warning
+				    ("Failed to write verifier log to file: %s\n",
+				     strerror(errno));
+				ctx->copy_failed = true;
+				break;
+			}
+
+			if (w == 0) {
+				ebpf_warning("Failed to write verifier log to file: zero bytes written\n");
+				ctx->copy_failed = true;
+				break;
+			}
+
+			written += w;
+		}
+	}
+
+	if (ctx->tail_len > ctx->tail_buf_sz) {
+		ctx->tail_len = ctx->tail_buf_sz;
+	}
+
+	ctx->tail_buf[ctx->tail_len] = '\0';
+
+	if (ctx->read_fd >= 0) {
+		close(ctx->read_fd);
+	}
+
+	ctx->read_fd = -1;
+
+	return NULL;
+}
+
+static void log_verifier_tail(const char *buf, size_t len)
+{
+	/*
+	 * ebpf_warning() has an internal 2KB buffer, so emit the tail in
+	 * smaller chunks to avoid truncating the final lines.
+	 */
+	const size_t max_chunk = MSG_SZ - 256;
+
+	if (!buf || len == 0) {
+		return;
+	}
+
+	ebpf_warning("Verifier log tail (last %zu bytes):", len);
+
+	const char *p = buf;
+	const char *end = buf + len;
+
+	while (p < end) {
+		const char *nl = memchr(p, '\n', end - p);
+		size_t line_len = nl ? (size_t)(nl - p + 1) : (size_t)(end - p);
+
+		while (line_len > 0) {
+			size_t emit = line_len > max_chunk ? max_chunk : line_len;
+			char line_buf[MSG_SZ];
+
+			memcpy(line_buf, p, emit);
+			line_buf[emit] = '\0';
+			ebpf_warning("%s", line_buf);
+
+			p += emit;
+			line_len -= emit;
+		}
+
+		if (nl) {
+			p = nl + 1;
+		}
+	}
+}
+
+int load_ebpf_prog(struct ebpf_prog *prog)
+{
+	return bcc_prog_load(prog->type, prog->name,
+			     prog->insns, prog->insns_size, prog->obj->license,
+			     prog->obj->kern_version, 0, NULL,
+			     0 /*EBPF_LOG_LEVEL, log_buf, LOG_BUF_SZ */ );
+}
+
+int df_prog_load(enum bpf_prog_type prog_type, const char *name,
+		 const struct bpf_insn *insns, int prog_len)
+{
+	return bcc_prog_load(prog_type, name, insns, prog_len, LICENSE_DEF,
+			     fetch_kernel_version_code(), 0, NULL, 0);
 }
 
 /*
@@ -162,8 +353,6 @@ static void sanitize_prog_instructions(struct ebpf_object *obj,
 
 static void ebpf_object__release_elf(struct ebpf_object *obj)
 {
-	int i;
-
 	if (obj->elf_info.elf) {
 		elf_end(obj->elf_info.elf);
 		obj->elf_info.elf = NULL;
@@ -211,11 +400,11 @@ static void ebpf_object__release_elf(struct ebpf_object *obj)
 		zfree(obj->elf_info.btf_ext_sec);
 	}
 
-	struct ebpf_prog *prog;
-	for (i = 0; i < obj->progs_cnt; i++) {
-		prog = &obj->progs[i];
-		prog->insns = NULL;
-	}
+	//struct ebpf_prog *prog;
+	//for (i = 0; i < obj->progs_cnt; i++) {
+	//	prog = &obj->progs[i];
+	//	prog->insns = NULL;
+	//}
 }
 
 void release_object(struct ebpf_object *obj)
@@ -287,6 +476,7 @@ static struct ebpf_object *create_new_obj(const void *buf, size_t buf_sz,
 		zfree(obj);
 		return NULL;
 	}
+
 	safe_buf_copy(obj->name, sizeof(obj->name), (void *)name, strlen(name));
 	obj->name[sizeof(obj->name) - 1] = '\0';
 	obj->elf_info.fd = -1;
@@ -433,6 +623,13 @@ static enum bpf_prog_type get_prog_type(struct sec_desc *desc)
 		prog_type = BPF_PROG_TYPE_TRACEPOINT;
 	} else if (!memcmp(desc->name, "perf_event", 10)) {
 		prog_type = BPF_PROG_TYPE_PERF_EVENT;
+	} else if (!memcmp(desc->name, "fentry/", 7) ||
+		   !memcmp(desc->name, "fexit/", 6)) {
+		prog_type = BPF_PROG_TYPE_TRACING;
+	} else if (!memcmp(desc->name, "socket/", 7)) {
+		prog_type = BPF_PROG_TYPE_SOCKET_FILTER;
+	} else if (!strncmp(desc->name, "sockops", 7)) {
+		prog_type = BPF_PROG_TYPE_SOCK_OPS;
 	} else {
 		prog_type = BPF_PROG_TYPE_UNSPEC;
 	}
@@ -487,6 +684,8 @@ static int load_obj__progs(struct ebpf_object *obj)
 				prog_type = BPF_PROG_TYPE_TRACEPOINT;
 			} else if (!memcmp(desc->name, "prog/kp/", 8)) {
 				prog_type = BPF_PROG_TYPE_KPROBE;
+			} else if (!memcmp(desc->name, "prog/pe/", 8)) {
+				prog_type = BPF_PROG_TYPE_PERF_EVENT;
 			} else {
 				ebpf_warning("Prog %s type %d invalid\n",
 					     desc->name, prog_type);
@@ -503,9 +702,28 @@ static int load_obj__progs(struct ebpf_object *obj)
 			return ETR_INVAL;
 		}
 
-		char *sym_name = elf_strptr(obj->elf_info.elf,
-					    obj->elf_info.syms_sec->strtabidx,
-					    sym.st_name);
+		char *sym_name =
+		    elf_strptr(obj->elf_info.elf,
+			       obj->elf_info.syms_sec->strtabidx,
+			       sym.st_name);
+
+		// Typically, the sec_off offset value is 0
+		size_t sec_off = sym.st_value;
+		size_t prog_sz = sym.st_size;
+		if (sec_off % BPF_INSN_SZ) {
+			ebpf_warning
+			    ("Program '%s' sec offset (%zu) is not aligned to BPF instruction size (%d).\n",
+			     sym_name ? sym_name : "<unknown>", sec_off,
+			     BPF_INSN_SZ);
+			return ETR_INVAL;
+		}
+		if (sec_off >= desc->size) {
+			ebpf_warning
+			    ("Program '%s' sec offset (%zu) exceeds section size (%zu).\n",
+			     sym_name ? sym_name : "<unknown>", sec_off,
+			     desc->size);
+			return ETR_INVAL;
+		}
 
 		new_prog = NULL;
 		add_new_prog(obj->progs, obj->progs_cnt, new_prog);
@@ -523,10 +741,23 @@ static int load_obj__progs(struct ebpf_object *obj)
 			return ETR_NOMEM;
 		}
 
-		new_prog->insns = insns;
-		new_prog->insns_cnt = desc->size / sizeof(struct bpf_insn);
+		/*
+		 * sym.st_value is a byte offset from the start of the section.
+		 * insns is a struct bpf_insn* (8 bytes each), so advance in bytes.
+		 */
+		new_prog->insns = (struct bpf_insn *)((char *)insns + sec_off);
+		new_prog->insns_size = desc->size - sec_off;
+		new_prog->insns_cnt = new_prog->insns_size / BPF_INSN_SZ;
 		new_prog->obj = obj;
 		new_prog->type = prog_type;
+		new_prog->sec_insn_off = sec_off / BPF_INSN_SZ;
+		new_prog->sec_insn_cnt = prog_sz / BPF_INSN_SZ;
+		new_prog->sec_desc = desc;
+
+		ebpf_debug
+		    ("sec '%s': found program '%s' at insn offset %zu (%zu bytes), code size %zu insns (%zu bytes)\n",
+		     new_prog->sec_name, new_prog->name, new_prog->sec_insn_off,
+		     sec_off, prog_sz / BPF_INSN_SZ, prog_sz);
 
 		/*
 		 * Addressing the adaptability issues of bpf_probe_read{kernel,user}[_str]
@@ -534,24 +765,229 @@ static int load_obj__progs(struct ebpf_object *obj)
 		 */
 		sanitize_prog_instructions(obj, new_prog);
 
+		// Modify eBPF instructions based on BTF relocation information.
+		obj_relocate_core(new_prog);
+
+		int stderr_fd = suspend_stderr();
+		if (stderr_fd < 0) {
+			ebpf_warning("Failed to suspend stderr\n");
+		}
 		new_prog->prog_fd =
 		    bcc_prog_load(new_prog->type, new_prog->name,
-				  new_prog->insns, desc->size, obj->license,
-				  obj->kern_version, 0, NULL,
+				  new_prog->insns, new_prog->insns_size,
+				  obj->license, obj->kern_version, 0, NULL,
 				  0 /*EBPF_LOG_LEVEL, log_buf, LOG_BUF_SZ */ );
-
+		resume_stderr(stderr_fd);
 		if (new_prog->prog_fd < 0) {
+			int saved_errno = errno;
+			int retry_errno = saved_errno;
+			bool save_full_log = env_flag_enabled(VERIFIER_LOG_ENV);
 			ebpf_warning
 			    ("bcc_prog_load() failed. name: %s, %s errno: %d\n",
 			     new_prog->name, strerror(errno), errno);
-			if (new_prog->insns_cnt > BPF_MAXINSNS) {
+			char log_path[] = "/tmp/df_verifier_XXXXXX.log";
+			int tmp_fd = -1;
+			char tail_buf[VERIFIER_LOG_TAIL_BYTES + 1] = { 0 };
+			bool log_file_ready = false;
+			struct log_drain_ctx ctx = {
+				.read_fd = -1,
+				.copy_fd = -1,
+				.tail_buf = tail_buf,
+				.tail_buf_sz = VERIFIER_LOG_TAIL_BYTES,
+				.tail_len = 0,
+				.copy_failed = false,
+			};
+			pthread_t drain_thread;
+			bool drain_started = false;
+			int fd2 = -1;
+			int fd2_errno = 0;
+			bool load_attempted = false;
+
+			if (save_full_log) {
+				tmp_fd = mkstemps(log_path, 4);
+				if (tmp_fd < 0) {
+					ebpf_warning
+					    ("Failed to create verifier log file %s: %s\n",
+					     log_path, strerror(errno));
+					save_full_log = false;
+				}
+			}
+
+			int log_pipe[2] = { -1, -1 };
+
+			if (pipe(log_pipe) < 0) {
+				ebpf_warning("Failed to create verifier log pipe: %s\n",
+					     strerror(errno));
+			} else {
+				ctx.read_fd = log_pipe[0];
+				ctx.copy_fd = save_full_log ? tmp_fd : -1;
+
+				if (pthread_create(&drain_thread, NULL,
+						   drain_log_pipe, &ctx) != 0) {
+					ebpf_warning
+					    ("Failed to start verifier log drain thread: %s\n",
+					     strerror(errno));
+					close(log_pipe[0]);
+					close(log_pipe[1]);
+					ctx.read_fd = -1;
+					log_pipe[0] = -1;
+					log_pipe[1] = -1;
+				} else {
+					drain_started = true;
+				}
+
+			}
+
+			if (drain_started) {
+				int stderr_fd2 = dup(STDERR_FILENO);
+
+				if (stderr_fd2 < 0) {
+					ebpf_warning("Failed to dup stderr (retry)\n");
+				} else if (dup2(log_pipe[1], STDERR_FILENO) < 0) {
+					ebpf_warning("Failed to redirect stderr (retry)\n");
+				} else {
+					close(log_pipe[1]);
+					log_pipe[1] = -1;
+
+					fd2 = bcc_prog_load(new_prog->type,
+							    new_prog->name,
+							    new_prog->insns,
+							    new_prog->insns_size,
+							    obj->license,
+							    obj->kern_version,
+							    1, NULL, 0);
+					fd2_errno = errno;
+					load_attempted = true;
+
+					dup2(stderr_fd2, STDERR_FILENO);
+					close(stderr_fd2);
+					stderr_fd2 = -1;
+
+					if (fd2 >= 0) {
+						new_prog->prog_fd = fd2;
+					} else {
+						retry_errno = fd2_errno;
+						log_file_ready = save_full_log &&
+						    tmp_fd >= 0;
+					}
+				}
+
+				if (log_pipe[1] >= 0) {
+					close(log_pipe[1]);
+					log_pipe[1] = -1;
+				}
+
+				if (stderr_fd2 >= 0) {
+					close(stderr_fd2);
+					stderr_fd2 = -1;
+				}
+			} else {
+				/* Drain not started, close pipe ends if they are valid. */
+				if (log_pipe[0] >= 0)
+					close(log_pipe[0]);
+				if (log_pipe[1] >= 0)
+					close(log_pipe[1]);
+				log_pipe[0] = -1;
+				log_pipe[1] = -1;
+
+				int stderr_fd2 = -1;
+
+				if (save_full_log && tmp_fd >= 0) {
+					stderr_fd2 = dup(STDERR_FILENO);
+					if (stderr_fd2 < 0) {
+						ebpf_warning
+						    ("Failed to dup stderr (no-drain retry)\n");
+					} else if (dup2(tmp_fd, STDERR_FILENO) < 0) {
+						ebpf_warning
+						    ("Failed to redirect stderr to log file (no-drain retry)\n");
+					}
+				}
+
+				fd2 = bcc_prog_load(new_prog->type,
+						    new_prog->name,
+						    new_prog->insns,
+						    new_prog->insns_size,
+						    obj->license,
+						    obj->kern_version, 1, NULL,
+						    0);
+				fd2_errno = errno;
+				load_attempted = true;
+
+				if (stderr_fd2 >= 0) {
+					dup2(stderr_fd2, STDERR_FILENO);
+					close(stderr_fd2);
+					stderr_fd2 = -1;
+				}
+
+				if (save_full_log && tmp_fd >= 0)
+					log_file_ready = true;
+			}
+
+			if (drain_started)
+				pthread_join(drain_thread, NULL);
+
+			if (!load_attempted) {
+				fd2 = bcc_prog_load(new_prog->type,
+						    new_prog->name,
+						    new_prog->insns,
+						    new_prog->insns_size,
+						    obj->license,
+						    obj->kern_version, 1, NULL,
+						    0);
+				fd2_errno = errno;
+				load_attempted = true;
+			}
+
+			if (fd2 >= 0)
+				new_prog->prog_fd = fd2;
+			else
+				retry_errno = fd2_errno;
+
+			if (tmp_fd >= 0) {
+				if (log_file_ready) {
+					struct stat st;
+
+					if (fstat(tmp_fd, &st) == 0 &&
+					    st.st_size > 0) {
+						ebpf_warning
+						    ("Verifier log saved to %s\n",
+						     log_path);
+					}
+				}
+				close(tmp_fd);
+			}
+
+			if (new_prog->prog_fd < 0) {
+				if (ctx.tail_len > 0)
+					log_verifier_tail(tail_buf, ctx.tail_len);
+
+				// Preserve errno from the latest attempt for better diagnostics.
+				ebpf_warning
+				    ("bcc_prog_load() still failed. name: %s, errno after retry: %d (orig %d)\n",
+				     new_prog->name, retry_errno, saved_errno);
+				errno = retry_errno;
+			}
+
+			/*
+			 * Don't mislead users on kernels whose max insns limit
+			 * is already bumped (>=5.2). Only warn if the kernel
+			 * actually returned E2BIG.
+			 */
+			if (errno == E2BIG && new_prog->insns_cnt > BPF_MAXINSNS) {
 				ebpf_warning
 				    ("The number of EBPF instructions (%d) "
 				     "exceeded the maximum limit (%d).\n",
 				     new_prog->insns_cnt, BPF_MAXINSNS);
 			}
 
-			return ETR_INVAL;
+			if (memcmp(desc->name, "uprobe/", 7) &&
+			    memcmp(desc->name, "uretprobe/", 10)) {
+				return ETR_INVAL;
+			} else {
+				ebpf_warning("The reason for the eBPF uprobe program "
+					     "loading failure is that the linux version "
+					     "needs to be 3.10 or 4.17+.\n");
+			}
 		}
 
 		ebpf_debug
@@ -587,6 +1023,7 @@ static int ebpf_btf_ext_collect(struct ebpf_object *obj)
 {
 	struct sec_desc *desc = obj->elf_info.btf_ext_sec;
 	struct btf_ext *ext = btf_ext__new(desc->d_buf, desc->size);
+
 	if (DF_IS_ERR(ext)) {
 		ebpf_warning("Processing .BTF.ext section failed\n");
 		obj->btf_ext = NULL;
@@ -597,7 +1034,52 @@ static int ebpf_btf_ext_collect(struct ebpf_object *obj)
 		   desc->name);
 	obj->btf_ext = ext;
 
+	// Setup .BTF.ext to ELF section mapping
+	struct btf_ext_info *ext_segs[] = {
+		&obj->btf_ext->func_info,
+		&obj->btf_ext->line_info,
+		&obj->btf_ext->core_relo_info
+	};
+
+	for (int seg_num = 0; seg_num < ARRAY_SIZE(ext_segs); seg_num++) {
+		struct btf_ext_info *seg = ext_segs[seg_num];
+
+		if (seg->sec_cnt == 0)
+			continue;
+
+		seg->sec_idxs = calloc(seg->sec_cnt, sizeof(*seg->sec_idxs));
+		if (!seg->sec_idxs) {
+			ebpf_warning("calloc failed\n");
+			return ETR_INVAL;
+		}
+
+		int sec_num = 0;
+		const struct btf_ext_info_sec *sec;
+
+		// Iterate through each section within the current segment
+		for_each_btf_ext_sec(seg, sec) {
+			sec_num++;
+
+			const char *sec_name =
+			    btf_name_by_offset(obj->btf, sec->sec_name_off);
+			if (str_is_empty(sec_name))
+				continue;
+
+			Elf_Scn *scn =
+			    get_scn_by_sec_name(obj->elf_info.elf, sec_name);
+			if (!scn)
+				continue;
+
+			seg->sec_idxs[sec_num - 1] = elf_ndxscn(scn);
+		}
+	}
+
 	return ETR_OK;
+}
+
+static inline bool is_ldimm64_insn(struct bpf_insn *insn)
+{
+	return insn->code == (BPF_LD | BPF_IMM | BPF_DW);
 }
 
 static int ebpf_obj__maps_collect(struct ebpf_object *obj)
@@ -716,10 +1198,11 @@ static int ebpf_obj__maps_collect(struct ebpf_object *obj)
 		memcpy(&new_map->def, def, cp_sz);
 		ebpf_debug
 		    ("map_name %s\tmaps_cnt:%d\toffset %zd\ttype %u\tkey_size "
-		     "%u\tvalue_size %u\tmax_entries %u\n",
+		     "%u\tvalue_size %u\tmax_entries %u feat %u\n",
 		     map_name, obj->maps_cnt, new_map->elf_offset,
 		     new_map->def.type, new_map->def.key_size,
-		     new_map->def.value_size, new_map->def.max_entries);
+		     new_map->def.value_size, new_map->def.max_entries,
+		     new_map->def.feat_flags);
 	}
 
 	return ETR_OK;
@@ -823,21 +1306,67 @@ int ebpf_obj_load(struct ebpf_object *obj)
 	struct ebpf_map *map;
 	for (i = 0; i < obj->maps_cnt; i++) {
 		map = &obj->maps[i];
+		int map_flags = 0;
+		// Note : perf_event programs can only use preallocated hash map
+		if (map->def.type == BPF_MAP_TYPE_HASH &&
+		    bpf_map_no_prealloc &&
+		    strstr(obj->name, "profiler") == NULL) {
+			map_flags = BPF_F_NO_PREALLOC;
+		}
+
+		uint32_t enabled_feats = map->def.feat_flags;
+		if (!is_golang_trace_enabled()) {
+			enabled_feats &= ~FEATURE_FLAG_UPROBE_GOLANG;
+		}
+		if (!is_openssl_trace_enabled()) {
+			enabled_feats &= ~FEATURE_FLAG_UPROBE_OPENSSL;
+		}
+		if (!oncpu_profiler_enabled()) {
+			enabled_feats &= ~FEATURE_FLAG_PROFILE_ONCPU;
+		}
+		if (!get_dwarf_enabled()) {
+			enabled_feats &= ~FEATURE_FLAG_DWARF_UNWINDING;
+		}
+		if (!php_profiler_enabled()) {
+			enabled_feats &= ~FEATURE_FLAG_PROFILE_PHP;
+		}
+		if (!v8_profiler_enabled()) {
+			enabled_feats &= ~FEATURE_FLAG_PROFILE_V8;
+		}
+		if (!python_profiler_enabled()) {
+			enabled_feats &= ~FEATURE_FLAG_PROFILE_PYTHON;
+		}
+		enabled_feats &= ~extended_feature_flags(map);
+		if (enabled_feats == 0 &&
+		    map->def.type != BPF_MAP_TYPE_PROG_ARRAY &&
+		    map->def.type != BPF_MAP_TYPE_PERF_EVENT_ARRAY) {
+			map->def.max_entries = 1;
+		}
+
+		extended_map_preprocess(map);
+
 		map->fd =
 		    bcc_create_map(map->def.type, map->name, map->def.key_size,
 				   map->def.value_size, map->def.max_entries,
-				   0);
+				   map_flags);
 		if (map->fd < 0) {
 			ebpf_warning
 			    ("bcc_create_map() failed, map name:%s - %s\n",
 			     map->name, strerror(errno));
 			goto failed;
 		}
+		// Log language profiler map creation with max_entries for verification
+		if (strstr(map->name, "php_") || strstr(map->name, "v8_") ||
+		    strstr(map->name, "python_")) {
+			ebpf_info
+			    ("Language profiler map created: name=%s, max_entries=%d (1 means disabled)\n",
+			     map->name, map->def.max_entries);
+		}
 		ebpf_debug
 		    ("map->fd:%d map->def.type:%d, map->name:%s, map->def.key_size:%d,"
-		     "map->def.value_size:%d, map->def.max_entries:%d\n",
+		     "map->def.value_size:%d, map->def.max_entries:%d, map_flags %d\n",
 		     map->fd, map->def.type, map->name, map->def.key_size,
-		     map->def.value_size, map->def.max_entries);
+		     map->def.value_size, map->def.max_entries, map_flags);
 	}
 
 	ebpf_obj__load_vmlinux_btf(obj);
@@ -852,6 +1381,10 @@ int ebpf_obj_load(struct ebpf_object *obj)
 
 failed:
 	ebpf_warning("eBPF load programs failed. (errno %d)\n", errno);
-	release_object(obj);
 	return ETR_INVAL;
+}
+
+void set_bpf_map_prealloc(bool enabled)
+{
+	bpf_map_no_prealloc = !enabled;
 }

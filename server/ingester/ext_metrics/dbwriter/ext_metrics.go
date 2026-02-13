@@ -17,10 +17,12 @@
 package dbwriter
 
 import (
+	"github.com/deepflowio/deepflow/server/ingester/common"
 	"github.com/deepflowio/deepflow/server/ingester/flow_tag"
 	"github.com/deepflowio/deepflow/server/libs/ckdb"
 	"github.com/deepflowio/deepflow/server/libs/datatype"
 	flow_metrics "github.com/deepflowio/deepflow/server/libs/flow-metrics"
+	"github.com/deepflowio/deepflow/server/libs/nativetag"
 	"github.com/deepflowio/deepflow/server/libs/pool"
 )
 
@@ -40,8 +42,8 @@ type ExtMetrics struct {
 
 	// Not stored, only determines which database to store in.
 	// When Orgid is 0 or 1, it is stored in database '<DatabaseName()>', otherwise stored in '<OrgId>_<DatabaseName()>'.
-	OrgId  uint16
-	TeamID uint16
+	OrgId, RawOrgId uint16 // RawOrgId is read from server-stats message, only used to distinguish which database data is written to
+	TeamID          uint16
 
 	TagNames  []string
 	TagValues []string
@@ -50,20 +52,36 @@ type ExtMetrics struct {
 	MetricsFloatValues []float64
 }
 
+func (m *ExtMetrics) IsValid() bool {
+	return len(m.TagNames) == len(m.TagValues) && len(m.MetricsFloatNames) == len(m.MetricsFloatValues)
+}
+
 func (m *ExtMetrics) DatabaseName() string {
-	if m.MsgType == datatype.MESSAGE_TYPE_DFSTATS || m.MsgType == datatype.MESSAGE_TYPE_SERVER_DFSTATS {
-		return DEEPFLOW_SYSTEM_DB
-	} else {
+	switch m.MsgType {
+	case datatype.MESSAGE_TYPE_DFSTATS:
+		return DEEPFLOW_TENANT_DB
+	case datatype.MESSAGE_TYPE_SERVER_DFSTATS:
+		if ckdb.IsValidOrgID(m.RawOrgId) {
+			return DEEPFLOW_TENANT_DB
+		} else {
+			return DEEPFLOW_ADMIN_DB
+		}
+	default:
 		return EXT_METRICS_DB
 	}
 }
 
 func (m *ExtMetrics) TableName() string {
-	if m.MsgType == datatype.MESSAGE_TYPE_DFSTATS {
-		return DEEPFLOW_SYSTEM_AGENT_TABLE
-	} else if m.MsgType == datatype.MESSAGE_TYPE_SERVER_DFSTATS {
-		return DEEPFLOW_SYSTEM_SERVER_TABLE
-	} else {
+	switch m.MsgType {
+	case datatype.MESSAGE_TYPE_DFSTATS:
+		return DEEPFLOW_TENANT_COLLECTOR_TABLE
+	case datatype.MESSAGE_TYPE_SERVER_DFSTATS:
+		if ckdb.IsValidOrgID(m.RawOrgId) {
+			return DEEPFLOW_TENANT_COLLECTOR_TABLE
+		} else {
+			return DEEPFLOW_ADMIN_SERVER_TABLE
+		}
+	default:
 		return EXT_METRICS_TABLE
 	}
 }
@@ -72,27 +90,25 @@ func (m *ExtMetrics) VirtualTableName() string {
 	return m.VTableName
 }
 
-// Note: The order of Write() must be consistent with the order of append() in Columns.
-func (m *ExtMetrics) WriteBlock(block *ckdb.Block) {
-	block.WriteDateTime(m.Timestamp)
-	if m.MsgType != datatype.MESSAGE_TYPE_DFSTATS && m.MsgType != datatype.MESSAGE_TYPE_SERVER_DFSTATS {
-		m.UniversalTag.WriteBlock(block)
+func (m *ExtMetrics) NativeTagVersion() uint32 {
+	switch m.MsgType {
+	case datatype.MESSAGE_TYPE_DFSTATS:
+		return nativetag.GetTableNativeTagsVersion(m.OrgId, nativetag.DEEPFLOW_TENANT)
+	case datatype.MESSAGE_TYPE_SERVER_DFSTATS:
+		if ckdb.IsValidOrgID(m.RawOrgId) {
+			return nativetag.GetTableNativeTagsVersion(m.OrgId, nativetag.DEEPFLOW_TENANT)
+		} else {
+			return nativetag.GetTableNativeTagsVersion(m.OrgId, nativetag.DEEPFLOW_ADMIN)
+		}
+	default:
+		return nativetag.GetTableNativeTagsVersion(m.OrgId, nativetag.EXT_METRICS)
 	}
-	block.Write(
-		m.VTableName,
-		m.TeamID,
-		m.TagNames,
-		m.TagValues,
-		m.MetricsFloatNames,
-		m.MetricsFloatValues,
-	)
 }
 
 func (m *ExtMetrics) OrgID() uint16 {
 	return m.OrgId
 }
 
-// Note: The order of append() must be consistent with the order of Write() in WriteBlock.
 func (m *ExtMetrics) Columns() []*ckdb.Column {
 	columns := []*ckdb.Column{}
 
@@ -116,7 +132,7 @@ func (m *ExtMetrics) Release() {
 	ReleaseExtMetrics(m)
 }
 
-func (m *ExtMetrics) GenCKTable(cluster, storagePolicy string, ttl int, coldStorage *ckdb.ColdStorage) *ckdb.Table {
+func (m *ExtMetrics) GenCKTable(cluster, storagePolicy, ckdbType string, ttl int, coldStorage *ckdb.ColdStorage) *ckdb.Table {
 	timeKey := "time"
 	engine := ckdb.MergeTree
 
@@ -130,7 +146,9 @@ func (m *ExtMetrics) GenCKTable(cluster, storagePolicy string, ttl int, coldStor
 	}
 
 	return &ckdb.Table{
+		Version:         common.CK_VERSION,
 		Database:        m.DatabaseName(),
+		DBType:          ckdbType,
 		LocalName:       m.TableName() + ckdb.LOCAL_SUBFFIX,
 		GlobalName:      m.TableName(),
 		Columns:         m.Columns(),
@@ -166,6 +184,10 @@ func (m *ExtMetrics) GenerateNewFlowTags(cache *flow_tag.FlowTagCache) {
 	cache.Fields = cache.Fields[:0]
 	cache.FieldValues = cache.FieldValues[:0]
 
+	if !m.IsValid() {
+		log.Warningf("ext metrics is invalid. %+v", m)
+		return
+	}
 	// tags
 	flowTagInfo.FieldType = flow_tag.FieldTag
 	for i, name := range m.TagNames {
@@ -221,12 +243,12 @@ func (m *ExtMetrics) GenerateNewFlowTags(cache *flow_tag.FlowTagCache) {
 	}
 }
 
-var extMetricsPool = pool.NewLockFreePool(func() interface{} {
+var extMetricsPool = pool.NewLockFreePool(func() *ExtMetrics {
 	return &ExtMetrics{}
 })
 
 func AcquireExtMetrics() *ExtMetrics {
-	return extMetricsPool.Get().(*ExtMetrics)
+	return extMetricsPool.Get()
 }
 
 var emptyUniversalTag = flow_metrics.UniversalTag{}

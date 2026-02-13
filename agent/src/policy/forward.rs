@@ -27,12 +27,12 @@ use pnet::datalink::NetworkInterface;
 
 use crate::{
     common::{
-        decapsulate::TunnelType, enums::TapType, lookup_key::LookupKey,
+        decapsulate::TunnelType, enums::CaptureNetworkType, lookup_key::LookupKey,
         platform_data::PlatformData, TapPort, Timestamp,
     },
     utils::environment::is_tt_workload,
 };
-use public::proto::common::TridentType;
+use public::proto::agent::AgentType;
 use public::utils::net::MacAddr;
 
 pub const FROM_CONTROLLER: u16 = 1;
@@ -52,7 +52,7 @@ struct L3Item {
     ip: IpAddr,
     mac: MacAddr,
     epc_id: i32,
-    tap_type: TapType,
+    tap_type: CaptureNetworkType,
     tap_port: TapPort,
 
     last: Timestamp,
@@ -96,7 +96,7 @@ impl fmt::Display for L3Item {
 
         write!(
             f,
-            "TapType: {} TapPort: {} EPC: {} MAC: {} IP: {} FROM: {} LAST: {}",
+            "CaptureNetworkType: {} TapPort: {} EPC: {} MAC: {} IP: {} FROM: {} LAST: {}",
             self.tap_type,
             self.tap_port,
             self.epc_id,
@@ -167,7 +167,7 @@ impl Forward {
                 }
                 let value = L3Item {
                     epc_id: platform.epc_id,
-                    tap_type: TapType::Cloud,
+                    tap_type: CaptureNetworkType::Cloud,
                     tap_port: TapPort::from_local_mac(
                         TapPort::NAT_SOURCE_NONE,
                         TunnelType::None,
@@ -184,6 +184,7 @@ impl Forward {
         }
     }
 
+    #[inline]
     fn is_link_local(ip_addr: IpAddr) -> bool {
         match ip_addr {
             IpAddr::V4(ip) => ip.is_link_local(),
@@ -192,11 +193,11 @@ impl Forward {
     }
 
     fn get_ip_from_lookback(
-        trident_type: TridentType,
+        agent_type: AgentType,
         interfaces: &Vec<NetworkInterface>,
     ) -> Vec<IpNetwork> {
         let mut ips = Vec::new();
-        if !is_tt_workload(trident_type) {
+        if !is_tt_workload(agent_type) {
             return ips;
         }
 
@@ -219,11 +220,11 @@ impl Forward {
 
     fn update_l3_from_interfaces(
         &self,
-        trident_type: TridentType,
+        agent_type: AgentType,
         table: &mut TableLruCache,
         interfaces: &Vec<NetworkInterface>,
     ) {
-        let ips = Self::get_ip_from_lookback(trident_type, interfaces);
+        let ips = Self::get_ip_from_lookback(agent_type, interfaces);
         debug!("Interface L3:");
         for interface in interfaces {
             if interface.is_loopback() || !interface.is_up() || interface.mac.is_none() {
@@ -241,7 +242,7 @@ impl Forward {
                 }
                 let value = L3Item {
                     epc_id: 0,
-                    tap_type: TapType::Cloud,
+                    tap_type: CaptureNetworkType::Cloud,
                     tap_port: TapPort::from_local_mac(
                         TapPort::NAT_SOURCE_NONE,
                         TunnelType::None,
@@ -260,7 +261,7 @@ impl Forward {
 
     pub fn update_from_config(
         &mut self,
-        trident_type: TridentType,
+        agent_type: AgentType,
         platforms: &Vec<Arc<PlatformData>>,
         interfaces: &Vec<NetworkInterface>,
     ) {
@@ -271,18 +272,20 @@ impl Forward {
         let mut mac_ip_table = self.mac_ip_tables.write().unwrap();
         mac_ip_table.clear();
         self.update_l3_from_platforms(&mut mac_ip_table, platforms);
-        self.update_l3_from_interfaces(trident_type, &mut mac_ip_table, interfaces);
+        self.update_l3_from_interfaces(agent_type, &mut mac_ip_table, interfaces);
 
         let mut vip_device_table = AHashMap::new();
         self.update_vip_from_platforms(&mut vip_device_table, platforms);
         *self.vip_device_tables.write().unwrap() = vip_device_table
     }
 
+    #[inline]
     fn query_vip(&self, mac: MacAddr) -> bool {
         let mac = u64::from(mac);
         return self.vip_device_tables.read().unwrap().get(&mac).is_some();
     }
 
+    #[inline]
     pub fn query(&mut self, _index: usize, mac: MacAddr, ip: IpAddr, l2_end: bool) -> bool {
         let key = L3Key { mac, ip };
         if self.mac_ip_tables.read().unwrap().peek(&key).is_none() {
@@ -292,6 +295,7 @@ impl Forward {
         return true;
     }
 
+    #[inline]
     pub fn add(&mut self, _index: usize, packet: &LookupKey, tap_port: TapPort, from: u16) {
         let key = L3Key {
             mac: packet.src_mac,
@@ -354,7 +358,7 @@ mod tests {
             ..Default::default()
         }));
 
-        forward.update_from_config(TridentType::TtHostPod, &platforms, &interfaces);
+        forward.update_from_config(AgentType::TtHostPod, &platforms, &interfaces);
 
         // 平台数据查询
         assert_eq!(

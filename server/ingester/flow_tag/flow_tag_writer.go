@@ -49,7 +49,7 @@ type Counter struct {
 }
 
 type FlowTagWriter struct {
-	ckdbAddrs    []string
+	ckdbAddrs    *[]string
 	ckdbUsername string
 	ckdbPassword string
 	writerConfig *config.CKWriterConfig
@@ -115,10 +115,10 @@ func NewFlowTagWriter(
 		tableName := fmt.Sprintf("%s_%s", srcDB, tagType.String())
 		t.TagType = tagType
 		w.ckwriters[tagType], err = ckwriter.NewCKWriter(
-			w.ckdbAddrs, w.ckdbUsername, w.ckdbPassword,
+			*w.ckdbAddrs, w.ckdbUsername, w.ckdbPassword,
 			fmt.Sprintf("%s-%s-%d", name, tableName, decoderIndex),
 			config.CKDB.TimeZone,
-			t.GenCKTable(config.CKDB.ClusterName, config.CKDB.StoragePolicy, tableName, ttl, partition),
+			t.GenCKTable(config.CKDB.ClusterName, config.CKDB.StoragePolicy, tableName, config.CKDB.Type, ttl, partition),
 			w.writerConfig.QueueCount, w.writerConfig.QueueSize, w.writerConfig.BatchSize, w.writerConfig.FlushTimeout, config.CKDB.Watcher)
 		if err != nil {
 			return nil, err
@@ -126,7 +126,7 @@ func NewFlowTagWriter(
 		w.ckwriters[tagType].Run()
 	}
 
-	common.RegisterCountableForIngester("flow_tag_writer", w, stats.OptionStatTags{"type": name, "decoder_index": strconv.Itoa(decoderIndex)})
+	common.RegisterCountableForIngester("flow_tag_writer", w, stats.OptionStatTags{"type": srcDB + "_" + name, "decoder_index": strconv.Itoa(decoderIndex)})
 	return w, nil
 }
 

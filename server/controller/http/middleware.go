@@ -21,13 +21,13 @@ import (
 	"strconv"
 
 	"github.com/deepflowio/deepflow/server/controller/common"
-	mcommon "github.com/deepflowio/deepflow/server/controller/db/mysql/common"
+	mcommon "github.com/deepflowio/deepflow/server/controller/db/metadb/common"
 	httpcommon "github.com/deepflowio/deepflow/server/controller/http/common"
-	routercommon "github.com/deepflowio/deepflow/server/controller/http/router/common"
+	"github.com/deepflowio/deepflow/server/controller/http/common/response"
 	"github.com/gin-gonic/gin"
 )
 
-func HandleOrgIDMiddleware() gin.HandlerFunc {
+func HandleORGIDMiddleware() gin.HandlerFunc {
 	return func(ctx *gin.Context) {
 		orgID := mcommon.DEFAULT_ORG_ID
 		orgIDString := ctx.Request.Header.Get(common.HEADER_KEY_X_ORG_ID)
@@ -35,13 +35,34 @@ func HandleOrgIDMiddleware() gin.HandlerFunc {
 			var err error
 			orgID, err = strconv.Atoi(orgIDString)
 			if err != nil {
-				errStr := fmt.Sprintf("invalid header (%s) value (%s)", common.HEADER_KEY_X_ORG_ID, orgIDString)
-				routercommon.BadRequestResponse(ctx, httpcommon.ORG_ID_INVALID, errStr)
+				response.JSON(ctx, response.SetOptStatus(httpcommon.ORG_ID_INVALID), response.SetError(fmt.Errorf("invalid header (%s) value (%s)", common.HEADER_KEY_X_ORG_ID, orgIDString)))
 				ctx.Abort()
 				return
 			}
 		}
 		ctx.Set(common.HEADER_KEY_X_ORG_ID, orgID)
+
+		var err error
+		userType, userID := common.DEFAULT_USER_TYPE, common.DEFAULT_USER_ID
+		userTypeString := ctx.Request.Header.Get(common.HEADER_KEY_X_USER_TYPE)
+		if len(userTypeString) != 0 {
+			userType, err = strconv.Atoi(userTypeString)
+			if err != nil {
+				ctx.Abort()
+				return
+			}
+		}
+		userIDString := ctx.Request.Header.Get(common.HEADER_KEY_X_USER_ID)
+		if len(userIDString) != 0 {
+			userID, err = strconv.Atoi(userIDString)
+			if err != nil {
+				ctx.Abort()
+				return
+			}
+		}
+		ctx.Set(common.HEADER_KEY_X_USER_TYPE, userType)
+		ctx.Set(common.HEADER_KEY_X_USER_ID, userID)
+
 		ctx.Next()
 	}
 }

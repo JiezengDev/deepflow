@@ -23,13 +23,14 @@ import (
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 // Kubernetes平台直接使用对应kubernetesgather的resource作为cloud的resource
 func (c *Cloud) getKubernetesData() model.Resource {
 	k8sGatherTask, ok := c.kubernetesGatherTaskMap[c.basicInfo.Lcuuid]
 	if !ok {
-		log.Warningf("domain (%s) no related kubernetes_gather_task", c.basicInfo.Name)
+		log.Warningf("domain (%s) no related kubernetes_gather_task", c.basicInfo.Name, logger.NewORGPrefix(c.orgID))
 		return model.Resource{
 			ErrorState: common.RESOURCE_STATE_CODE_SUCCESS,
 		}
@@ -38,11 +39,18 @@ func (c *Cloud) getKubernetesData() model.Resource {
 
 	// 避免合并时产生默认的空值，对kubernetes_gather resource的az做判断
 	if kubernetesGatherResource.AZ.Lcuuid == "" {
-		log.Infof("domain (%s) kubernetes_gather_task resource is null", c.basicInfo.Name)
+		log.Infof("domain (%s) kubernetes_gather_task resource is null", c.basicInfo.Name, logger.NewORGPrefix(c.orgID))
 		// return k8s gather error info
 		return model.Resource{
 			ErrorState:   kubernetesGatherResource.ErrorState,
 			ErrorMessage: kubernetesGatherResource.ErrorMessage,
+		}
+	}
+
+	if len(kubernetesGatherResource.PodNodes) == 0 {
+		return model.Resource{
+			ErrorState:   common.RESOURCE_STATE_CODE_WARNING,
+			ErrorMessage: "invalid pod node count (0)",
 		}
 	}
 
@@ -79,7 +87,7 @@ func (c *Cloud) getKubernetesData() model.Resource {
 		regions = append(regions, kubernetesGatherResource.Region)
 	}
 
-	// 将所有容器节点默认同步为云服务器
+	// 将所有容器节点默认同步为云主机
 	vms := []model.VM{}
 	vmPodNodeConnections := []model.VMPodNodeConnection{}
 	for _, node := range kubernetesGatherResource.PodNodes {
@@ -87,7 +95,7 @@ func (c *Cloud) getKubernetesData() model.Resource {
 		if node.State == common.POD_NODE_STATE_EXCEPTION {
 			state = common.VM_STATE_EXCEPTION
 		}
-		vmLcuuid := "ff" + common.GetUUID(node.Name, uuid.Nil)[2:]
+		vmLcuuid := "ff" + common.GetUUID(node.Lcuuid, uuid.Nil)[2:]
 		vms = append(vms, model.VM{
 			Lcuuid:       vmLcuuid,
 			Name:         node.Name,
@@ -107,43 +115,37 @@ func (c *Cloud) getKubernetesData() model.Resource {
 		})
 	}
 
-	if len(vms) == 0 {
-		return model.Resource{
-			ErrorState:   kubernetesGatherResource.ErrorState,
-			ErrorMessage: "invalid vm count (0). " + kubernetesGatherResource.ErrorMessage,
-		}
-	}
-
 	if kubernetesGatherResource.ErrorState == common.RESOURCE_STATE_CODE_SUCCESS {
 		c.sendStatsd(k8sGatherTask.GetGatherCost())
 	}
 
 	return model.Resource{
-		Verified:               true,
-		SyncAt:                 time.Now(),
-		AZs:                    []model.AZ{kubernetesGatherResource.AZ},
-		VPCs:                   []model.VPC{kubernetesGatherResource.VPC},
-		PodClusters:            []model.PodCluster{kubernetesGatherResource.PodCluster},
-		ErrorState:             kubernetesGatherResource.ErrorState,
-		ErrorMessage:           kubernetesGatherResource.ErrorMessage,
-		PodNodes:               kubernetesGatherResource.PodNodes,
-		PodServices:            kubernetesGatherResource.PodServices,
-		PodNamespaces:          kubernetesGatherResource.PodNamespaces,
-		Pods:                   kubernetesGatherResource.Pods,
-		PodGroups:              kubernetesGatherResource.PodGroups,
-		PodIngresses:           kubernetesGatherResource.PodIngresses,
-		PodGroupPorts:          kubernetesGatherResource.PodGroupPorts,
-		PodReplicaSets:         kubernetesGatherResource.PodReplicaSets,
-		PodServicePorts:        kubernetesGatherResource.PodServicePorts,
-		PodIngressRules:        kubernetesGatherResource.PodIngressRules,
-		PodIngressRuleBackends: kubernetesGatherResource.PodIngressRuleBackends,
-		PrometheusTargets:      kubernetesGatherResource.PrometheusTargets,
-		IPs:                    ips,
-		VMs:                    vms,
-		Regions:                regions,
-		Subnets:                subnets,
-		Networks:               networks,
-		VInterfaces:            vinterfaces,
-		VMPodNodeConnections:   vmPodNodeConnections,
+		Verified:                     true,
+		SyncAt:                       time.Now(),
+		AZs:                          []model.AZ{kubernetesGatherResource.AZ},
+		VPCs:                         []model.VPC{kubernetesGatherResource.VPC},
+		PodClusters:                  []model.PodCluster{kubernetesGatherResource.PodCluster},
+		ErrorState:                   kubernetesGatherResource.ErrorState,
+		ErrorMessage:                 kubernetesGatherResource.ErrorMessage,
+		PodNodes:                     kubernetesGatherResource.PodNodes,
+		PodServices:                  kubernetesGatherResource.PodServices,
+		PodNamespaces:                kubernetesGatherResource.PodNamespaces,
+		Pods:                         kubernetesGatherResource.Pods,
+		PodGroups:                    kubernetesGatherResource.PodGroups,
+		ConfigMaps:                   kubernetesGatherResource.ConfigMaps,
+		PodIngresses:                 kubernetesGatherResource.PodIngresses,
+		PodGroupPorts:                kubernetesGatherResource.PodGroupPorts,
+		PodReplicaSets:               kubernetesGatherResource.PodReplicaSets,
+		PodServicePorts:              kubernetesGatherResource.PodServicePorts,
+		PodIngressRules:              kubernetesGatherResource.PodIngressRules,
+		PodIngressRuleBackends:       kubernetesGatherResource.PodIngressRuleBackends,
+		PodGroupConfigMapConnections: kubernetesGatherResource.PodGroupConfigMapConnections,
+		IPs:                          ips,
+		VMs:                          vms,
+		Regions:                      regions,
+		Subnets:                      subnets,
+		Networks:                     networks,
+		VInterfaces:                  vinterfaces,
+		VMPodNodeConnections:         vmPodNodeConnections,
 	}
 }

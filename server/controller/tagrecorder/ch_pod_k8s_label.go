@@ -17,21 +17,40 @@
 package tagrecorder
 
 import (
-	"strings"
-
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type ChPodK8sLabel struct {
-	SubscriberComponent[*message.PodFieldsUpdate, message.PodFieldsUpdate, mysql.Pod, mysql.ChPodK8sLabel, K8sLabelKey]
+	SubscriberComponent[
+		*message.AddedPods,
+		message.AddedPods,
+		*message.UpdatedPod,
+		message.UpdatedPod,
+		*message.DeletedPods,
+		message.DeletedPods,
+		metadbmodel.Pod,
+		metadbmodel.ChPodK8sLabel,
+		IDKeyKey,
+	]
 }
 
 func NewChPodK8sLabel() *ChPodK8sLabel {
 	mng := &ChPodK8sLabel{
-		newSubscriberComponent[*message.PodFieldsUpdate, message.PodFieldsUpdate, mysql.Pod, mysql.ChPodK8sLabel, K8sLabelKey](
-			common.RESOURCE_TYPE_POD_EN, RESOURCE_TYPE_CH_K8S_LABEL,
+		newSubscriberComponent[
+			*message.AddedPods,
+			message.AddedPods,
+			*message.UpdatedPod,
+			message.UpdatedPod,
+			*message.DeletedPods,
+			message.DeletedPods,
+			metadbmodel.Pod,
+			metadbmodel.ChPodK8sLabel,
+			IDKeyKey,
+		](
+			common.RESOURCE_TYPE_POD_EN, RESOURCE_TYPE_CH_POD_K8S_LABEL,
 		),
 	}
 	mng.subscriberDG = mng
@@ -39,102 +58,52 @@ func NewChPodK8sLabel() *ChPodK8sLabel {
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChPodK8sLabel) onResourceUpdated(sourceID int, fieldsUpdate *message.PodFieldsUpdate) {
-	keysToAdd := make([]K8sLabelKey, 0)
-	targetsToAdd := make([]mysql.ChPodK8sLabel, 0)
-	keysToDelete := make([]K8sLabelKey, 0)
-	targetsToDelete := make([]mysql.ChPodK8sLabel, 0)
-	var chItem mysql.ChPodK8sLabel
-	var updateKey K8sLabelKey
-	updateInfo := make(map[string]interface{})
-	if fieldsUpdate.Label.IsDifferent() {
-		new := map[string]string{}
-		old := map[string]string{}
-		newStr := fieldsUpdate.Label.GetNew()
-		oldStr := fieldsUpdate.Label.GetOld()
-		splitNews := strings.Split(newStr, ", ")
-		splitOlds := strings.Split(oldStr, ", ")
+func (c *ChPodK8sLabel) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedPod) {
+	db := md.GetDB()
+	fieldsUpdate := updateMessage.GetFields().(*message.UpdatedPodFields)
+	newSource := updateMessage.GetNewMetadbItem().(*metadbmodel.Pod)
+	sourceID := newSource.ID
+	keysToDelete := make([]IDKeyKey, 0)
+	targetsToDelete := make([]metadbmodel.ChPodK8sLabel, 0)
 
-		for _, splitNew := range splitNews {
-			splitSingleTag := strings.Split(splitNew, ":")
-			if len(splitSingleTag) == 2 {
-				new[strings.Trim(splitSingleTag[0], " ")] = strings.Trim(splitSingleTag[1], " ")
-			}
-		}
-		for _, splitOld := range splitOlds {
-			splitSingleTag := strings.Split(splitOld, ":")
-			if len(splitSingleTag) == 2 {
-				old[strings.Trim(splitSingleTag[0], " ")] = strings.Trim(splitSingleTag[1], " ")
-			}
-		}
-		for k, v := range new {
-			oldV, ok := old[k]
-			if !ok {
-				keysToAdd = append(keysToAdd, K8sLabelKey{ID: sourceID, Key: k})
-				targetsToAdd = append(targetsToAdd, mysql.ChPodK8sLabel{
-					ID:    sourceID,
-					Key:   k,
-					Value: v,
-				})
-			} else {
-				if oldV != v {
-					updateKey = K8sLabelKey{ID: sourceID, Key: k}
-					updateInfo[k] = v
-					mysql.Db.Where("id = ? and `key` = ?", sourceID, k).First(&chItem)
-					if chItem.ID == 0 {
-						keysToAdd = append(keysToAdd, K8sLabelKey{ID: sourceID, Key: k})
-						targetsToAdd = append(targetsToAdd, mysql.ChPodK8sLabel{
-							ID:    sourceID,
-							Key:   k,
-							Value: v,
-						})
-					} else if len(updateInfo) > 0 {
-						c.SubscriberComponent.dbOperator.update(chItem, updateInfo, updateKey)
-					}
-				}
-			}
-		}
+	if fieldsUpdate.Label.IsDifferent() {
+		_, new := StrToJsonAndMap(fieldsUpdate.Label.GetNew())
+		_, old := StrToJsonAndMap(fieldsUpdate.Label.GetOld())
+
 		for k := range old {
 			if _, ok := new[k]; !ok {
-				keysToDelete = append(keysToDelete, K8sLabelKey{ID: sourceID, Key: k})
-				targetsToDelete = append(targetsToDelete, mysql.ChPodK8sLabel{
-					ID:  sourceID,
-					Key: k,
+				keysToDelete = append(keysToDelete, NewIDKeyKey(sourceID, k))
+				targetsToDelete = append(targetsToDelete, metadbmodel.ChPodK8sLabel{
+					ChIDBase: metadbmodel.ChIDBase{ID: sourceID},
+					Key:      k,
 				})
 			}
 		}
 	}
-	if len(keysToAdd) > 0 {
-		c.SubscriberComponent.dbOperator.add(keysToAdd, targetsToAdd)
-	}
+
 	if len(keysToDelete) > 0 {
-		c.SubscriberComponent.dbOperator.delete(keysToDelete, targetsToDelete)
+		c.SubscriberComponent.dbOperator.delete(keysToDelete, targetsToDelete, db)
 	}
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChPodK8sLabel) sourceToTarget(source *mysql.Pod) (keys []K8sLabelKey, targets []mysql.ChPodK8sLabel) {
-	labelMap := map[string]string{}
-	splitTags := strings.Split(source.Label, ", ")
-
-	for _, splitTag := range splitTags {
-		splitSingleTag := strings.Split(splitTag, ":")
-		if len(splitSingleTag) == 2 {
-			labelMap[strings.Trim(splitSingleTag[0], " ")] = strings.Trim(splitSingleTag[1], " ")
-		}
-	}
+func (c *ChPodK8sLabel) sourceToTarget(md *message.Metadata, source *metadbmodel.Pod) (keys []IDKeyKey, targets []metadbmodel.ChPodK8sLabel) {
+	_, labelMap := StrToJsonAndMap(source.Label)
 	for k, v := range labelMap {
-		keys = append(keys, K8sLabelKey{ID: source.ID, Key: k})
-		targets = append(targets, mysql.ChPodK8sLabel{
-			ID:    source.ID,
-			Key:   k,
-			Value: v,
+		keys = append(keys, NewIDKeyKey(source.ID, k))
+		targets = append(targets, metadbmodel.ChPodK8sLabel{
+			ChIDBase:    metadbmodel.ChIDBase{ID: source.ID},
+			Key:         k,
+			Value:       v,
+			TeamID:      md.GetTeamID(),
+			DomainID:    md.GetDomainID(),
+			SubDomainID: md.GetSubDomainID(),
 		})
 	}
 	return
 }
 
 // softDeletedTargetsUpdated implements SubscriberDataGenerator
-func (c *ChPodK8sLabel) softDeletedTargetsUpdated(targets []mysql.ChPodK8sLabel) {
+func (c *ChPodK8sLabel) softDeletedTargetsUpdated(targets []metadbmodel.ChPodK8sLabel, db *metadb.DB) {
 
 }

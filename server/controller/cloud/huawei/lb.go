@@ -23,6 +23,7 @@ import (
 	cloudcommon "github.com/deepflowio/deepflow/server/controller/cloud/common"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (h *HuaWei) getLBs() (
@@ -31,7 +32,7 @@ func (h *HuaWei) getLBs() (
 	requiredAttrs := []string{"id", "name", "vip_port_id", "vip_subnet_id", "vip_address"}
 	for project, token := range h.projectTokenMap {
 		jLBs, err := h.getRawData(newRawDataGetContext(
-			fmt.Sprintf("https://vpc.%s.%s/v2.0/lbaas/loadbalancers", project.name, h.config.Domain), token.token, "loadbalancers", pageQueryMethodMarker,
+			fmt.Sprintf("https://elb.%s.%s/v2/%s/elb/loadbalancers", project.name, h.config.Domain, project.id), token.token, "loadbalancers", pageQueryMethodMarker,
 		))
 		if err != nil {
 			return nil, nil, nil, nil, nil, err
@@ -42,15 +43,15 @@ func (h *HuaWei) getLBs() (
 			jLB := jLBs[i]
 			name := jLB.Get("name").MustString()
 			if !cloudcommon.CheckJsonAttributes(jLB, requiredAttrs) {
-				log.Infof("exclude lb: %s, missing attr", name)
+				log.Infof("exclude lb: %s, missing attr", name, logger.NewORGPrefix(h.orgID))
 				continue
 			}
 			network, ok := h.toolDataSet.neutronSubnetIDToNetwork[jLB.Get("vip_subnet_id").MustString()]
 			if !ok {
-				log.Infof("exclude lb: %s, missing network info", name)
+				log.Infof("exclude lb: %s, missing network info", name, logger.NewORGPrefix(h.orgID))
 				continue
 			}
-			id := jLB.Get("id").MustString()
+			id := common.IDGenerateUUID(h.orgID, jLB.Get("id").MustString())
 			var lbModel int
 			var vifType int
 			var networkLcuuid string
@@ -77,7 +78,7 @@ func (h *HuaWei) getLBs() (
 			lbs = append(lbs, lb)
 			h.toolDataSet.regionLcuuidToResourceNum[regionLcuuid]++
 
-			vifLcuuid := common.GenerateUUID(id)
+			vifLcuuid := common.GenerateUUIDByOrgID(h.orgID, id)
 			vifs = append(
 				vifs,
 				model.VInterface{
@@ -101,7 +102,7 @@ func (h *HuaWei) getLBs() (
 			ips = append(
 				ips,
 				model.IP{
-					Lcuuid:           common.GenerateUUID(vifLcuuid + ip),
+					Lcuuid:           common.GenerateUUIDByOrgID(h.orgID, vifLcuuid+ip),
 					VInterfaceLcuuid: vifLcuuid,
 					IP:               ip,
 					SubnetLcuuid:     subnetLcuuid,
@@ -112,7 +113,7 @@ func (h *HuaWei) getLBs() (
 			h.toolDataSet.lbLcuuidToIP[id] = ip
 		}
 
-		lls, ltss, err := h.formatListenersAndTargetServers(project.name, token.token)
+		lls, ltss, err := h.formatListenersAndTargetServers(project, token.token)
 		if err == nil {
 			lbListeners = append(lbListeners, lls...)
 			lbTargetSevers = append(lbTargetSevers, ltss...)
@@ -123,9 +124,9 @@ func (h *HuaWei) getLBs() (
 	return
 }
 
-func (h *HuaWei) formatListenersAndTargetServers(projectName, token string) (lbListeners []model.LBListener, lbTargetSevers []model.LBTargetServer, err error) {
+func (h *HuaWei) formatListenersAndTargetServers(project Project, token string) (lbListeners []model.LBListener, lbTargetSevers []model.LBTargetServer, err error) {
 	jLs, err := h.getRawData(newRawDataGetContext(
-		fmt.Sprintf("https://vpc.%s.%s/v2.0/lbaas/listeners", projectName, h.config.Domain), token, "listeners", pageQueryMethodMarker,
+		fmt.Sprintf("https://elb.%s.%s/v2/%s/elb/listeners", project.name, h.config.Domain, project.id), token, "listeners", pageQueryMethodMarker,
 	))
 	if err != nil {
 		return nil, nil, err
@@ -138,7 +139,7 @@ func (h *HuaWei) formatListenersAndTargetServers(projectName, token string) (lbL
 		jL := jLs[i]
 		name := jL.Get("name").MustString()
 		if !cloudcommon.CheckJsonAttributes(jL, listenerRequiredAttrs) {
-			log.Infof("exclude lb_listener: %s, missing attr", name)
+			log.Infof("exclude lb_listener: %s, missing attr", name, logger.NewORGPrefix(h.orgID))
 			continue
 		}
 
@@ -148,16 +149,16 @@ func (h *HuaWei) formatListenersAndTargetServers(projectName, token string) (lbL
 			jLB := jLBs.GetIndex(i)
 			id, ok := jLB.CheckGet("id")
 			if ok {
-				lbLcuuid = id.MustString()
+				lbLcuuid = common.IDGenerateUUID(h.orgID, id.MustString())
 			} else {
-				log.Infof("pass, missing id")
+				log.Infof("pass, missing id", logger.NewORGPrefix(h.orgID))
 			}
 		}
 		if lbLcuuid == "" {
-			log.Infof("exclude lb_listener: %s, missing lb info", name)
+			log.Infof("exclude lb_listener: %s, missing lb info", name, logger.NewORGPrefix(h.orgID))
 			continue
 		}
-		listenerID := jL.Get("id").MustString()
+		listenerID := common.IDGenerateUUID(h.orgID, jL.Get("id").MustString())
 		protocol := jL.Get("protocol").MustString()
 		if strings.Contains(protocol, "HTTPS") {
 			protocol = "HTTPS"
@@ -178,23 +179,23 @@ func (h *HuaWei) formatListenersAndTargetServers(projectName, token string) (lbL
 		poolID, ok := jL.CheckGet("default_pool_id")
 		if ok && poolID.MustString() != "" {
 			jTSs, err := h.getRawData(newRawDataGetContext(
-				fmt.Sprintf("https://vpc.%s.%s/v2.0/lbaas/pools/%s/members", projectName, h.config.Domain, poolID.MustString()), token, "members", pageQueryMethodMarker,
+				fmt.Sprintf("https://elb.%s.%s/v2/%s/elb/pools/%s/members", project.name, h.config.Domain, project.id, poolID.MustString()), token, "members", pageQueryMethodMarker,
 			))
 			if err != nil {
 				return nil, nil, err
 			}
 			for i := range jTSs {
 				jTS := jTSs[i]
-				tsID := jTS.Get("id").MustString()
+				tsID := common.IDGenerateUUID(h.orgID, jTS.Get("id").MustString())
 				if !cloudcommon.CheckJsonAttributes(jTS, tsRequiredAttrs) {
-					log.Infof("exclude lb_target_server: %s, missing attr", tsID)
+					log.Infof("exclude lb_target_server: %s, missing attr", tsID, logger.NewORGPrefix(h.orgID))
 					continue
 				}
-				subnetID := jTS.Get("subnet_id").MustString()
+				subnetID := common.IDGenerateUUID(h.orgID, jTS.Get("subnet_id").MustString())
 				ip := jTS.Get("address").MustString()
 				vmLcuuid, ok := h.toolDataSet.keyToVMLcuuid[SubnetIPKey{subnetID, ip}]
 				if !ok {
-					log.Infof("exclude lb_target_server: %s, missing vm info", tsID)
+					log.Infof("exclude lb_target_server: %s, missing vm info", tsID, logger.NewORGPrefix(h.orgID))
 					continue
 				}
 				lbTargetSevers = append(

@@ -18,6 +18,7 @@ package view
 
 import (
 	"bytes"
+	"slices"
 	"strings"
 
 	"github.com/deepflowio/deepflow/server/querier/common"
@@ -193,6 +194,7 @@ func (v *View) trans() {
 	var groupsLevelMetrics []Node
 	var tagsAliasInner []string
 	var groupsValueInner []string
+	hasLastFunction := false
 	// 遍历tags，解析至分层结构中
 	for _, tag := range v.Model.Tags.tags {
 		switch node := tag.(type) {
@@ -219,6 +221,10 @@ func (v *View) trans() {
 			}
 		case Function:
 			flag := node.GetFlag()
+			name := node.GetName()
+			if !hasLastFunction && strings.Contains(name, FUNCTION_LAST) {
+				hasLastFunction = true
+			}
 			node.SetTime(v.Model.Time)
 			node.Init()
 			if flag == METRICS_FLAG_INNER {
@@ -239,6 +245,10 @@ func (v *View) trans() {
 		group := node.(*Group)
 		if group.Flag == GROUP_FLAG_DEFAULT {
 			groupsLevelInner = append(groupsLevelInner, group)
+			// remove auto ip group
+			if strings.HasPrefix(group.Value, "auto_instance_ip") || strings.HasPrefix(group.Value, "auto_service_ip") {
+				continue
+			}
 			// 外层group
 			metricGroup := &Group{}
 			if group.Alias != "" {
@@ -255,11 +265,35 @@ func (v *View) trans() {
 			groupsLevelInner = append(groupsLevelInner, group)
 		}
 	}
+	// The inner tag should be in the outer group
+	groupList := []string{}
+	for _, group := range groupsLevelMetrics {
+		groupList = append(groupList, group.(*Group).Value)
+	}
+	for _, node := range v.Model.Tags.tags {
+		switch tag := node.(type) {
+		case *Tag:
+			if tag.Flag == NODE_FLAG_METRICS {
+				// outer group
+				if tag.Alias != "" && !slices.Contains(groupList, tag.Alias) {
+					groupsLevelMetrics = append(groupsLevelMetrics, &Group{Value: tag.Alias})
+				}
+			}
+		}
+	}
+
 	if v.Model.MetricsLevelFlag == MODEL_METRICS_LEVEL_FLAG_UNLAY {
 		// 计算层不拆层
 		// 里层tag+外层metric
+		newTagsInner := []Node{}
+		for _, tagInner := range tagsLevelInner {
+			_, ok := tagInner.(*Tag)
+			if ok {
+				newTagsInner = append(newTagsInner, tagInner)
+			}
+		}
 		sv := SubView{
-			Tags:       &Tags{tags: append(tagsLevelInner, metricsLevelMetrics...)},
+			Tags:       &Tags{tags: append(newTagsInner, metricsLevelMetrics...)},
 			Groups:     v.Model.Groups,
 			From:       v.Model.From,
 			Filters:    v.Model.Filters,
@@ -289,6 +323,16 @@ func (v *View) trans() {
 			NoPreWhere: v.NoPreWhere,
 		}
 		v.SubViewLevels = append(v.SubViewLevels, &svInner)
+		// last function add order by _time asc
+		if hasLastFunction {
+			svInner.Orders.Append(
+				&Order{
+					SortBy:  "_time",
+					OrderBy: "ASC",
+					IsField: true,
+				},
+			)
+		}
 		// 计算层外层
 		svMetrics := SubView{
 			Tags:       &Tags{tags: append(tagsLevelMetrics, metricsLevelMetrics...)}, // 计算层所有tag及外层算子
@@ -354,14 +398,31 @@ func (sv *SubView) ToString() string {
 
 func (sv *SubView) removeDup(ns NodeSet) []Node {
 	// 对NodeSet集合去重
-	tmpMap := make(map[string]interface{})
+	tmpMap := make(map[string]bool)
 	nodeList := ns.getList()
 	targetList := nodeList[:0]
 	for _, node := range nodeList {
 		str := node.ToString()
-		if _, ok := tmpMap[str]; !ok {
-			targetList = append(targetList, node)
-			tmpMap[str] = nil
+		postAs := ""
+		// x as y
+		// if the tag after as already exists, it is also considered duplicate​​​
+		if strings.Contains(str, " ") {
+			strSlice := strings.Fields(str)
+			if len(strSlice) == 3 && strings.ToUpper(strSlice[1]) == "AS" {
+				postAs = strings.Trim(strSlice[2], "`")
+			}
+		}
+		if postAs != "" {
+			if !tmpMap[postAs] {
+				targetList = append(targetList, node)
+				tmpMap[postAs] = true
+			}
+		} else {
+			strNoBackquote := strings.Trim(str, "`")
+			if !tmpMap[strNoBackquote] {
+				targetList = append(targetList, node)
+				tmpMap[strNoBackquote] = true
+			}
 		}
 	}
 	return targetList
@@ -385,16 +446,7 @@ func (sv *SubView) WriteTo(buf *bytes.Buffer) {
 		sv.From.WriteTo(buf)
 	}
 	if !sv.Filters.IsNull() {
-		from := sv.From.ToString()
-		if strings.Contains(from, "flow_tag") || strings.Contains(from, "deepflow_system") {
-			buf.WriteString(" WHERE ")
-		} else if strings.HasPrefix(from, "flow_metrics") && !strings.HasSuffix(from, ".1m`") && !strings.HasSuffix(from, ".1s`") {
-			buf.WriteString(" WHERE ")
-		} else if !sv.NoPreWhere {
-			buf.WriteString(" PREWHERE ")
-		} else {
-			buf.WriteString(" WHERE ")
-		}
+		buf.WriteString(" WHERE ")
 		sv.Filters.WriteTo(buf)
 	}
 	if !sv.Groups.IsNull() {

@@ -16,16 +16,25 @@
 
 package config
 
+import (
+	eventConfig "github.com/deepflowio/deepflow/server/controller/recorder/event/config"
+)
+
 var cfg *RecorderConfig
 
 type RecorderConfig struct {
-	CacheRefreshInterval         uint16 `default:"60" yaml:"cache_refresh_interval"`
+	CacheRefreshInterval         uint16 `default:"1440" yaml:"cache_refresh_interval"`
 	DeletedResourceCleanInterval uint16 `default:"24" yaml:"deleted_resource_clean_interval"`
 	DeletedResourceRetentionTime uint16 `default:"168" yaml:"deleted_resource_retention_time"`
+	DirtyResourceCleanInterval   uint16 `default:"1500" yaml:"dirty_resource_clean_interval"`
 	ResourceMaxID0               int    `default:"64000" yaml:"resource_max_id_0"`
 	ResourceMaxID1               int    `default:"499999" yaml:"resource_max_id_1"`
+	MySQLBatchSize               int    `default:"2500" yaml:"mysql_batch_size"`
 
-	LogDebug LogDebugConfig `yaml:"log_debug"`
+	LogDebug               LogDebugConfig `yaml:"log_debug"`
+	EventCfg               eventConfig.Config
+	SelfHealCfg            SelfHealConfig            `yaml:"self_heal"`
+	TagRecorderSelfHealCfg TagRecorderSelfHealConfig `yaml:"tagrecorder_self_heal"`
 }
 
 func Get() *RecorderConfig {
@@ -40,4 +49,13 @@ type LogDebugConfig struct {
 	Enabled       bool     `default:"false" yaml:"enabled"`
 	DetailEnabled bool     `default:"false" yaml:"detail_enabled"`
 	ResourceTypes []string `default:"" yaml:"resource_type"`
+}
+
+type SelfHealConfig struct {
+	Enabled   bool     `default:"true" yaml:"enabled"`
+	Resources []string `default:"" yaml:"resources"`
+}
+
+type TagRecorderSelfHealConfig struct {
+	Enabled bool `default:"true" yaml:"enabled"`
 }

@@ -19,80 +19,82 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
 
+// RoutingTableMessageFactory RoutingTable资源的消息工厂
+type RoutingTableMessageFactory struct{}
+
+func (f *RoutingTableMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedRoutingTables{}
+}
+
+func (f *RoutingTableMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedRoutingTable{}
+}
+
+func (f *RoutingTableMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedRoutingTables{}
+}
+
+func (f *RoutingTableMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedRoutingTableFields{}
+}
+
 type RoutingTable struct {
-	UpdaterBase[
-		cloudmodel.RoutingTable,
-		mysql.RoutingTable,
+	UpdaterBase[cloudmodel.RoutingTable,
 		*diffbase.RoutingTable,
-		*message.RoutingTableAdd,
-		message.RoutingTableAdd,
-		*message.RoutingTableUpdate,
-		message.RoutingTableUpdate,
-		*message.RoutingTableFieldsUpdate,
-		message.RoutingTableFieldsUpdate,
-		*message.RoutingTableDelete,
-		message.RoutingTableDelete]
+		*metadbmodel.RoutingTable,
+		metadbmodel.RoutingTable,
+	]
 }
 
 func NewRoutingTable(wholeCache *cache.Cache, cloudData []cloudmodel.RoutingTable) *RoutingTable {
 	updater := &RoutingTable{
-		newUpdaterBase[
-			cloudmodel.RoutingTable,
-			mysql.RoutingTable,
-			*diffbase.RoutingTable,
-			*message.RoutingTableAdd,
-			message.RoutingTableAdd,
-			*message.RoutingTableUpdate,
-			message.RoutingTableUpdate,
-			*message.RoutingTableFieldsUpdate,
-			message.RoutingTableFieldsUpdate,
-			*message.RoutingTableDelete,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_ROUTING_TABLE_EN,
 			wholeCache,
-			db.NewRoutingTable().SetORG(wholeCache.GetORG()),
+			db.NewRoutingTable().SetMetadata(wholeCache.GetMetadata()),
 			wholeCache.DiffBaseDataSet.RoutingTables,
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
+	updater.setDataGenerator(updater)
+
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &RoutingTableMessageFactory{})
+	}
+
 	return updater
 }
 
-func (t *RoutingTable) getDiffBaseByCloudItem(cloudItem *cloudmodel.RoutingTable) (diffBase *diffbase.RoutingTable, exists bool) {
-	diffBase, exists = t.diffBaseData[cloudItem.Lcuuid]
-	return
-}
-
-func (t *RoutingTable) generateDBItemToAdd(cloudItem *cloudmodel.RoutingTable) (*mysql.RoutingTable, bool) {
+func (t *RoutingTable) generateDBItemToAdd(cloudItem *cloudmodel.RoutingTable) (*metadbmodel.RoutingTable, bool) {
 	vrouterID, exists := t.cache.ToolDataSet.GetVRouterIDByLcuuid(cloudItem.VRouterLcuuid)
 	if !exists {
-		log.Error(t.org.LogPre(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_VROUTER_EN, cloudItem.VRouterLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_ROUTING_TABLE_EN, cloudItem.Lcuuid,
-		)))
+		), t.metadata.LogPrefixes)
 		return nil, false
 	}
-	dbItem := &mysql.RoutingTable{
+	dbItem := &metadbmodel.RoutingTable{
 		Destination: cloudItem.Destination,
 		NexthopType: cloudItem.NexthopType,
 		Nexthop:     cloudItem.Nexthop,
 		VRouterID:   vrouterID,
-		Domain:      t.cache.DomainLcuuid,
+		Domain:      t.metadata.GetDomainLcuuid(),
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true
 }
 
-func (t *RoutingTable) generateUpdateInfo(diffBase *diffbase.RoutingTable, cloudItem *cloudmodel.RoutingTable) (*message.RoutingTableFieldsUpdate, map[string]interface{}, bool) {
-	structInfo := new(message.RoutingTableFieldsUpdate)
+func (t *RoutingTable) generateUpdateInfo(diffBase *diffbase.RoutingTable, cloudItem *cloudmodel.RoutingTable) (types.UpdatedFields, map[string]interface{}, bool) {
+	structInfo := new(message.UpdatedRoutingTableFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.Destination != cloudItem.Destination {
 		mapInfo["destination"] = cloudItem.Destination

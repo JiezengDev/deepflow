@@ -24,66 +24,78 @@ import (
 
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 	rcommon "github.com/deepflowio/deepflow/server/controller/recorder/common"
 	"github.com/deepflowio/deepflow/server/controller/recorder/config"
 	"github.com/deepflowio/deepflow/server/controller/recorder/listener"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/statsd"
 	"github.com/deepflowio/deepflow/server/controller/recorder/updater"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/refresh"
-	"github.com/deepflowio/deepflow/server/libs/queue"
 )
 
 type subDomains struct {
-	org *rcommon.ORG
+	metadata *rcommon.Metadata
 
-	domainLcuuid string
-	domainName   string
-	cacheMng     *cache.CacheManager
-	eventQueue   *queue.OverwriteQueue
-
+	cacheMng   *cache.CacheManager
 	refreshers map[string]*subDomain
 }
 
-func newSubDomains(ctx context.Context, cfg config.RecorderConfig, eventQueue *queue.OverwriteQueue, org *rcommon.ORG, domainLcuuid, domainName string, cacheMng *cache.CacheManager) *subDomains {
+func newSubDomains(ctx context.Context, cfg config.RecorderConfig, md *rcommon.Metadata, cacheMng *cache.CacheManager) *subDomains {
 	return &subDomains{
-		org: org,
+		metadata: md,
 
-		domainLcuuid: domainLcuuid,
-		domainName:   domainName,
-		cacheMng:     cacheMng,
-		eventQueue:   eventQueue,
-		refreshers:   make(map[string]*subDomain),
+		cacheMng:   cacheMng,
+		refreshers: make(map[string]*subDomain),
 	}
 }
 
-func (s *subDomains) RefreshAll(cloudData map[string]cloudmodel.SubDomainResource) error {
+func (s *subDomains) CloseStatsd() {
+	for _, refresher := range s.refreshers {
+		refresher.statsd.Close()
+	}
+}
+
+func (s *subDomains) RefreshAll(cloudSubDomainResources map[string]cloudmodel.SubDomainResource) error {
 	// 遍历 cloud 中的 subdomain 资源，与缓存中的 subdomain 资源对比，根据对比结果增删改
-	for lcuuid, resource := range cloudData {
+	var err error
+	for lcuuid, resource := range cloudSubDomainResources {
 		sd, ok := s.refreshers[lcuuid]
 		if !ok {
-			sd = s.newRefresher(lcuuid)
+			sd, err = s.newRefresher(lcuuid)
+			if err != nil {
+				return err
+			}
 			s.refreshers[lcuuid] = sd
 		}
 		sd.tryRefresh(resource)
 	}
 
 	// 遍历 subdomain 字典，删除 cloud 未返回的 subdomain 资源
-	for _, sd := range s.refreshers {
-		if _, ok := cloudData[sd.Lcuuid]; !ok {
+	for lcuuid, sd := range s.refreshers {
+		if _, ok := cloudSubDomainResources[lcuuid]; !ok {
+			log.Info("sub_domain will be deleted", sd.metadata.LogPrefixes)
 			sd.clear()
+			delete(s.refreshers, lcuuid)
+			delete(s.cacheMng.SubDomainCacheMap, lcuuid)
 		}
 	}
 	return nil
 }
 
-func (s *subDomains) RefreshOne(cloudData map[string]cloudmodel.SubDomainResource) error {
+func (s *subDomains) RefreshOne(cloudSubDomainResources map[string]cloudmodel.SubDomainResource) error {
 	// 遍历 cloud 中的 subdomain 资源，与缓存中的 subdomain 资源对比，根据对比结果增删改
-	for lcuuid, resource := range cloudData {
+	var err error
+	for lcuuid, resource := range cloudSubDomainResources {
 		sd, ok := s.refreshers[lcuuid]
 		if !ok {
-			sd = s.newRefresher(lcuuid)
+			sd, err = s.newRefresher(lcuuid)
+			if err != nil {
+				return err
+			}
 			s.refreshers[lcuuid] = sd
 		}
 		return sd.tryRefresh(resource)
@@ -91,86 +103,107 @@ func (s *subDomains) RefreshOne(cloudData map[string]cloudmodel.SubDomainResourc
 	return nil
 }
 
-func (s *subDomains) newRefresher(lcuuid string) *subDomain {
-	copiedOrg := rcommon.ReplaceORGLogger(s.org)
-	copiedOrg.Logger.AppendSubDomainLcuuid(lcuuid)
-	return newSubDomain(s.eventQueue, copiedOrg, s.domainLcuuid, s.domainName, lcuuid, s.cacheMng.DomainCache.ToolDataSet, s.cacheMng.CreateSubDomainCacheIfNotExists(lcuuid))
+func (s *subDomains) newRefresher(lcuuid string) (*subDomain, error) {
+	var sd metadbmodel.SubDomain
+	if err := s.metadata.DB.Where("lcuuid = ?", lcuuid).First(&sd).Error; err != nil {
+		log.Errorf("failed to get sub_domain from db: %s", err.Error(), s.metadata.LogPrefixes)
+		return nil, err
+	}
+	md := s.metadata.Copy()
+	md.SetSubDomain(sd)
+	return newSubDomain(md, s.cacheMng.DomainCache.ToolDataSet, s.cacheMng.CreateSubDomainCacheIfNotExists(md)), nil
 }
 
 type subDomain struct {
-	org *rcommon.ORG
+	metadata *rcommon.Metadata
+	statsd   *statsd.SubDomainStatsd
 
-	domainLcuuid      string
-	domainName        string
 	domainToolDataSet *tool.DataSet
+	cache             *cache.Cache
 
-	Lcuuid     string
-	cache      *cache.Cache
-	eventQueue *queue.OverwriteQueue
+	pubsub      pubsub.AnyChangePubSub
+	msgMetadata *message.Metadata
 }
 
-func newSubDomain(eventQueue *queue.OverwriteQueue, org *rcommon.ORG, domainLcuuid, domainName, lcuuid string, domainToolDataSet *tool.DataSet, cache *cache.Cache) *subDomain {
+func newSubDomain(md *rcommon.Metadata, domainToolDataSet *tool.DataSet, cache *cache.Cache) *subDomain {
 	return &subDomain{
-		org: org,
+		metadata: md,
+		statsd:   statsd.NewSubDomainStatsd(md),
 
-		domainLcuuid:      domainLcuuid,
-		domainName:        domainName,
 		domainToolDataSet: domainToolDataSet,
-
-		Lcuuid:     lcuuid,
-		cache:      cache,
-		eventQueue: eventQueue,
+		cache:             cache,
+		pubsub:            pubsub.GetPubSub(pubsub.PubSubTypeWholeSubDomain).(pubsub.AnyChangePubSub),
+		msgMetadata: message.NewMetadata(
+			message.MetadataPlatform(md.Platform),
+			message.MetadataToolDataSet(cache.ToolDataSet),
+		),
 	}
 }
 
 func (s *subDomain) tryRefresh(cloudData cloudmodel.SubDomainResource) error {
-	if err := s.shouldRefresh(s.Lcuuid, cloudData); err != nil {
+	if err := s.shouldRefresh(s.metadata.GetSubDomainLcuuid(), cloudData); err != nil {
 		return err
 	}
 
 	select {
 	case <-s.cache.RefreshSignal:
 		s.cache.IncrementSequence()
-		s.cache.SetLogLevel(logging.INFO)
+		s.cache.SetLogLevel(logging.INFO, cache.RefreshSignalCallerSubDomain)
 
 		s.refresh(cloudData)
 		s.cache.ResetRefreshSignal(cache.RefreshSignalCallerSubDomain)
 	default:
-		log.Info(s.org.LogPre("sub_domain refresh is running, does nothing"))
+		log.Info("sub_domain refresh is running, does nothing", s.metadata.LogPrefixes)
 		return RefreshConflictError
 	}
 	return nil
 }
 
 func (s *subDomain) refresh(cloudData cloudmodel.SubDomainResource) {
-	log.Info(s.org.LogPre("sub_domain sync refresh started"))
+	log.Info("sub_domain sync refresh started", s.metadata.LogPrefixes)
 
-	listener := listener.NewWholeSubDomain(s.domainLcuuid, s.Lcuuid, s.cache, s.eventQueue)
-	subDomainUpdatersInUpdateOrder := s.getUpdatersInOrder(cloudData)
-	s.executeUpdaters(subDomainUpdatersInUpdateOrder)
-	s.notifyOnResourceChanged(subDomainUpdatersInUpdateOrder)
-	listener.OnUpdatersCompleted()
+	// TODO refactor
+	// for process
+	s.cache.RefreshVTaps()
+	s.refreshResource(&cloudData)
+	s.updateSyncedAt(s.metadata.GetSubDomainLcuuid(), cloudData.SyncAt)
 
-	s.updateSyncedAt(s.Lcuuid, cloudData.SyncAt)
-
-	log.Info(s.org.LogPre("sub_domain sync refresh completed"))
+	log.Info("sub_domain sync refresh completed", s.metadata.LogPrefixes)
 }
 
 func (s *subDomain) clear() {
-	log.Info(s.org.LogPre("sub_domain clean refresh started"))
-	subDomainUpdatersInUpdateOrder := s.getUpdatersInOrder(cloudmodel.SubDomainResource{})
-	s.executeUpdaters(subDomainUpdatersInUpdateOrder)
-	log.Info(s.org.LogPre("sub_domain clean refresh completed"))
+	log.Info("sub_domain is waiting for refresh signal to clear resources", s.metadata.LogPrefixes)
+	<-s.cache.RefreshSignal
+	s.cache.IncrementSequence()
+	s.cache.SetLogLevel(logging.INFO, cache.RefreshSignalCallerSubDomain)
+
+	log.Info("sub_domain clean refresh started", s.metadata.LogPrefixes)
+	s.refreshResource(nil)
+	log.Info("sub_domain clean refresh completed", s.metadata.LogPrefixes)
+
+	s.cache.ResetRefreshSignal(cache.RefreshSignalCallerSubDomain)
+}
+
+func (s *subDomain) refreshResource(cloudData *cloudmodel.SubDomainResource) {
+	onlyHandleDelete := false
+	if cloudData == nil {
+		onlyHandleDelete = true
+		cloudData = &cloudmodel.SubDomainResource{}
+	}
+	subDomainUpdatersInUpdateOrder := s.getUpdatersInOrder(*cloudData)
+	s.executeUpdaters(subDomainUpdatersInUpdateOrder, onlyHandleDelete)
+	s.notifyOnResourceChanged(subDomainUpdatersInUpdateOrder)
+	s.pubsub.PublishChange(s.msgMetadata)
 }
 
 func (s *subDomain) shouldRefresh(lcuuid string, cloudData cloudmodel.SubDomainResource) error {
 	if cloudData.Verified {
 		if len(cloudData.Networks) == 0 || len(cloudData.VInterfaces) == 0 || len(cloudData.Pods) == 0 {
-			log.Info(s.org.LogPre("sub_domain has no networks or vinterfaces or pods, does nothing"))
+			log.Info("sub_domain has no networks or vinterfaces or pods, does nothing", s.metadata.LogPrefixes)
 			return DataMissingError
 		}
 	} else {
-		log.Info(s.org.LogPre("sub_domain is not verified, does nothing"))
+		log.Info("sub_domain is not verified, does nothing", s.metadata.LogPrefixes)
 		return DataNotVerifiedError
 	}
 	return nil
@@ -178,14 +211,14 @@ func (s *subDomain) shouldRefresh(lcuuid string, cloudData cloudmodel.SubDomainR
 
 func (s *subDomain) getUpdatersInOrder(cloudData cloudmodel.SubDomainResource) []updater.ResourceUpdater {
 	ip := updater.NewIP(s.cache, cloudData.IPs, s.domainToolDataSet)
-	ip.GetLANIP().RegisterListener(listener.NewLANIP(s.cache, s.eventQueue))
-	ip.GetWANIP().RegisterListener(listener.NewWANIP(s.cache, s.eventQueue))
+	ip.GetLANIP().RegisterListener(listener.NewLANIP(s.cache))
+	ip.GetWANIP().RegisterListener(listener.NewWANIP(s.cache))
 
 	return []updater.ResourceUpdater{
 		updater.NewPodCluster(s.cache, cloudData.PodClusters).RegisterListener(
 			listener.NewPodCluster(s.cache)),
 		updater.NewPodNode(s.cache, cloudData.PodNodes).RegisterListener(
-			listener.NewPodNode(s.cache, s.eventQueue)),
+			listener.NewPodNode(s.cache)),
 		updater.NewPodNamespace(s.cache, cloudData.PodNamespaces).RegisterListener(
 			listener.NewPodNamespace(s.cache)),
 		updater.NewPodIngress(s.cache, cloudData.PodIngresses).RegisterListener(
@@ -193,7 +226,7 @@ func (s *subDomain) getUpdatersInOrder(cloudData cloudmodel.SubDomainResource) [
 		updater.NewPodIngressRule(s.cache, cloudData.PodIngressRules).RegisterListener(
 			listener.NewPodIngressRule(s.cache)),
 		updater.NewPodService(s.cache, cloudData.PodServices).RegisterListener(
-			listener.NewPodService(s.cache, s.eventQueue)),
+			listener.NewPodService(s.cache)),
 		updater.NewPodIngressRuleBackend(s.cache, cloudData.PodIngressRuleBackends).RegisterListener(
 			listener.NewPodIngressRuleBackend(s.cache)),
 		updater.NewPodServicePort(s.cache, cloudData.PodServicePorts).RegisterListener(
@@ -205,31 +238,42 @@ func (s *subDomain) getUpdatersInOrder(cloudData cloudmodel.SubDomainResource) [
 		updater.NewPodReplicaSet(s.cache, cloudData.PodReplicaSets).RegisterListener(
 			listener.NewPodReplicaSet(s.cache)),
 		updater.NewPod(s.cache, cloudData.Pods).RegisterListener(
-			listener.NewPod(s.cache, s.eventQueue)),
+			listener.NewPod(s.cache)).BuildStatsd(s.statsd),
+		updater.NewConfigMap(s.cache, cloudData.ConfigMaps).RegisterListener(
+			listener.NewConfigMap(s.cache)),
+		updater.NewPodGroupConfigMapConnection(s.cache, cloudData.PodGroupConfigMapConnections).RegisterListener(
+			listener.NewPodGroupConfigMapConnection(s.cache)),
 		updater.NewNetwork(s.cache, cloudData.Networks).RegisterListener(
 			listener.NewNetwork(s.cache)),
 		updater.NewSubnet(s.cache, cloudData.Subnets).RegisterListener(
 			listener.NewSubnet(s.cache)),
-		updater.NewPrometheusTarget(s.cache, cloudData.PrometheusTargets).RegisterListener(
-			listener.NewPrometheusTarget(s.cache)),
 		updater.NewVInterface(s.cache, cloudData.VInterfaces, s.domainToolDataSet).RegisterListener(
 			listener.NewVInterface(s.cache)),
 		ip,
 		updater.NewVMPodNodeConnection(s.cache, cloudData.VMPodNodeConnections).RegisterListener( // VMPodNodeConnection需放在最后
 			listener.NewVMPodNodeConnection(s.cache)),
 		updater.NewProcess(s.cache, cloudData.Processes).RegisterListener(
-			listener.NewProcess(s.cache, s.eventQueue)),
+			listener.NewProcess(s.cache)),
 	}
 }
 
-func (r *subDomain) executeUpdaters(updatersInUpdateOrder []updater.ResourceUpdater) {
+func (r *subDomain) executeUpdaters(updatersInUpdateOrder []updater.ResourceUpdater, onlyHandleDelete bool) {
+	if !onlyHandleDelete {
+		r.handleAddAndUpdate(updatersInUpdateOrder)
+	}
+	r.handleDelete(updatersInUpdateOrder)
+}
+
+func (r *subDomain) handleAddAndUpdate(updatersInUpdateOrder []updater.ResourceUpdater) {
 	for _, updater := range updatersInUpdateOrder {
 		updater.HandleAddAndUpdate()
 	}
+}
 
+func (r *subDomain) handleDelete(updatersInUpdateOrder []updater.ResourceUpdater) {
 	// 删除操作的顺序，是创建的逆序
 	// 特殊资源：VMPodNodeConnection虽然是末序创建，但需要末序删除，序号-1；
-	// 原因：避免数据量大时，此数据删除后，云服务器、容器节点还在，导致采集器类型变化
+	// 原因：避免数据量大时，此数据删除后，云主机、容器节点还在，导致采集器类型变化
 	processUpdater := updatersInUpdateOrder[len(updatersInUpdateOrder)-1]
 	vmPodNodeConnectionUpdater := updatersInUpdateOrder[len(updatersInUpdateOrder)-2]
 	// 因为 processUpdater 是 -1，VMPodNodeConnection 是 -2，特殊处理后，逆序删除从 -3 开始
@@ -241,10 +285,10 @@ func (r *subDomain) executeUpdaters(updatersInUpdateOrder []updater.ResourceUpda
 }
 
 func (s *subDomain) notifyOnResourceChanged(updatersInUpdateOrder []updater.ResourceUpdater) {
-	platformDataChanged := isPlatformDataChanged(updatersInUpdateOrder)
-	if platformDataChanged {
-		log.Info(s.org.LogPre("sub domain data changed, refresh platform data"))
-		refresh.RefreshCache([]common.DataChanged{common.DATA_CHANGED_PLATFORM_DATA})
+	changed := isPlatformDataChanged(updatersInUpdateOrder)
+	if changed {
+		log.Info("sub domain data changed, refresh platform data", s.metadata.LogPrefixes)
+		refresh.RefreshCache(s.metadata.GetORGID(), []common.DataChanged{common.DATA_CHANGED_PLATFORM_DATA})
 	}
 }
 
@@ -252,27 +296,29 @@ func (s *subDomain) updateSyncedAt(lcuuid string, syncAt time.Time) {
 	if syncAt.IsZero() {
 		return
 	}
-	var subDomain mysql.SubDomain
-	err := s.org.DB.Where("lcuuid = ?", lcuuid).First(&subDomain).Error
+	log.Infof("update sub_domain synced_at: %s", syncAt.Format(common.GO_BIRTHDAY), s.metadata.LogPrefixes)
+
+	var subDomain metadbmodel.SubDomain
+	err := s.metadata.DB.Where("lcuuid = ?", lcuuid).First(&subDomain).Error
 	if err != nil {
-		log.Error(s.org.LogPre("get sub_domain from db failed: %s", err.Error()))
+		log.Errorf("get sub_domain from db failed: %s", err.Error(), s.metadata.LogPrefixes)
 		return
 	}
 	subDomain.SyncedAt = &syncAt
-	s.org.DB.Save(&subDomain)
-	log.Debug(s.org.LogPre("update sub_domain (%+v)", subDomain))
+	s.metadata.DB.Save(&subDomain)
+	log.Debugf("update sub_domain (%+v)", subDomain, s.metadata.LogPrefixes)
 }
 
 // TODO 单独刷新 sub_domain 时是否需要更新状态信息
 func (s *subDomain) updateStateInfo(cloudData cloudmodel.SubDomainResource) {
-	var subDomain mysql.SubDomain
-	err := s.org.DB.Where("lcuuid = ?", s.Lcuuid).First(&subDomain).Error
+	var subDomain metadbmodel.SubDomain
+	err := s.metadata.DB.Where("lcuuid = ?", s.metadata.GetSubDomainLcuuid()).First(&subDomain).Error
 	if err != nil {
-		log.Error(s.org.LogPre("get sub_domain from db failed: %s", err.Error()))
+		log.Errorf("get sub_domain from db failed: %s", err.Error(), s.metadata.LogPrefixes)
 		return
 	}
 	subDomain.State = cloudData.ErrorState
 	subDomain.ErrorMsg = cloudData.ErrorMessage
-	s.org.DB.Save(&subDomain)
-	log.Debug(s.org.LogPre("update sub_domain (%+v)", subDomain))
+	s.metadata.DB.Save(&subDomain)
+	log.Debugf("update sub_domain (%+v)", subDomain, s.metadata.LogPrefixes)
 }

@@ -20,9 +20,11 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/bitly/go-simplejson"
 	"github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/config"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type IconData struct {
@@ -35,25 +37,16 @@ type IconKey struct {
 	SubType  int
 }
 
-func UpdateIconInfo(cfg config.ControllerConfig) (map[string]int, map[IconKey]int, error) {
+func ParseIcon(cfg config.ControllerConfig, response *simplejson.Json) (map[string]int, map[IconKey]int, error) {
 	domainToIconID := make(map[string]int)
 	resourceToIconID := make(map[IconKey]int)
-	if !cfg.DFWebService.Enabled {
-		return domainToIconID, resourceToIconID, nil
-	}
-	body := make(map[string]interface{})
-	response, err := common.CURLPerform("GET", fmt.Sprintf("http://%s:%d/v1/icons", cfg.DFWebService.Host, cfg.DFWebService.Port), body)
-	if err != nil {
-		log.Error(err)
-		return domainToIconID, resourceToIconID, err
-	}
 	if len(response.Get("DATA").MustArray()) == 0 {
 		return domainToIconID, resourceToIconID, errors.New("no data in get icons response")
 	}
 	Icons := []IconData{}
 	for i, _ := range response.Get("DATA").MustArray() {
 		data := response.Get("DATA").GetIndex(i)
-		for k, _ := range IconNameToDomainType {
+		for k, _ := range common.IconNameToDomainTypes {
 			if data.Get("NAME").MustString() == k {
 				var iconData IconData
 				iconData.Name = data.Get("NAME").MustString()
@@ -77,12 +70,16 @@ func UpdateIconInfo(cfg config.ControllerConfig) (map[string]int, map[IconKey]in
 	}
 	domainTypeToDefaultIconID := make(map[int]int)
 	for _, icon := range Icons {
-		for _, domainType := range IconNameToDomainType[icon.Name] {
+		for _, domainType := range common.IconNameToDomainTypes[icon.Name] {
 			domainTypeToDefaultIconID[domainType] = icon.ID
 		}
 	}
-	var domains []mysql.Domain
-	mysql.Db.Unscoped().Find(&domains)
+	var domains []metadbmodel.Domain
+	err := metadb.DefaultDB.Unscoped().Find(&domains).Error
+	if err != nil {
+		log.Error(err)
+		return domainToIconID, resourceToIconID, err
+	}
 	for _, domain := range domains {
 		if domain.IconID != 0 {
 			domainToIconID[domain.Lcuuid] = domain.IconID
@@ -96,4 +93,45 @@ func UpdateIconInfo(cfg config.ControllerConfig) (map[string]int, map[IconKey]in
 		}
 	}
 	return domainToIconID, resourceToIconID, nil
+}
+
+// TODO: Icon supports multiple organizations
+// timing
+func UpdateIconInfo(cfg config.ControllerConfig) (map[string]int, map[IconKey]int, error) {
+	domainToIconID := make(map[string]int)
+	resourceToIconID := make(map[IconKey]int)
+	if !cfg.DFWebService.Enabled {
+		return domainToIconID, resourceToIconID, nil
+	}
+	body := make(map[string]interface{})
+	response, err := common.CURLPerform("GET", fmt.Sprintf("http://%s:%d/v1/icons?flushCache=true", cfg.DFWebService.Host, cfg.DFWebService.Port), body)
+	if err != nil {
+		log.Error(err)
+		return domainToIconID, resourceToIconID, err
+	}
+	return ParseIcon(cfg, response)
+}
+
+// TODO: Icon supports multiple organizations
+// subscriber
+func GetIconInfo(cfg config.ControllerConfig) (map[string]int, map[IconKey]int, error) {
+	domainToIconID := make(map[string]int)
+	resourceToIconID := make(map[IconKey]int)
+	// master region
+	if cfg.TrisolarisCfg.NodeType == TrisolarisNodeTypeMaster {
+		return UpdateIconInfo(cfg)
+	}
+	var controller metadbmodel.Controller
+	err := metadb.DefaultDB.Where("node_type = ? AND state = ?", common.CONTROLLER_NODE_TYPE_MASTER, common.CONTROLLER_STATE_NORMAL).First(&controller).Error
+	if err != nil {
+		log.Error(err)
+		return domainToIconID, resourceToIconID, err
+	}
+	body := make(map[string]interface{})
+	response, err := common.CURLPerform("GET", fmt.Sprintf("http://%s:%d/v1/icons/", controller.IP, cfg.ListenNodePort), body)
+	if err != nil {
+		log.Error(err)
+		return domainToIconID, resourceToIconID, err
+	}
+	return ParseIcon(cfg, response)
 }

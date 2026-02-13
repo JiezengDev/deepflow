@@ -21,9 +21,7 @@ import (
 
 	"github.com/deepflowio/deepflow/server/libs/ckdb"
 	"github.com/deepflowio/deepflow/server/libs/codec"
-	"github.com/deepflowio/deepflow/server/libs/grpc"
 	"github.com/deepflowio/deepflow/server/libs/pool"
-	"github.com/deepflowio/deepflow/server/libs/utils"
 )
 
 const BLOCK_HEAD_SIZE = 16
@@ -39,7 +37,7 @@ type L4Packet struct {
 	OrgId       uint16
 	TeamID      uint16
 	PacketCount uint32
-	PacketBatch []byte
+	PacketBatch string
 }
 
 func L4PacketColumns() []*ckdb.Column {
@@ -55,15 +53,8 @@ func L4PacketColumns() []*ckdb.Column {
 	}
 }
 
-func (s *L4Packet) WriteBlock(block *ckdb.Block) {
-	block.WriteDateTime(uint32(s.EndTime / US_TO_S_DEVISOR))
-	block.Write(s.StartTime)
-	block.Write(s.EndTime)
-	block.Write(s.FlowID)
-	block.Write(s.VtapID)
-	block.Write(s.TeamID)
-	block.Write(s.PacketCount)
-	block.Write(utils.String(s.PacketBatch))
+func (s *L4Packet) NativeTagVersion() uint32 {
+	return 0
 }
 
 func (s *L4Packet) OrgID() uint16 {
@@ -78,12 +69,12 @@ func (p *L4Packet) String() string {
 	return fmt.Sprintf("L4Packet: %+v\n", *p)
 }
 
-var poolL4Packet = pool.NewLockFreePool(func() interface{} {
+var poolL4Packet = pool.NewLockFreePool(func() *L4Packet {
 	return new(L4Packet)
 })
 
 func AcquireL4Packet() *L4Packet {
-	l := poolL4Packet.Get().(*L4Packet)
+	l := poolL4Packet.Get()
 	return l
 }
 
@@ -91,13 +82,11 @@ func ReleaseL4Packet(l *L4Packet) {
 	if l == nil {
 		return
 	}
-	t := l.PacketBatch[:0]
 	*l = L4Packet{}
-	l.PacketBatch = t
 	poolL4Packet.Put(l)
 }
 
-func DecodePacketSequence(decoder *codec.SimpleDecoder, vtapID uint16) (*L4Packet, error) {
+func DecodePacketSequence(vtapID, orgId, teamId uint16, decoder *codec.SimpleDecoder) (*L4Packet, error) {
 	l4Packet := AcquireL4Packet()
 	l4Packet.VtapID = vtapID
 	blockSize := decoder.ReadU32()
@@ -110,8 +99,9 @@ func DecodePacketSequence(decoder *codec.SimpleDecoder, vtapID uint16) (*L4Packe
 	// sequence packet defaults to a maximum of 5s timeout sending, so the minimum value of StartTime is EndTime - 5s
 	l4Packet.StartTime = l4Packet.EndTime - 5*US_TO_S_DEVISOR
 	l4Packet.PacketCount = uint32(endTimePacketCount >> 56)
-	l4Packet.PacketBatch = append(l4Packet.PacketBatch, decoder.ReadBytesN(int(blockSize)-BLOCK_HEAD_SIZE)...)
-	l4Packet.OrgId, l4Packet.TeamID = grpc.QueryVtapOrgAndTeamID(vtapID)
+	l4Packet.PacketBatch = string(decoder.ReadBytesN(int(blockSize) - BLOCK_HEAD_SIZE))
+
+	l4Packet.OrgId, l4Packet.TeamID = orgId, teamId
 
 	return l4Packet, nil
 }

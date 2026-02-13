@@ -18,55 +18,57 @@ package event
 
 import (
 	"fmt"
-	"strings"
 
-	mapset "github.com/deckarep/golang-set/v2"
-	"golang.org/x/exp/slices"
-
-	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/trisolaris/metadata"
 	"github.com/deepflowio/deepflow/server/libs/eventapi"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 )
 
 type Process struct {
-	EventManagerBase
+	ManagerComponent
+	CUDSubscriberComponent
 	deviceType int
 	tool       *IPTool
 }
 
-func NewProcess(toolDS *tool.DataSet, eq *queue.OverwriteQueue) *Process {
+func NewProcess(q *queue.OverwriteQueue) *Process {
 	mng := &Process{
-		newEventManagerBase("process",
-			toolDS,
-			eq,
-		),
+		newManagerComponent(common.RESOURCE_TYPE_PROCESS_EN, q),
+		newCUDSubscriberComponent(common.RESOURCE_TYPE_PROCESS_EN),
 		common.PROCESS_INSTANCE_TYPE,
-		newTool(toolDS),
+		newTool(),
 	}
+	mng.SetSubscriberSelf(mng)
 	return mng
 }
 
-func (p *Process) ProduceByAdd(items []*mysql.Process) {
-	processData, err := p.GetProcessData(items)
-	if err != nil {
-		log.Error(err)
-	}
+func (p *Process) OnResourceBatchAdded(md *message.Metadata, msg interface{}) {
+	items := msg.([]*metadbmodel.Process)
 	for _, item := range items {
+		vtapName, ok := md.GetToolDataSet().GetVTapNameByID(int(item.VTapID))
+		if !ok {
+			log.Errorf("vtap name not found for vtap id %d", item.VTapID, md.LogPrefixes)
+		}
 		description := fmt.Sprintf("agent %s report process %s cmdline %s",
-			processData[item.ID].VTapName, item.ProcessName, item.CommandLine)
+			vtapName, item.ProcessName, item.CommandLine)
+
 		opts := []eventapi.TagFieldOption{eventapi.TagDescription(description)}
 
-		switch t := processData[item.ID].ResourceType; t {
+		switch t := item.DeviceType; t {
 		case common.VIF_DEVICE_TYPE_POD:
-			podID := processData[item.ID].ResourceID
-			info, err := p.ToolDataSet.GetPodInfoByID(podID)
+			podID := item.DeviceID
+			info, err := md.GetToolDataSet().GetPodInfoByID(podID)
 			if err != nil {
 				log.Error(err)
 			} else {
+				podGroupType, ok := md.GetToolDataSet().GetPodGroupTypeByID(info.PodGroupID)
+				if !ok {
+					log.Errorf("db pod_group type(id: %d) not found", info.PodGroupID, md.LogPrefixes)
+				}
+
 				opts = append(opts, []eventapi.TagFieldOption{
 					eventapi.TagPodID(podID),
 					eventapi.TagRegionID(info.RegionID),
@@ -74,17 +76,18 @@ func (p *Process) ProduceByAdd(items []*mysql.Process) {
 					eventapi.TagVPCID(info.VPCID),
 					eventapi.TagPodClusterID(info.PodClusterID),
 					eventapi.TagPodGroupID(info.PodGroupID),
+					eventapi.TagPodGroupType(metadata.PodGroupTypeMap[podGroupType]),
 					eventapi.TagPodNodeID(info.PodNodeID),
 					eventapi.TagPodNSID(info.PodNamespaceID),
 				}...)
-				if l3DeviceOpts, ok := p.tool.getL3DeviceOptionsByPodNodeID(info.PodNodeID); ok {
+				if l3DeviceOpts, ok := p.tool.getL3DeviceOptionsByPodNodeID(md, info.PodNodeID); ok {
 					opts = append(opts, l3DeviceOpts...)
 				}
 			}
 
 		case common.VIF_DEVICE_TYPE_POD_NODE:
-			podNodeID := processData[item.ID].ResourceID
-			info, err := p.ToolDataSet.GetPodNodeInfoByID(podNodeID)
+			podNodeID := item.DeviceID
+			info, err := md.GetToolDataSet().GetPodNodeInfoByID(podNodeID)
 			if err != nil {
 				log.Error(err)
 			} else {
@@ -95,19 +98,19 @@ func (p *Process) ProduceByAdd(items []*mysql.Process) {
 					eventapi.TagVPCID(info.VPCID),
 					eventapi.TagPodClusterID(info.PodClusterID),
 				}...)
-				if l3DeviceOpts, ok := p.tool.getL3DeviceOptionsByPodNodeID(podNodeID); ok {
+				if l3DeviceOpts, ok := p.tool.getL3DeviceOptionsByPodNodeID(md, podNodeID); ok {
 					opts = append(opts, l3DeviceOpts...)
 				}
 			}
 
 		case common.VIF_DEVICE_TYPE_VM:
-			vmID := processData[item.ID].ResourceID
-			info, err := p.ToolDataSet.GetVMInfoByID(vmID)
+			vmID := item.DeviceID
+			info, err := md.GetToolDataSet().GetVMInfoByID(vmID)
 			if err != nil {
 				log.Error(err)
 			} else {
 				opts = append(opts, []eventapi.TagFieldOption{
-					eventapi.TagL3DeviceType(processData[item.ID].ResourceType),
+					eventapi.TagL3DeviceType(item.DeviceType),
 					eventapi.TagL3DeviceID(vmID),
 					eventapi.TagAZID(info.AZID),
 					eventapi.TagRegionID(info.RegionID),
@@ -118,144 +121,43 @@ func (p *Process) ProduceByAdd(items []*mysql.Process) {
 		default:
 			log.Error("cannot support type: %s", t)
 		}
+		opts = append(opts, []eventapi.TagFieldOption{
+			eventapi.TagGProcessID(item.GID),
+			eventapi.TagGProcessName(item.Name), // TODO @weiqiang why use name
+		}...)
 
-		p.createProcessAndEnqueue(
+		p.createInstanceAndEnqueue(
+			md,
 			item.Lcuuid,
 			eventapi.RESOURCE_EVENT_TYPE_CREATE,
 			item.Name,
 			p.deviceType,
-			item.ID,
+			int(item.GID),
 			opts...,
 		)
 	}
 }
 
-func (p *Process) ProduceByUpdate(cloudItem *cloudmodel.Process, diffBase *diffbase.Process) {
-}
-
-func (p *Process) ProduceByDelete(lcuuids []string) {
-	for _, lcuuid := range lcuuids {
-		var id int
-		var name string
-		processInfo, exists := p.ToolDataSet.GetProcessInfoByLcuuid(lcuuid)
-		if !exists {
-			log.Error(p.org.LogPre("process info not fount, lcuuid: %s", lcuuid))
-		} else {
-			id = processInfo.ID
-			name = processInfo.Name
+func (p *Process) OnResourceBatchDeleted(md *message.Metadata, msg interface{}) {
+	for _, item := range msg.([]*metadbmodel.Process) {
+		opts := []eventapi.TagFieldOption{
+			eventapi.TagGProcessID(item.GID),
+			eventapi.TagGProcessName(item.Name),
 		}
-
-		p.createProcessAndEnqueue(
-			lcuuid,
+		// 当 pod 内的 container 重启并伴随进程删除时，pod 会关联上新的 container，
+		// 而进程删除时无法使用其旧的 container 找到对应的 pod 信息，所以由 server 打 pod id。
+		// 仅在 pod 内的进程删除时，才会打上 pod id， 并且其他 tag 还是由 ingester 打上。
+		if item.DeviceType == common.VIF_DEVICE_TYPE_POD {
+			opts = append(opts, eventapi.TagPodID(item.DeviceID))
+		}
+		p.createInstanceAndEnqueue(
+			md,
+			item.Lcuuid,
 			eventapi.RESOURCE_EVENT_TYPE_DELETE,
-			name,
+			item.Name,
 			p.deviceType,
-			id,
+			int(item.GID),
+			opts...,
 		)
 	}
-}
-
-type ProcessData struct {
-	ResourceType int
-	ResourceName string
-	ResourceID   int
-	VTapName     string
-}
-
-func (p *Process) GetProcessData(processes []*mysql.Process) (map[int]ProcessData, error) {
-	// store vtap info
-	vtapIDs := mapset.NewSet[uint32]()
-	for _, item := range processes {
-		vtapIDs.Add(item.VTapID)
-	}
-	var vtaps []mysql.VTap
-	if err := p.org.DB.Where("id IN (?)", vtapIDs.ToSlice()).Find(&vtaps).Error; err != nil {
-		return nil, err
-	}
-	type vtapInfo struct {
-		Name           string
-		Type           int
-		LaunchServerID int
-	}
-	vtapIDToInfo := make(map[int]vtapInfo, len(vtaps))
-	vmLaunchServerIDs := mapset.NewSet[int]()
-	podNodeLaunchServerIDs := mapset.NewSet[int]()
-	for _, vtap := range vtaps {
-		vtapIDToInfo[vtap.ID] = vtapInfo{
-			Name:           vtap.Name,
-			Type:           vtap.Type,
-			LaunchServerID: vtap.LaunchServerID,
-		}
-		if slices.Contains([]int{common.VTAP_TYPE_WORKLOAD_V, common.VTAP_TYPE_WORKLOAD_P}, vtap.Type) {
-			vmLaunchServerIDs.Add(vtap.LaunchServerID)
-		} else if slices.Contains([]int{common.VTAP_TYPE_POD_HOST, common.VTAP_TYPE_POD_VM}, vtap.Type) {
-			podNodeLaunchServerIDs.Add(vtap.LaunchServerID)
-		}
-	}
-
-	// store vm info
-	var vms []mysql.VM
-	if err := p.org.DB.Where("id IN (?)", vmLaunchServerIDs.ToSlice()).Find(&vms).Error; err != nil {
-		return nil, err
-	}
-	vmIDToName := make(map[int]string, len(vms))
-	for _, vm := range vms {
-		vmIDToName[vm.ID] = vm.Name
-	}
-
-	// store pod node info
-	var podNodes []mysql.PodNode
-	if err := p.org.DB.Where("id IN (?)", podNodeLaunchServerIDs.ToSlice()).Find(&podNodes).Error; err != nil {
-		return nil, err
-	}
-	podNodeIDToName := make(map[int]string, len(podNodes))
-	for _, podNode := range podNodes {
-		podNodeIDToName[podNode.ID] = podNode.Name
-	}
-
-	// store pod info
-	var pods []mysql.Pod
-	if err := p.org.DB.Find(&pods).Error; err != nil {
-		return nil, err
-	}
-	podIDToName := make(map[int]string, len(pods))
-	containerIDToPodID := make(map[string]int)
-	for _, pod := range pods {
-		podIDToName[pod.ID] = pod.Name
-		var containerIDs []string
-		if len(pod.ContainerIDs) > 0 {
-			containerIDs = strings.Split(pod.ContainerIDs, ", ")
-		}
-		for _, id := range containerIDs {
-			containerIDToPodID[id] = pod.ID
-		}
-	}
-
-	resp := make(map[int]ProcessData, len(processes))
-	for _, process := range processes {
-		var deviceType, resourceID int
-		var resourceName string
-
-		pVTapID := int(process.VTapID)
-		if podID, ok := containerIDToPodID[process.ContainerID]; ok {
-			deviceType = common.VIF_DEVICE_TYPE_POD
-			resourceName = podIDToName[podID]
-			resourceID = podID
-		} else {
-			deviceType = common.VTAP_TYPE_TO_DEVICE_TYPE[vtapIDToInfo[pVTapID].Type]
-			if deviceType == common.VIF_DEVICE_TYPE_VM {
-				resourceName = vmIDToName[vtapIDToInfo[pVTapID].LaunchServerID]
-			} else if deviceType == common.VIF_DEVICE_TYPE_POD_NODE {
-				resourceName = podNodeIDToName[vtapIDToInfo[pVTapID].LaunchServerID]
-			}
-			resourceID = vtapIDToInfo[pVTapID].LaunchServerID
-		}
-		resp[process.ID] = ProcessData{
-			ResourceType: deviceType,
-			ResourceID:   resourceID,
-			ResourceName: resourceName,
-			VTapName:     vtapIDToInfo[pVTapID].Name,
-		}
-	}
-	return resp, nil
 }

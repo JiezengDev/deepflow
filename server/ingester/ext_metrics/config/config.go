@@ -17,7 +17,6 @@
 package config
 
 import (
-	"io/ioutil"
 	"os"
 
 	"github.com/deepflowio/deepflow/server/ingester/config"
@@ -30,7 +29,7 @@ var log = logging.MustGetLogger("ext_metrics.config")
 
 const (
 	DefaultDecoderQueueCount = 2
-	DefaultDecoderQueueSize  = 1 << 17
+	DefaultDecoderQueueSize  = 4096
 	DefaultExtMetricsTTL     = 168 // hour
 )
 
@@ -71,7 +70,7 @@ func Load(base *config.Config, path string) *Config {
 		log.Info("no config file, use defaults")
 		return &config.ExtMetrics
 	}
-	configBytes, err := ioutil.ReadFile(path)
+	configBytes, err := os.ReadFile(path)
 	if err != nil {
 		log.Warning("Read config file error:", err)
 		config.ExtMetrics.Validate()

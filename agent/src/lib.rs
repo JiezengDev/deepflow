@@ -18,24 +18,24 @@
 
 mod collector;
 pub mod common;
-mod config;
+pub mod config;
 pub mod debug;
 pub mod dispatcher;
-#[cfg(any(target_os = "linux", target_os = "android"))]
-mod ebpf;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(unix, feature = "libtrace"))]
+pub mod ebpf;
+#[cfg(all(unix, feature = "libtrace"))]
 mod ebpf_dispatcher;
 mod error;
-mod exception;
-mod flow_generator;
+pub mod exception;
+pub mod flow_generator;
 mod handler;
 mod integration_collector;
 mod metric;
 mod monitor;
 mod platform;
-mod plugin;
+pub mod plugin;
 mod policy;
-mod rpc;
+pub mod rpc;
 mod sender;
 pub mod trident;
 pub mod utils;
@@ -52,7 +52,7 @@ pub use {
         feature as _feature,
         flow::PacketDirection as _PacketDirection,
         l7_protocol_log::L7PerfCache as _L7PerfCache,
-        l7_protocol_log::LogCache as _LogCache,
+        l7_protocol_log::{LogCache as _LogCache, LogCacheKey as _LogCacheKey},
         lookup_key::LookupKey as _LookupKey,
         platform_data::{IpSubnet as _IpSubnet, PlatformData as _PlatformData},
         policy::{
@@ -72,12 +72,12 @@ pub use {
         },
         FlowPerfCounter as _FlowPerfCounter, L7FlowPerf as _L7FlowPerf,
     },
-    flow_generator::protocol_logs::LogMessageType as _LogMessageType,
     flow_generator::HttpLog,
     npb_pcap_policy::{
         DirectionType as _DirectionType, NpbAction as _NpbAction, NpbTunnelType as _NpbTunnelType,
         TapSide as _TapSide,
     },
+    policy::fast_path::EndpointTableType as _EndpointTableType,
     policy::first_path::FirstPath as _FirstPath,
     policy::labeler::Labeler as _Labeler,
 };

@@ -20,28 +20,50 @@ import (
 	"gorm.io/gorm/clause"
 
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type ChVPC struct {
-	SubscriberComponent[*message.VPCFieldsUpdate, message.VPCFieldsUpdate, mysql.VPC, mysql.ChVPC, IDKey]
+	SubscriberComponent[
+		*message.AddedVPCs,
+		message.AddedVPCs,
+		*message.UpdatedVPC,
+		message.UpdatedVPC,
+		*message.DeletedVPCs,
+		message.DeletedVPCs,
+		metadbmodel.VPC,
+		metadbmodel.ChVPC,
+		IDKey,
+	]
 	resourceTypeToIconID map[IconKey]int
 }
 
 func NewChVPC(resourceTypeToIconID map[IconKey]int) *ChVPC {
 	mng := &ChVPC{
-		newSubscriberComponent[*message.VPCFieldsUpdate, message.VPCFieldsUpdate, mysql.VPC, mysql.ChVPC, IDKey](
+		newSubscriberComponent[
+			*message.AddedVPCs,
+			message.AddedVPCs,
+			*message.UpdatedVPC,
+			message.UpdatedVPC,
+			*message.DeletedVPCs,
+			message.DeletedVPCs,
+			metadbmodel.VPC,
+			metadbmodel.ChVPC,
+			IDKey,
+		](
 			common.RESOURCE_TYPE_VPC_EN, RESOURCE_TYPE_CH_VPC,
 		),
 		resourceTypeToIconID,
 	}
 	mng.subscriberDG = mng
+	mng.softDelete = true
 	return mng
 }
 
 // sourceToTarget implements SubscriberDataGenerator
-func (c *ChVPC) sourceToTarget(source *mysql.VPC) (keys []IDKey, targets []mysql.ChVPC) {
+func (c *ChVPC) sourceToTarget(md *message.Metadata, source *metadbmodel.VPC) (keys []IDKey, targets []metadbmodel.ChVPC) {
 	iconID := c.resourceTypeToIconID[IconKey{
 		NodeType: RESOURCE_TYPE_VPC,
 	}]
@@ -51,34 +73,24 @@ func (c *ChVPC) sourceToTarget(source *mysql.VPC) (keys []IDKey, targets []mysql
 	}
 
 	keys = append(keys, IDKey{ID: source.ID})
-	targets = append(targets, mysql.ChVPC{
-		ID:     source.ID,
-		Name:   sourceName,
-		UID:    source.UID,
-		IconID: iconID,
+	targets = append(targets, metadbmodel.ChVPC{
+		ChIDBase: metadbmodel.ChIDBase{ID: source.ID},
+		Name:     sourceName,
+		UID:      source.UID,
+		IconID:   iconID,
+		TeamID:   md.GetTeamID(),
+		DomainID: md.GetDomainID(),
 	})
 	return
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChVPC) onResourceUpdated(sourceID int, fieldsUpdate *message.VPCFieldsUpdate) {
-	updateInfo := make(map[string]interface{})
-	if fieldsUpdate.Name.IsDifferent() {
-		updateInfo["name"] = fieldsUpdate.Name.GetNew()
-	}
-	if fieldsUpdate.UID.IsDifferent() {
-		updateInfo["uid"] = fieldsUpdate.UID.GetNew()
-	}
-	if len(updateInfo) > 0 {
-		var chItem mysql.ChVPC
-		mysql.Db.Where("id = ?", sourceID).First(&chItem)
-		c.SubscriberComponent.dbOperator.update(chItem, updateInfo, IDKey{ID: sourceID})
-	}
+func (c *ChVPC) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedVPC) {
 }
 
 // softDeletedTargetsUpdated implements SubscriberDataGenerator
-func (c *ChVPC) softDeletedTargetsUpdated(targets []mysql.ChVPC) {
-	mysql.Db.Clauses(clause.OnConflict{
+func (c *ChVPC) softDeletedTargetsUpdated(targets []metadbmodel.ChVPC, db *metadb.DB) {
+	db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "id"}},
 		DoUpdates: clause.AssignmentColumns([]string{"name"}),
 	}).Create(&targets)

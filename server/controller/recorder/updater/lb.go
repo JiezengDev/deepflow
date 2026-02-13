@@ -19,75 +19,78 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
+
+// LBMessageFactory LB资源的消息工厂
+type LBMessageFactory struct{}
+
+func (f *LBMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedLBs{}
+}
+
+func (f *LBMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedLB{}
+}
+
+func (f *LBMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedLBs{}
+}
+
+func (f *LBMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedLBFields{}
+}
 
 type LB struct {
 	UpdaterBase[
 		cloudmodel.LB,
-		mysql.LB,
 		*diffbase.LB,
-		*message.LBAdd,
-		message.LBAdd,
-		*message.LBUpdate,
-		message.LBUpdate,
-		*message.LBFieldsUpdate,
-		message.LBFieldsUpdate,
-		*message.LBDelete,
-		message.LBDelete]
+		*metadbmodel.LB,
+		metadbmodel.LB,
+	]
 }
 
 func NewLB(wholeCache *cache.Cache, cloudData []cloudmodel.LB) *LB {
 	updater := &LB{
-		newUpdaterBase[
-			cloudmodel.LB,
-			mysql.LB,
-			*diffbase.LB,
-			*message.LBAdd,
-			message.LBAdd,
-			*message.LBUpdate,
-			message.LBUpdate,
-			*message.LBFieldsUpdate,
-			message.LBFieldsUpdate,
-			*message.LBDelete,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_LB_EN,
 			wholeCache,
-			db.NewLB().SetORG(wholeCache.GetORG()),
+			db.NewLB().SetMetadata(wholeCache.GetMetadata()),
 			wholeCache.DiffBaseDataSet.LBs,
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
+	updater.setDataGenerator(updater)
+
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &LBMessageFactory{})
+	}
+
 	return updater
 }
 
-func (l *LB) getDiffBaseByCloudItem(cloudItem *cloudmodel.LB) (diffBase *diffbase.LB, exists bool) {
-	diffBase, exists = l.diffBaseData[cloudItem.Lcuuid]
-	return
-}
-
-func (l *LB) generateDBItemToAdd(cloudItem *cloudmodel.LB) (*mysql.LB, bool) {
+func (l *LB) generateDBItemToAdd(cloudItem *cloudmodel.LB) (*metadbmodel.LB, bool) {
 	vpcID, exists := l.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)
 	if !exists {
-		log.Error(l.org.LogPre(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_VPC_EN, cloudItem.VPCLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_LB_EN, cloudItem.Lcuuid,
-		)))
+		), l.metadata.LogPrefixes)
 		return nil, false
 	}
 
-	dbItem := &mysql.LB{
+	dbItem := &metadbmodel.LB{
 		Name:   cloudItem.Name,
 		Label:  cloudItem.Label,
 		UID:    cloudItem.Label,
 		Model:  cloudItem.Model,
 		VIP:    cloudItem.VIP,
-		Domain: l.cache.DomainLcuuid,
+		Domain: l.metadata.GetDomainLcuuid(),
 		Region: cloudItem.RegionLcuuid,
 		VPCID:  vpcID,
 	}
@@ -95,8 +98,8 @@ func (l *LB) generateDBItemToAdd(cloudItem *cloudmodel.LB) (*mysql.LB, bool) {
 	return dbItem, true
 }
 
-func (l *LB) generateUpdateInfo(diffBase *diffbase.LB, cloudItem *cloudmodel.LB) (*message.LBFieldsUpdate, map[string]interface{}, bool) {
-	structInfo := new(message.LBFieldsUpdate)
+func (l *LB) generateUpdateInfo(diffBase *diffbase.LB, cloudItem *cloudmodel.LB) (types.UpdatedFields, map[string]interface{}, bool) {
+	structInfo := new(message.UpdatedLBFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
 		mapInfo["name"] = cloudItem.Name

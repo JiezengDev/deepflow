@@ -22,6 +22,7 @@ use std::{
 use anyhow::Result;
 use log::error;
 use prost::Message as ProstMessage;
+use public::l7_protocol::LogMessageType;
 use wasmtime::{Engine, Linker, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder};
 
@@ -58,9 +59,9 @@ pub(super) const IMPORT_FUNC_VM_READ_CUSTOM_MESSAGE: &str = "vm_read_custom_mess
 pub(super) const IMPORT_FUNC_HOST_READ_L7_PROTOCOL_INFO: &str = "host_read_l7_protocol_info";
 pub(super) const IMPORT_FUNC_HOST_READ_STR_RESULT: &str = "host_read_str_result";
 
-pub(super) const LOG_LEVEL_INFO: i32 = 0;
-pub(super) const LOG_LEVEL_WARN: i32 = 1;
-pub(super) const LOG_LEVEL_ERR: i32 = 2;
+pub(super) const LOG_LEVEL_INFO: u32 = 0;
+pub(super) const LOG_LEVEL_WARN: u32 = 1;
+pub(super) const LOG_LEVEL_ERR: u32 = 2;
 
 pub const WASM_EXPORT_FUNC_NAME: [&'static str; 5] = [
     EXPORT_FUNC_CHECK_PAYLOAD,
@@ -102,6 +103,14 @@ impl WasmData {
             hook_point: HookPoint::ProtocolParse,
             type_code: protocol as u32,
             protobuf: message.encode_to_vec(),
+        }
+    }
+
+    pub fn new(protocol: L7Protocol) -> Self {
+        Self {
+            hook_point: HookPoint::ProtocolParse,
+            type_code: protocol as u32,
+            protobuf: vec![],
         }
     }
 }
@@ -169,7 +178,11 @@ impl WasmVm {
         self.instance.len()
     }
 
-    pub fn on_check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<(u8, String)> {
+    pub fn on_check_payload(
+        &mut self,
+        payload: &[u8],
+        param: &ParseParam,
+    ) -> Option<(u8, String, LogMessageType)> {
         if self.instance.len() == 0 {
             return None;
         }
@@ -225,12 +238,12 @@ impl WasmVm {
                 Ordering::Relaxed,
             );
 
-            let result = result.unwrap();
-            if result == 0 {
+            let (protocol, message_type) = result.unwrap();
+            if protocol == 0 {
                 continue;
             }
 
-            res = Some((result, "".to_string()));
+            res = Some((protocol, "".to_string(), message_type));
             self.store
                 .data_mut()
                 .parse_ctx

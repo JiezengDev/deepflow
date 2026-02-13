@@ -19,68 +19,71 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
+
+// NetworkMessageFactory Network资源的消息工厂
+type NetworkMessageFactory struct{}
+
+func (f *NetworkMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedNetworks{}
+}
+
+func (f *NetworkMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedNetwork{}
+}
+
+func (f *NetworkMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedNetworks{}
+}
+
+func (f *NetworkMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedNetworkFields{}
+}
 
 type Network struct {
 	UpdaterBase[
 		cloudmodel.Network,
-		mysql.Network,
 		*diffbase.Network,
-		*message.NetworkAdd,
-		message.NetworkAdd,
-		*message.NetworkUpdate,
-		message.NetworkUpdate,
-		*message.NetworkFieldsUpdate,
-		message.NetworkFieldsUpdate,
-		*message.NetworkDelete,
-		message.NetworkDelete]
+		*metadbmodel.Network,
+		metadbmodel.Network,
+	]
 }
 
 func NewNetwork(wholeCache *cache.Cache, cloudData []cloudmodel.Network) *Network {
 	updater := &Network{
-		newUpdaterBase[
-			cloudmodel.Network,
-			mysql.Network,
-			*diffbase.Network,
-			*message.NetworkAdd,
-			message.NetworkAdd,
-			*message.NetworkUpdate,
-			message.NetworkUpdate,
-			*message.NetworkFieldsUpdate,
-			message.NetworkFieldsUpdate,
-			*message.NetworkDelete,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_NETWORK_EN,
 			wholeCache,
-			db.NewNetwork().SetORG(wholeCache.GetORG()),
+			db.NewNetwork().SetMetadata(wholeCache.GetMetadata()),
 			wholeCache.DiffBaseDataSet.Networks,
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
+	updater.setDataGenerator(updater)
+
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &NetworkMessageFactory{})
+	}
+
 	return updater
 }
 
-func (n *Network) getDiffBaseByCloudItem(cloudItem *cloudmodel.Network) (diffBase *diffbase.Network, exists bool) {
-	diffBase, exists = n.diffBaseData[cloudItem.Lcuuid]
-	return
-}
-
-func (n *Network) generateDBItemToAdd(cloudItem *cloudmodel.Network) (*mysql.Network, bool) {
+func (n *Network) generateDBItemToAdd(cloudItem *cloudmodel.Network) (*metadbmodel.Network, bool) {
 	vpcID, exists := n.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)
 	if !exists {
-		log.Error(n.org.LogPre(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_VPC_EN, cloudItem.VPCLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_NETWORK_EN, cloudItem.Lcuuid,
-		)))
+		), n.metadata.LogPrefixes)
 		return nil, false
 	}
-	dbItem := &mysql.Network{
+	dbItem := &metadbmodel.Network{
 		Name:           cloudItem.Name,
 		Label:          cloudItem.Label,
 		State:          2,
@@ -89,7 +92,7 @@ func (n *Network) generateDBItemToAdd(cloudItem *cloudmodel.Network) (*mysql.Net
 		Shared:         cloudItem.Shared,
 		NetType:        cloudItem.NetType,
 		SubDomain:      cloudItem.SubDomainLcuuid,
-		Domain:         n.cache.DomainLcuuid,
+		Domain:         n.metadata.GetDomainLcuuid(),
 		Region:         cloudItem.RegionLcuuid,
 		AZ:             cloudItem.AZLcuuid,
 		VPCID:          vpcID,
@@ -98,16 +101,16 @@ func (n *Network) generateDBItemToAdd(cloudItem *cloudmodel.Network) (*mysql.Net
 	return dbItem, true
 }
 
-func (n *Network) generateUpdateInfo(diffBase *diffbase.Network, cloudItem *cloudmodel.Network) (*message.NetworkFieldsUpdate, map[string]interface{}, bool) {
-	structInfo := new(message.NetworkFieldsUpdate)
+func (n *Network) generateUpdateInfo(diffBase *diffbase.Network, cloudItem *cloudmodel.Network) (types.UpdatedFields, map[string]interface{}, bool) {
+	structInfo := new(message.UpdatedNetworkFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.VPCLcuuid != cloudItem.VPCLcuuid {
 		vpcID, exists := n.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)
 		if !exists {
-			log.Error(n.org.LogPre(resourceAForResourceBNotFound(
+			log.Error(resourceAForResourceBNotFound(
 				ctrlrcommon.RESOURCE_TYPE_VPC_EN, cloudItem.VPCLcuuid,
 				ctrlrcommon.RESOURCE_TYPE_NETWORK_EN, cloudItem.Lcuuid,
-			)))
+			), n.metadata.LogPrefixes)
 			return nil, nil, false
 		}
 		mapInfo["epc_id"] = vpcID

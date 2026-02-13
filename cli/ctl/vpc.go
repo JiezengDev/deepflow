@@ -70,7 +70,7 @@ func RegisterVPCCommend() *cobra.Command {
 
 func listVPC(cmd *cobra.Command, args []string, output string) error {
 	server := common.GetServerInfo(cmd)
-	url := fmt.Sprintf("http://%s:%d/v2/epcs/", server.IP, server.Port)
+	url := fmt.Sprintf("http://%s:%d/v2/epcs", server.IP, server.Port)
 	var name string
 	if len(args) > 0 {
 		name = args[0]
@@ -79,7 +79,7 @@ func listVPC(cmd *cobra.Command, args []string, output string) error {
 		url += fmt.Sprintf("?name=%s", name)
 	}
 
-	response, err := common.CURLPerform("GET", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
+	response, err := common.CURLPerform("GET", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd)), common.WithORGID(common.GetORGID(cmd))}...)
 	if err != nil {
 		return err
 	}

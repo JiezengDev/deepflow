@@ -19,83 +19,88 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
+
+// PodClusterMessageFactory PodCluster资源的消息工厂
+type PodClusterMessageFactory struct{}
+
+func (f *PodClusterMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedPodClusters{}
+}
+
+func (f *PodClusterMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedPodCluster{}
+}
+
+func (f *PodClusterMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedPodClusters{}
+}
+
+func (f *PodClusterMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedPodClusterFields{}
+}
 
 type PodCluster struct {
 	UpdaterBase[
 		cloudmodel.PodCluster,
-		mysql.PodCluster,
 		*diffbase.PodCluster,
-		*message.PodClusterAdd,
-		message.PodClusterAdd,
-		*message.PodClusterUpdate,
-		message.PodClusterUpdate,
-		*message.PodClusterFieldsUpdate,
-		message.PodClusterFieldsUpdate,
-		*message.PodClusterDelete,
-		message.PodClusterDelete]
+		*metadbmodel.PodCluster,
+		metadbmodel.PodCluster,
+	]
 }
 
 func NewPodCluster(wholeCache *cache.Cache, cloudData []cloudmodel.PodCluster) *PodCluster {
 	updater := &PodCluster{
-		newUpdaterBase[
-			cloudmodel.PodCluster,
-			mysql.PodCluster,
-			*diffbase.PodCluster,
-			*message.PodClusterAdd,
-			message.PodClusterAdd,
-			*message.PodClusterUpdate,
-			message.PodClusterUpdate,
-			*message.PodClusterFieldsUpdate,
-			message.PodClusterFieldsUpdate,
-			*message.PodClusterDelete,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_POD_CLUSTER_EN,
 			wholeCache,
-			db.NewPodCluster().SetORG(wholeCache.GetORG()),
+			db.NewPodCluster().SetMetadata(wholeCache.GetMetadata()),
 			wholeCache.DiffBaseDataSet.PodClusters,
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
+	updater.setDataGenerator(updater)
+
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &PodClusterMessageFactory{})
+	}
+
 	return updater
 }
 
-func (c *PodCluster) getDiffBaseByCloudItem(cloudItem *cloudmodel.PodCluster) (diffBase *diffbase.PodCluster, exists bool) {
-	diffBase, exists = c.diffBaseData[cloudItem.Lcuuid]
-	return
-}
-
-func (c *PodCluster) generateDBItemToAdd(cloudItem *cloudmodel.PodCluster) (*mysql.PodCluster, bool) {
+func (c *PodCluster) generateDBItemToAdd(cloudItem *cloudmodel.PodCluster) (*metadbmodel.PodCluster, bool) {
 	vpcID, exists := c.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)
 	if !exists {
-		log.Error(c.org.LogPre(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_VPC_EN, cloudItem.VPCLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_POD_CLUSTER_EN, cloudItem.Lcuuid,
-		)))
+		), c.metadata.LogPrefixes)
 		return nil, false
 	}
-	dbItem := &mysql.PodCluster{
+
+	dbItem := &metadbmodel.PodCluster{
 		Name:        cloudItem.Name,
 		Version:     cloudItem.Version,
 		ClusterName: cloudItem.ClusterName,
 		SubDomain:   cloudItem.SubDomainLcuuid,
-		Domain:      c.cache.DomainLcuuid,
+		Domain:      c.metadata.GetDomainLcuuid(),
 		Region:      cloudItem.RegionLcuuid,
 		AZ:          cloudItem.AZLcuuid,
 		VPCID:       vpcID,
+		UID:         ctrlrcommon.GenerateResourceShortUUID(ctrlrcommon.RESOURCE_TYPE_POD_CLUSTER_EN),
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true
 }
 
-func (c *PodCluster) generateUpdateInfo(diffBase *diffbase.PodCluster, cloudItem *cloudmodel.PodCluster) (*message.PodClusterFieldsUpdate, map[string]interface{}, bool) {
-	structInfo := new(message.PodClusterFieldsUpdate)
+func (c *PodCluster) generateUpdateInfo(diffBase *diffbase.PodCluster, cloudItem *cloudmodel.PodCluster) (types.UpdatedFields, map[string]interface{}, bool) {
+	structInfo := new(message.UpdatedPodClusterFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
 		mapInfo["name"] = cloudItem.Name
@@ -108,10 +113,6 @@ func (c *PodCluster) generateUpdateInfo(diffBase *diffbase.PodCluster, cloudItem
 	if diffBase.RegionLcuuid != cloudItem.RegionLcuuid {
 		mapInfo["region"] = cloudItem.RegionLcuuid
 		structInfo.RegionLcuuid.Set(diffBase.RegionLcuuid, cloudItem.RegionLcuuid)
-	}
-	if diffBase.AZLcuuid != cloudItem.AZLcuuid {
-		mapInfo["az"] = cloudItem.AZLcuuid
-		structInfo.AZLcuuid.Set(diffBase.AZLcuuid, cloudItem.AZLcuuid)
 	}
 
 	return structInfo, mapInfo, len(mapInfo) > 0

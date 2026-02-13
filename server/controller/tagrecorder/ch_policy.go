@@ -17,16 +17,17 @@
 package tagrecorder
 
 import (
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type ChPolicy struct {
-	UpdaterComponent[mysql.ChPolicy, PolicyKey]
+	UpdaterComponent[metadbmodel.ChPolicy, PolicyKey]
 }
 
 func NewChPolicy() *ChPolicy {
 	updater := &ChPolicy{
-		newUpdaterComponent[mysql.ChPolicy, PolicyKey](
+		newUpdaterComponent[metadbmodel.ChPolicy, PolicyKey](
 			RESOURCE_TYPE_CH_POLICY,
 		),
 	}
@@ -34,47 +35,49 @@ func NewChPolicy() *ChPolicy {
 	return updater
 }
 
-func (p *ChPolicy) generateNewData() (map[PolicyKey]mysql.ChPolicy, bool) {
+func (p *ChPolicy) generateNewData(db *metadb.DB) (map[PolicyKey]metadbmodel.ChPolicy, bool) {
 	var (
-		pcapPolicys []mysql.PcapPolicy
-		npbPolicys  []mysql.NpbPolicy
+		pcapPolicys []metadbmodel.PcapPolicy
+		npbPolicys  []metadbmodel.NpbPolicy
 	)
-	err := mysql.Db.Unscoped().Select("id", "name", "policy_acl_group_id").Find(&pcapPolicys).Error
+	err := db.Unscoped().Select("id", "name", "policy_acl_group_id", "team_id").Find(&pcapPolicys).Error
 	if err != nil {
-		log.Errorf(dbQueryResourceFailed(p.resourceTypeName, err))
+		log.Errorf(dbQueryResourceFailed(p.resourceTypeName, err), db.LogPrefixORGID)
 		return nil, false
 	}
-	err = mysql.Db.Unscoped().Select("id", "name", "policy_acl_group_id", "npb_tunnel_id").Find(&npbPolicys).Error
+	err = db.Unscoped().Select("id", "name", "policy_acl_group_id", "npb_tunnel_id", "team_id").Find(&npbPolicys).Error
 	if err != nil {
-		log.Errorf(dbQueryResourceFailed(p.resourceTypeName, err))
+		log.Errorf(dbQueryResourceFailed(p.resourceTypeName, err), db.LogPrefixORGID)
 		return nil, false
 	}
 
-	keyToItem := make(map[PolicyKey]mysql.ChPolicy)
+	keyToItem := make(map[PolicyKey]metadbmodel.ChPolicy)
 	for _, pcapPolicy := range pcapPolicys {
-		keyToItem[PolicyKey{ACLGID: pcapPolicy.PolicyACLGroupID, TunnelType: 0}] = mysql.ChPolicy{
+		keyToItem[PolicyKey{ACLGID: pcapPolicy.PolicyACLGroupID, TunnelType: 0}] = metadbmodel.ChPolicy{
 			ACLGID:     pcapPolicy.PolicyACLGroupID,
 			TunnelType: 0, // Pcap
 			ID:         pcapPolicy.ID,
 			Name:       pcapPolicy.Name,
+			TeamID:     pcapPolicy.TeamID,
 		}
 	}
 	for _, npbPolicy := range npbPolicys {
-		keyToItem[PolicyKey{ACLGID: npbPolicy.PolicyACLGroupID, TunnelType: 1}] = mysql.ChPolicy{
+		keyToItem[PolicyKey{ACLGID: npbPolicy.PolicyACLGroupID, TunnelType: 1}] = metadbmodel.ChPolicy{
 			ACLGID:     npbPolicy.PolicyACLGroupID,
 			TunnelType: 1, // Npb
 			ID:         npbPolicy.ID,
 			Name:       npbPolicy.Name,
+			TeamID:     npbPolicy.TeamID,
 		}
 	}
 	return keyToItem, true
 }
 
-func (p *ChPolicy) generateKey(dbItem mysql.ChPolicy) PolicyKey {
+func (p *ChPolicy) generateKey(dbItem metadbmodel.ChPolicy) PolicyKey {
 	return PolicyKey{ACLGID: dbItem.ACLGID, TunnelType: dbItem.TunnelType}
 }
 
-func (p *ChPolicy) generateUpdateInfo(oldItem, newItem mysql.ChPolicy) (map[string]interface{}, bool) {
+func (p *ChPolicy) generateUpdateInfo(oldItem, newItem metadbmodel.ChPolicy) (map[string]interface{}, bool) {
 	updateInfo := make(map[string]interface{})
 	if oldItem.ID != newItem.ID {
 		updateInfo["id"] = newItem.ID

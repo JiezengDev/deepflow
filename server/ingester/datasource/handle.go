@@ -18,11 +18,13 @@ package datasource
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 
 	basecommon "github.com/deepflowio/deepflow/server/ingester/common"
 	"github.com/deepflowio/deepflow/server/libs/ckdb"
 	flow_metrics "github.com/deepflowio/deepflow/server/libs/flow-metrics"
+	"github.com/deepflowio/deepflow/server/libs/utils"
 )
 
 const (
@@ -31,43 +33,57 @@ const (
 	NETWORK         = "network"
 	APPLICATION     = "application"
 	TRAFFIC_POLICY  = "traffic_policy"
+	FLOW_TAG_DB     = "flow_tag"
 
 	ERR_IS_MODIFYING = "Modifying the retention time (%s), please try again later"
 )
 
 type DatasourceModifiedOnly string
 type DatasourceInfo struct {
-	ID     int
-	DB     string
-	Tables []string
+	ID            int
+	DB            string
+	Tables        []string
+	FlowTagTables []string
 }
 
 const (
-	DEEPFLOW_SYSTEM   DatasourceModifiedOnly = "deepflow_system"
-	L4_FLOW_LOG                              = "flow_log.l4_flow_log"
-	L7_FLOW_LOG                              = "flow_log.l7_flow_log"
-	L4_PACKET                                = "flow_log.l4_packet"
-	L7_PACKET                                = "flow_log.l7_packet"
-	EXT_METRICS                              = "ext_metrics"
-	PROMETHEUS                               = "prometheus"
-	EVENT_EVENT                              = "event.event"
-	EVENT_PERF_EVENT                         = "event.perf_event"
-	EVENT_ALARM_EVENT                        = "event.alarm_event"
-	PROFILE                                  = "profile.in_process"
+	DEEPFLOW_SYSTEM    DatasourceModifiedOnly = "deepflow_system"
+	L4_FLOW_LOG                               = "flow_log.l4_flow_log"
+	L7_FLOW_LOG                               = "flow_log.l7_flow_log"
+	L4_PACKET                                 = "flow_log.l4_packet"
+	L7_PACKET                                 = "flow_log.l7_packet"
+	EXT_METRICS                               = "ext_metrics"
+	PROMETHEUS                                = "prometheus"
+	EVENT_EVENT                               = "event.event"
+	EVENT_FILE_EVENT                          = "event.file_event"
+	EVENT_ALERT_EVENT                         = "event.alert_event"
+	PROFILE                                   = "profile.in_process"
+	APPLOG                                    = "application_log.log"
+	DEEPFLOW_TENANT                           = "deepflow_tenant"
+	DEEPFLOW_ADMIN                            = "deepflow_admin"
+	PROFILE_METRICS                           = "profile.in_process_metrics"
+	FILE_EVNET_METRICS                        = "event.file_event_metrics"
 )
 
+// to modify the datasource TTL, you need to also modify the 'flow_tag' database tables.
+// FIXME: only the 'prometheus' database is supported now, and the remaining databases will be completed in the future.
 var DatasourceModifiedOnlyIDMap = map[DatasourceModifiedOnly]DatasourceInfo{
-	DEEPFLOW_SYSTEM:   {int(flow_metrics.METRICS_TABLE_ID_MAX) + 1, "deepflow_system", []string{"deepflow_system"}},
-	L4_FLOW_LOG:       {int(flow_metrics.METRICS_TABLE_ID_MAX) + 2, "flow_log", []string{"l4_flow_log"}},
-	L7_FLOW_LOG:       {int(flow_metrics.METRICS_TABLE_ID_MAX) + 3, "flow_log", []string{"l7_flow_log"}},
-	L4_PACKET:         {int(flow_metrics.METRICS_TABLE_ID_MAX) + 4, "flow_log", []string{"l4_packet"}},
-	L7_PACKET:         {int(flow_metrics.METRICS_TABLE_ID_MAX) + 5, "flow_log", []string{"l7_packet"}},
-	EXT_METRICS:       {int(flow_metrics.METRICS_TABLE_ID_MAX) + 6, "ext_metrics", []string{"metrics"}},
-	PROMETHEUS:        {int(flow_metrics.METRICS_TABLE_ID_MAX) + 7, "prometheus", []string{"samples"}},
-	EVENT_EVENT:       {int(flow_metrics.METRICS_TABLE_ID_MAX) + 8, "event", []string{"event"}},
-	EVENT_PERF_EVENT:  {int(flow_metrics.METRICS_TABLE_ID_MAX) + 9, "event", []string{"perf_event"}},
-	EVENT_ALARM_EVENT: {int(flow_metrics.METRICS_TABLE_ID_MAX) + 10, "event", []string{"alarm_event"}},
-	PROFILE:           {int(flow_metrics.METRICS_TABLE_ID_MAX) + 11, "profile", []string{"in_process"}},
+	DEEPFLOW_SYSTEM:    {int(flow_metrics.METRICS_TABLE_ID_MAX) + 1, "deepflow_system", []string{"deepflow_system"}, []string{}},
+	L4_FLOW_LOG:        {int(flow_metrics.METRICS_TABLE_ID_MAX) + 2, "flow_log", []string{"l4_flow_log"}, []string{}},
+	L7_FLOW_LOG:        {int(flow_metrics.METRICS_TABLE_ID_MAX) + 3, "flow_log", []string{"l7_flow_log"}, []string{}},
+	L4_PACKET:          {int(flow_metrics.METRICS_TABLE_ID_MAX) + 4, "flow_log", []string{"l4_packet"}, []string{}},
+	L7_PACKET:          {int(flow_metrics.METRICS_TABLE_ID_MAX) + 5, "flow_log", []string{"l7_packet"}, []string{}},
+	EXT_METRICS:        {int(flow_metrics.METRICS_TABLE_ID_MAX) + 6, "ext_metrics", []string{"metrics"}, []string{}},
+	PROMETHEUS:         {int(flow_metrics.METRICS_TABLE_ID_MAX) + 7, "prometheus", []string{"samples"}, []string{"prometheus_custom_field", "prometheus_custom_field_value"}},
+	EVENT_EVENT:        {int(flow_metrics.METRICS_TABLE_ID_MAX) + 8, "event", []string{"event"}, []string{}},
+	EVENT_FILE_EVENT:   {int(flow_metrics.METRICS_TABLE_ID_MAX) + 9, "event", []string{"file_event"}, []string{}},
+	EVENT_ALERT_EVENT:  {int(flow_metrics.METRICS_TABLE_ID_MAX) + 10, "event", []string{"alert_event"}, []string{}},
+	PROFILE:            {int(flow_metrics.METRICS_TABLE_ID_MAX) + 11, "profile", []string{"in_process"}, []string{}},
+	APPLOG:             {int(flow_metrics.METRICS_TABLE_ID_MAX) + 12, "application_log", []string{"log"}, []string{}},
+	DEEPFLOW_TENANT:    {int(flow_metrics.METRICS_TABLE_ID_MAX) + 13, "deepflow_tenant", []string{"deepflow_collector"}, []string{}},
+	DEEPFLOW_ADMIN:     {int(flow_metrics.METRICS_TABLE_ID_MAX) + 14, "deepflow_admin", []string{"deepflow_server"}, []string{}},
+	PROFILE_METRICS:    {int(flow_metrics.METRICS_TABLE_ID_MAX) + 15, "profile", []string{"in_process_metrics.1s_agg"}, []string{}},
+	FILE_EVNET_METRICS: {int(flow_metrics.METRICS_TABLE_ID_MAX) + 16, "event", []string{"file_event_metrics.1s_agg"}, []string{}},
 }
 
 func (ds DatasourceModifiedOnly) DatasourceInfo() DatasourceInfo {
@@ -116,6 +132,9 @@ var unsummableMaxFieldsMap = map[string]struct{}{
 	"srt_max":        {},
 	"art_max":        {},
 	"rrt_max":        {},
+	"cit_max":        {},
+
+	"direction_score": {},
 }
 
 // 对于unsumable的sum列使用max,min聚合时, count列取相应的max,min列的值
@@ -126,6 +145,7 @@ var unsummableFieldsMap = map[string]struct{}{
 	"srt_sum":        {},
 	"art_sum":        {},
 	"rrt_sum":        {},
+	"cit_sum":        {},
 
 	"rtt_count":        {},
 	"rtt_client_count": {},
@@ -133,6 +153,7 @@ var unsummableFieldsMap = map[string]struct{}{
 	"srt_count":        {},
 	"art_count":        {},
 	"rrt_count":        {},
+	"cit_count":        {},
 }
 
 func getColumnString(column *ckdb.Column, aggrSummable, aggrUnsummable string, t TableType) string {
@@ -140,7 +161,7 @@ func getColumnString(column *ckdb.Column, aggrSummable, aggrUnsummable string, t
 	isMaxMinAggr := (aggrUnsummable == aggrStrings[MAX]) || (aggrUnsummable == aggrStrings[MIN])
 	_, isUnsummableMax := unsummableMaxFieldsMap[column.Name]
 
-	// count字段的max,min聚合
+	// 'max', 'min' aggregation of 'xxx_count', 'xxx_sum' fields, use 'argMax', 'argMin' aggregation
 	if isUnsummable && isMaxMinAggr {
 		aggrFunc := "argMax"
 		if aggrUnsummable == aggrStrings[MIN] {
@@ -158,22 +179,29 @@ func getColumnString(column *ckdb.Column, aggrSummable, aggrUnsummable string, t
 				strings.ReplaceAll(column.Name, "count", "sum"), strings.ReplaceAll(column.Name, "sum", "count"), // 总是取 xxx_sum/xxx_count 的值
 				column.Name, AGG.String())
 		case LOCAL:
-			// 例如： argMaxMerge(rtt_count__agg) as rtt_count,
-			return fmt.Sprintf("%sMerge(%s__%s) AS %s", aggrFunc, column.Name, AGG.String(), column.Name)
+			// 例如： finalizeAggregation(rtt_count__agg) as rtt_count,
+			return fmt.Sprintf("finalizeAggregation(%s__%s) AS %s", column.Name, AGG.String(), column.Name)
 		}
 	} else {
-		// 普通的非累加和聚合和count字段的非max,min聚合和可累加的字段的聚合
-		aggr := aggrSummable
-		if isUnsummableMax || isUnsummable {
+		var aggr string
+		if isUnsummable {
+			// 'avg' aggregation of 'xxx_count', 'xxx_sum' fields, using 'sum' aggregation
+			aggr = aggrStrings[SUM]
+		} else if isUnsummableMax {
+			// 'max', 'min', 'avg' aggregation of 'xxx_max' fields, use 'max', 'min', 'avg' aggregation
 			aggr = aggrUnsummable
+		} else {
+			// summable aggregation
+			aggr = aggrSummable
 		}
+
 		switch t {
 		case AGG:
 			return fmt.Sprintf("%s__%s AggregateFunction(%s, %s)", column.Name, t.String(), aggr, column.Type.String())
 		case MV:
 			return fmt.Sprintf("%sState(%s) AS %s__%s", aggr, column.Name, column.Name, AGG.String())
 		case LOCAL:
-			return fmt.Sprintf("%sMerge(%s__%s) AS %s", aggr, column.Name, AGG.String(), column.Name)
+			return fmt.Sprintf("finalizeAggregation(%s__%s) AS %s", column.Name, AGG.String(), column.Name)
 		}
 	}
 
@@ -259,9 +287,12 @@ func getMetricsTableName(id uint8, db, table string, t TableType) string {
 	tableId := flow_metrics.MetricsTableID(id)
 	tablePrefix := strings.Split(tableId.TableName(), ".")[0]
 	if len(table) == 0 {
+		if t == GLOBAL {
+			return fmt.Sprintf("%s.`%s`", db, tableId.TableName())
+		}
 		return fmt.Sprintf("%s.`%s_%s`", db, tableId.TableName(), t.String())
 	}
-	if len(t.String()) == 0 {
+	if t == GLOBAL {
 		return fmt.Sprintf("%s.`%s.%s`", db, tablePrefix, table)
 	}
 	return fmt.Sprintf("%s.`%s.%s_%s`", db, tablePrefix, table, t.String())
@@ -301,6 +332,10 @@ func (m *DatasourceManager) makeAggTableCreateSQL(t *ckdb.Table, db, dstTable, a
 			codec = fmt.Sprintf("codec(%s)", p.Codec.String())
 		}
 
+		if p.Name == t.TimeKey {
+			p.Comment = t.Version
+		}
+
 		if p.GroupBy {
 			if !stringSliceHas(orderKeys, p.Name) {
 				orderKeys = append(orderKeys, p.Name)
@@ -316,6 +351,9 @@ func (m *DatasourceManager) makeAggTableCreateSQL(t *ckdb.Table, db, dstTable, a
 	}
 
 	engine := ckdb.AggregatingMergeTree.String()
+	if t.DBType == ckdb.CKDBTypeByconity {
+		engine = ckdb.CnchAggregatingMergeTree.String()
+	}
 	if m.replicaEnabled {
 		engine = fmt.Sprintf(ckdb.ReplicatedAggregatingMergeTree.String(), db, dstTable+"_"+AGG.String())
 	}
@@ -344,6 +382,9 @@ func MakeMVTableCreateSQL(t *ckdb.Table, db, dstTable, aggrSummable, aggrUnsumma
 
 	// 对于从1m,1s表进行聚合的表，使用local表作为源表
 	baseTableType := LOCAL
+	if t.DBType == ckdb.CKDBTypeByconity {
+		baseTableType = GLOBAL
+	}
 	columnTableType := MV
 	tableBase := getMetricsTableName(t.ID, db, "", baseTableType)
 
@@ -370,18 +411,19 @@ func MakeMVTableCreateSQL(t *ckdb.Table, db, dstTable, aggrSummable, aggrUnsumma
 	return fmt.Sprintf(`CREATE MATERIALIZED VIEW IF NOT EXISTS %s TO %s
 			AS SELECT %s
 	                FROM %s
-			GROUP BY (%s)
-			ORDER BY (%s)`,
+			GROUP BY %s`,
 		tableMv, tableAgg,
 		strings.Join(columns, ",\n"),
 		tableBase,
-		strings.Join(groupKeys, ","),
-		strings.Join(t.OrderKeys, ","))
+		strings.Join(groupKeys, ","))
 }
 
 func MakeCreateTableLocal(t *ckdb.Table, db, dstTable, aggrSummable, aggrUnsummable string) string {
 	tableAgg := getMetricsTableName(t.ID, db, dstTable, AGG)
 	tableLocal := getMetricsTableName(t.ID, db, dstTable, LOCAL)
+	if t.DBType == ckdb.CKDBTypeByconity {
+		tableLocal = getMetricsTableName(t.ID, db, dstTable, GLOBAL)
+	}
 
 	columns := []string{}
 	groupKeys := t.OrderKeys
@@ -403,15 +445,16 @@ func MakeCreateTableLocal(t *ckdb.Table, db, dstTable, aggrSummable, aggrUnsumma
 CREATE VIEW IF NOT EXISTS %s
 AS SELECT
 %s
-FROM %s
-GROUP BY %s`,
+FROM %s`,
 		tableLocal,
 		strings.Join(columns, ",\n"),
-		tableAgg,
-		strings.Join(groupKeys, ","))
+		tableAgg)
 }
 
 func MakeGlobalTableCreateSQL(t *ckdb.Table, db, dstTable string) string {
+	if t.DBType == ckdb.CKDBTypeByconity {
+		return "SELECT VERSION()"
+	}
 	tableGlobal := getMetricsTableName(t.ID, db, dstTable, GLOBAL)
 	tableLocal := getMetricsTableName(t.ID, db, dstTable, LOCAL)
 	tablePrefix := strings.Split(t.GlobalName, ".")[0]
@@ -423,13 +466,13 @@ func MakeGlobalTableCreateSQL(t *ckdb.Table, db, dstTable string) string {
 }
 
 func (m *DatasourceManager) getMetricsTable(id flow_metrics.MetricsTableID) *ckdb.Table {
-	return flow_metrics.GetMetricsTables(ckdb.MergeTree, basecommon.CK_VERSION, m.ckdbCluster, m.ckdbStoragePolicy, 7, 1, 7, 1, m.ckdbColdStorages)[id]
+	return flow_metrics.GetMetricsTables(ckdb.MergeTree, basecommon.CK_VERSION, m.ckdbCluster, m.ckdbStoragePolicy, m.ckdbType, 7, 1, 7, 1, m.ckdbColdStorages)[id]
 }
 
 func (m *DatasourceManager) createTableMV(cks basecommon.DBs, db string, tableId flow_metrics.MetricsTableID, baseTable, dstTable, aggrSummable, aggrUnsummable string, aggInterval IntervalEnum, duration int) error {
 	table := m.getMetricsTable(tableId)
 	if baseTable != ORIGIN_TABLE_1M && baseTable != ORIGIN_TABLE_1S {
-		return fmt.Errorf("Only support base datasource 1s,1m")
+		return fmt.Errorf("Only support base data_source 1s,1m")
 	}
 
 	aggTime := ckdb.TimeFuncHour
@@ -459,6 +502,9 @@ func (m *DatasourceManager) modTableMV(cks basecommon.DBs, tableId flow_metrics.
 	tableMod := ""
 	if dstTable == ORIGIN_TABLE_1M || dstTable == ORIGIN_TABLE_1S {
 		tableMod = getMetricsTableName(uint8(tableId), db, "", LOCAL)
+		if m.ckdbType == ckdb.CKDBTypeByconity {
+			tableMod = getMetricsTableName(uint8(tableId), db, "", GLOBAL)
+		}
 	} else {
 		tableMod = getMetricsTableName(uint8(tableId), db, dstTable, AGG)
 	}
@@ -485,53 +531,67 @@ func delTableMV(cks basecommon.DBs, dbId flow_metrics.MetricsTableID, db, table 
 	return nil
 }
 
+func isAggTable(table string) bool {
+	return strings.HasSuffix(table, "_agg")
+}
+
 func (m *DatasourceManager) modTableTTL(cks basecommon.DBs, db, table string, duration int) error {
-	tableLocal := fmt.Sprintf("%s.%s_%s", db, table, LOCAL)
+	ttlTable := fmt.Sprintf("%s.`%s_%s`", db, table, LOCAL)
+	if m.ckdbType == ckdb.CKDBTypeByconity || isAggTable(table) {
+		ttlTable = fmt.Sprintf("%s.`%s`", db, table)
+	}
 	modTable := fmt.Sprintf("ALTER TABLE %s MODIFY TTL %s",
-		tableLocal, m.makeTTLString("time", db, table, duration))
+		ttlTable, m.makeTTLString("time", db, table, duration))
 	_, err := cks.ExecParallel(modTable)
 	return err
 }
 
-func (m *DatasourceManager) Handle(orgID int, action ActionEnum, dbGroup, baseTable, dstTable, aggrSummable, aggrUnsummable string, interval, duration int) error {
-	if len(m.ckAddrs) == 0 {
-		return fmt.Errorf("ck addrs is empty")
+func (m *DatasourceManager) updateCKConnections() {
+	if len(m.cks) == 0 || !reflect.DeepEqual(m.currentCkAddrs, *m.ckAddrs) {
+		log.Infof("data_source clickhouse endpoints change from %+v to %+v", m.currentCkAddrs, *m.ckAddrs)
+		m.currentCkAddrs = utils.CloneStringSlice(*m.ckAddrs)
+		m.cks.Close()
+		cks, err := basecommon.NewCKConnections(m.currentCkAddrs, m.user, m.password)
+		if err != nil {
+			log.Errorf("create clickhouse connections failed: %s", err)
+		}
+		m.cks = cks
 	}
+}
 
+func (m *DatasourceManager) Handle(orgID int, action ActionEnum, dbGroup, baseTable, dstTable, aggrSummable, aggrUnsummable string, interval, duration int) error {
+	m.updateCKConnections()
+	if len(m.cks) == 0 {
+		return fmt.Errorf("clickhouse connections is empty")
+	}
 	if IsModifiedOnlyDatasource(dbGroup) && action == MOD {
 		datasoureInfo := DatasourceModifiedOnly(dbGroup).DatasourceInfo()
 		datasourceId := datasoureInfo.ID
 		db := ckdb.OrgDatabasePrefix(uint16(orgID)) + datasoureInfo.DB
 		tables := datasoureInfo.Tables
+		flowTagDb := ckdb.OrgDatabasePrefix(uint16(orgID)) + FLOW_TAG_DB
+		flowTagTables := datasoureInfo.FlowTagTables
 
-		cks, err := basecommon.NewCKConnections(m.ckAddrs, m.user, m.password)
-		if err != nil {
-			log.Error(err)
-			return err
-		}
-		if m.isModifyingFlags[datasourceId] {
+		if m.isModifyingFlags[orgID][datasourceId] {
 			return fmt.Errorf(ERR_IS_MODIFYING, dbGroup)
 		}
-		go func(tableNames []string, id int) {
-			m.isModifyingFlags[id] = true
+		go func(tableNames, flowTagTableNames []string, id int) {
+			m.isModifyingFlags[orgID][id] = true
 			for _, tableName := range tableNames {
-				if err := m.modTableTTL(cks, db, tableName, duration); err != nil {
+				if err := m.modTableTTL(m.cks, db, tableName, duration); err != nil {
 					log.Info(err)
 				}
 			}
-			m.isModifyingFlags[id] = false
-			cks.Close()
-		}(tables, datasourceId)
+			for _, tableName := range flowTagTableNames {
+				if err := m.modTableTTL(m.cks, flowTagDb, tableName, duration); err != nil {
+					log.Info(err)
+				}
+			}
+			m.isModifyingFlags[orgID][id] = false
+		}(tables, flowTagTables, datasourceId)
 
 		return nil
 	}
-
-	cks, err := basecommon.NewCKConnections(m.ckAddrs, m.user, m.password)
-	if err != nil {
-		log.Error(err)
-		return err
-	}
-	defer cks.Close()
 
 	table := baseTable
 	if table == "" {
@@ -575,29 +635,23 @@ func (m *DatasourceManager) Handle(orgID int, action ActionEnum, dbGroup, baseTa
 			if interval == 1440 {
 				aggInterval = IntervalDay
 			}
-			if err := m.createTableMV(cks, db, tableId, baseTable, dstTable, aggrSummable, aggrUnsummable, aggInterval, duration); err != nil {
+			if err := m.createTableMV(m.cks, db, tableId, baseTable, dstTable, aggrSummable, aggrUnsummable, aggInterval, duration); err != nil {
 				return err
 			}
 		case MOD:
-			if m.isModifyingFlags[tableId] {
+			if m.isModifyingFlags[orgID][tableId] {
 				return fmt.Errorf(ERR_IS_MODIFYING, tableId.TableName())
 			}
 			log.Infof("mod rp tableId %d %s, dstTable %s", tableId, tableId.TableName(), dstTable)
 			go func(id flow_metrics.MetricsTableID) {
-				cks, err := basecommon.NewCKConnections(m.ckAddrs, m.user, m.password)
-				if err != nil {
-					log.Error(err)
-					return
-				}
-				defer cks.Close()
-				m.isModifyingFlags[id] = true
-				if err := m.modTableMV(cks, id, db, dstTable, duration); err != nil {
+				m.isModifyingFlags[orgID][id] = true
+				if err := m.modTableMV(m.cks, id, db, dstTable, duration); err != nil {
 					log.Warning(err)
 				}
-				m.isModifyingFlags[id] = false
+				m.isModifyingFlags[orgID][id] = false
 			}(tableId)
 		case DEL:
-			if err := delTableMV(cks, tableId, db, dstTable); err != nil {
+			if err := delTableMV(m.cks, tableId, db, dstTable); err != nil {
 				return err
 			}
 		default:

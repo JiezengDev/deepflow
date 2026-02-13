@@ -20,12 +20,11 @@ import (
 	"net"
 	"os"
 
-	"github.com/op/go-logging"
-
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-var log = logging.MustGetLogger("trisolaris/config")
+var log = logger.MustGetLogger("trisolaris.config")
 
 type Chrony struct {
 	Host    string `default:"chrony" yaml:"host"`
@@ -33,23 +32,30 @@ type Chrony struct {
 	Timeout uint32 `default:"1" yaml:"timeout"`
 }
 
+type Push struct {
+	Enabled  bool `default:"true" yaml:"enabled"`
+	DelayMax int  `default:"0" yaml:"delay-max"` // unit: second min: 1 max: 10
+}
+
 type Config struct {
 	ListenPort                     string   `default:"20014" yaml:"listen-port"`
 	LogLevel                       string   `default:"info"`
 	TsdbIP                         string   `yaml:"tsdb-ip"`
 	Chrony                         Chrony   `yaml:"chrony"`
+	Push                           Push     `yaml:"push"`
 	SelfUpdateUrl                  string   `default:"grpc" yaml:"self-update-url"`
 	RemoteApiTimeout               uint16   `default:"30" yaml:"remote-api-timeout"`
-	TridentTypeForUnkonwVtap       uint16   `default:"0" yaml:"trident-type-for-unkonw-vtap"`
 	PlatformVips                   []string `yaml:"platform-vips"`
 	NodeType                       string   `default:"master" yaml:"node-type"`
 	RegionDomainPrefix             string   `yaml:"region-domain-prefix"`
 	ClearKubernetesTime            int      `default:"600" yaml:"clear-kubernetes-time"`
+	AutoGRPCBufferSizeInterval     float64  `default:"3600" yaml:"auto-grpc-buffer-size-interval"` // unit: second
 	NodeIP                         string
 	VTapCacheRefreshInterval       int  `default:"300" yaml:"vtapcache-refresh-interval"`
 	MetaDataRefreshInterval        int  `default:"60" yaml:"metadata-refresh-interval"`
 	NodeRefreshInterval            int  `default:"60" yaml:"node-refresh-interval"`
 	GPIDRefreshInterval            int  `default:"9" yaml:"gpid-refresh-interval"`
+	ImageExpire                    int  `default:"300" yaml:"image_expire"` // unit: second
 	VTapAutoRegister               bool `default:"true" yaml:"vtap-auto-register"`
 	DomainAutoRegister             bool `default:"true" yaml:"domain-auto-register"`
 	DefaultTapMode                 int  `yaml:"default-tap-mode"`
@@ -58,6 +64,15 @@ type Config struct {
 	IngesterPort                   int
 	PodClusterInternalIPToIngester int
 	GrpcMaxMessageLength           int
+	ExportersEnabled               bool
+	PlatformDataRefreshDelayTime   int `default:"1" yaml:"platform-data-refresh-delay-time"`
+	ORGDataRefreshInterval         int `default:"60" yaml:"org-data-refresh-interval"`
+	NoTeamIDRefused                bool
+	FPermit                        common.FPermit
+	IngesterAPI                    common.IngesterApi // data source
+	AllAgentConnectToNatIP         bool
+	NoIPOverlapping                bool
+	LogAgentConfig                 bool `default:"false" yaml:"log-agent-config"`
 }
 
 func (c *Config) Convert() {
@@ -78,6 +93,27 @@ func (c *Config) Convert() {
 	} else {
 		c.NodeIP = nodeIP
 	}
+
+	if c.Push.DelayMax != 0 && (c.Push.DelayMax < 1 || c.Push.DelayMax > 10) {
+		log.Errorf("invalid config push:delay-max (%d), min: 1 , max: 10", c.Push.DelayMax)
+		c.Push.DelayMax = 0
+	}
+}
+
+func (c *Config) SetAllAgentConnectToNatIP(data bool) {
+	c.AllAgentConnectToNatIP = data
+}
+
+func (c *Config) GetAllAgentConnectToNatIP() bool {
+	return c.AllAgentConnectToNatIP
+}
+
+func (c *Config) SetNoIPOverlapping(data bool) {
+	c.NoIPOverlapping = data
+}
+
+func (c *Config) GetNoIPOverlapping() bool {
+	return c.NoIPOverlapping
 }
 
 func (c *Config) SetGrpcPort(port int) {
@@ -94,6 +130,14 @@ func (c *Config) GetGrpcPort() int {
 
 func (c *Config) GetIngesterPort() int {
 	return c.IngesterPort
+}
+
+func (c *Config) SetIngesterAPI(ingesterAPI common.IngesterApi) {
+	c.IngesterAPI = ingesterAPI
+}
+
+func (c *Config) GetIngesterAPI() common.IngesterApi {
+	return c.IngesterAPI
 }
 
 func (c *Config) SetLogLevel(logLevel string) {
@@ -114,4 +158,28 @@ func (c *Config) SetGrpcMaxMessageLength(maxLen int) {
 
 func (c *Config) GetGrpcMaxMessageLength() int {
 	return c.GrpcMaxMessageLength
+}
+
+func (c *Config) SetExportersEnabled(exporterEnabled bool) {
+	c.ExportersEnabled = exporterEnabled
+}
+
+func (c *Config) GetExportersEnabled() bool {
+	return c.ExportersEnabled
+}
+
+func (c *Config) SetNoTeamIDRefused(refused bool) {
+	c.NoTeamIDRefused = refused
+}
+
+func (c *Config) GetNoTeamIDRefused() bool {
+	return c.NoTeamIDRefused
+}
+
+func (c *Config) SetFPermitConfig(fpermit common.FPermit) {
+	c.FPermit = fpermit
+}
+
+func (c *Config) GetFPermitConfig() common.FPermit {
+	return c.FPermit
 }

@@ -17,39 +17,54 @@
 package tencent
 
 import (
+	"strconv"
+
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	uuid "github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-func (t *Tencent) getAZs(region tencentRegion) ([]model.AZ, error) {
-	log.Debug("get azs starting")
+func (t *Tencent) getAZs(region string) ([]model.AZ, error) {
+	log.Debug("get azs starting", logger.NewORGPrefix(t.orgID))
 	var azs []model.AZ
 
+	// 由于 cvm.DescribeZones 不再返回已售罄的 az，导致部分资源无法关联
+	// 尝试使用 cdb.DescribeZones 接口获取所有 az
 	attrs := []string{"Zone", "ZoneName"}
-	resp, err := t.getResponse("cvm", "2017-03-12", "DescribeZones", region.name, "ZoneSet", false, map[string]interface{}{})
+	params := map[string]interface{}{
+		"Product": "cdb",
+	}
+	resp, err := t.getResponse("region", "2022-06-27", "DescribeZones", region, "ZoneSet", false, params)
 	if err != nil {
-		log.Errorf("az request tencent api error: (%s)", err.Error())
+		log.Errorf("az request tencent api error: (%s)", err.Error(), logger.NewORGPrefix(t.orgID))
 		return []model.AZ{}, err
 	}
 	for _, aData := range resp {
 		if !t.checkRequiredAttributes(aData, attrs) {
 			continue
 		}
-		zone := aData.Get("Zone").MustString()
-		name := aData.Get("ZoneName").MustString()
-		lcuuid := common.GetUUID(t.uuidGenerate+"_"+zone, uuid.Nil)
-		if _, ok := t.azLcuuidMap[lcuuid]; !ok {
-			log.Debugf("az (%s) has no resource", name)
+		state := aData.Get("ZoneState").MustString()
+		if state != "AVAILABLE" {
+			log.Infof("invalid az state (%s)", state, logger.NewORGPrefix(t.orgID))
 			continue
 		}
+		zone := aData.Get("Zone").MustString()
+		name := aData.Get("ZoneName").MustString()
+		lcuuid := common.GetUUIDByOrgID(t.orgID, t.uuidGenerate+"_"+zone)
 		azs = append(azs, model.AZ{
 			Lcuuid:       lcuuid,
 			Label:        zone,
 			Name:         name,
-			RegionLcuuid: t.getRegionLcuuid(region.lcuuid),
+			RegionLcuuid: t.regionLcuuid,
 		})
+		t.zoneToLcuuid[zone] = lcuuid
+		zoneID, err := strconv.Atoi(aData.Get("ZoneId").MustString())
+		if err != nil {
+			log.Errorf("convert zone id to int failed: (%s)", err.Error(), logger.NewORGPrefix(t.orgID))
+			continue
+		}
+		t.azIDToLcuuid[zoneID] = lcuuid
 	}
-	log.Debug("get azs complete")
+	log.Debug("get azs complete", logger.NewORGPrefix(t.orgID))
 	return azs, nil
 }

@@ -21,54 +21,59 @@ import (
 
 	"github.com/bitly/go-simplejson"
 	mapset "github.com/deckarep/golang-set"
+	cloudcommon "github.com/deepflowio/deepflow/server/controller/cloud/common"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-func (k *KubernetesGather) getReplicaSetsAndReplicaSetControllers() (podRSs []model.PodReplicaSet, podRSCs []model.PodGroup, err error) {
-	log.Debug("get replicasets,replicasetcontrollers starting")
-	for _, r := range k.k8sInfo["*v1.ReplicaSet"] {
-		rData, rErr := simplejson.NewJson([]byte(r))
+func (k *KubernetesGather) getReplicaSetsAndReplicaSetControllers() (podRSs []model.PodReplicaSet, podRSCs []model.PodGroup, podGroupConfigMapConnections []model.PodGroupConfigMapConnection, err error) {
+	log.Debug("get replicasets,replicasetcontrollers starting", logger.NewORGPrefix(k.orgID))
+	for _, r := range k.k8sEntries["*v1.ReplicaSet"] {
+		rData, rErr := simplejson.NewJson(r)
 		if rErr != nil {
 			err = rErr
-			log.Errorf("replicaset,replicasetcontroller initialization simplejson error: (%s)", rErr.Error())
+			log.Errorf("replicaset,replicasetcontroller initialization simplejson error: (%s)", rErr.Error(), logger.NewORGPrefix(k.orgID))
 			return
 		}
 		metaData, ok := rData.CheckGet("metadata")
 		if !ok {
-			log.Info("replicaset,replicasetcontroller metadata not found")
+			log.Info("replicaset,replicasetcontroller metadata not found", logger.NewORGPrefix(k.orgID))
 			continue
 		}
 		uID := metaData.Get("uid").MustString()
 		if uID == "" {
-			log.Info("replicaset,replicasetcontroller uid not found")
+			log.Info("replicaset,replicasetcontroller uid not found", logger.NewORGPrefix(k.orgID))
 			continue
 		}
 		name := metaData.Get("name").MustString()
 		if name == "" {
-			log.Infof("replicaset,replicasetcontroller (%s) name not found", uID)
+			log.Infof("replicaset,replicasetcontroller (%s) name not found", uID, logger.NewORGPrefix(k.orgID))
 			continue
 		}
-		replicas := rData.Get("spec").Get("replicas").MustInt()
+		spec := rData.Get("spec")
+		replicas := spec.Get("replicas").MustInt()
 		if replicas == 0 {
-			log.Debugf("replicaset,replicasetcontroller (%s) is inactive", name)
+			log.Debugf("replicaset,replicasetcontroller (%s) is inactive", name, logger.NewORGPrefix(k.orgID))
 			continue
 		}
 		namespace := metaData.Get("namespace").MustString()
 		namespaceLcuuid, ok := k.namespaceToLcuuid[namespace]
 		if !ok {
-			log.Infof("replicaset,replicasetcontroller (%s) namespace not found", name)
+			log.Infof("replicaset,replicasetcontroller (%s) namespace not found", name, logger.NewORGPrefix(k.orgID))
 			continue
 		}
 		podGroups := metaData.Get("ownerReferences")
 		podGroupLcuuid := podGroups.GetIndex(0).Get("uid").MustString()
 		if len(podGroups.MustArray()) == 0 || podGroupLcuuid == "" {
-			log.Infof("replicaset,replicasetcontroller (%s) pod group not found", name)
+			log.Infof("replicaset,replicasetcontroller (%s) pod group not found", name, logger.NewORGPrefix(k.orgID))
 			continue
 		}
+		podGroupLcuuid = common.IDGenerateUUID(k.orgID, podGroupLcuuid)
+		uLcuuid := common.IDGenerateUUID(k.orgID, uID)
 		labelString := k.GetLabel(metaData.Get("labels").MustMap())
 		if !k.podGroupLcuuids.Contains(podGroupLcuuid) {
-			podGroupLcuuid = uID
+			podGroupLcuuid = uLcuuid
 			// ReplicaSetController类型名称去掉最后的'-' + hash值
 			nName := name
 			targetIndex := strings.LastIndex(name, "-")
@@ -78,13 +83,13 @@ func (k *KubernetesGather) getReplicaSetsAndReplicaSetControllers() (podRSs []mo
 			label := "replicasetcontroller:" + namespace + ":" + name
 			_, ok = k.nsLabelToGroupLcuuids[namespace+label]
 			if ok {
-				k.nsLabelToGroupLcuuids[namespace+label].Add(uID)
+				k.nsLabelToGroupLcuuids[namespace+label].Add(uLcuuid)
 			} else {
 				rscLcuuidsSet := mapset.NewSet()
-				rscLcuuidsSet.Add(uID)
+				rscLcuuidsSet.Add(uLcuuid)
 				k.nsLabelToGroupLcuuids[namespace+label] = rscLcuuidsSet
 			}
-			mLabels := rData.GetPath("spec", "template", "metadata", "labels").MustMap()
+			mLabels := spec.GetPath("template", "metadata", "labels").MustMap()
 			for key, v := range mLabels {
 				vString, ok := v.(string)
 				if !ok {
@@ -93,16 +98,22 @@ func (k *KubernetesGather) getReplicaSetsAndReplicaSetControllers() (podRSs []mo
 				nsLabel := namespace + key + "_" + vString
 				_, ok = k.nsLabelToGroupLcuuids[nsLabel]
 				if ok {
-					k.nsLabelToGroupLcuuids[nsLabel].Add(uID)
+					k.nsLabelToGroupLcuuids[nsLabel].Add(uLcuuid)
 				} else {
 					nsRSCLcuuidsSet := mapset.NewSet()
-					nsRSCLcuuidsSet.Add(uID)
+					nsRSCLcuuidsSet.Add(uLcuuid)
 					k.nsLabelToGroupLcuuids[nsLabel] = nsRSCLcuuidsSet
 				}
 			}
-			podRSC := model.PodGroup{
-				Lcuuid:             uID,
+			metaDataStr := k.simpleJsonMarshal(metaData)
+			specStr := k.simpleJsonMarshal(spec)
+			podRSCs = append(podRSCs, model.PodGroup{
+				Lcuuid:             uLcuuid,
 				Name:               nName,
+				Metadata:           metaDataStr,
+				MetadataHash:       cloudcommon.GenerateMD5Sum(metaDataStr),
+				Spec:               specStr,
+				SpecHash:           cloudcommon.GenerateMD5Sum(specStr),
 				Label:              labelString,
 				Type:               common.POD_GROUP_REPLICASET_CONTROLLER,
 				PodNum:             replicas,
@@ -110,11 +121,11 @@ func (k *KubernetesGather) getReplicaSetsAndReplicaSetControllers() (podRSs []mo
 				AZLcuuid:           k.azLcuuid,
 				PodNamespaceLcuuid: namespaceLcuuid,
 				PodClusterLcuuid:   k.podClusterLcuuid,
-			}
-			podRSCs = append(podRSCs, podRSC)
+			})
+			podGroupConfigMapConnections = append(podGroupConfigMapConnections, k.pgSpecGenerateConnections(namespace, name, uLcuuid, spec)...)
 		}
 		podRS := model.PodReplicaSet{
-			Lcuuid:             uID,
+			Lcuuid:             uLcuuid,
 			Name:               name,
 			PodNum:             replicas,
 			Label:              labelString,
@@ -125,8 +136,8 @@ func (k *KubernetesGather) getReplicaSetsAndReplicaSetControllers() (podRSs []mo
 			PodClusterLcuuid:   k.podClusterLcuuid,
 		}
 		podRSs = append(podRSs, podRS)
-		k.rsLcuuidToPodGroupLcuuid[uID] = podGroupLcuuid
+		k.rsLcuuidToPodGroupLcuuid[uLcuuid] = podGroupLcuuid
 	}
-	log.Debug("get replicasets,replicasetcontrollers complete")
+	log.Debug("get replicasets,replicasetcontrollers complete", logger.NewORGPrefix(k.orgID))
 	return
 }

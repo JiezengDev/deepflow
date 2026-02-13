@@ -17,95 +17,119 @@
 package updater
 
 import (
+	"sigs.k8s.io/yaml"
+
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
+
+// PodGroupMessageFactory defines the message factory for PodGroup
+type PodGroupMessageFactory struct{}
+
+func (f *PodGroupMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedPodGroups{}
+}
+
+func (f *PodGroupMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedPodGroup{}
+}
+
+func (f *PodGroupMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedPodGroups{}
+}
+
+func (f *PodGroupMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedPodGroupFields{}
+}
 
 type PodGroup struct {
 	UpdaterBase[
 		cloudmodel.PodGroup,
-		mysql.PodGroup,
 		*diffbase.PodGroup,
-		*message.PodGroupAdd,
-		message.PodGroupAdd,
-		*message.PodGroupUpdate,
-		message.PodGroupUpdate,
-		*message.PodGroupFieldsUpdate,
-		message.PodGroupFieldsUpdate,
-		*message.PodGroupDelete,
-		message.PodGroupDelete]
+		*metadbmodel.PodGroup,
+		metadbmodel.PodGroup,
+	]
 }
 
 func NewPodGroup(wholeCache *cache.Cache, cloudData []cloudmodel.PodGroup) *PodGroup {
 	updater := &PodGroup{
-		newUpdaterBase[
-			cloudmodel.PodGroup,
-			mysql.PodGroup,
-			*diffbase.PodGroup,
-			*message.PodGroupAdd,
-			message.PodGroupAdd,
-			*message.PodGroupUpdate,
-			message.PodGroupUpdate,
-			*message.PodGroupFieldsUpdate,
-			message.PodGroupFieldsUpdate,
-			*message.PodGroupDelete,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN,
 			wholeCache,
-			db.NewPodGroup().SetORG(wholeCache.GetORG()),
+			db.NewPodGroup().SetMetadata(wholeCache.GetMetadata()),
 			wholeCache.DiffBaseDataSet.PodGroups,
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
+	updater.setDataGenerator(updater)
+
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &PodGroupMessageFactory{})
+	}
+
+	updater.toLoggable = true
 	return updater
 }
 
-func (p *PodGroup) getDiffBaseByCloudItem(cloudItem *cloudmodel.PodGroup) (diffBase *diffbase.PodGroup, exists bool) {
-	diffBase, exists = p.diffBaseData[cloudItem.Lcuuid]
-	return
-}
-
-func (p *PodGroup) generateDBItemToAdd(cloudItem *cloudmodel.PodGroup) (*mysql.PodGroup, bool) {
+// Implement DataGenerator interface
+func (p *PodGroup) generateDBItemToAdd(cloudItem *cloudmodel.PodGroup) (*metadbmodel.PodGroup, bool) {
 	podNamespaceID, exists := p.cache.ToolDataSet.GetPodNamespaceIDByLcuuid(cloudItem.PodNamespaceLcuuid)
 	if !exists {
-		log.Error(p.org.LogPre(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_POD_NAMESPACE_EN, cloudItem.PodNamespaceLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN, cloudItem.Lcuuid,
-		)))
+		), p.metadata.LogPrefixes)
 		return nil, false
 	}
 	podClusterID, exists := p.cache.ToolDataSet.GetPodClusterIDByLcuuid(cloudItem.PodClusterLcuuid)
 	if !exists {
-		log.Error(p.org.LogPre(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_POD_CLUSTER_EN, cloudItem.PodClusterLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN, cloudItem.Lcuuid,
-		)))
+		), p.metadata.LogPrefixes)
 		return nil, false
 	}
-	dbItem := &mysql.PodGroup{
+	yamlMetadata, err := yaml.JSONToYAML([]byte(cloudItem.Metadata))
+	if err != nil {
+		log.Errorf("failed to convert %s metadata JSON to YAML: %s", p.resourceType, cloudItem.Metadata, p.metadata.LogPrefixes)
+		return nil, false
+	}
+	yamlSpec, err := yaml.JSONToYAML([]byte(cloudItem.Spec))
+	if err != nil {
+		log.Errorf("failed to convert %s spec JSON to YAML: %s", p.resourceType, cloudItem.Spec, p.metadata.LogPrefixes)
+		return nil, false
+	}
+
+	dbItem := &metadbmodel.PodGroup{
 		Name:           cloudItem.Name,
 		Type:           cloudItem.Type,
 		Label:          cloudItem.Label,
+		NetworkMode:    cloudItem.NetworkMode,
+		Metadata:       yamlMetadata,
+		MetadataHash:   cloudItem.MetadataHash,
+		Spec:           yamlSpec,
+		SpecHash:       cloudItem.SpecHash,
 		PodNum:         cloudItem.PodNum,
 		PodNamespaceID: podNamespaceID,
 		PodClusterID:   podClusterID,
 		SubDomain:      cloudItem.SubDomainLcuuid,
-		Domain:         p.cache.DomainLcuuid,
+		Domain:         p.metadata.GetDomainLcuuid(),
 		Region:         cloudItem.RegionLcuuid,
 		AZ:             cloudItem.AZLcuuid,
+		UID:            ctrlrcommon.GenerateResourceShortUUID(ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN),
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true
 }
 
-func (p *PodGroup) generateUpdateInfo(diffBase *diffbase.PodGroup, cloudItem *cloudmodel.PodGroup) (*message.PodGroupFieldsUpdate, map[string]interface{}, bool) {
-	structInfo := new(message.PodGroupFieldsUpdate)
+func (p *PodGroup) generateUpdateInfo(diffBase *diffbase.PodGroup, cloudItem *cloudmodel.PodGroup) (types.UpdatedFields, map[string]interface{}, bool) {
+	structInfo := new(message.UpdatedPodGroupFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
 		mapInfo["name"] = cloudItem.Name
@@ -124,13 +148,49 @@ func (p *PodGroup) generateUpdateInfo(diffBase *diffbase.PodGroup, cloudItem *cl
 		mapInfo["label"] = cloudItem.Label
 		structInfo.Label.Set(diffBase.Label, cloudItem.Label)
 	}
+	if diffBase.NetworkMode != cloudItem.NetworkMode {
+		mapInfo["network_mode"] = cloudItem.NetworkMode
+		structInfo.NetworkMode.Set(diffBase.NetworkMode, cloudItem.NetworkMode)
+	}
 	if diffBase.RegionLcuuid != cloudItem.RegionLcuuid {
 		mapInfo["region"] = cloudItem.RegionLcuuid
 		structInfo.RegionLcuuid.Set(diffBase.RegionLcuuid, cloudItem.RegionLcuuid)
 	}
-	if diffBase.AZLcuuid != cloudItem.AZLcuuid {
-		mapInfo["az"] = cloudItem.AZLcuuid
-		structInfo.AZLcuuid.Set(diffBase.AZLcuuid, cloudItem.AZLcuuid)
+	if diffBase.MetadataHash != cloudItem.MetadataHash {
+		mapInfo["metadata_hash"] = cloudItem.MetadataHash
+
+		yamlMetadataBytes, err := yaml.JSONToYAML([]byte(cloudItem.Metadata))
+		if err != nil {
+			log.Errorf("failed to convert %s metadata JSON (data: %v) to YAML: %s", p.resourceType, cloudItem.Metadata, p.metadata.LogPrefixes)
+			return nil, nil, false
+		}
+		if compressedBytes, err := metadbmodel.AutoCompressedBytes(yamlMetadataBytes).Value(); err != nil {
+			log.Errorf("failed to compress %s YAML data: %v: %s", p.resourceType, yamlMetadataBytes, err.Error(), p.metadata.LogPrefixes)
+			return nil, nil, false
+		} else {
+			mapInfo["compressed_metadata"] = compressedBytes
+		}
+		structInfo.Metadata.Set(diffBase.Metadata, string(yamlMetadataBytes))
+	} else {
+		structInfo.Metadata.Set(diffBase.Metadata, diffBase.Metadata) // set for resource event, because it publish combined config of metadata and spec
+	}
+	if diffBase.SpecHash != cloudItem.SpecHash {
+		mapInfo["spec_hash"] = cloudItem.SpecHash
+
+		yamlSpecBytes, err := yaml.JSONToYAML([]byte(cloudItem.Spec))
+		if err != nil {
+			log.Errorf("failed to convert %s spec JSON (data: %v) to YAML: %s", p.resourceType, cloudItem.Spec, p.metadata.LogPrefixes)
+			return nil, nil, false
+		}
+		if compressedBytes, err := metadbmodel.AutoCompressedBytes(yamlSpecBytes).Value(); err != nil {
+			log.Errorf("failed to compress %s YAML data: %v: %s", p.resourceType, yamlSpecBytes, err.Error(), p.metadata.LogPrefixes)
+			return nil, nil, false
+		} else {
+			mapInfo["compressed_spec"] = compressedBytes
+		}
+		structInfo.Spec.Set(diffBase.Spec, string(yamlSpecBytes))
+	} else {
+		structInfo.Spec.Set(diffBase.Spec, diffBase.Spec) // set for resource event, because it publish combined config of metadata and spec
 	}
 
 	return structInfo, mapInfo, len(mapInfo) > 0

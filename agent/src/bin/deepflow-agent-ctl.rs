@@ -28,12 +28,14 @@ use clap::{ArgEnum, Parser, Subcommand};
 #[cfg(target_os = "linux")]
 use flate2::write::ZlibDecoder;
 
+#[cfg(all(target_os = "linux", feature = "libtrace"))]
+use deepflow_agent::debug::EbpfMessage;
+#[cfg(target_os = "linux")]
+use deepflow_agent::debug::PlatformMessage;
 use deepflow_agent::debug::{
     Beacon, Client, Message, Module, PolicyMessage, RpcMessage, DEBUG_QUEUE_IDLE_TIMEOUT,
     DEEPFLOW_AGENT_BEACON,
 };
-#[cfg(target_os = "linux")]
-use deepflow_agent::debug::{EbpfMessage, PlatformMessage};
 use public::{consts::DEFAULT_CONTROLLER_PORT, debug::QueueMessage};
 
 const ERR_PORT_MSG: &str = "error: The following required arguments were not provided:
@@ -65,7 +67,7 @@ enum ControllerCmd {
     Queue(QueueCmd),
     /// get information about the policy
     Policy(PolicyCmd),
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "libtrace"))]
     /// get information about the ebpf
     Ebpf(EbpfCmd),
     /// get information about the deepflow-agent
@@ -173,8 +175,9 @@ struct EbpfArgs {
     ///
     /// App Protocol: All(0), Other(1),
     ///   HTTP1(20), HTTP2(21), Dubbo(40), SofaRPC(43),
-    ///   MySQL(60), PostGreSQL(61), Oracle(62), Redis(80),
-    ///   Kafka(100), MQTT(101), DNS(120), TLS(121),
+    ///   MySQL(60), PostGreSQL(61), Oracle(62),
+    ///   Redis(80), MongoDB(81), Memcached(82),
+    ///   Kafka(100), MQTT(101), RocketMQ(107), WebSphereMQ(108),  DNS(120), TLS(121),
     ///
     /// eg: deepflow-agent-ctl ebpf datadump --proto 20
     #[clap(long, parse(try_from_str), default_value_t = 0)]
@@ -228,7 +231,7 @@ impl fmt::Display for Resource {
         match *self {
             Resource::No | Resource::Node | Resource::Nodes => write!(f, "nodes"),
             Resource::Ns | Resource::Namespace | Resource::Namespaces => write!(f, "namespaces"),
-            Resource::Svc | Resource::Service | Resource::Services => write!(f, "namespaces"),
+            Resource::Svc | Resource::Service | Resource::Services => write!(f, "services"),
             Resource::Deploy | Resource::Deployment | Resource::Deployments => {
                 write!(f, "deployments")
             }
@@ -264,7 +267,7 @@ struct RpcCmd {
 enum RpcData {
     Config,
     Platform,
-    TapTypes,
+    CaptureNetworkTypes,
     Cidr,
     Groups,
     Acls,
@@ -296,7 +299,7 @@ impl Controller {
             ControllerCmd::List => self.list(),
             ControllerCmd::Queue(c) => self.queue(c),
             ControllerCmd::Policy(c) => self.policy(c),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "libtrace"))]
             ControllerCmd::Ebpf(c) => self.ebpf(c),
         }
     }
@@ -372,15 +375,15 @@ impl Controller {
 
                     let beacon: Beacon =
                         decode_from_std_read(&mut &buf[length..n], config::standard())?;
-                    if !vtap_map.contains(&beacon.vtap_id) {
+                    if !vtap_map.contains(&beacon.agent_id) {
                         println!(
                             "{:<14} {:<28} {:<45} {}",
-                            beacon.vtap_id,
+                            beacon.agent_id,
                             beacon.hostname,
                             a.ip(),
                             a.port()
                         );
-                        vtap_map.insert(beacon.vtap_id);
+                        vtap_map.insert(beacon.agent_id);
                     }
                 }
                 Err(e) => return Err(anyhow!("{}", e)),
@@ -398,7 +401,7 @@ impl Controller {
             RpcData::Acls => RpcMessage::Acls(None),
             RpcData::Config => RpcMessage::Config(None),
             RpcData::Platform => RpcMessage::PlatformData(None),
-            RpcData::TapTypes => RpcMessage::TapTypes(None),
+            RpcData::CaptureNetworkTypes => RpcMessage::CaptureNetworkTypes(None),
             RpcData::Cidr => RpcMessage::Cidr(None),
             RpcData::Groups => RpcMessage::Groups(None),
             RpcData::Segments => RpcMessage::Segments(None),
@@ -418,7 +421,7 @@ impl Controller {
             match resp {
                 RpcMessage::Acls(v)
                 | RpcMessage::PlatformData(v)
-                | RpcMessage::TapTypes(v)
+                | RpcMessage::CaptureNetworkTypes(v)
                 | RpcMessage::Cidr(v)
                 | RpcMessage::Groups(v)
                 | RpcMessage::Segments(v) => match v {
@@ -742,7 +745,7 @@ impl Controller {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "libtrace"))]
     fn ebpf(&self, c: EbpfCmd) -> Result<()> {
         if self.port.is_none() {
             return Err(anyhow!(ERR_PORT_MSG));

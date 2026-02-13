@@ -29,9 +29,9 @@ use thread::JoinHandle;
 use super::{
     check_active,
     consts::*,
-    round_to_minute,
+    reset_delay_seconds, round_to_minute,
     types::{AppMeterWithFlow, MiniFlow},
-    MetricsType,
+    MetricsType, QgStats,
 };
 
 use crate::common::flow::{CloseType, L7Protocol, L7Stats, SignalSource};
@@ -40,7 +40,7 @@ use crate::metric::meter::{AppAnomaly, AppLatency, AppMeter, AppTraffic};
 use crate::rpc::get_timestamp;
 use crate::utils::{
     possible_host::PossibleHost,
-    stats::{Collector, Countable, Counter, CounterType, CounterValue, RefCountable, StatsOption},
+    stats::{Collector, Countable, Counter, CounterType, CounterValue, RefCountable},
 };
 use public::{
     buffer::BatchedBox,
@@ -65,8 +65,12 @@ struct AppMeterWithL7Protocol {
     app_meter: AppMeter,
     endpoint: Option<String>,
     endpoint_hash: u32,
+    // request-reponse time span
+    time_span: u32,
     l7_protocol: L7Protocol,
     biz_type: u8,
+    time_in_second: Duration,
+    is_reversed: bool,
 }
 
 struct QuadrupleStash {
@@ -91,6 +95,7 @@ struct SubQuadGen {
     id: usize,
 
     l7_output: DebugSender<Box<AppMeterWithFlow>>,
+    closed_app_meters: Vec<Box<AppMeterWithFlow>>,
 
     counter: Arc<QgCounter>,
     metrics_type: MetricsType,
@@ -104,6 +109,7 @@ struct SubQuadGen {
     delay_seconds: u64,
 
     stashs: VecDeque<QuadrupleStash>, // flow_generator will not have a delay of more than 2 minutes
+    batch_buffer: Vec<Box<AppMeterWithFlow>>,
     ntp_diff: Arc<AtomicI64>,
 }
 
@@ -190,10 +196,20 @@ impl SubQuadGen {
         self.stashs.push_back(QuadrupleStash::new());
         let mut stash = self.stashs.swap_remove_back(stash_index).unwrap();
         stash.l7_stats.clear();
-        if !stash.meters.is_empty() {
-            if let Err(_) = self.l7_output.send_large(stash.meters) {
-                debug!("l7 qg push l7 stats to queue failed maybe queue have terminated");
+
+        self.batch_buffer.clear();
+        while stash.meters.len() >= QUEUE_BATCH_SIZE {
+            self.batch_buffer
+                .extend(stash.meters.drain(..QUEUE_BATCH_SIZE));
+            if let Err(e) = self.l7_output.send_all(&mut self.batch_buffer) {
+                debug!("l7 qg push l7 stats to queue failed: {}", e);
+                self.batch_buffer.clear();
             }
+        }
+        // send the remaining data (not drained) in stash.meters
+        if let Err(e) = self.l7_output.send_all(&mut stash.meters) {
+            debug!("l7 qg push l7 stats to queue failed: {}", e);
+            stash.meters.clear();
         }
     }
 
@@ -218,13 +234,30 @@ impl SubQuadGen {
             .store(cap as u64, Ordering::Relaxed);
     }
 
+    fn push_closed_app_meter(
+        closed_app_meters: &mut Vec<Box<AppMeterWithFlow>>,
+        l7_output: &mut DebugSender<Box<AppMeterWithFlow>>,
+        boxed_app_meter: Box<AppMeterWithFlow>,
+    ) {
+        closed_app_meters.push(boxed_app_meter);
+        if closed_app_meters.len() >= QUEUE_BATCH_SIZE {
+            if let Err(e) = l7_output.send_all(closed_app_meters) {
+                warn!(
+                    "l7_quadruple_generator push AppMeterWithFlows to queue failed, because {:?}",
+                    e
+                );
+                closed_app_meters.clear();
+            }
+        }
+    }
+
     pub fn inject_app_meter(
         &mut self,
         l7_stats: &L7Stats,
         app_meter: &AppMeter,
         endpoint_hash: u32,
         time_in_second: Duration,
-        possible_host: &mut PossibleHost,
+        possible_host: &mut Option<PossibleHost>,
     ) {
         if time_in_second < self.window_start {
             self.counter
@@ -232,26 +265,24 @@ impl SubQuadGen {
                 .fetch_add(1, Ordering::Relaxed);
             return;
         }
-
         let slot = (((time_in_second - self.window_start).as_secs() / self.slot_interval) as usize)
             .min(self.stashs.len() - 1);
+        let current_span = time_in_second.as_secs() / self.slot_interval;
+        let request_span =
+            (time_in_second.as_secs() - l7_stats.time_span as u64) / self.slot_interval;
+        let time_span = (current_span - request_span) as u32;
         let stash = &mut self.stashs[slot];
         let value = stash.l7_stats.get_mut(&l7_stats.flow_id);
+
         if let Some(meters) = value {
-            if let Some(meter) = meters
-                .iter_mut()
-                .find(|m| m.endpoint == l7_stats.endpoint && m.biz_type == l7_stats.biz_type)
-            {
-                // flow L7Protocol of different client ports on the same server port may be inconsistent.
-                // unknown l7_protocol needs to be judged by the close_type and duration of the flow,
-                // so the L7Protocol of the same flow may be different. The principles are as follows:
-                // 1. Unknown l7_protocol can be overwritten by any protocol.
-                if l7_stats.l7_protocol == meter.l7_protocol {
-                    meter.app_meter.sequential_merge(app_meter);
-                } else if meter.l7_protocol == L7Protocol::Unknown {
-                    meter.l7_protocol = l7_stats.l7_protocol;
-                    meter.app_meter = *app_meter;
-                }
+            if let Some(meter) = meters.iter_mut().find(|m| {
+                m.endpoint == l7_stats.endpoint
+                    && m.biz_type == l7_stats.biz_type
+                    && m.time_span == time_span
+                    && m.is_reversed == l7_stats.is_reversed
+                    && m.l7_protocol == l7_stats.l7_protocol
+            }) {
+                meter.app_meter.sequential_merge(app_meter);
             } else {
                 let meter = AppMeterWithL7Protocol {
                     app_meter: *app_meter,
@@ -259,17 +290,25 @@ impl SubQuadGen {
                     endpoint: l7_stats.endpoint.clone(),
                     endpoint_hash,
                     biz_type: l7_stats.biz_type,
+                    time_span,
+                    time_in_second,
+                    is_reversed: l7_stats.is_reversed,
                 };
                 meters.push(meter);
             }
 
             // If l7_stats.flow.is_some(), set the flow of all meter belonging to this flow
             if let Some(tagged_flow) = &l7_stats.flow {
+                let close_type = tagged_flow.flow.close_type;
                 let flow = MiniFlow::from(&tagged_flow.flow);
                 let (is_active_host0, is_active_host1) =
                     check_active(time_in_second.as_secs(), possible_host, &flow);
                 for meter in meters.drain(..) {
-                    let app_meter = Box::new(AppMeterWithFlow {
+                    // meter.app_meter is empty, there is no need to save
+                    if meter.app_meter.is_empty() {
+                        continue;
+                    }
+                    let boxed_app_meter = Box::new(AppMeterWithFlow {
                         app_meter: meter.app_meter,
                         flow: flow.clone(),
                         l7_protocol: meter.l7_protocol,
@@ -277,19 +316,31 @@ impl SubQuadGen {
                         endpoint: meter.endpoint,
                         is_active_host0,
                         is_active_host1,
-                        time_in_second: tagged_flow.flow.flow_stat_time,
+                        time_in_second: meter.time_in_second.into(),
                         biz_type: meter.biz_type,
+                        is_reversed: meter.is_reversed,
+                        time_span,
                     });
-                    stash.meters.push(app_meter);
+
+                    if close_type != CloseType::Unknown && close_type != CloseType::ForcedReport {
+                        Self::push_closed_app_meter(
+                            &mut self.closed_app_meters,
+                            &mut self.l7_output,
+                            boxed_app_meter,
+                        );
+                    } else {
+                        stash.meters.push(boxed_app_meter);
+                    }
                 }
             }
         } else {
-            // app_meter.traffic.request and app_meter.traffic.response are 0, there is no need to save
-            if app_meter.traffic.request == 0 && app_meter.traffic.response == 0 {
+            // app_meter is empty, there is no need to save
+            if app_meter.is_empty() {
                 return;
             }
             // If l7_stats.flow.is_some(), set the flow of all meter belonging to this flow
             if let Some(tagged_flow) = &l7_stats.flow {
+                let close_type = tagged_flow.flow.close_type;
                 let flow = MiniFlow::from(&tagged_flow.flow);
                 let (is_active_host0, is_active_host1) =
                     check_active(time_in_second.as_secs(), possible_host, &flow);
@@ -301,10 +352,20 @@ impl SubQuadGen {
                     endpoint: l7_stats.endpoint.clone(),
                     is_active_host0,
                     is_active_host1,
-                    time_in_second: tagged_flow.flow.flow_stat_time,
+                    time_in_second: l7_stats.time_in_second.into(),
                     biz_type: l7_stats.biz_type,
+                    time_span,
+                    is_reversed: l7_stats.is_reversed,
                 });
-                stash.meters.push(boxed_app_meter);
+                if close_type != CloseType::Unknown && close_type != CloseType::ForcedReport {
+                    Self::push_closed_app_meter(
+                        &mut self.closed_app_meters,
+                        &mut self.l7_output,
+                        boxed_app_meter,
+                    );
+                } else {
+                    stash.meters.push(boxed_app_meter);
+                }
             } else {
                 let meter = AppMeterWithL7Protocol {
                     app_meter: *app_meter,
@@ -312,6 +373,9 @@ impl SubQuadGen {
                     endpoint: l7_stats.endpoint.clone(),
                     endpoint_hash,
                     biz_type: l7_stats.biz_type,
+                    time_span,
+                    time_in_second,
+                    is_reversed: l7_stats.is_reversed,
                 };
                 let _ = stash.l7_stats.insert(l7_stats.flow_id, vec![meter]);
             }
@@ -441,7 +505,7 @@ pub struct L7QuadrupleGenerator {
     name: String,
     second_quad_gen: Option<SubQuadGen>,
     minute_quad_gen: Option<SubQuadGen>,
-    possible_host: PossibleHost,
+    possible_host: Option<PossibleHost>,
     config: CollectorAccess,
     running: Arc<AtomicBool>,
     ntp_diff: Arc<AtomicI64>,
@@ -465,10 +529,7 @@ impl L7QuadrupleGenerator {
     ) -> Self {
         let collector_config = config.load();
         info!("new l7 quadruple_generator id: {}, second_delay: {}, minute_delay: {}, l7_metrics_enabled: {}, vtap_flow_1s_enabled: {} collector_enabled: {}", id, second_delay_seconds, minute_delay_seconds, collector_config.l7_metrics_enabled, collector_config.vtap_flow_1s_enabled, collector_config.enabled);
-        if minute_delay_seconds < SECONDS_IN_MINUTE || minute_delay_seconds >= SECONDS_IN_MINUTE * 2
-        {
-            panic!("minute_delay_seconds must be in [60, 120)s")
-        }
+        let minute_delay_seconds = reset_delay_seconds(minute_delay_seconds);
 
         let second_slots = second_delay_seconds as usize;
         let minute_slots = 2 as usize;
@@ -487,8 +548,10 @@ impl L7QuadrupleGenerator {
                 number_of_slots: second_slots as u64,
                 delay_seconds: second_delay_seconds,
                 stashs: VecDeque::with_capacity(second_slots),
+                batch_buffer: Vec::with_capacity(QUEUE_BATCH_SIZE),
                 counter: Arc::new(QgCounter::default()),
                 ntp_diff: ntp_diff.clone(),
+                closed_app_meters: Vec::with_capacity(QUEUE_BATCH_SIZE),
                 // traffic_setter: traffic_setter,
             };
 
@@ -496,12 +559,11 @@ impl L7QuadrupleGenerator {
                 quad_gen.stashs.push_back(QuadrupleStash::new());
             }
             stats.register_countable(
-                "quadruple_generator",
+                &QgStats {
+                    id,
+                    kind: "l7_second",
+                },
                 Countable::Ref(Arc::downgrade(&quad_gen.counter) as Weak<dyn RefCountable>),
-                vec![
-                    StatsOption::Tag("kind", "l7_second".to_owned()),
-                    StatsOption::Tag("index", id.to_string()),
-                ],
             );
             second_quad_gen = Some(quad_gen);
         }
@@ -516,8 +578,10 @@ impl L7QuadrupleGenerator {
                 number_of_slots: minute_slots as u64,
                 delay_seconds: minute_delay_seconds,
                 stashs: VecDeque::with_capacity(minute_slots),
+                batch_buffer: Vec::with_capacity(QUEUE_BATCH_SIZE),
                 counter: Arc::new(QgCounter::default()),
                 ntp_diff: ntp_diff.clone(),
+                closed_app_meters: Vec::with_capacity(QUEUE_BATCH_SIZE),
                 // traffic_setter: traffic_setter,
             };
 
@@ -525,12 +589,11 @@ impl L7QuadrupleGenerator {
                 quad_gen.stashs.push_back(QuadrupleStash::new());
             }
             stats.register_countable(
-                "quadruple_generator",
+                &QgStats {
+                    id,
+                    kind: "l7_minute",
+                },
                 Countable::Ref(Arc::downgrade(&quad_gen.counter) as Weak<dyn RefCountable>),
-                vec![
-                    StatsOption::Tag("kind", "l7_minute".to_owned()),
-                    StatsOption::Tag("index", id.to_string()),
-                ],
             );
             minute_quad_gen = Some(quad_gen);
         }
@@ -541,7 +604,11 @@ impl L7QuadrupleGenerator {
             name: "quadruple_generator".to_string(),
             second_quad_gen,
             minute_quad_gen,
-            possible_host: PossibleHost::new(possible_host_size),
+            possible_host: if !collector_config.inactive_ip_aggregation {
+                Some(PossibleHost::new(possible_host_size))
+            } else {
+                None
+            },
             config,
             running,
             ntp_diff,
@@ -662,6 +729,18 @@ impl L7QuadrupleGenerator {
                             let time_in_second = l7_stat.time_in_second;
                             self.handle(&config, Some(l7_stat), time_in_second);
                         }
+                        if let Some(q) = self.second_quad_gen.as_mut() {
+                            if let Err(e) = q.l7_output.send_all(&mut q.closed_app_meters) {
+                                warn!("second_quad_gen queue failed to send l7 Document data, because {:?}", e);
+                                q.closed_app_meters.clear();
+                            }
+                        }
+                        if let Some(q) = self.minute_quad_gen.as_mut() {
+                            if let Err(e) = q.l7_output.send_all(&mut q.closed_app_meters) {
+                                warn!("minute_quad_gen queue failed to send l7 Document data, because {:?}", e);
+                                q.closed_app_meters.clear();
+                            }
+                        }
                     } else {
                         l7_recv_batch.clear();
                     }
@@ -678,6 +757,18 @@ impl L7QuadrupleGenerator {
                         None,
                         get_timestamp(self.ntp_diff.load(Ordering::Relaxed)),
                     );
+                    if let Some(q) = self.second_quad_gen.as_mut() {
+                        if let Err(e) = q.l7_output.send_all(&mut q.closed_app_meters) {
+                            warn!("second_quad_gen queue failed to send l7 Document data, because {:?}", e);
+                            q.closed_app_meters.clear();
+                        }
+                    }
+                    if let Some(q) = self.minute_quad_gen.as_mut() {
+                        if let Err(e) = q.l7_output.send_all(&mut q.closed_app_meters) {
+                            warn!("minute_quad_gen queue failed to send l7 Document data, because {:?}", e);
+                            q.closed_app_meters.clear();
+                        }
+                    }
                 }
                 Err(Error::Terminated(_, _)) => {
                     if let Some(g) = self.second_quad_gen.as_mut() {

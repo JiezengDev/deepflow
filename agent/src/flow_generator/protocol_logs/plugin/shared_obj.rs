@@ -20,7 +20,7 @@ use std::{
 };
 
 use log::error;
-use public::l7_protocol::{CustomProtocol, L7Protocol};
+use public::l7_protocol::{CustomProtocol, L7Protocol, LogMessageType};
 
 use crate::{
     common::{
@@ -28,10 +28,7 @@ use crate::{
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
         l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
     },
-    flow_generator::{
-        protocol_logs::{L7ResponseStatus, LogMessageType},
-        Error, Result,
-    },
+    flow_generator::{protocol_logs::set_captured_byte, Error, Result},
     plugin::{
         c_ffi::{c_str_to_string, ParseCtx, ParseInfo, ACTION_CONTINUE, ACTION_ERROR, ACTION_OK},
         CustomInfo,
@@ -44,14 +41,14 @@ const RESULT_LEN: i32 = 8;
 pub struct SoLog {
     proto_num: Option<u8>,
     proto_str: String,
-    perf_stats: Option<L7PerfStats>,
+    perf_stats: Vec<L7PerfStats>,
 }
 
 impl L7ProtocolParserInterface for SoLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
         let so_func_ref = param.so_func.borrow();
         let Some(c_funcs) = &*so_func_ref else {
-            return false;
+            return None;
         };
         let ctx = &ParseCtx::from((param, payload));
 
@@ -64,8 +61,8 @@ impl L7ProtocolParserInterface for SoLog {
             /*
                 call the func from so, correctness depends on plugin implementation.
 
-                there is impossible to verify the plugin implemention correctness, so plugin maybe do some UB,
-                for eaxmple, modify the payload (due to the payload is not copy but pass the ptr to ctx directly and should
+                there is impossible to verify the plugin implementation correctness, so plugin maybe do some UB,
+                for example, modify the payload (due to the payload is not copy but pass the ptr to ctx directly and should
                 not be modify, modify the payload is UB).
 
                 the plugin correctness depend on the implementation of the developer
@@ -93,13 +90,18 @@ impl L7ProtocolParserInterface for SoLog {
                     None => {
                         error!("read proto str from so plugin fail");
                         counter.fail_cnt.fetch_add(1, Ordering::Relaxed);
-                        return false;
+                        return None;
                     }
                 }
-                return true;
+
+                return match res.direction {
+                    1 => Some(LogMessageType::Request),
+                    2 => Some(LogMessageType::Response),
+                    _ => None,
+                };
             }
         }
-        false
+        None
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
@@ -111,11 +113,7 @@ impl L7ProtocolParserInterface for SoLog {
         let ctx = &mut ParseCtx::from((param, payload));
         ctx.proto = self.proto_num.unwrap();
         let mut resp = [ParseInfo::default(); RESULT_LEN as usize];
-
-        if self.perf_stats.is_none() && param.parse_perf {
-            self.perf_stats = Some(L7PerfStats::default());
-        }
-
+        self.perf_stats.clear();
         for c in c_funcs.iter() {
             let counter = &c.parse_payload_counter;
 
@@ -171,31 +169,24 @@ impl L7ProtocolParserInterface for SoLog {
                             Ok(mut info) => {
                                 info.proto_str = self.proto_str.clone();
                                 info.proto = self.proto_num.unwrap();
+                                set_captured_byte!(info, param);
 
-                                match info.msg_type {
-                                    LogMessageType::Request => {
-                                        self.perf_stats.as_mut().map(|p| p.inc_req());
+                                if param.parse_perf {
+                                    let mut perf_stat = L7PerfStats::default();
+                                    if info.msg_type == LogMessageType::Response {
+                                        if let Some(endpoint) =
+                                            info.load_endpoint_from_cache(param, info.is_reversed())
+                                        {
+                                            info.req.endpoint = endpoint.to_string();
+                                        }
                                     }
-                                    LogMessageType::Response => {
-                                        self.perf_stats.as_mut().map(|p| p.inc_resp());
+                                    if let Some(stats) = info.perf_stats(param) {
+                                        info.rrt = stats.rrt_sum;
+                                        perf_stat.sequential_merge(&stats);
                                     }
-                                    _ => unreachable!(),
+                                    self.perf_stats.push(perf_stat);
                                 }
 
-                                match info.resp.status {
-                                    L7ResponseStatus::ClientError => {
-                                        self.perf_stats.as_mut().map(|p| p.inc_req_err());
-                                    }
-                                    L7ResponseStatus::ServerError => {
-                                        self.perf_stats.as_mut().map(|p| p.inc_resp_err());
-                                    }
-                                    _ => {}
-                                }
-
-                                info.cal_rrt(param, None).map(|rrt| {
-                                    info.rrt = rrt;
-                                    self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
-                                });
                                 if res.len == 1 {
                                     return Ok(L7ParseResult::Single(L7ProtocolInfo::CustomInfo(
                                         info,
@@ -238,8 +229,8 @@ impl L7ProtocolParserInterface for SoLog {
         ))
     }
 
-    fn perf_stats(&mut self) -> Option<L7PerfStats> {
-        self.perf_stats.take()
+    fn perf_stats(&mut self) -> Vec<L7PerfStats> {
+        std::mem::take(&mut self.perf_stats)
     }
 }
 
@@ -247,6 +238,6 @@ pub fn get_so_parser(p: u8, s: String) -> SoLog {
     SoLog {
         proto_num: Some(p),
         proto_str: s,
-        perf_stats: None,
+        perf_stats: vec![],
     }
 }

@@ -22,7 +22,6 @@ import (
 	"github.com/deepflowio/deepflow/server/ingester/common"
 	"github.com/deepflowio/deepflow/server/libs/ckdb"
 	"github.com/deepflowio/deepflow/server/libs/pool"
-	"github.com/deepflowio/deepflow/server/libs/utils"
 )
 
 const (
@@ -59,18 +58,8 @@ func PcapStoreColumns() []*ckdb.Column {
 	}
 }
 
-func (s *PcapStore) WriteBlock(block *ckdb.Block) {
-	block.WriteDateTime(s.Time)
-	block.Write(
-		s.StartTime,
-		s.EndTime,
-		s.FlowID,
-		s.VtapID,
-		s.PacketCount,
-		utils.String(s.PacketBatch),
-		s.AclGids,
-		s.TeamID,
-	)
+func (s *PcapStore) NativeTagVersion() uint32 {
+	return 0
 }
 
 func (s *PcapStore) OrgID() uint16 {
@@ -85,12 +74,12 @@ func (p *PcapStore) String() string {
 	return fmt.Sprintf("PcapStore: %+v\n", *p)
 }
 
-var poolPcapStore = pool.NewLockFreePool(func() interface{} {
+var poolPcapStore = pool.NewLockFreePool(func() *PcapStore {
 	return new(PcapStore)
 })
 
 func AcquirePcapStore() *PcapStore {
-	l := poolPcapStore.Get().(*PcapStore)
+	l := poolPcapStore.Get()
 	return l
 }
 
@@ -106,7 +95,7 @@ func ReleasePcapStore(l *PcapStore) {
 	poolPcapStore.Put(l)
 }
 
-func GenPcapCKTable(cluster, storagePolicy string, ttl int, coldStorage *ckdb.ColdStorage) *ckdb.Table {
+func GenPcapCKTable(cluster, storagePolicy, ckdbType string, ttl int, coldStorage *ckdb.ColdStorage) *ckdb.Table {
 	timeKey := "time"
 	engine := ckdb.MergeTree
 	orderKeys := []string{"flow_id", timeKey, "agent_id"}
@@ -114,6 +103,7 @@ func GenPcapCKTable(cluster, storagePolicy string, ttl int, coldStorage *ckdb.Co
 	return &ckdb.Table{
 		Version:         common.CK_VERSION,
 		Database:        PCAP_DB,
+		DBType:          ckdbType,
 		LocalName:       PCAP_TABLE + ckdb.LOCAL_SUBFFIX,
 		GlobalName:      PCAP_TABLE,
 		Columns:         PcapStoreColumns(),

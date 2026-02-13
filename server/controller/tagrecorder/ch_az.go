@@ -20,66 +20,88 @@ import (
 	"gorm.io/gorm/clause"
 
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type ChAZ struct {
-	SubscriberComponent[*message.AZFieldsUpdate, message.AZFieldsUpdate, mysql.AZ, mysql.ChAZ, IDKey]
+	SubscriberComponent[
+		*message.AddedAZs,
+		message.AddedAZs,
+		*message.UpdatedAZ,
+		message.UpdatedAZ,
+		*message.DeletedAZs,
+		message.DeletedAZs,
+		metadbmodel.AZ,
+		metadbmodel.ChAZ,
+		IDKey,
+	]
 	domainLcuuidToIconID map[string]int
 	resourceTypeToIconID map[IconKey]int
 }
 
 func NewChAZ(domainLcuuidToIconID map[string]int, resourceTypeToIconID map[IconKey]int) *ChAZ {
 	mng := &ChAZ{
-		newSubscriberComponent[*message.AZFieldsUpdate, message.AZFieldsUpdate, mysql.AZ, mysql.ChAZ, IDKey](
+		newSubscriberComponent[
+			*message.AddedAZs,
+			message.AddedAZs,
+			*message.UpdatedAZ,
+			message.UpdatedAZ,
+			*message.DeletedAZs,
+			message.DeletedAZs,
+			metadbmodel.AZ,
+			metadbmodel.ChAZ,
+			IDKey,
+		](
 			common.RESOURCE_TYPE_AZ_EN, RESOURCE_TYPE_CH_AZ,
 		),
 		domainLcuuidToIconID,
 		resourceTypeToIconID,
 	}
 	mng.subscriberDG = mng
+	mng.softDelete = true
 	return mng
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (a *ChAZ) onResourceUpdated(sourceID int, fieldsUpdate *message.AZFieldsUpdate) {
-	updateInfo := make(map[string]interface{})
-	if fieldsUpdate.Name.IsDifferent() {
-		updateInfo["name"] = fieldsUpdate.Name.GetNew()
-	}
-	if len(updateInfo) > 0 {
-		var chItem mysql.ChAZ
-		mysql.Db.Where("id = ?", sourceID).First(&chItem) // TODO use query to update ?
-		a.SubscriberComponent.dbOperator.update(chItem, updateInfo, IDKey{ID: sourceID})
-	}
+func (a *ChAZ) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedAZ) {
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (a *ChAZ) sourceToTarget(az *mysql.AZ) (keys []IDKey, targets []mysql.ChAZ) {
+func (a *ChAZ) sourceToTarget(md *message.Metadata, az *metadbmodel.AZ) (keys []IDKey, targets []metadbmodel.ChAZ) {
 	iconID := a.domainLcuuidToIconID[az.Domain]
+	var err error
 	if iconID == 0 {
-		key := IconKey{
-			NodeType: RESOURCE_TYPE_AZ,
+		a.domainLcuuidToIconID, a.resourceTypeToIconID, err = GetIconInfo(a.cfg)
+		if err == nil {
+			iconID = a.domainLcuuidToIconID[az.Domain]
 		}
-		iconID = a.resourceTypeToIconID[key]
+		if iconID == 0 {
+			key := IconKey{
+				NodeType: RESOURCE_TYPE_AZ,
+			}
+			iconID = a.resourceTypeToIconID[key]
+		}
 	}
 	keys = append(keys, IDKey{ID: az.ID})
 	name := az.Name
 	if az.DeletedAt.Valid {
 		name += " (deleted)"
 	}
-	targets = append(targets, mysql.ChAZ{
-		ID:     az.ID,
-		Name:   name,
-		IconID: iconID,
+	targets = append(targets, metadbmodel.ChAZ{
+		ChIDBase: metadbmodel.ChIDBase{ID: az.ID},
+		Name:     name,
+		IconID:   iconID,
+		TeamID:   md.GetTeamID(),
+		DomainID: md.GetDomainID(),
 	})
 	return
 }
 
 // softDeletedTargetsUpdated implements SubscriberDataGenerator
-func (a *ChAZ) softDeletedTargetsUpdated(targets []mysql.ChAZ) {
-	mysql.Db.Clauses(clause.OnConflict{
+func (a *ChAZ) softDeletedTargetsUpdated(targets []metadbmodel.ChAZ, db *metadb.DB) {
+	db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "id"}},
 		DoUpdates: clause.AssignmentColumns([]string{"name"}),
 	}).Create(&targets)

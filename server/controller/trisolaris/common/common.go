@@ -16,6 +16,11 @@
 
 package common
 
+import (
+	"github.com/deepflowio/deepflow/message/agent"
+	api "github.com/deepflowio/deepflow/message/trident"
+)
+
 const (
 	// VTAP
 	VTAP_CONTROLLER_EXCEPTIONS_MASK = 0xFFFFFFFF00000000
@@ -54,6 +59,7 @@ const (
 	AZ_TO_PLATFORM_DATA_ONLY_POD          = 19
 	PLATFORM_DATA_FOR_INGESTER_1          = 20
 	PLATFORM_DATA_FOR_INGESTER_2          = 21
+	PLATFORM_DATA_FOR_INGESTER_MERGE      = 22
 
 	NO_DOMAIN_TO_PLATFORM = 22
 
@@ -109,4 +115,54 @@ const (
 
 	DISABLED = 0
 	ENABLED  = 1
+
+	MEGA_BYTE = 1024 * 1024
+
+	HALF_MEGA_BYTE = MEGA_BYTE / 2
+
+	BUFFER_SIZE_EXTRA = 512 * 1024 // 512KB
 )
+
+const (
+	UNKNOW_VTAP_TYPE_KVM        = 1
+	UNKNOW_VTAP_TYPE_WORKLOAD_V = 3
+)
+
+const (
+	CONFIG_KEY_BIZ_PROTOCOL_POLICIES  = "biz_protocol_policies"
+	CONFIG_KEY_BIZ_FIELD_DICTIONARIES = "biz_field.dictionaries"
+	CONFIG_KEY_BIZ_FIELD_POLICIES     = "biz_field.policies"
+)
+
+const (
+	CONFIG_KEY_NTP_ENABLED                 = "global.ntp.enabled"
+	CONFIG_KEY_INGESTER_IP                 = "global.communication.ingester_ip"
+	CONFIG_KEY_INGESTER_PORT               = "global.communication.ingester_port"
+	CONFIG_KEY_PROXY_CONTROLLER_IP         = "global.communication.proxy_controller_ip"
+	CONFIG_KEY_PROXY_CONTROLLER_PORT       = "global.communication.proxy_controller_port"
+	CONFIG_KEY_CAPTURE_MODE                = "inputs.cbpf.common.capture_mode"
+	CONFIG_KEY_DOMAIN_FILTER               = "inputs.resources.pull_resource_from_controller.domain_filter"
+	CONFIG_KEY_WORKLOAD_RESOURCE_ENABLED   = "inputs.resources.workload_resource_sync_enabled"
+	CONFIG_KEY_HYPERVISOR_RESOURCE_ENABLED = "inputs.resources.private_cloud.hypervisor_resource_enabled"
+)
+
+var (
+	KWP_NORMAL         = api.KubernetesWatchPolicy_KWP_NORMAL
+	KWP_WATCH_ONLY     = api.KubernetesWatchPolicy_KWP_WATCH_ONLY
+	KWP_WATCH_DISABLED = api.KubernetesWatchPolicy_KWP_WATCH_DISABLED
+)
+
+var (
+	AGENT_KWP_NORMAL         = agent.KubernetesWatchPolicy_KWP_NORMAL
+	AGENT_KWP_WATCH_ONLY     = agent.KubernetesWatchPolicy_KWP_WATCH_ONLY
+	AGENT_KWP_WATCH_DISABLED = agent.KubernetesWatchPolicy_KWP_WATCH_DISABLED
+)
+
+type UpgradeData struct {
+	Content  []byte
+	TotalLen uint64
+	PktCount uint32
+	Md5Sum   string
+	Step     uint64
+	K8sImage string
+}

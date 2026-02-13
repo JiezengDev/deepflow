@@ -56,6 +56,9 @@ PerfData {
     synack: 0,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 1th perf data:
@@ -116,6 +119,9 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 2th perf data:
@@ -176,14 +182,17 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 3th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 9.1ms,
-        max: 9.1ms,
+        count: 2,
+        sum: 318.2ms,
+        max: 309.1ms,
         updated: true,
     },
     rtt_1: TimeStats {
@@ -223,7 +232,7 @@ PerfData {
         updated: false,
     },
     retrans_sum: 0,
-    rtt_full: 225.4ms,
+    rtt_full: 525.4ms,
     retrans_0: 0,
     retrans_1: 0,
     retrans_syn_0: 0,
@@ -236,14 +245,17 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 4th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 9.1ms,
-        max: 9.1ms,
+        count: 2,
+        sum: 318.2ms,
+        max: 309.1ms,
         updated: true,
     },
     rtt_1: TimeStats {
@@ -283,7 +295,7 @@ PerfData {
         updated: false,
     },
     retrans_sum: 0,
-    rtt_full: 225.4ms,
+    rtt_full: 525.4ms,
     retrans_0: 0,
     retrans_1: 0,
     retrans_syn_0: 0,
@@ -296,14 +308,17 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 1,
     updated: true,
 }
 5th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 9.1ms,
-        max: 9.1ms,
+        count: 2,
+        sum: 318.2ms,
+        max: 309.1ms,
         updated: true,
     },
     rtt_1: TimeStats {
@@ -343,7 +358,7 @@ PerfData {
         updated: false,
     },
     retrans_sum: 0,
-    rtt_full: 225.4ms,
+    rtt_full: 525.4ms,
     retrans_0: 0,
     retrans_1: 0,
     retrans_syn_0: 0,
@@ -356,14 +371,17 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 2,
     updated: true,
 }
 6th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 9.1ms,
-        max: 9.1ms,
+        count: 2,
+        sum: 318.2ms,
+        max: 309.1ms,
         updated: true,
     },
     rtt_1: TimeStats {
@@ -403,7 +421,7 @@ PerfData {
         updated: false,
     },
     retrans_sum: 0,
-    rtt_full: 225.4ms,
+    rtt_full: 525.4ms,
     retrans_0: 0,
     retrans_1: 0,
     retrans_syn_0: 0,
@@ -416,6 +434,9 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 2,
     updated: true,
 }
 0th perf data:
@@ -476,6 +497,9 @@ PerfData {
     synack: 0,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 1th perf data:
@@ -536,6 +560,9 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 2th perf data:
@@ -596,14 +623,17 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 3th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 74µs,
-        max: 74µs,
+        count: 2,
+        sum: 454.813ms,
+        max: 454.739ms,
         updated: true,
     },
     rtt_1: TimeStats {
@@ -643,7 +673,7 @@ PerfData {
         updated: false,
     },
     retrans_sum: 0,
-    rtt_full: 825µs,
+    rtt_full: 455.49ms,
     retrans_0: 0,
     retrans_1: 0,
     retrans_syn_0: 0,
@@ -656,14 +686,17 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 4th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 74µs,
-        max: 74µs,
+        count: 2,
+        sum: 454.813ms,
+        max: 454.739ms,
         updated: true,
     },
     rtt_1: TimeStats {
@@ -703,7 +736,7 @@ PerfData {
         updated: true,
     },
     retrans_sum: 0,
-    rtt_full: 825µs,
+    rtt_full: 455.49ms,
     retrans_0: 0,
     retrans_1: 0,
     retrans_syn_0: 0,
@@ -716,14 +749,17 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 5th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 74µs,
-        max: 74µs,
+        count: 2,
+        sum: 454.813ms,
+        max: 454.739ms,
         updated: true,
     },
     rtt_1: TimeStats {
@@ -763,7 +799,7 @@ PerfData {
         updated: true,
     },
     retrans_sum: 0,
-    rtt_full: 825µs,
+    rtt_full: 455.49ms,
     retrans_0: 0,
     retrans_1: 0,
     retrans_syn_0: 0,
@@ -776,14 +812,17 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 6th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 74µs,
-        max: 74µs,
+        count: 2,
+        sum: 454.813ms,
+        max: 454.739ms,
         updated: true,
     },
     rtt_1: TimeStats {
@@ -823,7 +862,7 @@ PerfData {
         updated: true,
     },
     retrans_sum: 0,
-    rtt_full: 825µs,
+    rtt_full: 455.49ms,
     retrans_0: 0,
     retrans_1: 0,
     retrans_syn_0: 0,
@@ -836,14 +875,17 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 1,
     updated: true,
 }
 7th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 74µs,
-        max: 74µs,
+        count: 2,
+        sum: 454.813ms,
+        max: 454.739ms,
         updated: true,
     },
     rtt_1: TimeStats {
@@ -883,7 +925,7 @@ PerfData {
         updated: true,
     },
     retrans_sum: 0,
-    rtt_full: 825µs,
+    rtt_full: 455.49ms,
     retrans_0: 0,
     retrans_1: 0,
     retrans_syn_0: 0,
@@ -896,14 +938,17 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 1,
     updated: true,
 }
 8th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 74µs,
-        max: 74µs,
+        count: 2,
+        sum: 454.813ms,
+        max: 454.739ms,
         updated: true,
     },
     rtt_1: TimeStats {
@@ -943,7 +988,7 @@ PerfData {
         updated: true,
     },
     retrans_sum: 0,
-    rtt_full: 825µs,
+    rtt_full: 455.49ms,
     retrans_0: 0,
     retrans_1: 0,
     retrans_syn_0: 0,
@@ -956,14 +1001,17 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 2,
     updated: true,
 }
 9th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 74µs,
-        max: 74µs,
+        count: 2,
+        sum: 454.813ms,
+        max: 454.739ms,
         updated: true,
     },
     rtt_1: TimeStats {
@@ -1003,7 +1051,7 @@ PerfData {
         updated: true,
     },
     retrans_sum: 0,
-    rtt_full: 825µs,
+    rtt_full: 455.49ms,
     retrans_0: 0,
     retrans_1: 0,
     retrans_syn_0: 0,
@@ -1016,6 +1064,9 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 2,
     updated: true,
 }
 0th perf data:
@@ -1076,6 +1127,9 @@ PerfData {
     synack: 0,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 1th perf data:
@@ -1136,6 +1190,9 @@ PerfData {
     synack: 0,
     retrans_syn: 1,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 2th perf data:
@@ -1148,8 +1205,8 @@ PerfData {
     },
     rtt_1: TimeStats {
         count: 1,
-        sum: 216.3ms,
-        max: 216.3ms,
+        sum: 316.3ms,
+        max: 316.3ms,
         updated: true,
     },
     art_0: TimeStats {
@@ -1196,6 +1253,9 @@ PerfData {
     synack: 1,
     retrans_syn: 1,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 3th perf data:
@@ -1208,8 +1268,8 @@ PerfData {
     },
     rtt_1: TimeStats {
         count: 1,
-        sum: 216.3ms,
-        max: 216.3ms,
+        sum: 316.3ms,
+        max: 316.3ms,
         updated: true,
     },
     art_0: TimeStats {
@@ -1256,20 +1316,23 @@ PerfData {
     synack: 1,
     retrans_syn: 1,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 4th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 9.1ms,
-        max: 9.1ms,
+        count: 2,
+        sum: 318.2ms,
+        max: 309.1ms,
         updated: true,
     },
     rtt_1: TimeStats {
         count: 1,
-        sum: 216.3ms,
-        max: 216.3ms,
+        sum: 316.3ms,
+        max: 316.3ms,
         updated: true,
     },
     art_0: TimeStats {
@@ -1303,7 +1366,7 @@ PerfData {
         updated: false,
     },
     retrans_sum: 1,
-    rtt_full: 325.4ms,
+    rtt_full: 625.4ms,
     retrans_0: 1,
     retrans_1: 0,
     retrans_syn_0: 1,
@@ -1316,20 +1379,23 @@ PerfData {
     synack: 1,
     retrans_syn: 1,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 5th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 9.1ms,
-        max: 9.1ms,
+        count: 2,
+        sum: 318.2ms,
+        max: 309.1ms,
         updated: true,
     },
     rtt_1: TimeStats {
         count: 1,
-        sum: 216.3ms,
-        max: 216.3ms,
+        sum: 316.3ms,
+        max: 316.3ms,
         updated: true,
     },
     art_0: TimeStats {
@@ -1363,7 +1429,7 @@ PerfData {
         updated: false,
     },
     retrans_sum: 1,
-    rtt_full: 325.4ms,
+    rtt_full: 625.4ms,
     retrans_0: 1,
     retrans_1: 0,
     retrans_syn_0: 1,
@@ -1376,20 +1442,23 @@ PerfData {
     synack: 1,
     retrans_syn: 1,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 1,
     updated: true,
 }
 6th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 9.1ms,
-        max: 9.1ms,
+        count: 2,
+        sum: 318.2ms,
+        max: 309.1ms,
         updated: true,
     },
     rtt_1: TimeStats {
         count: 1,
-        sum: 216.3ms,
-        max: 216.3ms,
+        sum: 316.3ms,
+        max: 316.3ms,
         updated: true,
     },
     art_0: TimeStats {
@@ -1423,7 +1492,7 @@ PerfData {
         updated: false,
     },
     retrans_sum: 1,
-    rtt_full: 325.4ms,
+    rtt_full: 625.4ms,
     retrans_0: 1,
     retrans_1: 0,
     retrans_syn_0: 1,
@@ -1436,20 +1505,23 @@ PerfData {
     synack: 1,
     retrans_syn: 1,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 2,
     updated: true,
 }
 7th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 9.1ms,
-        max: 9.1ms,
+        count: 2,
+        sum: 318.2ms,
+        max: 309.1ms,
         updated: true,
     },
     rtt_1: TimeStats {
         count: 1,
-        sum: 216.3ms,
-        max: 216.3ms,
+        sum: 316.3ms,
+        max: 316.3ms,
         updated: true,
     },
     art_0: TimeStats {
@@ -1483,7 +1555,7 @@ PerfData {
         updated: false,
     },
     retrans_sum: 1,
-    rtt_full: 325.4ms,
+    rtt_full: 625.4ms,
     retrans_0: 1,
     retrans_1: 0,
     retrans_syn_0: 1,
@@ -1496,6 +1568,9 @@ PerfData {
     synack: 1,
     retrans_syn: 1,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 2,
     updated: true,
 }
 0th perf data:
@@ -1556,6 +1631,9 @@ PerfData {
     synack: 0,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 1th perf data:
@@ -1616,6 +1694,9 @@ PerfData {
     synack: 0,
     retrans_syn: 1,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 2th perf data:
@@ -1628,8 +1709,8 @@ PerfData {
     },
     rtt_1: TimeStats {
         count: 1,
-        sum: 216.3ms,
-        max: 216.3ms,
+        sum: 316.3ms,
+        max: 316.3ms,
         updated: true,
     },
     art_0: TimeStats {
@@ -1676,6 +1757,9 @@ PerfData {
     synack: 1,
     retrans_syn: 1,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 3th perf data:
@@ -1687,9 +1771,9 @@ PerfData {
         updated: false,
     },
     rtt_1: TimeStats {
-        count: 1,
-        sum: 216.3ms,
-        max: 216.3ms,
+        count: 2,
+        sum: 848.9ms,
+        max: 532.6ms,
         updated: true,
     },
     art_0: TimeStats {
@@ -1736,20 +1820,23 @@ PerfData {
     synack: 2,
     retrans_syn: 1,
     retrans_synack: 1,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 4th perf data:
 PerfData {
     rtt_0: TimeStats {
         count: 1,
-        sum: 9.1ms,
-        max: 9.1ms,
+        sum: 225.4ms,
+        max: 225.4ms,
         updated: true,
     },
     rtt_1: TimeStats {
-        count: 1,
-        sum: 216.3ms,
-        max: 216.3ms,
+        count: 2,
+        sum: 848.9ms,
+        max: 532.6ms,
         updated: true,
     },
     art_0: TimeStats {
@@ -1796,20 +1883,23 @@ PerfData {
     synack: 2,
     retrans_syn: 1,
     retrans_synack: 1,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 5th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 9.1ms,
-        max: 9.1ms,
+        count: 2,
+        sum: 750.8ms,
+        max: 525.4ms,
         updated: true,
     },
     rtt_1: TimeStats {
-        count: 1,
-        sum: 216.3ms,
-        max: 216.3ms,
+        count: 2,
+        sum: 848.9ms,
+        max: 532.6ms,
         updated: true,
     },
     art_0: TimeStats {
@@ -1843,7 +1933,7 @@ PerfData {
         updated: false,
     },
     retrans_sum: 2,
-    rtt_full: 541.7ms,
+    rtt_full: 841.7ms,
     retrans_0: 1,
     retrans_1: 1,
     retrans_syn_0: 1,
@@ -1856,20 +1946,23 @@ PerfData {
     synack: 2,
     retrans_syn: 1,
     retrans_synack: 1,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 6th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 9.1ms,
-        max: 9.1ms,
+        count: 2,
+        sum: 750.8ms,
+        max: 525.4ms,
         updated: true,
     },
     rtt_1: TimeStats {
-        count: 1,
-        sum: 216.3ms,
-        max: 216.3ms,
+        count: 2,
+        sum: 848.9ms,
+        max: 532.6ms,
         updated: true,
     },
     art_0: TimeStats {
@@ -1903,7 +1996,7 @@ PerfData {
         updated: false,
     },
     retrans_sum: 2,
-    rtt_full: 541.7ms,
+    rtt_full: 841.7ms,
     retrans_0: 1,
     retrans_1: 1,
     retrans_syn_0: 1,
@@ -1916,20 +2009,23 @@ PerfData {
     synack: 2,
     retrans_syn: 1,
     retrans_synack: 1,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 1,
     updated: true,
 }
 7th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 9.1ms,
-        max: 9.1ms,
+        count: 2,
+        sum: 750.8ms,
+        max: 525.4ms,
         updated: true,
     },
     rtt_1: TimeStats {
-        count: 1,
-        sum: 216.3ms,
-        max: 216.3ms,
+        count: 2,
+        sum: 848.9ms,
+        max: 532.6ms,
         updated: true,
     },
     art_0: TimeStats {
@@ -1963,7 +2059,7 @@ PerfData {
         updated: false,
     },
     retrans_sum: 2,
-    rtt_full: 541.7ms,
+    rtt_full: 841.7ms,
     retrans_0: 1,
     retrans_1: 1,
     retrans_syn_0: 1,
@@ -1976,20 +2072,23 @@ PerfData {
     synack: 2,
     retrans_syn: 1,
     retrans_synack: 1,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 2,
     updated: true,
 }
 8th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 9.1ms,
-        max: 9.1ms,
+        count: 2,
+        sum: 750.8ms,
+        max: 525.4ms,
         updated: true,
     },
     rtt_1: TimeStats {
-        count: 1,
-        sum: 216.3ms,
-        max: 216.3ms,
+        count: 2,
+        sum: 848.9ms,
+        max: 532.6ms,
         updated: true,
     },
     art_0: TimeStats {
@@ -2023,7 +2122,7 @@ PerfData {
         updated: false,
     },
     retrans_sum: 2,
-    rtt_full: 541.7ms,
+    rtt_full: 841.7ms,
     retrans_0: 1,
     retrans_1: 1,
     retrans_syn_0: 1,
@@ -2036,6 +2135,9 @@ PerfData {
     synack: 2,
     retrans_syn: 1,
     retrans_synack: 1,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 2,
     updated: true,
 }
 0th perf data:
@@ -2096,6 +2198,9 @@ PerfData {
     synack: 0,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 1th perf data:
@@ -2156,6 +2261,9 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 2th perf data:
@@ -2216,6 +2324,9 @@ PerfData {
     synack: 1,
     retrans_syn: 1,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 3th perf data:
@@ -2228,8 +2339,8 @@ PerfData {
     },
     rtt_1: TimeStats {
         count: 2,
-        sum: 432.6ms,
-        max: 216.3ms,
+        sum: 748.9ms,
+        max: 532.6ms,
         updated: true,
     },
     art_0: TimeStats {
@@ -2276,20 +2387,23 @@ PerfData {
     synack: 2,
     retrans_syn: 1,
     retrans_synack: 1,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 4th perf data:
 PerfData {
     rtt_0: TimeStats {
         count: 1,
-        sum: 9.1ms,
-        max: 9.1ms,
+        sum: 325.4ms,
+        max: 325.4ms,
         updated: true,
     },
     rtt_1: TimeStats {
         count: 2,
-        sum: 432.6ms,
-        max: 216.3ms,
+        sum: 748.9ms,
+        max: 532.6ms,
         updated: true,
     },
     art_0: TimeStats {
@@ -2336,20 +2450,23 @@ PerfData {
     synack: 2,
     retrans_syn: 1,
     retrans_synack: 1,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 5th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 9.1ms,
-        max: 9.1ms,
+        count: 2,
+        sum: 950.8ms,
+        max: 625.4ms,
         updated: true,
     },
     rtt_1: TimeStats {
         count: 2,
-        sum: 432.6ms,
-        max: 216.3ms,
+        sum: 748.9ms,
+        max: 532.6ms,
         updated: true,
     },
     art_0: TimeStats {
@@ -2383,7 +2500,7 @@ PerfData {
         updated: false,
     },
     retrans_sum: 2,
-    rtt_full: 541.7ms,
+    rtt_full: 841.7ms,
     retrans_0: 1,
     retrans_1: 1,
     retrans_syn_0: 1,
@@ -2396,20 +2513,23 @@ PerfData {
     synack: 2,
     retrans_syn: 1,
     retrans_synack: 1,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 6th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 9.1ms,
-        max: 9.1ms,
+        count: 2,
+        sum: 950.8ms,
+        max: 625.4ms,
         updated: true,
     },
     rtt_1: TimeStats {
         count: 2,
-        sum: 432.6ms,
-        max: 216.3ms,
+        sum: 748.9ms,
+        max: 532.6ms,
         updated: true,
     },
     art_0: TimeStats {
@@ -2443,7 +2563,7 @@ PerfData {
         updated: false,
     },
     retrans_sum: 2,
-    rtt_full: 541.7ms,
+    rtt_full: 841.7ms,
     retrans_0: 1,
     retrans_1: 1,
     retrans_syn_0: 1,
@@ -2456,20 +2576,23 @@ PerfData {
     synack: 2,
     retrans_syn: 1,
     retrans_synack: 1,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 1,
     updated: true,
 }
 7th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 9.1ms,
-        max: 9.1ms,
+        count: 2,
+        sum: 950.8ms,
+        max: 625.4ms,
         updated: true,
     },
     rtt_1: TimeStats {
         count: 2,
-        sum: 432.6ms,
-        max: 216.3ms,
+        sum: 748.9ms,
+        max: 532.6ms,
         updated: true,
     },
     art_0: TimeStats {
@@ -2503,7 +2626,7 @@ PerfData {
         updated: false,
     },
     retrans_sum: 2,
-    rtt_full: 541.7ms,
+    rtt_full: 841.7ms,
     retrans_0: 1,
     retrans_1: 1,
     retrans_syn_0: 1,
@@ -2516,20 +2639,23 @@ PerfData {
     synack: 2,
     retrans_syn: 1,
     retrans_synack: 1,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 2,
     updated: true,
 }
 8th perf data:
 PerfData {
     rtt_0: TimeStats {
-        count: 1,
-        sum: 9.1ms,
-        max: 9.1ms,
+        count: 2,
+        sum: 950.8ms,
+        max: 625.4ms,
         updated: true,
     },
     rtt_1: TimeStats {
         count: 2,
-        sum: 432.6ms,
-        max: 216.3ms,
+        sum: 748.9ms,
+        max: 532.6ms,
         updated: true,
     },
     art_0: TimeStats {
@@ -2563,7 +2689,7 @@ PerfData {
         updated: false,
     },
     retrans_sum: 2,
-    rtt_full: 541.7ms,
+    rtt_full: 841.7ms,
     retrans_0: 1,
     retrans_1: 1,
     retrans_syn_0: 1,
@@ -2576,6 +2702,9 @@ PerfData {
     synack: 2,
     retrans_syn: 1,
     retrans_synack: 1,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 2,
     updated: true,
 }
 0th perf data:
@@ -2636,6 +2765,9 @@ PerfData {
     synack: 0,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 1th perf data:
@@ -2696,6 +2828,9 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 2th perf data:
@@ -2756,6 +2891,9 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 3th perf data:
@@ -2816,6 +2954,9 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 4th perf data:
@@ -2876,6 +3017,9 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 5th perf data:
@@ -2936,6 +3080,9 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 6th perf data:
@@ -2996,6 +3143,9 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 7th perf data:
@@ -3056,6 +3206,9 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 8th perf data:
@@ -3116,6 +3269,9 @@ PerfData {
     synack: 2,
     retrans_syn: 0,
     retrans_synack: 1,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 9th perf data:
@@ -3176,6 +3332,9 @@ PerfData {
     synack: 2,
     retrans_syn: 0,
     retrans_synack: 1,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 10th perf data:
@@ -3236,6 +3395,9 @@ PerfData {
     synack: 2,
     retrans_syn: 0,
     retrans_synack: 1,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 11th perf data:
@@ -3296,6 +3458,9 @@ PerfData {
     synack: 2,
     retrans_syn: 0,
     retrans_synack: 1,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 12th perf data:
@@ -3356,6 +3521,9 @@ PerfData {
     synack: 2,
     retrans_syn: 0,
     retrans_synack: 1,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 13th perf data:
@@ -3416,6 +3584,9 @@ PerfData {
     synack: 2,
     retrans_syn: 0,
     retrans_synack: 1,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 1,
     updated: true,
 }
 14th perf data:
@@ -3476,6 +3647,9 @@ PerfData {
     synack: 2,
     retrans_syn: 0,
     retrans_synack: 1,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 2,
     updated: true,
 }
 15th perf data:
@@ -3536,6 +3710,9 @@ PerfData {
     synack: 2,
     retrans_syn: 0,
     retrans_synack: 1,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 2,
     updated: true,
 }
 16th perf data:
@@ -3596,6 +3773,9 @@ PerfData {
     synack: 2,
     retrans_syn: 0,
     retrans_synack: 1,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 2,
     updated: true,
 }
 0th perf data:
@@ -3656,6 +3836,9 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 1th perf data:
@@ -3716,6 +3899,9 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 2th perf data:
@@ -3776,6 +3962,9 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 3th perf data:
@@ -3836,6 +4025,9 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
 4th perf data:
@@ -3896,6 +4088,9 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 1,
     updated: true,
 }
 5th perf data:
@@ -3956,6 +4151,9 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 2,
     updated: true,
 }
 6th perf data:
@@ -4016,5 +4214,8 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 2,
     updated: true,
 }

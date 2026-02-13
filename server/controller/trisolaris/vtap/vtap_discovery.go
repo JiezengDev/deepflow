@@ -23,21 +23,28 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	. "github.com/deepflowio/deepflow/server/controller/common"
-	models "github.com/deepflowio/deepflow/server/controller/db/mysql"
+	models "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/recorder/db/idmng"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/dbmgr"
-	"github.com/deepflowio/deepflow/server/controller/trisolaris/utils"
 	. "github.com/deepflowio/deepflow/server/controller/trisolaris/utils"
 )
 
 type VTapRegister struct {
-	tapMode               int
-	vTapGroupID           string
-	defaultVTapGroup      string
-	vTapAutoRegister      bool
-	agentUniqueIdentifier int
+	tapMode                          int
+	vTapGroupID                      string
+	defaultVTapGroup                 string
+	defaultVTapGroupLicenseFunctions string
+	vTapAutoRegister                 bool
+	agentUniqueIdentifier            int
+	teamID                           int
+	vTapInfo                         *VTapInfo
+	registerBy                       string
+	groupLicenseFunctions            string
 	VTapLKData
+	ORGID
 }
 
 type VTapLKData struct {
@@ -46,25 +53,28 @@ type VTapLKData struct {
 	hostIPs []string
 	host    string
 	region  string
+	ORGID
 }
 
 type VTapLKResult struct {
 	VTapType       int
 	LaunchServer   string
 	LaunchServerID int
+	CPUNum         int
 	VTapName       string
 	AZ             string
 	Region         string
 	Lcuuid         string
 }
 
-func NewVTapLkData(ctrlIP string, ctrlMac string, ips []string, host string, region string) *VTapLKData {
+func NewVTapLkData(ctrlIP string, ctrlMac string, ips []string, host string, region string, orgID ORGID) *VTapLKData {
 	return &VTapLKData{
 		ctrlIP:  ctrlIP,
 		ctrlMac: ctrlMac,
 		hostIPs: ips,
 		host:    host,
 		region:  region,
+		ORGID:   orgID,
 	}
 }
 
@@ -83,7 +93,7 @@ func FilterSlice(s []string, filter func(x string) bool) []string {
 }
 
 func newVTapRegister(tapMode int, ctrlIP string, ctrlMac string, hostIPs []string,
-	host string, vTapGroupID string, agentUniqueIdentifier int) *VTapRegister {
+	host string, vTapGroupID string, agentUniqueIdentifier int, vTapInfo *VTapInfo, teamID int) *VTapRegister {
 	hIPs := FilterSlice(hostIPs, func(x string) bool {
 		if x == "127.0.0.1" {
 			return true
@@ -97,9 +107,13 @@ func newVTapRegister(tapMode int, ctrlIP string, ctrlMac string, hostIPs []strin
 			ctrlIP:  ctrlIP,
 			ctrlMac: ctrlMac,
 			hostIPs: hIPs,
-			host:    host},
+			host:    host,
+			ORGID:   vTapInfo.ORGID},
 		vTapGroupID:           vTapGroupID,
 		agentUniqueIdentifier: agentUniqueIdentifier,
+		vTapInfo:              vTapInfo,
+		teamID:                teamID,
+		ORGID:                 vTapInfo.ORGID,
 	}
 }
 
@@ -107,14 +121,20 @@ func (r *VTapRegister) String() string {
 	return fmt.Sprintf("%+v", *r)
 }
 
+func (r *VTapRegister) setRegisterBy(registerBy string) {
+	r.registerBy = registerBy
+}
+
 func (r *VTapRegister) getVTapGroupLcuuid(db *gorm.DB) string {
+	r.groupLicenseFunctions = r.defaultVTapGroupLicenseFunctions
 	if r.vTapGroupID != "" {
 		vtapGroup := &models.VTapGroup{}
-		ret := db.Where("short_uuid = ?", r.vTapGroupID).First(vtapGroup)
+		ret := db.Where("name = ?", r.vTapGroupID).Or("short_uuid = ?", r.vTapGroupID).First(vtapGroup)
 		if ret.Error != nil {
-			log.Error("vtap group(short_uuid=%s) not found", r.vTapGroupID)
+			log.Error(r.Logf("vtap group (name or short_uuid: %s) not found", r.vTapGroupID))
 			return r.defaultVTapGroup
 		} else {
+			r.groupLicenseFunctions = vtapGroup.LicenseFunctions
 			return vtapGroup.Lcuuid
 		}
 	}
@@ -122,12 +142,12 @@ func (r *VTapRegister) getVTapGroupLcuuid(db *gorm.DB) string {
 	return r.defaultVTapGroup
 }
 
-func finishLog(dbVTap *models.VTap) {
-	log.Infof(
-		"finish register vtap (type: %d tap_mode:%d, name:%s ctrl_ip: %s ctrl_mac: %s "+
-			"launch_server: %s launch_server_id: %d vtap_group_lcuuid: %s az: %s lcuuid: %s)",
-		dbVTap.Type, dbVTap.TapMode, dbVTap.Name, dbVTap.CtrlIP, dbVTap.CtrlMac, dbVTap.LaunchServer,
-		dbVTap.LaunchServerID, dbVTap.VtapGroupLcuuid, dbVTap.AZ, dbVTap.Lcuuid)
+func (r *VTapRegister) finishLog(dbVTap *models.VTap) {
+	log.Infof(r.Logf(
+		"finish register(%s) vtap (type: %d tap_mode:%d, name:%s ctrl_ip: %s ctrl_mac: %s "+
+			"launch_server: %s launch_server_id: %d vtap_group_lcuuid: %s az: %s team_id: %d lcuuid: %s)",
+		r.registerBy, dbVTap.Type, dbVTap.TapMode, dbVTap.Name, dbVTap.CtrlIP, dbVTap.CtrlMac, dbVTap.LaunchServer,
+		dbVTap.LaunchServerID, dbVTap.VtapGroupLcuuid, dbVTap.AZ, dbVTap.TeamID, dbVTap.Lcuuid))
 }
 
 // 采集器名称不支持空格和:
@@ -135,45 +155,73 @@ var reg = regexp.MustCompile(` |:`)
 
 func (r *VTapRegister) insertToDB(dbVTap *models.VTap, db *gorm.DB) bool {
 	vTapName := reg.ReplaceAllString(dbVTap.Name, "-")
-	oldVTap, err := dbmgr.DBMgr[models.VTap](db).GetFromName(vTapName)
+	vtapMgr := dbmgr.DBMgr[models.VTap](db)
+	oldVTap, err := vtapMgr.GetByOption(
+		vtapMgr.WithCtrlIP(r.ctrlIP),
+		vtapMgr.WithCtrlMac(r.ctrlMac))
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		dbVTap.Name = vTapName
 	} else {
 		if err == nil {
-			log.Errorf("agent(%s) name=%s already exist", r, vTapName)
+			log.Errorf(r.Logf("agent(%s) ctrl_ip=%s ctrl_mac= %s already exist", r, r.ctrlIP, r.ctrlMac))
 			if oldVTap.State == VTAP_STATE_NOT_CONNECTED {
-				log.Warningf("vtap(%s) info (ctrl_ip: %s, ctr_mac: %s) change to (ctrl_ip: %s, ctr_mac: %s)", vTapName,
-					oldVTap.CtrlIP, oldVTap.CtrlMac, dbVTap.CtrlIP, dbVTap.CtrlMac)
+				log.Warningf(r.Logf("vtap(%s) info (ctrl_ip: %s, ctr_mac: %s) change to (ctrl_ip: %s, ctr_mac: %s)", vTapName,
+					oldVTap.CtrlIP, oldVTap.CtrlMac, dbVTap.CtrlIP, dbVTap.CtrlMac))
 				oldVTap.CtrlMac = dbVTap.CtrlMac
 				oldVTap.CtrlIP = dbVTap.CtrlIP
 				oldVTap.LaunchServer = dbVTap.LaunchServer
 				err := dbmgr.DBMgr[models.VTap](db).Save(oldVTap)
 				if err != nil {
-					log.Error(err)
+					log.Error(r.Log(err.Error()))
 					return false
 				}
 				*dbVTap = *oldVTap
 				return true
 			}
 		} else {
-			log.Errorf("query agent(%s) from DB table vtap failed, err: %s", vTapName, err)
+			log.Errorf(r.Logf("query agent(%s) from DB table vtap failed, err: %s", vTapName, err))
 		}
 		return false
 	}
 	if r.vTapAutoRegister {
 		dbVTap.State = VTAP_STATE_NORMAL
 	}
+	ids, err := idmng.GetIDs(r.GetORGID(), RESOURCE_TYPE_VTAP_EN, 1)
+	if err != nil {
+		log.Error(r.Logf("%s request ids failed", RESOURCE_TYPE_VTAP_EN))
+		return false
+	}
+	if len(ids) != 1 {
+		log.Error(r.Logf("request ids=%v err", ids))
+		return false
+	}
+	dbVTap.ID = ids[0]
+	// Voucher mode turns on group features
+	if r.vTapInfo.config.BillingMethod == BILLING_METHOD_VOUCHER {
+		dbVTap.LicenseFunctions = r.groupLicenseFunctions
+		dbVTap.FollowGroupFeatures = AGENT_ALL_LICENSE_FUNCTIONS
+	}
 	err = db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(dbVTap).Error; err != nil {
-			log.Errorf("insert agent(%s) to DB faild, err: %s", r, err)
+		if err := tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{
+				{Name: "ctrl_ip"},
+				{Name: "ctrl_mac"},
+			},
+			DoNothing: true,
+		}).Create(dbVTap).Error; err != nil {
+			log.Errorf(r.Logf("insert agent(%s) to DB faild, err: %s", r, err))
+			errID := idmng.ReleaseIDs(r.GetORGID(), RESOURCE_TYPE_VTAP_EN, ids)
+			if errID != nil {
+				log.Error(r.Logf("Release ids=%v err: %s", ids, errID))
+			}
 			return err
 		}
-		finishLog(dbVTap)
+		r.finishLog(dbVTap)
 		return nil
 	})
 
 	if err != nil {
-		log.Error(err)
+		log.Error(r.Log(err.Error()))
 		return false
 	}
 	return true
@@ -187,12 +235,12 @@ func (l *VTapLKData) LookUpVTapByHost(db *gorm.DB) *VTapLKResult {
 	hostMgr := dbmgr.DBMgr[models.Host](db)
 	dbHost, err := hostMgr.GetFirstFromBatchIPs(l.hostIPs)
 	if err != nil {
-		log.Errorf("failed to register agent(%s) by querying DB table host_device(ip in (%s)) without finding data, err: %s",
-			l.getKey(), l.hostIPs, err)
+		log.Errorf(l.Logf("failed to register agent(%s) by querying DB table host_device(ip in (%s)) without finding data, err: %s",
+			l.getKey(), l.hostIPs, err))
 		dbHost, err = hostMgr.GetFromName(l.host)
 		if err != nil {
-			log.Errorf("failed to register agent(%s) by querying DB table host_device(name in (%s)) without finding data, err: %s",
-				l.getKey(), l.host, err)
+			log.Errorf(l.Logf("failed to register agent(%s) by querying DB table host_device(name in (%s)) without finding data, err: %s",
+				l.getKey(), l.host, err))
 			return nil
 		}
 	}
@@ -227,6 +275,7 @@ func (l *VTapLKData) LookUpVTapByHost(db *gorm.DB) *VTapLKResult {
 }
 
 func (r *VTapRegister) registerVTapByHost(db *gorm.DB) (*models.VTap, bool) {
+	r.setRegisterBy("registerVTapByHost")
 	vtapLKData := r.LookUpVTapByHost(db)
 	if vtapLKData == nil {
 		return nil, false
@@ -243,6 +292,7 @@ func (r *VTapRegister) registerVTapByHost(db *gorm.DB) (*models.VTap, bool) {
 		VtapGroupLcuuid: r.getVTapGroupLcuuid(db),
 		State:           VTAP_STATE_PENDING,
 		TapMode:         r.tapMode,
+		TeamID:          r.teamID,
 		Lcuuid:          vtapLKData.Lcuuid,
 	}
 	result := r.insertToDB(dbVTap, db)
@@ -255,8 +305,8 @@ func (l *VTapLKData) LookUpVTapByPodNode(db *gorm.DB) *VTapLKResult {
 	if err != nil || len(podNodes) == 0 {
 		podNodes, err = podNodeMgr.GetBatchFromName(l.host)
 		if err != nil || len(podNodes) == 0 {
-			log.Errorf("failed to register agent(%s) by querying DB table pod_node(ip in (%s) or name in (%s)) without finding data",
-				l.getKey(), l.hostIPs, l.host)
+			log.Errorf(l.Logf("failed to register agent(%s) by querying DB table pod_node(ip in (%s) or name in (%s)) without finding data",
+				l.getKey(), l.hostIPs, l.host))
 			return nil
 		}
 	}
@@ -286,8 +336,8 @@ func (l *VTapLKData) LookUpVTapByPodNode(db *gorm.DB) *VTapLKResult {
 		VIF_DEVICE_TYPE_POD_NODE,
 		podNodeIDs)
 	if err != nil {
-		log.Errorf("failed to register agent(%s) by querying DB table vinterface(mac=%s, region=%s, devicetype=%d, deviceid in (%v)) without finding data, err: %s",
-			l.getKey(), l.ctrlMac, l.region, VIF_DEVICE_TYPE_POD_NODE, podNodeIDs, err)
+		log.Errorf(l.Logf("failed to register agent(%s) by querying DB table vinterface(mac=%s, region=%s, devicetype=%d, deviceid in (%v)) without finding data, err: %s",
+			l.getKey(), l.ctrlMac, l.region, VIF_DEVICE_TYPE_POD_NODE, podNodeIDs, err))
 		if len(vmIDs) > 0 {
 			matchVif, err = vifMgr.GetVInterfaceFromDeviceIDs(
 				l.ctrlMac,
@@ -295,8 +345,8 @@ func (l *VTapLKData) LookUpVTapByPodNode(db *gorm.DB) *VTapLKResult {
 				VIF_DEVICE_TYPE_VM,
 				vmIDs)
 			if err != nil {
-				log.Errorf("failed to register agent(%s) by querying DB table vinterface(mac=%s, region=%s, devicetype=%d, deviceid in (%v)) without finding data, err: %s",
-					l.getKey(), l.ctrlMac, l.region, VIF_DEVICE_TYPE_VM, vmIDs, err)
+				log.Errorf(l.Logf("failed to register agent(%s) by querying DB table vinterface(mac=%s, region=%s, devicetype=%d, deviceid in (%v)) without finding data, err: %s",
+					l.getKey(), l.ctrlMac, l.region, VIF_DEVICE_TYPE_VM, vmIDs, err))
 				return nil
 			}
 		} else {
@@ -312,11 +362,11 @@ func (l *VTapLKData) LookUpVTapByPodNode(db *gorm.DB) *VTapLKResult {
 		if conn, ok := podNodeIdToConn[matchVif.DeviceID]; ok {
 			vm, err := dbmgr.DBMgr[models.VM](db).GetFromID(conn.VMID)
 			if err != nil {
-				log.Errorf("failed to register agent(%s) by querying DB table vm(id=%d) without finding data, err: %s",
-					l.getKey(), conn.VMID, err)
+				log.Errorf(l.Logf("failed to register agent(%s) by querying DB table vm(id=%d) without finding data, err: %s",
+					l.getKey(), conn.VMID, err))
 				return nil
 			}
-			if utils.IsVMofBMHtype(vm.HType) == true {
+			if IsVMofBMHtype(vm.HType) == true {
 				vTapType = VTAP_TYPE_POD_HOST
 			} else {
 				vTapType = VTAP_TYPE_POD_VM
@@ -329,10 +379,10 @@ func (l *VTapLKData) LookUpVTapByPodNode(db *gorm.DB) *VTapLKResult {
 			matchPodNode = idToPodNode[conn.PodNodeID]
 			vm, err := dbmgr.DBMgr[models.VM](db).GetFromID(matchVif.DeviceID)
 			if err != nil {
-				log.Errorf("failed to register agent(%s) by querying DB table vm(id=%d) without finding data, err: %s", l.getKey(), matchVif.DeviceID, err)
+				log.Errorf(l.Logf("failed to register agent(%s) by querying DB table vm(id=%d) without finding data, err: %s", l.getKey(), matchVif.DeviceID, err))
 				return nil
 			}
-			if utils.IsVMofBMHtype(vm.HType) == true {
+			if IsVMofBMHtype(vm.HType) == true {
 				vTapType = VTAP_TYPE_POD_HOST
 			} else {
 				vTapType = VTAP_TYPE_POD_VM
@@ -340,7 +390,7 @@ func (l *VTapLKData) LookUpVTapByPodNode(db *gorm.DB) *VTapLKResult {
 		}
 	}
 	if matchPodNode == nil {
-		log.Errorf("failed to register agent(%s) pod_node not found", l.getKey())
+		log.Errorf(l.Logf("failed to register agent(%s) pod_node not found", l.getKey()))
 		return nil
 	}
 	vTapName := fmt.Sprintf("%s-P%d", matchPodNode.Name, matchPodNode.ID)
@@ -356,6 +406,7 @@ func (l *VTapLKData) LookUpVTapByPodNode(db *gorm.DB) *VTapLKResult {
 }
 
 func (r *VTapRegister) registerVTapByPodNode(db *gorm.DB) (*models.VTap, bool) {
+	r.setRegisterBy("registerVTapByPodNode")
 	vtapLKResult := r.LookUpVTapByPodNode(db)
 	if vtapLKResult == nil {
 		return nil, false
@@ -372,6 +423,7 @@ func (r *VTapRegister) registerVTapByPodNode(db *gorm.DB) (*models.VTap, bool) {
 		VtapGroupLcuuid: r.getVTapGroupLcuuid(db),
 		State:           VTAP_STATE_PENDING,
 		TapMode:         r.tapMode,
+		TeamID:          r.teamID,
 		Lcuuid:          vtapLKResult.Lcuuid,
 	}
 	result := r.insertToDB(dbVTap, db)
@@ -398,8 +450,8 @@ func (l *VTapLKData) LookUpVTapByPod(db *gorm.DB) *VTapLKResult {
 		VIF_DEVICE_TYPE_POD,
 		vifIDs)
 	if err != nil || len(vifs) == 0 {
-		log.Errorf("failed to register agent(%s) by querying DB table vinterface(mac=%s, region=%s, devicetype=%d, vifid in (%v)) without finding data",
-			l.getKey(), l.ctrlMac, l.region, VIF_DEVICE_TYPE_POD, vifIDs)
+		log.Errorf(l.Logf("failed to register agent(%s) by querying DB table vinterface(mac=%s, region=%s, devicetype=%d, vifid in (%v)) without finding data",
+			l.getKey(), l.ctrlMac, l.region, VIF_DEVICE_TYPE_POD, vifIDs))
 		if err != nil {
 			log.Error(err)
 		}
@@ -413,7 +465,7 @@ func (l *VTapLKData) LookUpVTapByPod(db *gorm.DB) *VTapLKResult {
 	}
 	pod, err := dbmgr.DBMgr[models.Pod](db).GetFirstFromBatchIDs(deviceIDs)
 	if err != nil {
-		log.Errorf("failed to register agent(%s) by querying DB table pod(id in %v) without finding data, err: %s", l.getKey(), deviceIDs, err)
+		log.Errorf(l.Logf("failed to register agent(%s) by querying DB table pod(id in %v) without finding data, err: %s", l.getKey(), deviceIDs, err))
 		return nil
 	}
 
@@ -437,6 +489,7 @@ func (l *VTapLKData) LookUpVTapByPod(db *gorm.DB) *VTapLKResult {
 }
 
 func (r *VTapRegister) registerVTapByPod(db *gorm.DB) (*models.VTap, bool) {
+	r.setRegisterBy("registerVTapByPod")
 	vtapLKResult := r.LookUpVTapByPod(db)
 	if vtapLKResult == nil {
 		return nil, false
@@ -453,6 +506,7 @@ func (r *VTapRegister) registerVTapByPod(db *gorm.DB) (*models.VTap, bool) {
 		VtapGroupLcuuid: r.getVTapGroupLcuuid(db),
 		State:           VTAP_STATE_PENDING,
 		TapMode:         r.tapMode,
+		TeamID:          r.teamID,
 		Lcuuid:          vtapLKResult.Lcuuid,
 	}
 	result := r.insertToDB(dbVTap, db)
@@ -463,9 +517,9 @@ func (l *VTapLKData) getLanIPVIFIDs(db *gorm.DB) ([]int, map[int]string) {
 	lanIPMgr := dbmgr.DBMgr[models.LANIP](db)
 	lanIPs, err := lanIPMgr.GetBatchFromIPs(l.hostIPs)
 	if err != nil || len(lanIPs) == 0 {
-		log.Errorf("failed to register agent(%s) by querying DB table vinterface_ip(ip in (%s)) without finding data", l.getKey(), l.hostIPs)
+		log.Errorf(l.Logf("failed to register agent(%s) by querying DB table vinterface_ip(ip in (%s)) without finding data", l.getKey(), l.hostIPs))
 		if err != nil {
-			log.Error(err)
+			log.Error(l.Logf("%s", err))
 		}
 		return nil, nil
 	}
@@ -481,9 +535,9 @@ func (l *VTapLKData) getLanIPVIFIDs(db *gorm.DB) ([]int, map[int]string) {
 func (l *VTapLKData) getWanIPVIFIDs(db *gorm.DB) ([]int, map[int]string) {
 	wanIPs, err := dbmgr.DBMgr[models.WANIP](db).GetBatchFromIPs(l.hostIPs)
 	if err != nil || len(wanIPs) == 0 {
-		log.Errorf("failed to register agent(%s) by querying DB table ip_resource(ip in (%s)) without finding data", l.getKey(), l.hostIPs)
+		log.Errorf(l.Logf("failed to register agent(%s) by querying DB table ip_resource(ip in (%s)) without finding data", l.getKey(), l.hostIPs))
 		if err != nil {
-			log.Error(err)
+			log.Error(l.Logf("%s", err))
 		}
 		return nil, nil
 	}
@@ -517,10 +571,10 @@ func (l *VTapLKData) LookUpMirrorVTapByIP(db *gorm.DB) *VTapLKResult {
 		VIF_DEVICE_TYPE_VM,
 		vifIDs)
 	if err != nil || len(vifs) == 0 {
-		log.Errorf("failed to register agent(%s) by querying DB table vinterface(mac=%s, region=%s, devicetype=%d, vifid in (%v)) without finding data",
-			l.getKey(), l.ctrlMac, l.region, VIF_DEVICE_TYPE_VM, vifIDs)
+		log.Errorf(l.Logf("failed to register agent(%s) by querying DB table vinterface(mac=%s, region=%s, devicetype=%d, vifid in (%v)) without finding data",
+			l.getKey(), l.ctrlMac, l.region, VIF_DEVICE_TYPE_VM, vifIDs))
 		if err != nil {
-			log.Error(err)
+			log.Error(l.Logf("%s", err))
 		}
 		return nil
 	}
@@ -532,9 +586,9 @@ func (l *VTapLKData) LookUpMirrorVTapByIP(db *gorm.DB) *VTapLKResult {
 	}
 	vms, err := dbmgr.DBMgr[models.VM](db).GetBatchFromIDs(deviceIDs)
 	if err != nil || len(vms) == 0 {
-		log.Errorf("failed to register agent(%s) by querying DB table vm(id in (%v)) without finding data", l.getKey(), deviceIDs)
+		log.Errorf(l.Logf("failed to register agent(%s) by querying DB table vm(id in (%v)) without finding data", l.getKey(), deviceIDs))
 		if err != nil {
-			log.Error(err)
+			log.Error(l.Logf("%s", err))
 		}
 		return nil
 	}
@@ -543,7 +597,7 @@ func (l *VTapLKData) LookUpMirrorVTapByIP(db *gorm.DB) *VTapLKResult {
 	launchServerToVM := make(map[string]*models.VM)
 	for _, vm := range vms {
 		if vm.LaunchServer == "" {
-			log.Errorf("failed to register agent(%s), vm(id=%d) not launch server", l.getKey(), vm.ID)
+			log.Errorf(l.Logf("failed to register agent(%s), vm(id=%d) not launch server", l.getKey(), vm.ID))
 			continue
 		}
 		if !Find[string](vmLaunchServers, vm.LaunchServer) {
@@ -556,27 +610,36 @@ func (l *VTapLKData) LookUpMirrorVTapByIP(db *gorm.DB) *VTapLKResult {
 	}
 	host, err := dbmgr.DBMgr[models.Host](db).GetFirstFromBatchIPs(vmLaunchServers)
 	if err != nil {
-		log.Error("failed to register agent(%s) by querying DB table host(ip in(%s)) without finding data", l.getKey(), vmLaunchServers)
+		log.Error(l.Logf("failed to register agent(%s) by querying DB table host(ip in(%s)) without finding data", l.getKey(), vmLaunchServers))
 		return nil
 	}
 
+	var domainType int
+	domain, err := dbmgr.DBMgr[models.Domain](db).GetFromLcuuid(host.Domain)
+	if err != nil {
+		log.Warning(l.Logf("host(%s) domain(%s) not found", host.Name, host.Domain))
+	} else {
+		domainType = domain.Type
+	}
+
 	var vTapName, launchServer, az, region, lcuuid string
-	var vTapType, launchServerID int
-	if host.HType == HOST_HTYPE_ESXI {
+	var vTapType, launchServerID, cpuNum int
+	if host.HType == HOST_HTYPE_ESXI || domainType == CLOUD_TOWER {
 		vTapName = fmt.Sprintf("%s-H%d", host.Name, host.ID)
 		vTapType = VTAP_TYPE_ESXI
 		launchServer = host.IP
 		launchServerID = host.ID
+		cpuNum = host.VCPUNum
 		az = host.AZ
 		region = host.Region
 		lcuuid = uuid.NewString()
 	} else {
 		vm, ok := launchServerToVM[host.IP]
 		if ok == false {
-			log.Errorf("failed to register agent(%s), host_device(ip=%s) not found vm", host.IP)
+			log.Errorf(l.Logf("failed to register agent(%s), host_device(ip=%s) not found vm", l.getKey(), host.IP))
 			return nil
 		}
-		if utils.IsVMofBMHtype(vm.HType) == true {
+		if IsVMofBMHtype(vm.HType) == true {
 			vTapType = VTAP_TYPE_WORKLOAD_P
 		} else {
 			vTapType = VTAP_TYPE_WORKLOAD_V
@@ -595,6 +658,7 @@ func (l *VTapLKData) LookUpMirrorVTapByIP(db *gorm.DB) *VTapLKResult {
 		lcuuid = vm.Lcuuid
 	}
 	return &VTapLKResult{
+		CPUNum:         cpuNum,
 		VTapType:       vTapType,
 		LaunchServer:   launchServer,
 		LaunchServerID: launchServerID,
@@ -606,6 +670,7 @@ func (l *VTapLKData) LookUpMirrorVTapByIP(db *gorm.DB) *VTapLKResult {
 }
 
 func (r *VTapRegister) registerMirrorVTapByIP(db *gorm.DB) (*models.VTap, bool) {
+	r.setRegisterBy("registerMirrorVTapByIP")
 	vtapLKResult := r.LookUpMirrorVTapByIP(db)
 	if vtapLKResult == nil {
 		return nil, false
@@ -613,6 +678,7 @@ func (r *VTapRegister) registerMirrorVTapByIP(db *gorm.DB) (*models.VTap, bool) 
 	dbVTap := &models.VTap{
 		CtrlIP:          r.ctrlIP,
 		CtrlMac:         r.ctrlMac,
+		CPUNum:          vtapLKResult.CPUNum,
 		Type:            vtapLKResult.VTapType,
 		LaunchServer:    vtapLKResult.LaunchServer,
 		LaunchServerID:  vtapLKResult.LaunchServerID,
@@ -622,6 +688,7 @@ func (r *VTapRegister) registerMirrorVTapByIP(db *gorm.DB) (*models.VTap, bool) 
 		VtapGroupLcuuid: r.getVTapGroupLcuuid(db),
 		State:           VTAP_STATE_PENDING,
 		TapMode:         r.tapMode,
+		TeamID:          r.teamID,
 		Lcuuid:          vtapLKResult.Lcuuid,
 	}
 	result := r.insertToDB(dbVTap, db)
@@ -641,17 +708,16 @@ func (l *VTapLKData) LookUpLocalVTapByIP(db *gorm.DB) *VTapLKResult {
 	if len(vifIDs) == 0 {
 		return nil
 	}
-
 	vifs, err := dbmgr.DBMgr[models.VInterface](db).GetBatchVInterfaceFromIDs(
 		l.ctrlMac,
 		l.region,
 		VIF_DEVICE_TYPE_VM,
 		vifIDs)
 	if err != nil || len(vifs) == 0 {
-		log.Errorf("failed to register agent(%s) by querying DB table vinterface(mac=%s, region=%s, devicetype=%d, vifid in (%v)) without finding data",
-			l.getKey(), l.ctrlMac, l.region, VIF_DEVICE_TYPE_VM, vifIDs)
+		log.Errorf(l.Logf("failed to register agent(%s) by querying DB table vinterface(mac=%s, region=%s, devicetype=%d, vifid in (%v)) without finding data",
+			l.getKey(), l.ctrlMac, l.region, VIF_DEVICE_TYPE_VM, vifIDs))
 		if err != nil {
-			log.Error(err)
+			log.Error(l.Logf("%s", err))
 		}
 		return nil
 	}
@@ -663,14 +729,14 @@ func (l *VTapLKData) LookUpLocalVTapByIP(db *gorm.DB) *VTapLKResult {
 	}
 	vm, err := dbmgr.DBMgr[models.VM](db).GetFirstFromBatchIDs(deviceIDs)
 	if err != nil {
-		log.Errorf("failed to register agent(%s) by querying DB table vm(id in %v) without finding data, err: %s", l.getKey(), deviceIDs, err)
+		log.Errorf(l.Logf("failed to register agent(%s) by querying DB table vm(id in %v) without finding data, err: %s", l.getKey(), deviceIDs, err))
 		return nil
 	}
 	var (
 		vTapType     int
 		launchServer string
 	)
-	if utils.IsVMofBMHtype(vm.HType) == true {
+	if IsVMofBMHtype(vm.HType) == true {
 		vTapType = VTAP_TYPE_WORKLOAD_P
 	} else {
 		vTapType = VTAP_TYPE_WORKLOAD_V
@@ -694,6 +760,7 @@ func (l *VTapLKData) LookUpLocalVTapByIP(db *gorm.DB) *VTapLKResult {
 }
 
 func (r *VTapRegister) registerLocalVTapByIP(db *gorm.DB) (*models.VTap, bool) {
+	r.setRegisterBy("registerLocalVTapByIP")
 	vtapLKResult := r.LookUpLocalVTapByIP(db)
 	if vtapLKResult == nil {
 		return nil, false
@@ -710,6 +777,7 @@ func (r *VTapRegister) registerLocalVTapByIP(db *gorm.DB) (*models.VTap, bool) {
 		VtapGroupLcuuid: r.getVTapGroupLcuuid(db),
 		State:           VTAP_STATE_PENDING,
 		TapMode:         r.tapMode,
+		TeamID:          r.teamID,
 		Lcuuid:          vtapLKResult.Lcuuid,
 	}
 	result := r.insertToDB(dbVTap, db)
@@ -717,9 +785,10 @@ func (r *VTapRegister) registerLocalVTapByIP(db *gorm.DB) (*models.VTap, bool) {
 }
 
 func (r *VTapRegister) registerVTapAnalyzerTapMode(db *gorm.DB) (*models.VTap, bool) {
+	r.setRegisterBy("registerVTapAnalyzerTapMode")
 	az, err := dbmgr.DBMgr[models.AZ](db).GetFromRegion(r.region)
 	if err != nil {
-		log.Errorf("failed to register agent(%s), because no az in region %s", r.getKey(), r.region)
+		log.Errorf(r.Logf("failed to register agent(%s), because no az in region %s", r.getKey(), r.region))
 		return nil, false
 	}
 
@@ -734,6 +803,7 @@ func (r *VTapRegister) registerVTapAnalyzerTapMode(db *gorm.DB) (*models.VTap, b
 		VtapGroupLcuuid: r.getVTapGroupLcuuid(db),
 		State:           VTAP_STATE_PENDING,
 		TapMode:         r.tapMode,
+		TeamID:          r.teamID,
 		Lcuuid:          uuid.NewString(),
 	}
 	result := r.insertToDB(dbVTap, db)
@@ -748,7 +818,7 @@ func (r *VTapRegister) registerVTapByCtrlIP(db *gorm.DB) (*models.VTap, bool) {
 	lanIPMgr := dbmgr.DBMgr[models.LANIP](db)
 	lanIP, err := lanIPMgr.GetByOption(lanIPMgr.WithIP(r.ctrlIP))
 	if err != nil || lanIP == nil {
-		log.Errorf("failed to register agent(%s) by querying DB table vinterface_ip(ip = %s) without finding data", r.getKey(), r.ctrlIP)
+		log.Errorf(r.Logf("failed to register agent(%s) by querying DB table vinterface_ip(ip = %s) without finding data", r.getKey(), r.ctrlIP))
 		if err != nil {
 			log.Error(err)
 		}
@@ -784,7 +854,7 @@ func (r *VTapRegister) registerVTapByCtrlIP(db *gorm.DB) (*models.VTap, bool) {
 		return nil, false
 	}
 	var vTapType int
-	if utils.IsVMofBMHtype(vm.HType) == true {
+	if IsVMofBMHtype(vm.HType) == true {
 		vTapType = VTAP_TYPE_WORKLOAD_P
 	} else {
 		vTapType = VTAP_TYPE_WORKLOAD_V
@@ -802,6 +872,7 @@ func (r *VTapRegister) registerVTapByCtrlIP(db *gorm.DB) (*models.VTap, bool) {
 		VtapGroupLcuuid: r.getVTapGroupLcuuid(db),
 		State:           VTAP_STATE_PENDING,
 		TapMode:         r.tapMode,
+		TeamID:          r.teamID,
 		Lcuuid:          vm.Lcuuid,
 	}
 	result := r.insertToDB(dbVTap, db)
@@ -809,73 +880,72 @@ func (r *VTapRegister) registerVTapByCtrlIP(db *gorm.DB) (*models.VTap, bool) {
 }
 
 func (r *VTapRegister) registerVTapByCtrlIPMac(db *gorm.DB) (vtap *models.VTap, ok bool) {
-	for {
-		switch r.tapMode {
-		case TAPMODE_LOCAL:
-			vtap, ok = r.registerVTapByHost(db)
-			if ok == true {
-				break
-			}
-			vtap, ok = r.registerVTapByPodNode(db)
-			if ok == true {
-				break
-			}
-			vtap, ok = r.registerVTapByPod(db)
-			if ok == true {
-				break
-			}
-			vtap, ok = r.registerLocalVTapByIP(db)
-		case TAPMODE_MIRROR:
-			vtap, ok = r.registerVTapByHost(db)
-			if ok == true {
-				break
-			}
-			vtap, ok = r.registerVTapByPodNode(db)
-			if ok == true {
-				break
-			}
-			vtap, ok = r.registerVTapByPod(db)
-			if ok == true {
-				break
-			}
-			vtap, ok = r.registerMirrorVTapByIP(db)
-		case TAPMODE_ANALYZER:
-			vtap, ok = r.registerVTapAnalyzerTapMode(db)
-
-		default:
-			log.Errorf("unkown tap_mode(%d) from agent(%s)", r.tapMode, r.getKey())
+	switch r.tapMode {
+	case TAPMODE_LOCAL:
+		vtap, ok = r.registerVTapByHost(db)
+		if ok == true {
+			break
 		}
-		break
+		vtap, ok = r.registerVTapByPodNode(db)
+		if ok == true {
+			break
+		}
+		vtap, ok = r.registerVTapByPod(db)
+		if ok == true {
+			break
+		}
+		vtap, ok = r.registerLocalVTapByIP(db)
+	case TAPMODE_MIRROR:
+		vtap, ok = r.registerVTapByHost(db)
+		if ok == true {
+			break
+		}
+		vtap, ok = r.registerVTapByPodNode(db)
+		if ok == true {
+			break
+		}
+		vtap, ok = r.registerVTapByPod(db)
+		if ok == true {
+			break
+		}
+		vtap, ok = r.registerMirrorVTapByIP(db)
+	case TAPMODE_ANALYZER:
+		vtap, ok = r.registerVTapAnalyzerTapMode(db)
+
+	default:
+		log.Errorf(r.vTapInfo.Logf("unknown tap_mode(%d) from agent(%s)", r.tapMode, r.getKey()))
 	}
 
 	return
 }
 
-func (r *VTapRegister) registerVTap(v *VTapInfo, done func()) {
+func (r *VTapRegister) registerVTap(done func()) {
 	defer done()
+	v := r.vTapInfo
 	vtapMgr := dbmgr.DBMgr[models.VTap](v.db)
 	_, err := vtapMgr.GetByOption(
 		vtapMgr.WithCtrlIP(r.ctrlIP),
 		vtapMgr.WithCtrlMac(r.ctrlMac))
 	if err == nil {
-		log.Warningf(
+		log.Warningf(r.Logf(
 			"agent(ctrl_ip: %s ctrl_mac: %s) already exist on DB",
-			r.ctrlIP, r.ctrlMac)
+			r.ctrlIP, r.ctrlMac))
 		return
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-		log.Error(err)
+		log.Error(r.Log(err.Error()))
 		return
 	}
-	vtapConfig := v.GetVTapConfigFromShortID(r.vTapGroupID)
+	vtapConfig := r.vTapInfo.GetVTapConfigByNameOrShortUUID(r.vTapGroupID)
 	if vtapConfig != nil {
-		r.tapMode = vtapConfig.TapMode
+		r.tapMode = vtapConfig.GetConfigTapMode()
 	} else {
 		r.tapMode = DefaultTapMode
 	}
 	r.region = v.getRegion()
 	r.defaultVTapGroup = v.getDefaultVTapGroup()
+	r.defaultVTapGroupLicenseFunctions = v.getDefaultVTapGroupLicenseFunctions()
 	r.vTapAutoRegister = v.getVTapAutoRegister()
-	log.Infof("register vtap: %s", r)
+	log.Infof(r.Logf("register vtap: %s", r))
 	var vtap *models.VTap
 	ok := false
 	switch r.agentUniqueIdentifier {
@@ -884,14 +954,14 @@ func (r *VTapRegister) registerVTap(v *VTapInfo, done func()) {
 	case AGENT_IDENTIFIE_IP:
 		vtap, ok = r.registerVTapByCtrlIP(v.db)
 	default:
-		log.Errorf("unkown agent_unique_identifier(%d) from agent(%s)", r.agentUniqueIdentifier, r.getKey())
+		log.Errorf(r.Logf("unknown agent_unique_identifier(%d) from agent(%s)", r.agentUniqueIdentifier, r.getKey()))
 
 	}
 
 	if vtap != nil && ok == true {
 		v.AddVTapCache(vtap)
 		v.putChRegisterFisnish()
-		log.Infof("finish register vtap: %s", r)
+		log.Infof(r.Logf("finish register vtap: %s", r))
 	}
 }
 

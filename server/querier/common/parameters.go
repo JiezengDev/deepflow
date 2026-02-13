@@ -32,6 +32,9 @@ type QuerierParams struct {
 	DataSource    string
 	Context       context.Context
 	NoPreWhere    bool
+	ORGID         string
+	SimpleSql     bool
+	Language      string
 }
 
 type TempoParams struct {
@@ -66,6 +69,11 @@ func (p *TempoParams) SetFilters(filterStr string) {
 type KeyValue struct {
 	Key   string
 	Value string
+}
+
+type EntryKey struct {
+	ORGID  string
+	Filter string
 }
 
 type EntryValue struct {

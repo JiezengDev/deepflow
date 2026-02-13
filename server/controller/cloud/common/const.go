@@ -23,15 +23,6 @@ const (
 )
 
 const (
-	SECURITY_GROUP_RULE_ACCEPT  = 1
-	SECURITY_GROUP_RULE_DROP    = 2
-	SECURITY_GROUP_RULE_INGRESS = 1
-	SECURITY_GROUP_RULE_EGRESS  = 2
-	SECURITY_GROUP_IPV4         = 1
-	SECURITY_GROUP_IPV6         = 2
-)
-
-const (
 	PORT_RANGE_ALL = "0-65535"
 	PROTOCOL_ALL   = "ALL"
 )
@@ -53,4 +44,9 @@ const (
 
 const (
 	SVC_RULE_RESOURCE_NAME = "virtual-kubelet.io/provider-resource-name"
+)
+
+const (
+	K8S_VPC_NAME       = "kubernetes_vpc"
+	K8S_VERSION_PREFIX = "Kubernetes"
 )

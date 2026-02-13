@@ -17,31 +17,56 @@
 package tagrecorder
 
 import (
+	"slices"
+
 	"gorm.io/gorm/clause"
 
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type ChGProcess struct {
-	SubscriberComponent[*message.ProcessFieldsUpdate, message.ProcessFieldsUpdate, mysql.Process, mysql.ChGProcess, IDKey]
+	SubscriberComponent[
+		*message.AddedProcesses,
+		message.AddedProcesses,
+		*message.UpdatedProcess,
+		message.UpdatedProcess,
+		*message.DeletedProcesses,
+		message.DeletedProcesses,
+		metadbmodel.Process,
+		metadbmodel.ChGProcess,
+		IDKey,
+	]
 	resourceTypeToIconID map[IconKey]int
 }
 
 func NewChGProcess(resourceTypeToIconID map[IconKey]int) *ChGProcess {
 	mng := &ChGProcess{
-		newSubscriberComponent[*message.ProcessFieldsUpdate, message.ProcessFieldsUpdate, mysql.Process, mysql.ChGProcess, IDKey](
+		newSubscriberComponent[
+			*message.AddedProcesses,
+			message.AddedProcesses,
+			*message.UpdatedProcess,
+			message.UpdatedProcess,
+			*message.DeletedProcesses,
+			message.DeletedProcesses,
+			metadbmodel.Process,
+			metadbmodel.ChGProcess,
+			IDKey,
+		](
 			common.RESOURCE_TYPE_PROCESS_EN, RESOURCE_TYPE_CH_GPROCESS,
 		),
 		resourceTypeToIconID,
 	}
 	mng.subscriberDG = mng
+	mng.hookers[hookerDeletePage] = mng
+	mng.softDelete = true
 	return mng
 }
 
 // sourceToTarget implements SubscriberDataGenerator
-func (c *ChGProcess) sourceToTarget(source *mysql.Process) (keys []IDKey, targets []mysql.ChGProcess) {
+func (c *ChGProcess) sourceToTarget(md *message.Metadata, source *metadbmodel.Process) (keys []IDKey, targets []metadbmodel.ChGProcess) {
 	iconID := c.resourceTypeToIconID[IconKey{
 		NodeType: RESOURCE_TYPE_GPROCESS,
 	}]
@@ -49,41 +74,40 @@ func (c *ChGProcess) sourceToTarget(source *mysql.Process) (keys []IDKey, target
 	if source.DeletedAt.Valid {
 		sourceName += " (deleted)"
 	}
-
-	keys = append(keys, IDKey{ID: source.ID})
-	targets = append(targets, mysql.ChGProcess{
-		ID:      source.ID,
-		Name:    sourceName,
-		CHostID: source.VMID,
-		L3EPCID: source.VPCID,
-		IconID:  iconID,
+	gid := int(source.GID)
+	keys = append(keys, IDKey{ID: gid})
+	targets = append(targets, metadbmodel.ChGProcess{
+		ChIDBase:    metadbmodel.ChIDBase{ID: gid},
+		Name:        sourceName,
+		CHostID:     source.VMID,
+		L3EPCID:     source.VPCID,
+		IconID:      iconID,
+		TeamID:      md.GetTeamID(),
+		DomainID:    md.GetDomainID(),
+		SubDomainID: md.GetSubDomainID(),
 	})
 	return
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChGProcess) onResourceUpdated(sourceID int, fieldsUpdate *message.ProcessFieldsUpdate) {
-	updateInfo := make(map[string]interface{})
-	if fieldsUpdate.Name.IsDifferent() {
-		updateInfo["name"] = fieldsUpdate.Name.GetNew()
-	}
-	if fieldsUpdate.VMID.IsDifferent() {
-		updateInfo["chost_id"] = fieldsUpdate.VMID.GetNew()
-	}
-	if fieldsUpdate.VPCID.IsDifferent() {
-		updateInfo["l3_epc_id"] = fieldsUpdate.VPCID.GetNew()
-	}
-	if len(updateInfo) > 0 {
-		var chItem mysql.ChGProcess
-		mysql.Db.Where("id = ?", sourceID).First(&chItem)
-		c.SubscriberComponent.dbOperator.update(chItem, updateInfo, IDKey{ID: sourceID})
-	}
+func (c *ChGProcess) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedProcess) {
 }
 
 // softDeletedTargetsUpdated implements SubscriberDataGenerator
-func (c *ChGProcess) softDeletedTargetsUpdated(targets []mysql.ChGProcess) {
-	mysql.Db.Clauses(clause.OnConflict{
+func (c *ChGProcess) softDeletedTargetsUpdated(targets []metadbmodel.ChGProcess, db *metadb.DB) {
+	db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "id"}},
 		DoUpdates: clause.AssignmentColumns([]string{"name"}),
 	}).Create(&targets)
+}
+
+func (c *ChGProcess) beforeDeletePage(dbData []*metadbmodel.Process, msg *message.DeletedProcesses) []*metadbmodel.Process {
+	gids := msg.GetAddition().(*message.ProcessDeleteAddition).DeletedGIDs
+	newDatas := []*metadbmodel.Process{}
+	for _, item := range dbData {
+		if slices.Contains(gids, item.GID) {
+			newDatas = append(newDatas, item)
+		}
+	}
+	return newDatas
 }

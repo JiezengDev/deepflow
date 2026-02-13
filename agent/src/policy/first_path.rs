@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+use std::net::IpAddr;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, RwLock,
@@ -22,7 +23,7 @@ use std::sync::{
 use ahash::AHashMap;
 use log::{info, warn};
 
-use super::fast_path::FastPath;
+use super::fast_path::{EndpointTableType, FastPath};
 use super::{Error as PError, Result as PResult};
 use crate::common::endpoint::{EndpointData, FeatureFlags};
 use crate::common::lookup_key::LookupKey;
@@ -247,6 +248,7 @@ pub struct FirstPath {
     fast: FastPath,
 
     fast_disable: bool,
+    memory_check_disable: bool,
 
     memory_limit: AtomicU64,
 }
@@ -260,7 +262,13 @@ impl FirstPath {
     const POLICY_LIMIT: u64 = 500000;
     const MEMORY_LIMIT: u64 = 1 << 20;
 
-    pub fn new(queue_count: usize, level: usize, map_size: usize, fast_disable: bool) -> FirstPath {
+    pub fn new(
+        queue_count: usize,
+        level: usize,
+        map_size: usize,
+        fast_disable: bool,
+        memory_check_disable: bool,
+    ) -> FirstPath {
         FirstPath {
             group_ip_map: Some(AHashMap::new()),
             vector_4: Vector4::default(),
@@ -280,6 +288,7 @@ impl FirstPath {
 
             fast: FastPath::new(queue_count, map_size),
             fast_disable,
+            memory_check_disable,
             memory_limit: AtomicU64::new(0),
         }
     }
@@ -331,7 +340,6 @@ impl FirstPath {
         }
 
         if self.group_ip_map.is_none() {
-            warn!("IpGroup is nil, invalid acl: {}", acl);
             return false;
         }
 
@@ -343,7 +351,6 @@ impl FirstPath {
                 .get(&(*group as u16))
                 .is_none()
             {
-                warn!("Invalid acl by src group({}): {}", group, acl);
                 return true;
             }
         }
@@ -356,21 +363,31 @@ impl FirstPath {
                 .get(&(*group as u16))
                 .is_none()
             {
-                warn!("Invalid acl by dst group({}): {}", group, acl);
                 return true;
             }
         }
         return false;
     }
 
-    fn memory_check(&self, size: u64) -> bool {
+    fn memory_check(&self, size: u64, disabled: bool) -> bool {
+        if self.memory_check_disable || disabled {
+            return true;
+        }
+
         let Ok(current) = get_memory_rss() else {
             warn!("Cannot check policy memory: Get process memory failed.");
             return true;
         };
         let memory_limit = self.memory_limit.load(Ordering::Relaxed);
+        if memory_limit == 0 {
+            return true;
+        }
+        if current >= memory_limit {
+            warn!("The current memory usage is greater than the memory threshold, Please reconfigure the memory threshold.");
+            return false;
+        }
 
-        memory_limit == 0 || current + size < memory_limit
+        current + size < memory_limit
     }
 
     fn generate_acl_bits(&mut self, acls: &mut Vec<Acl>) -> PResult<u64> {
@@ -435,7 +452,7 @@ impl FirstPath {
                 * dst_ipv6_count
                 * acl.src_port_ranges.len().max(1)
                 * acl.dst_port_ranges.len().max(1);
-            if !self.memory_check(need_memory as u64) {
+            if !self.memory_check(need_memory as u64, false) {
                 warn!(
                     "Memory will exceed limit {} bytes, policy {} probably need memory {} bytes.",
                     self.memory_limit.load(Ordering::Relaxed),
@@ -551,7 +568,7 @@ impl FirstPath {
             let item_count = vector_4.count + vector_6.count;
             info!("Policy memory level {}, policy count {}, item count {} + {} = {}, vector size {}, probably need memory {}B bytes.",
                 self.current_level, policy_count, vector_4.count, vector_6.count, item_count, vector_size, need_memory + acl_memory);
-            ok = self.memory_check(need_memory);
+            ok = self.memory_check(need_memory, acls.is_empty());
             if !ok {
                 if self.current_level < Self::LEVEL_MAX && item_count > policy_count {
                     self.current_level += 1;
@@ -573,12 +590,22 @@ impl FirstPath {
         Ok(())
     }
 
-    pub fn update_acl(&mut self, acls: &Vec<Arc<Acl>>, check: bool) -> PResult<()> {
+    pub fn update_acl(
+        &mut self,
+        acls: &Vec<Arc<Acl>>,
+        check: bool,
+        enabled_invalid_log: bool,
+        has_invalid_log: &mut bool,
+    ) -> PResult<()> {
         if !NOT_SUPPORT {
             let mut valid_acls = Vec::new();
+            let mut invalid_acls = vec![];
 
             for acl in acls {
                 if self.is_invalid_acl(acl, check) {
+                    if enabled_invalid_log {
+                        invalid_acls.push(acl.id);
+                    }
                     continue;
                 }
                 let mut valid_acl = (**acl).clone();
@@ -586,6 +613,15 @@ impl FirstPath {
                 valid_acl.reset();
                 valid_acls.push(valid_acl);
             }
+
+            if enabled_invalid_log && !invalid_acls.is_empty() {
+                warn!(
+                    "Invalid acls: {:?}, maybe the IP resource group doesn't have an IP address.",
+                    invalid_acls
+                );
+                *has_invalid_log = true;
+            }
+
             self.generate_first_table(&mut valid_acls)?;
         }
 
@@ -599,6 +635,7 @@ impl FirstPath {
         self.fast.flush();
     }
 
+    #[inline]
     fn get_policy_from_table4(
         &self,
         field: &MatchedFieldv4,
@@ -617,6 +654,7 @@ impl FirstPath {
         }
     }
 
+    #[inline]
     fn get_policy_from_table6(
         &self,
         field: &MatchedFieldv6,
@@ -635,6 +673,7 @@ impl FirstPath {
         }
     }
 
+    #[inline]
     fn get_policy_from_table(
         &mut self,
         key: &mut LookupKey,
@@ -662,6 +701,7 @@ impl FirstPath {
         }
     }
 
+    #[inline]
     pub fn first_get(
         &mut self,
         key: &mut LookupKey,
@@ -688,6 +728,49 @@ impl FirstPath {
         return Some((forward_policy, forward_endpoints));
     }
 
+    pub fn endpoint_fast_get(
+        &mut self,
+        table_type: EndpointTableType,
+        ip_src: IpAddr,
+        ip_dst: IpAddr,
+        l3_epc_id_src: i32,
+        l3_epc_id_dst: i32,
+        l2_end_0: bool,
+    ) -> Option<Arc<EndpointData>> {
+        if self.fast_disable {
+            return None;
+        }
+
+        self.fast.get_endpoints(
+            table_type,
+            ip_src,
+            ip_dst,
+            l3_epc_id_src,
+            l3_epc_id_dst,
+            l2_end_0,
+        )
+    }
+
+    pub fn endpoint_fast_add(
+        &mut self,
+        table_type: EndpointTableType,
+        ip_src: IpAddr,
+        ip_dst: IpAddr,
+        l3_epc_id_src: i32,
+        l3_epc_id_dst: i32,
+        endpoints: EndpointData,
+    ) -> Arc<EndpointData> {
+        self.fast.add_endpoints(
+            table_type,
+            ip_src,
+            ip_dst,
+            l3_epc_id_src,
+            l3_epc_id_dst,
+            endpoints,
+        )
+    }
+
+    #[inline]
     pub fn fast_get(
         &mut self,
         key: &mut LookupKey,
@@ -727,7 +810,7 @@ mod tests {
 
     use super::*;
     use crate::common::endpoint::EndpointInfo;
-    use crate::common::enums::TapType;
+    use crate::common::enums::CaptureNetworkType;
     use crate::common::port_range::PortRange;
 
     use npb_pcap_policy::{NpbAction, NpbTunnelType, TapSide};
@@ -769,7 +852,7 @@ mod tests {
     }
 
     fn generate_table() -> PResult<FirstPath> {
-        let mut first = FirstPath::new(1, 8, 1 << 16, false);
+        let mut first = FirstPath::new(1, 8, 1 << 16, false, false);
         let acl = Acl::new(
             1,
             vec![10],
@@ -819,7 +902,7 @@ mod tests {
             src_port: 80,
             dst_port: 100,
             feature_flag: FeatureFlags::NONE,
-            tap_type: TapType::Cloud,
+            tap_type: CaptureNetworkType::Cloud,
             ..Default::default()
         };
 
@@ -854,7 +937,7 @@ mod tests {
             src_port: 80,
             dst_port: 100,
             feature_flag: FeatureFlags::DEDUP,
-            tap_type: TapType::Cloud,
+            tap_type: CaptureNetworkType::Cloud,
             ..Default::default()
         };
         let (policy, _) = first_get(&mut first, &mut key, endpotins).unwrap();

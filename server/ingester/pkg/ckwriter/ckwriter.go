@@ -19,32 +19,79 @@ package ckwriter
 import (
 	"context"
 	"fmt"
+	"net"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
+	server_common "github.com/deepflowio/deepflow/server/common"
 	"github.com/deepflowio/deepflow/server/ingester/common"
 	"github.com/deepflowio/deepflow/server/ingester/config"
 	"github.com/deepflowio/deepflow/server/libs/ckdb"
 	"github.com/deepflowio/deepflow/server/libs/grpc"
+	"github.com/deepflowio/deepflow/server/libs/nativetag"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 	"github.com/deepflowio/deepflow/server/libs/stats"
 	"github.com/deepflowio/deepflow/server/libs/utils"
 
-	clickhouse "github.com/ClickHouse/clickhouse-go/v2"
-	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+	"github.com/ClickHouse/ch-go"
+	"github.com/ClickHouse/ch-go/proto"
+
 	logging "github.com/op/go-logging"
 )
 
 var log = logging.MustGetLogger("ckwriter")
 
 const (
-	FLUSH_TIMEOUT        = 10 * time.Second
-	SQL_LOG_LENGTH       = 256
-	MAX_ORGANIZATINON_ID = 1024
+	FLUSH_TIMEOUT     = 10 * time.Second
+	SQL_LOG_LENGTH    = 256
+	SQL_RESULT_LENGTH = 1024
+	RETRY_COUNT       = 2
 )
+
+var ckwriterManager = &CKWriterManager{}
+
+type CKWriterManager struct {
+	ckwriters []*CKWriter
+	sync.Mutex
+}
+
+func RegisterToCkwriterManager(w *CKWriter) {
+	ckwriterManager.Lock()
+	if len(ckwriterManager.ckwriters) == 0 {
+		server_common.SetOrgHandler(ckwriterManager)
+		config.AddClickHouseEndpointsOnChange(ckwriterManager)
+	}
+	ckwriterManager.ckwriters = append(ckwriterManager.ckwriters, w)
+	ckwriterManager.Unlock()
+}
+
+func (m *CKWriterManager) DropOrg(orgId uint16) error {
+	log.Infof("call ckwriters drop org %d", orgId)
+	ckwriterManager.Lock()
+	for _, ckwriter := range m.ckwriters {
+		log.Infof("ckwriter %s drop org %d", ckwriter.name, orgId)
+		ckwriter.dropOrg(orgId)
+	}
+	ckwriterManager.Unlock()
+	return nil
+}
+
+func (m *CKWriterManager) UpdateNativeTag(op nativetag.NativeTagOP, orgId uint16, nativeTag *nativetag.NativeTag) error {
+	return nil
+}
+
+func (m *CKWriterManager) EndpointsChange(addrs []string) {
+	ckwriterManager.Lock()
+	for _, ckwriter := range m.ckwriters {
+		log.Infof("ckwriter %s addrs change from %s to %s ", ckwriter.name, ckwriter.addrs, addrs)
+		ckwriter.addrs = utils.CloneStringSlice(addrs)
+		ckwriter.endpointsChange(addrs)
+	}
+	ckwriterManager.Unlock()
+}
 
 type CKWriter struct {
 	addrs         []string
@@ -58,37 +105,180 @@ type CKWriter struct {
 	flushDuration time.Duration // 超时写入
 	counterName   string        // 写入成功失败的统计数据表名称，若写入失败，会根据该数据上报告警
 
-	name         string // 数据库名-表名 用作 queue名字和counter名字
-	prepare      string // 写入数据时，先执行prepare
-	conns        []clickhouse.Conn
-	batchs       []driver.Batch
-	connCount    uint64
-	dataQueues   queue.FixedMultiQueue
-	counters     []Counter
-	putCounter   int
-	writeCounter uint64
-	ckdbwatcher  *config.Watcher
+	name          string // 数据库名-表名 用作 queue名字和counter名字
+	dataQueues    queue.FixedMultiQueue
+	putCounter    int
+	ckdbwatcher   *config.Watcher
+	queueContexts []*QueueContext
 
 	wg   sync.WaitGroup
 	exit bool
 }
 
-type CKItem interface {
-	WriteBlock(block *ckdb.Block)
-	OrgID() uint16
-	Release()
+type QueueContext struct {
+	endpointsChange bool
+	orgCaches       []*Cache // write caches for all organizations
+	addrs           []string
+	user, password  string
+	conns           []*ch.Client
+	connCount       int
+	counter         Counter
 }
 
-func ExecSQL(conn clickhouse.Conn, query string) error {
+func (qc *QueueContext) EndpointsChange(addrs []string) {
+	if !qc.endpointsChange || len(addrs) == 0 {
+		return
+	}
+	for _, conn := range qc.conns {
+		if conn != nil {
+			conn.Close()
+		}
+	}
+	qc.connCount = len(addrs)
+	qc.conns = make([]*ch.Client, qc.connCount)
+	for i, addr := range addrs {
+		client, err := ch.Dial(
+			context.Background(),
+			ch.Options{
+				Address:          addr,
+				User:             qc.user,
+				Password:         qc.password,
+				HandshakeTimeout: time.Minute,
+				DialTimeout:      5 * time.Second,
+			},
+		)
+
+		if err != nil {
+			log.Warningf("dial to %s failed, %s", addr, err)
+		} else {
+			qc.conns[i] = client
+		}
+	}
+	qc.addrs = addrs
+	qc.endpointsChange = false
+	for _, cache := range qc.orgCaches {
+		cache.tableCreated = false
+	}
+}
+
+func (qc *QueueContext) Init(addrs []string, user, password string, table *ckdb.Table) error {
+	qc.addrs = addrs
+	qc.connCount = len(addrs)
+	qc.conns = make([]*ch.Client, qc.connCount)
+	for i := 0; i < qc.connCount; i++ {
+		client, err := ch.Dial(
+			context.Background(),
+			ch.Options{
+				Address:          addrs[i],
+				User:             user,
+				Password:         password,
+				HandshakeTimeout: time.Minute,
+				DialTimeout:      5 * time.Second,
+			},
+		)
+		if err != nil {
+			log.Warningf("dial to %s failed, %s", addrs[i], err)
+		}
+		qc.conns[i] = client
+	}
+	orgCaches := make([]*Cache, ckdb.MAX_ORG_ID+1)
+	for i := range orgCaches {
+		orgCaches[i] = new(Cache)
+		orgCaches[i].orgID = uint16(i)
+		orgCaches[i].queueContext = qc
+		insertTable := fmt.Sprintf("%s.`%s`", table.OrgDatabase(uint16(i)), table.LocalName)
+		orgCaches[i].prepare = fmt.Sprintf("INSERT INTO %s VALUES", insertTable)
+	}
+	qc.orgCaches = orgCaches
+	qc.user, qc.password = user, password
+	return nil
+}
+
+func (qc *QueueContext) initConn(connIndex int) error {
+	if len(qc.addrs) <= connIndex {
+		return fmt.Errorf("conn index (%d) is exceeded address range (%d)", connIndex, len(qc.addrs))
+	}
+	client, err := ch.Dial(
+		context.Background(),
+		ch.Options{
+			Address:          qc.addrs[connIndex],
+			User:             qc.user,
+			Password:         qc.password,
+			HandshakeTimeout: time.Minute,
+			DialTimeout:      5 * time.Second,
+		},
+	)
+	if err != nil {
+		if qc.counter.WriteFailedCount == 0 {
+			log.Warningf("dial to %s failed, %s", qc.addrs[connIndex], err)
+		}
+	} else {
+		qc.conns[connIndex] = client
+	}
+	return err
+}
+
+type CKItem interface {
+	OrgID() uint16
+	Release()
+	NativeTagVersion() uint32
+	NewColumnBlock() ckdb.CKColumnBlock
+	AppendToColumnBlock(ckdb.CKColumnBlock)
+}
+
+func ExecSQL(conn *ch.Client, query string) error {
 	if len(query) > SQL_LOG_LENGTH {
 		log.Infof("Exec SQL: %s ...", query[:SQL_LOG_LENGTH])
 	} else {
 		log.Info("Exec SQL: ", query)
 	}
-	return conn.Exec(context.Background(), query)
+	err := conn.Do(context.Background(), ch.Query{Body: query})
+	retryTimes := RETRY_COUNT
+	for err != nil && retryTimes > 0 {
+		log.Warningf("Exec SQL (%s) failed: %s, will retry", query, err)
+		time.Sleep(time.Second)
+		err = conn.Do(context.Background(), ch.Query{Body: query})
+		if err == nil {
+			log.Infof("Retry exec SQL (%s) success", query)
+			return nil
+		}
+		retryTimes--
+	}
+	return err
 }
 
-func initTable(conn clickhouse.Conn, timeZone string, t *ckdb.Table, orgID uint16) error {
+func QuerySingleStringColumn(conn *ch.Client, query, columnName string) (string, error) {
+	if len(query) > SQL_LOG_LENGTH {
+		log.Infof("Query SQL: %s ...", query[:SQL_LOG_LENGTH])
+	} else {
+		log.Info("Query SQL: ", query)
+	}
+
+	var columnData proto.ColStr
+	if err := conn.Do(context.Background(), ch.Query{
+		Body: query,
+		Result: proto.Results{
+			{Name: columnName, Data: &columnData},
+		},
+	}); err != nil {
+		log.Errorf("query failed: %v", err)
+	}
+
+	var result strings.Builder
+	for i := 0; i < columnData.Rows(); i++ {
+		result.WriteString(columnData.Row(i))
+		result.WriteString("\n")
+	}
+	r := result.String()
+	if len(query) > SQL_RESULT_LENGTH {
+		log.Infof("Query SQL result: %s ...", r[:SQL_RESULT_LENGTH])
+	} else {
+		log.Info("Query SQL result: ", r)
+	}
+	return r, nil
+}
+
+func initTable(conn *ch.Client, timeZone string, t *ckdb.Table, orgID uint16) error {
 	if err := ExecSQL(conn, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", t.OrgDatabase(orgID))); err != nil {
 		return err
 	}
@@ -99,10 +289,73 @@ func initTable(conn clickhouse.Conn, timeZone string, t *ckdb.Table, orgID uint1
 	if err := ExecSQL(conn, t.MakeOrgGlobalTableCreateSQL(orgID)); err != nil {
 		return err
 	}
-	for _, view := range t.MakeViewsCreateSQLForDeepflowSystem(orgID) {
-		if err := ExecSQL(conn, view); err != nil {
-			return err
+
+	if t.Aggr1H1D {
+		aggrTableCreateSQL, err := QuerySingleStringColumn(conn, fmt.Sprintf("SHOW CREATE TABLE %s", t.AggrTable1H(orgID)), "statement")
+		if err != nil {
+			log.Warningf("query 1h agg table failed: %s", err)
 		}
+		if t.IsAggrTableWrong(aggrTableCreateSQL) {
+			if err := ExecSQL(conn, t.MakeAggrTableDropSQL1H(orgID)); err != nil {
+				log.Warningf("drop 1h agg table failed: %s", err)
+			}
+		}
+
+		if err := ExecSQL(conn, t.MakeAggrTableCreateSQL1H(orgID)); err != nil {
+			log.Warningf("create 1h agg table failed: %s", err)
+		}
+		if err := ExecSQL(conn, t.MakeAggrMVTableCreateSQL1H(orgID)); err != nil {
+			log.Warningf("create 1h mv table failed: %s", err)
+		}
+		if err := ExecSQL(conn, t.MakeAggrLocalTableCreateSQL1H(orgID)); err != nil {
+			log.Warningf("create 1h local table failed: %s", err)
+		}
+		if err := ExecSQL(conn, t.MakeAggrGlobalTableCreateSQL1H(orgID)); err != nil {
+			log.Warningf("create 1h global table failed: %s", err)
+		}
+
+		aggrTableCreateSQL, err = QuerySingleStringColumn(conn, fmt.Sprintf("SHOW CREATE TABLE %s", t.AggrTable1D(orgID)), "statement")
+		if err != nil {
+			log.Warningf("query 1d agg table failed: %s", err)
+		}
+		if t.IsAggrTableWrong(aggrTableCreateSQL) {
+			if err := ExecSQL(conn, t.MakeAggrTableDropSQL1D(orgID)); err != nil {
+				log.Warningf("drop 1d agg table failed: %s", err)
+			}
+		}
+		if err := ExecSQL(conn, t.MakeAggrTableCreateSQL1D(orgID)); err != nil {
+			log.Warningf("create 1d agg table failed: %s", err)
+		}
+		if err := ExecSQL(conn, t.MakeAggrMVTableCreateSQL1D(orgID)); err != nil {
+			log.Warningf("create 1d mv table failed: %s", err)
+		}
+		if err := ExecSQL(conn, t.MakeAggrLocalTableCreateSQL1D(orgID)); err != nil {
+			log.Warningf("create 1d local table failed: %s", err)
+		}
+		if err := ExecSQL(conn, t.MakeAggrGlobalTableCreateSQL1D(orgID)); err != nil {
+			log.Warningf("create 1d global table failed: %s", err)
+		}
+	}
+
+	if t.Aggr1S {
+		if err := ExecSQL(conn, t.MakeAggrTableCreateSQL1S(orgID)); err != nil {
+			log.Warningf("create 1s agg table failed: %s", err)
+		}
+		if err := ExecSQL(conn, t.MakeAggrMVTableCreateSQL1S(orgID)); err != nil {
+			log.Warningf("create 1s mv table failed: %s", err)
+		}
+		if err := ExecSQL(conn, t.MakeAggrLocalTableCreateSQL1S(orgID)); err != nil {
+			log.Warningf("create 1s local table failed: %s", err)
+		}
+		if err := ExecSQL(conn, t.MakeAggrGlobalTableCreateSQL1S(orgID)); err != nil {
+			log.Warningf("create 1s global table failed: %s", err)
+		}
+
+	}
+
+	// ByConity not support modify timezone
+	if t.DBType == ckdb.CKDBTypeByconity {
+		return nil
 	}
 
 	for _, c := range t.Columns {
@@ -122,14 +375,16 @@ func initTable(conn clickhouse.Conn, timeZone string, t *ckdb.Table, orgID uint1
 }
 
 func InitTable(addr, user, password, timeZone string, t *ckdb.Table, orgID uint16) error {
-	conn, err := clickhouse.Open(&clickhouse.Options{
-		Addr: []string{addr},
-		Auth: clickhouse.Auth{
-			Database: "default",
-			Username: user,
-			Password: password,
+	conn, err := ch.Dial(
+		context.Background(),
+		ch.Options{
+			Address:          addr,
+			User:             user,
+			Password:         password,
+			HandshakeTimeout: time.Minute,
+			DialTimeout:      5 * time.Second,
 		},
-	})
+	)
 	if err != nil {
 		return err
 	}
@@ -143,8 +398,15 @@ func InitTable(addr, user, password, timeZone string, t *ckdb.Table, orgID uint1
 	return nil
 }
 
-func (w *CKWriter) InitTable(orgID uint16) error {
-	for _, conn := range w.conns {
+func (w *CKWriter) InitTable(queueID int, orgID uint16) error {
+	queueContext := w.queueContexts[queueID]
+	for i, conn := range queueContext.conns {
+		if conn == nil || conn.IsClosed() {
+			if err := queueContext.initConn(i); err != nil {
+				return err
+			}
+			conn = queueContext.conns[i]
+		}
 		if err := initTable(conn, w.timeZone, w.table, orgID); err != nil {
 			return err
 		}
@@ -162,7 +424,7 @@ func (w *CKWriter) InitTable(orgID uint16) error {
 	}
 
 	for _, endpoint := range endpoints {
-		err := InitTable(fmt.Sprintf("%s:%d", endpoint.Host, endpoint.Port), w.user, w.password, w.timeZone, w.table, orgID)
+		err := InitTable(net.JoinHostPort(endpoint.Host, fmt.Sprintf("%d", endpoint.Port)), w.user, w.password, w.timeZone, w.table, orgID)
 		if err != nil {
 			log.Warningf("node %s:%d init table failed. err: %s", endpoint.Host, endpoint.Port, err)
 		} else {
@@ -186,7 +448,9 @@ func NewCKWriter(addrs []string, user, password, counterName, timeZone string, t
 	// clickhouse init default organization database/tables
 	for _, addr := range addrs {
 		orgIds := grpc.QueryAllOrgIDs()
-		log.Infof("database %s get orgIDs: %v", table.Database, orgIds)
+		if len(orgIds) > 1 {
+			log.Infof("database %s get orgIDs: %v", table.Database, orgIds)
+		}
 		for _, orgId := range orgIds {
 			if err = InitTable(addr, user, password, timeZone, table, orgId); err != nil {
 				return nil, err
@@ -194,23 +458,13 @@ func NewCKWriter(addrs []string, user, password, counterName, timeZone string, t
 		}
 	}
 
-	addrCount := len(addrs)
-	conns := make([]clickhouse.Conn, addrCount)
-	batchs := make([]driver.Batch, queueCount*addrCount)
-	for i := 0; i < addrCount; i++ {
-		if conns[i], err = clickhouse.Open(&clickhouse.Options{
-			Addr: []string{addrs[i]},
-			Auth: clickhouse.Auth{
-				Database: "default",
-				Username: user,
-				Password: password,
-			},
-			ConnMaxLifetime: time.Hour * 24,
-		}); err != nil {
+	queueContexts := make([]*QueueContext, queueCount)
+	for i := range queueContexts {
+		queueContexts[i] = &QueueContext{}
+		if err := queueContexts[i].Init(addrs, user, password, table); err != nil {
 			return nil, err
 		}
 	}
-
 	name := fmt.Sprintf("%s-%s-%s", table.Database, table.LocalName, counterName)
 	dataQueues := queue.NewOverwriteQueues(
 		name, queue.HashKey(queueCount), queueSize,
@@ -218,8 +472,8 @@ func NewCKWriter(addrs []string, user, password, counterName, timeZone string, t
 		queue.OptionRelease(func(p interface{}) { p.(CKItem).Release() }),
 		common.QUEUE_STATS_MODULE_INGESTER)
 
-	return &CKWriter{
-		addrs:         addrs,
+	w := &CKWriter{
+		addrs:         utils.CloneStringSlice(addrs),
 		user:          user,
 		password:      password,
 		timeZone:      timeZone,
@@ -229,16 +483,29 @@ func NewCKWriter(addrs []string, user, password, counterName, timeZone string, t
 		batchSize:     batchSize,
 		flushDuration: time.Duration(flushTimeout) * time.Second,
 		counterName:   counterName,
+		queueContexts: queueContexts,
 
 		name:        name,
-		prepare:     table.MakePrepareTableInsertSQL(),
-		conns:       conns,
-		batchs:      batchs,
-		connCount:   uint64(len(conns)),
 		dataQueues:  dataQueues,
-		counters:    make([]Counter, queueCount),
 		ckdbwatcher: ckdbwatcher,
-	}, nil
+	}
+	RegisterToCkwriterManager(w)
+	return w, nil
+}
+
+func (w *CKWriter) dropOrg(orgId uint16) {
+	for i, qc := range w.queueContexts {
+		log.Debugf("ckwriter %s queue %d drop org %d", w.name, i, orgId)
+		qc.orgCaches[orgId].dropTime = uint32(time.Now().Unix())
+		qc.orgCaches[orgId].tableCreated = false
+	}
+}
+
+func (w *CKWriter) endpointsChange(addrs []string) {
+	for i := 0; i < len(w.queueContexts); i++ {
+		log.Debugf("ckwriter %s queue %d endpoints will change to %s", w.name, i, addrs)
+		w.queueContexts[i].endpointsChange = true
+	}
 }
 
 func (w *CKWriter) Run() {
@@ -277,137 +544,181 @@ func (w *CKWriter) Put(items ...interface{}) {
 }
 
 type Cache struct {
+	queueContext  *QueueContext
 	orgID         uint16
 	prepare       string
-	items         []CKItem
+	columnBlock   ckdb.CKColumnBlock
+	ItemVersion   uint32
+	protoInput    proto.Input
+	size          int
+	writeCounter  int
 	lastWriteTime time.Time
 	tableCreated  bool
+	dropTime      uint32
 }
 
 func (c *Cache) Release() {
-	for _, item := range c.items {
-		item.Release()
+	c.size = 0
+	c.columnBlock = nil
+	c.protoInput = nil
+}
+
+func (c *Cache) OrgIdExists() bool {
+	updateTime, exists := grpc.QueryOrgIDExist(c.orgID)
+	if updateTime == 0 || c.dropTime == 0 {
+		return exists
 	}
-	c.items = c.items[:0]
+	// dropped but not update org id list, return false
+	if updateTime <= c.dropTime {
+		return false
+	}
+	c.dropTime = 0
+	return exists
 }
 
 func (w *CKWriter) queueProcess(queueID int) {
-	common.RegisterCountableForIngester("ckwriter", &(w.counters[queueID]), stats.OptionStatTags{"thread": strconv.Itoa(queueID), "table": w.name, "name": w.counterName})
-	defer w.wg.Done()
+	qc := w.queueContexts[queueID]
+	common.RegisterCountableForIngester("ckwriter", &(qc.counter), stats.OptionStatTags{"thread": strconv.Itoa(queueID), "table": w.name, "name": w.counterName})
+
 	w.wg.Add(1)
+	defer w.wg.Done()
 
 	rawItems := make([]interface{}, 1024)
-	var cache *Cache
-	orgCaches := make([]*Cache, MAX_ORGANIZATINON_ID+1)
-	for i := range orgCaches {
-		orgCaches[i] = new(Cache)
-		orgCaches[i].items = make([]CKItem, 0)
-		orgCaches[i].orgID = uint16(i)
-		orgCaches[i].prepare = w.table.MakeOrgPrepareTableInsertSQL(uint16(i))
-	}
+	orgCaches := qc.orgCaches
 
 	for !w.exit {
 		n := w.dataQueues.Gets(queue.HashKey(queueID), rawItems)
 		for i := 0; i < n; i++ {
 			item := rawItems[i]
-			if ck, ok := item.(CKItem); ok {
-				orgID := ck.OrgID()
-				if orgID > MAX_ORGANIZATINON_ID {
-					if w.counters[queueID].OrgInvalidCount == 0 {
-						log.Warningf("get writer queue(%s) data orgID wrong %d", w.name, orgID)
+			if ckItem, ok := item.(CKItem); ok {
+				orgID := ckItem.OrgID()
+				if orgID > ckdb.MAX_ORG_ID {
+					if qc.counter.OrgInvalidCount == 0 {
+						log.Warningf("writer queue (%s) item wrong orgID %d", w.name, orgID)
 					}
-					w.counters[queueID].OrgInvalidCount++
+					qc.counter.OrgInvalidCount++
 					continue
 				}
-				cache = orgCaches[orgID]
-				cache.items = append(cache.items, ck)
-				if len(cache.items) >= w.batchSize {
+				cache := orgCaches[orgID]
+				cache.Add(ckItem)
+				if cache.size >= w.batchSize {
 					w.Write(queueID, cache)
-					cache.lastWriteTime = time.Now()
 				}
 			} else if IsNil(item) { // flush ticker
 				now := time.Now()
 				for _, cache := range orgCaches {
-					if len(cache.items) > 0 && now.Sub(cache.lastWriteTime) > w.flushDuration {
+					if cache.size > 0 && now.Sub(cache.lastWriteTime) > w.flushDuration {
 						w.Write(queueID, cache)
-						cache.lastWriteTime = now
 					}
 				}
 			} else {
-				log.Warningf("get writer queue data type wrong %T", ck)
+				log.Warningf("get writer queue data type wrong %T", item)
 			}
 		}
 	}
 }
 
-func (w *CKWriter) ResetConnection(connID int) error {
-	var err error
-	// FIXME: do reset actually
-	if !IsNil(w.conns[connID]) {
+func (c *Cache) Add(item CKItem) error {
+	if IsNil(c.columnBlock) ||
+		(c.size == 0 && c.ItemVersion != item.NativeTagVersion()) {
+		c.columnBlock = item.NewColumnBlock()
+		log.Infof("orgId %d (%s) update item version from %d to %d", c.orgID, c.prepare, c.ItemVersion, item.NativeTagVersion())
+		c.ItemVersion = item.NativeTagVersion()
+	}
+	item.AppendToColumnBlock(c.columnBlock)
+	item.Release()
+	c.size++
+	return nil
+}
+
+func (c *Cache) Write() error {
+	if c.size == 0 {
 		return nil
 	}
-	w.conns[connID], err = clickhouse.Open(&clickhouse.Options{
-		Addr: []string{w.addrs[connID]},
-		Auth: clickhouse.Auth{
-			Database: "default",
-			Username: w.user,
-			Password: w.password,
-		},
+
+	connIndex := c.writeCounter % c.queueContext.connCount
+	conn := c.queueContext.conns[connIndex]
+	if conn == nil || conn.IsClosed() {
+		if err := c.queueContext.initConn(connIndex); err != nil {
+			c.writeCounter++
+			c.lastWriteTime = time.Now()
+			c.size = 0
+			c.columnBlock.Reset()
+			return err
+		}
+		conn = c.queueContext.conns[connIndex]
+	}
+	c.protoInput = c.protoInput[:0]
+	input := c.columnBlock.ToInput(c.protoInput)
+	c.protoInput = input
+
+	err := conn.Do(context.Background(), ch.Query{
+		Body:  c.prepare,
+		Input: input,
 	})
+	c.writeCounter++
+	c.lastWriteTime = time.Now()
+	c.size = 0
+	c.columnBlock.Reset()
+	if err != nil {
+		return fmt.Errorf("batch item write block failed: %s", err)
+	}
+	return nil
+}
+
+func (w *CKWriter) ResetConnection(queueID, connID int) error {
+	var err error
+	// FIXME: do reset actually
+	if !IsNil(w.queueContexts[queueID].conns[connID]) {
+		return nil
+	}
+	w.queueContexts[queueID].conns[connID], err = ch.Dial(
+		context.Background(),
+		ch.Options{
+			Address:          w.addrs[connID],
+			User:             w.user,
+			Password:         w.password,
+			HandshakeTimeout: time.Minute,
+			DialTimeout:      5 * time.Second,
+		},
+	)
 	return err
 }
 
 func (w *CKWriter) Write(queueID int, cache *Cache) {
-	connID := int(atomic.AddUint64(&w.writeCounter, 1) % w.connCount)
-	itemsLen := len(cache.items)
+	qc := w.queueContexts[queueID]
+	qc.EndpointsChange(w.addrs)
+	itemsLen := cache.size
 	// Prevent frequent log writing
-	logEnabled := w.counters[queueID].WriteFailedCount == 0
+	logEnabled := qc.counter.WriteFailedCount == 0
+	if !cache.OrgIdExists() {
+		if logEnabled {
+			log.Warningf("table (%s.%s) orgId is not exist, drop (%d) items", w.table.OrgDatabase(cache.orgID), w.table.LocalName, itemsLen)
+		}
+		qc.counter.OrgInvalidCount += int64(itemsLen)
+		cache.Release()
+		return
+	}
 	if !cache.tableCreated {
-		err := w.InitTable(cache.orgID)
+		err := w.InitTable(queueID, cache.orgID)
 		if err != nil {
 			if logEnabled {
-				log.Warningf("create table(%s.%s) failed, drop(%d) items: %s", w.table.OrgDatabase(cache.orgID), w.table.LocalName, itemsLen, err)
+				log.Warningf("create table (%s.%s) failed, drop (%d) items: %s", w.table.OrgDatabase(cache.orgID), w.table.LocalName, itemsLen, err)
 			}
-			w.counters[queueID].WriteFailedCount += int64(itemsLen)
+			qc.counter.WriteFailedCount += int64(itemsLen)
 			cache.Release()
 			return
 		}
 		cache.tableCreated = true
 	}
-	if err := w.writeItems(queueID, connID, cache); err != nil {
+	if err := cache.Write(); err != nil {
 		if logEnabled {
-			log.Warningf("write table(%s.%s) failed, will retry write(%d) items: %s", w.table.OrgDatabase(cache.orgID), w.table.LocalName, itemsLen, err)
+			log.Warningf("write table (%s.%s) failed, drop (%d) items: %s", w.table.OrgDatabase(cache.orgID), w.table.LocalName, itemsLen, err)
 		}
-		if err := w.ResetConnection(connID); err != nil {
-			log.Warningf("reconnect clickhouse failed: %s", err)
-			time.Sleep(time.Second * 10)
-		} else {
-			if logEnabled {
-				log.Infof("reconnect clickhouse success: %s %s", w.table.OrgDatabase(cache.orgID), w.table.LocalName)
-			}
-		}
-
-		w.counters[queueID].RetryCount++
-		// 写失败重连后重试一次, 规避偶尔写失败问题
-		err = w.writeItems(queueID, connID, cache)
-		if logEnabled {
-			if err != nil {
-				w.counters[queueID].RetryFailedCount++
-				log.Warningf("retry write table(%s.%s) failed, drop(%d) items: %s", w.table.OrgDatabase(cache.orgID), w.table.LocalName, itemsLen, err)
-			} else {
-				log.Infof("retry write table(%s.%s) success, write(%d) items", w.table.OrgDatabase(cache.orgID), w.table.LocalName, itemsLen)
-			}
-		}
-		if err != nil {
-			w.counters[queueID].WriteFailedCount += int64(itemsLen)
-		} else {
-			w.counters[queueID].WriteSuccessCount += int64(itemsLen)
-		}
+		qc.counter.WriteFailedCount += int64(itemsLen)
 	} else {
-		w.counters[queueID].WriteSuccessCount += int64(itemsLen)
+		qc.counter.WriteSuccessCount += int64(itemsLen)
 	}
-
-	cache.Release()
 }
 
 func IsNil(i interface{}) bool {
@@ -421,61 +732,17 @@ func IsNil(i interface{}) bool {
 	return false
 }
 
-func (w *CKWriter) writeItems(queueID, connID int, cache *Cache) error {
-	if len(cache.items) == 0 {
-		return nil
-	}
-	ck := w.conns[connID]
-	if IsNil(ck) {
-		if err := w.ResetConnection(connID); err != nil {
-			time.Sleep(time.Second * 10)
-			return fmt.Errorf("can not connect to clickhouse: %s", err)
-		}
-		ck = w.conns[connID]
-	}
-	var err error
-	batchID := queueID*int(w.connCount) + connID
-	batch := w.batchs[batchID]
-	if IsNil(batch) {
-		w.batchs[batchID], err = ck.PrepareBatch(context.Background(), cache.prepare)
-		if err != nil {
-			return err
-		}
-		batch = w.batchs[batchID]
-	} else {
-		batch, err = ck.PrepareReuseBatch(context.Background(), cache.prepare, batch)
-		if err != nil {
-			return err
-		}
-		w.batchs[batchID] = batch
-	}
-
-	ckdbBlock := ckdb.NewBlock(batch)
-	for _, item := range cache.items {
-		item.WriteBlock(ckdbBlock)
-		if err := ckdbBlock.WriteAll(); err != nil {
-			return fmt.Errorf("item write block failed: %s", err)
-		}
-	}
-	if err = ckdbBlock.Send(); err != nil {
-		return fmt.Errorf("send write block failed: %s", err)
-	} else {
-		log.Debugf("batch write success, table (%s.%s) commit %d items", w.table.Database, w.table.LocalName, len(cache.items))
-	}
-	return nil
-}
-
 func (w *CKWriter) Close() {
 	w.exit = true
 	w.wg.Wait()
-	for i, c := range w.conns {
-		if !IsNil(c) {
-			c.Close()
-			w.conns[i] = nil
+	for _, qc := range w.queueContexts {
+		for i, c := range qc.conns {
+			if !IsNil(c) {
+				c.Close()
+				qc.conns[i] = nil
+			}
 		}
-	}
-	for _, c := range w.counters {
-		c.Close()
+		qc.counter.Close()
 	}
 
 	for _, q := range w.dataQueues {

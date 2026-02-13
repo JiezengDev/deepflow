@@ -24,7 +24,7 @@
 #include <string.h>
 #include <assert.h>
 #include <errno.h>
-#include "common.h"
+#include "utils.h"
 #include "list.h"
 
 #define UNIX_DOMAIN_DEF "/var/run/deepflow_bpf_ctrl"
@@ -38,6 +38,10 @@ typedef uint32_t sockoptid_t;
           (SOCKOPT_VERSION_MINOR << 8) + SOCKOPT_VERSION_PATCH)
 
 #define SOCKOPT_ERRSTR_LEN  64
+
+#ifndef ADDRSTRLEN
+#define ADDRSTRLEN 46 // Compatible with both IPv4 and IPv6
+#endif
 
 enum sockopt_type {
 	SOCKOPT_GET = 0,
@@ -83,11 +87,18 @@ struct datadump_msg {
 	int pid;
 	uint8_t proto;
 	char comm[16];
+	char ipaddr[ADDRSTRLEN];
+	unsigned short port;
 };
 
 struct cpdbg_msg {
 	bool enable;		// Whether to enable the datadump ?
 	int timeout;
+};
+
+struct socktrace_msg {
+	int pid;
+	int fd;
 };
 
 int sockopt_ctl(void *arg);

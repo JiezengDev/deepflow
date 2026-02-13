@@ -20,7 +20,8 @@ import (
 	cmap "github.com/orcaman/concurrent-map/v2"
 
 	"github.com/deepflowio/deepflow/message/controller"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/prometheus/common"
 )
 
 type LabelKey struct {
@@ -40,11 +41,14 @@ func NewLabelKey(name, value string) LabelKey {
 }
 
 type label struct {
+	org *common.ORG
+
 	keyToID cmap.ConcurrentMap[LabelKey, int]
 }
 
-func newLabel() *label {
+func newLabel(org *common.ORG) *label {
 	return &label{
+		org:     org,
 		keyToID: cmap.NewStringer[LabelKey, int](),
 	}
 }
@@ -79,8 +83,8 @@ func (l *label) refresh(args ...interface{}) error {
 	return nil
 }
 
-func (l *label) load() ([]*mysql.PrometheusLabel, error) {
-	var labels []*mysql.PrometheusLabel
-	err := mysql.Db.Find(&labels).Error
+func (l *label) load() ([]*metadbmodel.PrometheusLabel, error) {
+	var labels []*metadbmodel.PrometheusLabel
+	err := l.org.DB.Find(&labels).Error
 	return labels, err
 }

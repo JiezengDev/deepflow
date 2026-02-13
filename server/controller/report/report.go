@@ -28,7 +28,7 @@ import (
 	"gorm.io/gorm"
 
 	. "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 var log = logging.MustGetLogger("report")
@@ -113,9 +113,9 @@ func (r *ReportServer) report() {
 		r.DFUUID = GetCAMD5()
 	}
 	var controllerCount int64
-	var vtaps []mysql.VTap
-	r.db.Model(&mysql.Controller{}).Count(&controllerCount)
-	r.db.Find(&vtaps)
+	var vtaps []metadbmodel.VTap
+	r.db.Model(&metadbmodel.Controller{}).Count(&controllerCount)
+	r.db.Select("type", "revision").Find(&vtaps)
 	agentDataMap := make(map[AgentDataKey]int)
 	for _, vtap := range vtaps {
 		agentDataKey := AgentDataKey{

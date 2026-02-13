@@ -25,8 +25,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
+	"os"
 
 	"google.golang.org/grpc"
 
@@ -34,10 +34,6 @@ import (
 )
 
 var CAMD5 string
-
-func init() {
-	CAMD5 = getCAMD5()
-}
 
 func GenerateAesKey(input []byte) string {
 	return fmt.Sprintf("%x", md5.Sum(input))
@@ -118,7 +114,7 @@ func GetEncryptKey(controllerIP, grpcServerPort, key string) (string, error) {
 }
 
 func EncryptSecretKey(secretKey string) (string, error) {
-	caData, err := ioutil.ReadFile(K8S_CA_CRT_PATH)
+	caData, err := os.ReadFile(K8S_CA_CRT_PATH)
 	if err != nil {
 		log.Error(err)
 		return "", err
@@ -133,7 +129,7 @@ func EncryptSecretKey(secretKey string) (string, error) {
 }
 
 func DecryptSecretKey(secretKey string) (string, error) {
-	caData, err := ioutil.ReadFile(K8S_CA_CRT_PATH)
+	caData, err := os.ReadFile(K8S_CA_CRT_PATH)
 	if err != nil {
 		log.Error(err)
 		return "", err
@@ -147,17 +143,17 @@ func DecryptSecretKey(secretKey string) (string, error) {
 	return decryptSecretKey, nil
 }
 
-func GetLocalClusterID() (string, error) {
-	caData, err := ioutil.ReadFile(K8S_CA_CRT_PATH)
+func GetLocalCAMD5() (string, error) {
+	caData, err := os.ReadFile(K8S_CA_CRT_PATH)
 	if err != nil {
 		log.Error(err)
 		return "", err
 	}
-	return GenerateKuberneteClusterIDByMD5(GenerateAesKey(caData))
+	return GenerateAesKey(caData), nil
 }
 
 func getCAMD5() string {
-	caData, err := ioutil.ReadFile(K8S_CA_CRT_PATH)
+	caData, err := os.ReadFile(K8S_CA_CRT_PATH)
 	if err != nil {
 		log.Error(err)
 		return ""

@@ -29,6 +29,7 @@ pub mod meta_packet;
 pub mod platform_data;
 pub mod policy;
 pub mod port_range;
+#[cfg(feature = "libtrace")]
 pub mod proc_event;
 pub(crate) mod tag;
 pub mod tagged_flow;
@@ -43,7 +44,7 @@ pub use platform_data::PlatformData;
 pub use public::enums;
 pub use tagged_flow::TaggedFlow;
 pub use tap_port::TapPort;
-pub use tap_types::TapTyper;
+pub use tap_types::CaptureNetworkTyper;
 pub use timestamp::{timestamp_to_micros, Timestamp};
 
 use std::{
@@ -56,7 +57,7 @@ use std::{
 use num_enum::IntoPrimitive;
 
 use crate::common::policy::Acl;
-use public::proto::common::TridentType;
+use public::proto::agent::AgentType;
 
 use policy::{Cidr, Container, IpGroupData, PeerConnection};
 
@@ -93,13 +94,15 @@ pub enum FlowAclListenerId {
 pub trait FlowAclListener: Send + Sync {
     fn flow_acl_change(
         &mut self,
-        trident_type: TridentType,
+        agent_type: AgentType,
         local_epc: i32,
         ip_groups: &Vec<Arc<IpGroupData>>,
         platform_data: &Vec<Arc<PlatformData>>,
         peers: &Vec<Arc<PeerConnection>>,
         cidrs: &Vec<Arc<Cidr>>,
         acls: &Vec<Arc<Acl>>,
+        enabled_invalid_log: bool,
+        has_invalid_log: &mut bool,
     ) -> Result<(), String>;
     fn containers_change(&mut self, _: &Vec<Arc<Container>>) {}
     fn id(&self) -> usize;

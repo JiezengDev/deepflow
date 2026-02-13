@@ -17,14 +17,15 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, RwLock,
+    Arc,
 };
 
 use ahash::AHashMap;
-use log::{debug, warn};
+use log::{debug, info};
 use pnet::datalink;
 use public::enums::IpProtocol;
 
+use super::fast_path::EndpointTableType;
 use super::{
     first_path::FirstPath,
     forward::{Forward, FROM_TRAFFIC_ARP},
@@ -32,7 +33,7 @@ use super::{
     Result as PResult,
 };
 use crate::common::endpoint::{EndpointData, EndpointDataPov};
-use crate::common::enums::TapType;
+use crate::common::enums::CaptureNetworkType;
 use crate::common::flow::{PacketDirection, SignalSource};
 use crate::common::lookup_key::LookupKey;
 use crate::common::platform_data::PlatformData;
@@ -42,9 +43,9 @@ use crate::common::policy::{
 use crate::common::MetaPacket;
 use crate::common::TapPort;
 use crate::common::{FlowAclListener, FlowAclListenerId};
+use crate::utils::environment::{is_tt_pod, is_tt_workload};
 use npb_pcap_policy::PolicyData;
-use public::proto::common::TridentType;
-use public::proto::trident::RoleType;
+use public::proto::agent::{AgentType, RoleType};
 use public::queue::Sender;
 
 pub struct PolicyMonitor {
@@ -92,7 +93,9 @@ pub struct Policy {
     table: FirstPath,
     forward: Forward,
 
-    nat: RwLock<Vec<AHashMap<u128, GpidEntry>>>,
+    nats: [Vec<AHashMap<u128, GpidEntry>>; super::MAX_QUEUE_COUNT],
+    nats_flags: [AtomicBool; super::MAX_QUEUE_COUNT],
+    nats_caches: [Option<Vec<AHashMap<u128, GpidEntry>>>; super::MAX_QUEUE_COUNT],
 
     first_hit: usize,
     fast_hit: usize,
@@ -103,18 +106,35 @@ pub struct Policy {
 }
 
 impl Policy {
+    const ARRAY_REPEAT_NONE: Option<Vec<AHashMap<u128, GpidEntry>>> = None;
+    const ARRAY_REPEAT_FALSE: AtomicBool = AtomicBool::new(false);
+
     pub fn new(
         queue_count: usize,
         level: usize,
         map_size: usize,
         forward_capacity: usize,
         fast_disable: bool,
+        memory_check_disable: bool,
     ) -> (PolicySetter, PolicyGetter) {
+        if memory_check_disable {
+            info!("The policy module does not check the memory.");
+        }
+        let nats: [Vec<AHashMap<u128, GpidEntry>>; super::MAX_QUEUE_COUNT] =
+            std::array::from_fn(|_| vec![AHashMap::new(), AHashMap::new()]);
         let policy = Box::into_raw(Box::new(Policy {
             labeler: Labeler::default(),
-            table: FirstPath::new(queue_count, level, map_size, fast_disable),
+            table: FirstPath::new(
+                queue_count,
+                level,
+                map_size,
+                fast_disable,
+                memory_check_disable,
+            ),
             forward: Forward::new(queue_count, forward_capacity),
-            nat: RwLock::new(vec![AHashMap::new(), AHashMap::new()]),
+            nats,
+            nats_flags: [Self::ARRAY_REPEAT_FALSE; super::MAX_QUEUE_COUNT],
+            nats_caches: [Self::ARRAY_REPEAT_NONE; super::MAX_QUEUE_COUNT],
             first_hit: 0,
             fast_hit: 0,
             monitor: None,
@@ -128,10 +148,11 @@ impl Policy {
         self.monitor = Some(PolicyMonitor { sender, enabled });
     }
 
+    #[inline]
     pub fn lookup_l3(&mut self, packet: &mut MetaPacket) {
         let key = &mut packet.lookup_key;
         let index = key.fast_index;
-        if key.tap_type != TapType::Cloud {
+        if key.tap_type != CaptureNetworkType::Cloud {
             return;
         }
         if key.src_ip.is_loopback() {
@@ -157,6 +178,7 @@ impl Policy {
         // TODO: 根据TTL添加forward表
     }
 
+    #[inline]
     fn fill_gpid_entry(packet: &mut MetaPacket, gpid_entry: &GpidEntry) {
         if gpid_entry.port_1 == 0 && gpid_entry.port_0 == 0 {
             return;
@@ -257,6 +279,7 @@ impl Policy {
         }
     }
 
+    #[inline]
     pub fn lookup(&mut self, packet: &mut MetaPacket, index: usize, local_epc_id: i32) {
         packet.lookup_key.fast_index = index;
         self.lookup_l3(packet);
@@ -264,8 +287,9 @@ impl Policy {
         let key = &mut packet.lookup_key;
 
         if packet.signal_source == SignalSource::EBPF {
-            let (endpoints, gpid_entries) = self.lookup_all_by_epc(key, local_epc_id);
-            packet.endpoint_data = Some(EndpointDataPov::new(Arc::new(endpoints)));
+            let (endpoints, gpid_entries) =
+                self.lookup_endpoint(EndpointTableType::Ebpf, key, local_epc_id);
+            packet.endpoint_data = Some(EndpointDataPov::new(endpoints));
             packet.policy_data = Some(Arc::new(PolicyData::default())); // Only endpoint is required for ebpf data
             Self::fill_gpid_entry(packet, &gpid_entries);
             return;
@@ -279,6 +303,7 @@ impl Policy {
         }
     }
 
+    #[inline]
     fn send(
         &self,
         key: &LookupKey,
@@ -294,6 +319,7 @@ impl Policy {
         }
     }
 
+    #[inline]
     fn send_ebpf(
         &self,
         src_ip: IpAddr,
@@ -311,6 +337,7 @@ impl Policy {
         }
     }
 
+    #[inline]
     pub fn lookup_all_by_key(
         &mut self,
         key: &mut LookupKey,
@@ -339,7 +366,7 @@ impl Policy {
         // TODO：可能也需要走fast提升性能
         let endpoints = self
             .labeler
-            .get_endpoint_data_by_epc(src, dst, l3_epc_id_src, 0);
+            .get_endpoint_data_by_epc(src, dst, l3_epc_id_src, 0, false);
         self.send_ebpf(
             src,
             dst,
@@ -353,20 +380,64 @@ impl Policy {
         endpoints.dst_info.l3_epc_id
     }
 
-    pub fn lookup_all_by_epc(
-        &self,
+    #[inline]
+    pub fn lookup_from_otel(
+        &mut self,
         key: &mut LookupKey,
         local_epc_id: i32,
-    ) -> (EndpointData, GpidEntry) {
-        // TODO：可能也需要走fast提升性能
+    ) -> (Arc<EndpointData>, GpidEntry) {
+        self.lookup_endpoint(EndpointTableType::Otel, key, local_epc_id)
+    }
+
+    #[inline]
+    fn lookup_endpoint(
+        &mut self,
+        table_type: EndpointTableType,
+        key: &mut LookupKey,
+        local_epc_id: i32,
+    ) -> (Arc<EndpointData>, GpidEntry) {
         let (l3_epc_id_0, l3_epc_id_1) = if key.l2_end_0 {
             (local_epc_id, 0)
         } else {
             (0, local_epc_id)
         };
-        let endpoints =
-            self.labeler
-                .get_endpoint_data_by_epc(key.src_ip, key.dst_ip, l3_epc_id_0, l3_epc_id_1);
+
+        if let Some(endpoints) = self.table.endpoint_fast_get(
+            table_type,
+            key.src_ip,
+            key.dst_ip,
+            l3_epc_id_0,
+            l3_epc_id_1,
+            key.l2_end_0,
+        ) {
+            let entry = self.lookup_gpid_entry(key, &endpoints);
+            self.send_ebpf(
+                key.src_ip,
+                key.dst_ip,
+                key.src_port,
+                key.dst_port,
+                endpoints.src_info.l3_epc_id,
+                endpoints.dst_info.l3_epc_id,
+                &entry,
+            );
+            return (endpoints, entry);
+        }
+
+        let endpoints = self.labeler.get_endpoint_data_by_epc(
+            key.src_ip,
+            key.dst_ip,
+            l3_epc_id_0,
+            l3_epc_id_1,
+            key.l2_end_0,
+        );
+        let endpoints = self.table.endpoint_fast_add(
+            table_type,
+            key.src_ip,
+            key.dst_ip,
+            l3_epc_id_0,
+            l3_epc_id_1,
+            endpoints,
+        );
         let entry = self.lookup_gpid_entry(key, &endpoints);
         self.send_ebpf(
             key.src_ip,
@@ -381,22 +452,19 @@ impl Policy {
         (endpoints, entry)
     }
 
-    pub fn lookup_pod_id(&self, container_id: &String) -> u32 {
+    #[inline]
+    pub fn lookup_pod_id(&self, container_id: &str) -> u32 {
         self.labeler.lookup_pod_id(container_id)
     }
 
-    pub fn update_interfaces(
-        &mut self,
-        trident_type: TridentType,
-        ifaces: &Vec<Arc<PlatformData>>,
-    ) {
+    pub fn update_interfaces(&mut self, agent_type: AgentType, ifaces: &Vec<Arc<PlatformData>>) {
         self.labeler.update_interface_table(ifaces);
         self.table.update_interfaces(ifaces);
 
         // TODO: 后续需要添加监控本地网卡，如果网卡配置有变化应该也需要出发表更新
         let local_interfaces = datalink::interfaces();
         self.forward
-            .update_from_config(trident_type, ifaces, &local_interfaces);
+            .update_from_config(agent_type, ifaces, &local_interfaces);
     }
 
     pub fn update_ip_group(&mut self, groups: &Vec<Arc<IpGroupData>>) {
@@ -409,51 +477,70 @@ impl Policy {
         self.labeler.update_peer_table(peers);
     }
 
-    pub fn update_cidr(&mut self, cidrs: &Vec<Arc<Cidr>>) {
+    pub fn update_cidr(
+        &mut self,
+        cidrs: &Vec<Arc<Cidr>>,
+        enabled_invalid_log: bool,
+        has_invalid_log: &mut bool,
+    ) {
         self.table.update_cidr(cidrs);
-        self.labeler.update_cidr_table(cidrs);
+        self.labeler
+            .update_cidr_table(cidrs, enabled_invalid_log, has_invalid_log);
     }
 
     pub fn update_container(&mut self, cidrs: &Vec<Arc<Container>>) {
         self.labeler.update_container(cidrs);
     }
 
-    pub fn update_acl(&mut self, acls: &Vec<Arc<Acl>>, check: bool) -> PResult<()> {
-        self.table.update_acl(acls, check)?;
+    pub fn update_acl(
+        &mut self,
+        acls: &Vec<Arc<Acl>>,
+        check: bool,
+        enabled_invalid_log: bool,
+        has_invalid_log: &mut bool,
+    ) -> PResult<()> {
+        self.table
+            .update_acl(acls, check, enabled_invalid_log, has_invalid_log)?;
 
         self.acls = acls.clone();
 
         Ok(())
     }
 
-    fn lookup_gpid_entry(&self, key: &mut LookupKey, _endpoints: &EndpointData) -> GpidEntry {
-        if !key.is_ipv4() || (key.proto != IpProtocol::UDP && key.proto != IpProtocol::TCP) {
+    #[inline]
+    fn lookup_gpid_entry(
+        &mut self,
+        packet: &mut LookupKey,
+        _endpoints: &EndpointData,
+    ) -> GpidEntry {
+        if !packet.is_ipv4() || (packet.proto != IpProtocol::UDP && packet.proto != IpProtocol::TCP)
+        {
             return GpidEntry::default();
         }
-        let protocol = u8::from(GpidProtocol::try_from(key.proto).unwrap()) as usize;
+        let protocol = u8::from(GpidProtocol::try_from(packet.proto).unwrap()) as usize;
         // FIXME: Support epc id
         let epc_id_0 = 0;
         let epc_id_1 = 0;
 
-        let (ip_0, port_0) = if TapPort::NAT_SOURCE_TOA == key.src_nat_source {
-            if let IpAddr::V4(addr) = key.src_nat_ip {
-                (u32::from(addr), key.src_nat_port)
+        let (ip_0, port_0) = if TapPort::NAT_SOURCE_TOA == packet.src_nat_source {
+            if let IpAddr::V4(addr) = packet.src_nat_ip {
+                (u32::from(addr), packet.src_nat_port)
             } else {
-                (0, key.src_nat_port)
+                (0, packet.src_nat_port)
             }
-        } else if let IpAddr::V4(addr) = key.src_ip {
-            (u32::from(addr), key.src_port)
+        } else if let IpAddr::V4(addr) = packet.src_ip {
+            (u32::from(addr), packet.src_port)
         } else {
             (0, 0)
         };
-        let (ip_1, port_1) = if TapPort::NAT_SOURCE_TOA == key.dst_nat_source {
-            if let IpAddr::V4(addr) = key.dst_nat_ip {
-                (u32::from(addr), key.dst_nat_port)
+        let (ip_1, port_1) = if TapPort::NAT_SOURCE_TOA == packet.dst_nat_source {
+            if let IpAddr::V4(addr) = packet.dst_nat_ip {
+                (u32::from(addr), packet.dst_nat_port)
             } else {
-                (0, key.dst_nat_port)
+                (0, packet.dst_nat_port)
             }
-        } else if let IpAddr::V4(addr) = key.dst_ip {
-            (u32::from(addr), key.dst_port)
+        } else if let IpAddr::V4(addr) = packet.dst_ip {
+            (u32::from(addr), packet.dst_port)
         } else {
             (0, 0)
         };
@@ -461,7 +548,13 @@ impl Policy {
         let key_0 = gpid_key(ip_0, epc_id_0, port_0);
         let key_1 = gpid_key(ip_1, epc_id_1, port_1);
         let key = (key_0 as u128) << 64 | key_1 as u128;
-        *self.nat.read().unwrap()[protocol]
+
+        if self.nats_flags[packet.fast_index].load(Ordering::Acquire) {
+            self.nats[packet.fast_index] = self.nats_caches[packet.fast_index].take().unwrap();
+            self.nats_flags[packet.fast_index].store(false, Ordering::Release)
+        }
+
+        *self.nats[packet.fast_index][protocol]
             .get(&key)
             .unwrap_or(&GpidEntry::default())
     }
@@ -474,7 +567,7 @@ impl Policy {
         for gpid_entry in gpid_entries.iter() {
             let protocol = u8::from(gpid_entry.protocol) as usize;
             if protocol >= table.len() {
-                warn!("Invalid protocol {:?} in {:?}", protocol, &gpid_entry);
+                debug!("Invalid protocol {:?} in {:?}", protocol, &gpid_entry);
                 continue;
             }
 
@@ -487,7 +580,13 @@ impl Policy {
             let key = (key_1 as u128) << 64 | key_0 as u128;
             table[protocol].insert(key, gpid_entry.clone());
         }
-        *self.nat.write().unwrap() = table;
+
+        for i in 0..super::MAX_QUEUE_COUNT {
+            if !self.nats_flags[i].load(Ordering::Acquire) {
+                self.nats_caches[i] = Some(table.clone());
+                self.nats_flags[i].store(true, Ordering::Release);
+            }
+        }
     }
 
     pub fn get_acls(&self) -> &Vec<Arc<Acl>> {
@@ -533,6 +632,7 @@ impl PolicyGetter {
         self.switch = false;
     }
 
+    #[inline]
     pub fn lookup(&mut self, packet: &mut MetaPacket, index: usize, local_epc_id: i32) {
         if !self.switch {
             return;
@@ -540,6 +640,7 @@ impl PolicyGetter {
         self.policy().lookup(packet, index, local_epc_id);
     }
 
+    #[inline]
     pub fn lookup_all_by_key(
         &mut self,
         key: &mut LookupKey,
@@ -547,11 +648,13 @@ impl PolicyGetter {
         self.policy().lookup_all_by_key(key)
     }
 
+    #[inline]
     pub fn lookup_epc_by_epc(&mut self, src: IpAddr, dst: IpAddr, l3_epc_id_src: i32) -> i32 {
         self.policy().lookup_epc_by_epc(src, dst, l3_epc_id_src)
     }
 
-    pub fn lookup_pod_id(&self, container_id: &String) -> u32 {
+    #[inline]
+    pub fn lookup_pod_id(&self, container_id: &str) -> u32 {
         self.policy().lookup_pod_id(container_id)
     }
 }
@@ -582,20 +685,25 @@ impl From<*mut Policy> for PolicySetter {
 impl FlowAclListener for PolicySetter {
     fn flow_acl_change(
         &mut self,
-        trident_type: TridentType,
+        agent_type: AgentType,
         local_epc: i32,
         ip_groups: &Vec<Arc<IpGroupData>>,
         platform_data: &Vec<Arc<PlatformData>>,
         peers: &Vec<Arc<PeerConnection>>,
         cidrs: &Vec<Arc<Cidr>>,
         acls: &Vec<Arc<Acl>>,
+        enabled_invalid_log: bool,
+        has_invalid_log: &mut bool,
     ) -> Result<(), String> {
-        self.update_local_epc(local_epc);
-        self.update_interfaces(trident_type, platform_data);
+        self.update_local_epc(
+            local_epc,
+            is_tt_pod(agent_type) || is_tt_workload(agent_type),
+        );
+        self.update_interfaces(agent_type, platform_data);
         self.update_ip_group(ip_groups);
         self.update_peer_connections(peers);
-        self.update_cidr(cidrs);
-        if let Err(e) = self.update_acl(acls, true) {
+        self.update_cidr(cidrs, enabled_invalid_log, has_invalid_log);
+        if let Err(e) = self.update_acl(acls, true, enabled_invalid_log, has_invalid_log) {
             return Err(format!("{}", e));
         }
 
@@ -617,16 +725,14 @@ impl PolicySetter {
         unsafe { &mut *self.policy }
     }
 
-    pub fn update_local_epc(&mut self, local_epc: i32) {
-        self.policy().labeler.update_local_epc(local_epc);
+    pub fn update_local_epc(&mut self, local_epc: i32, running_in_single_epc: bool) {
+        self.policy()
+            .labeler
+            .update_local_epc(local_epc, running_in_single_epc);
     }
 
-    pub fn update_interfaces(
-        &mut self,
-        trident_type: TridentType,
-        ifaces: &Vec<Arc<PlatformData>>,
-    ) {
-        self.policy().update_interfaces(trident_type, ifaces);
+    pub fn update_interfaces(&mut self, agent_type: AgentType, ifaces: &Vec<Arc<PlatformData>>) {
+        self.policy().update_interfaces(agent_type, ifaces);
     }
 
     pub fn update_ip_group(&mut self, groups: &Vec<Arc<IpGroupData>>) {
@@ -637,16 +743,29 @@ impl PolicySetter {
         self.policy().update_peer_connections(peers);
     }
 
-    pub fn update_cidr(&mut self, cidrs: &Vec<Arc<Cidr>>) {
-        self.policy().update_cidr(cidrs);
+    pub fn update_cidr(
+        &mut self,
+        cidrs: &Vec<Arc<Cidr>>,
+        enabled_invalid_log: bool,
+        has_invalid_log: &mut bool,
+    ) {
+        self.policy()
+            .update_cidr(cidrs, enabled_invalid_log, has_invalid_log);
     }
 
     pub fn update_container(&mut self, containers: &Vec<Arc<Container>>) {
         self.policy().update_container(containers);
     }
 
-    pub fn update_acl(&mut self, acls: &Vec<Arc<Acl>>, check: bool) -> PResult<()> {
-        self.policy().update_acl(acls, check)?;
+    pub fn update_acl(
+        &mut self,
+        acls: &Vec<Arc<Acl>>,
+        check: bool,
+        enabled_invalid_log: bool,
+        has_invalid_log: &mut bool,
+    ) -> PResult<()> {
+        self.policy()
+            .update_acl(acls, check, enabled_invalid_log, has_invalid_log)?;
 
         Ok(())
     }
@@ -698,7 +817,7 @@ mod test {
 
     #[test]
     fn test_policy_normal() {
-        let (mut setter, mut getter) = Policy::new(10, 0, 1024, 1024, false);
+        let (mut setter, mut getter) = Policy::new(10, 0, 1024, 1024, false, false);
         let interface: PlatformData = PlatformData {
             mac: 0x002233445566,
             ips: vec![IpSubnet {
@@ -714,8 +833,8 @@ mod test {
             cidr_type: CidrType::Wan,
             ..Default::default()
         };
-        setter.update_interfaces(TridentType::TtHostPod, &vec![Arc::new(interface)]);
-        setter.update_cidr(&vec![Arc::new(cidr)]);
+        setter.update_interfaces(AgentType::TtHostPod, &vec![Arc::new(interface)]);
+        setter.update_cidr(&vec![Arc::new(cidr)], false, &mut false);
         setter.flush();
 
         let mut key = LookupKey {

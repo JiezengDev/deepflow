@@ -16,7 +16,6 @@
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::mem::drop;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::process::Command;
@@ -28,17 +27,23 @@ use std::time::Duration;
 
 use arc_swap::access::Access;
 use log::{debug, info, log_enabled, warn};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use nix::{
+    sched::{sched_setaffinity, CpuSet},
+    unistd::Pid,
+};
 
 use super::base_dispatcher::{BaseDispatcher, BaseDispatcherListener};
 use super::error::Result;
-use super::local_mode_dispatcher::{LocalModeDispatcherListener, MacRewriter};
+use super::local_mode_dispatcher::{skip_by_blacklist, LocalModeDispatcherListener, MacRewriter};
+use super::Packet;
 
 #[cfg(target_os = "linux")]
 use crate::platform::LibvirtXmlExtractor;
 use crate::{
     common::{
         decapsulate::{TunnelInfo, TunnelType},
-        enums::{EthernetType, TapType},
+        enums::{CaptureNetworkType, EthernetType},
         MetaPacket, TapPort, FIELD_OFFSET_ETH_TYPE, MAC_ADDR_LEN, VLAN_HEADER_SIZE,
     },
     config::DispatcherConfig,
@@ -47,25 +52,16 @@ use crate::{
     rpc::get_timestamp,
     utils::{
         bytes::read_u16_be,
-        stats::{self, Countable, StatsOption},
+        stats::{self, Countable, QueueStats},
     },
 };
 use public::{
-    buffer::{Allocator, BatchedBuffer},
+    buffer::Allocator,
     debug::QueueDebugger,
-    proto::{common::TridentType, trident::IfMacSource},
+    proto::agent::{AgentType, IfMacSource},
     queue::{self, bounded_with_debug, DebugSender, Receiver},
     utils::net::{Link, MacAddr},
 };
-
-#[derive(Debug)]
-struct Packet {
-    timestamp: Duration,
-    raw: BatchedBuffer<u8>,
-    original_length: u32,
-    raw_length: u32,
-    if_index: isize,
-}
 
 const HANDLER_BATCH_SIZE: usize = 64;
 
@@ -95,7 +91,7 @@ impl LocalPlusModeDispatcher {
         receiver: Receiver<Packet>,
         sender: DebugSender<MiniPacket<'static>>,
     ) {
-        let base = &self.base;
+        let base = &self.base.is;
 
         let terminated = base.terminated.clone();
         let counter = base.counter.clone();
@@ -106,7 +102,7 @@ impl LocalPlusModeDispatcher {
         let log_output_queue = base.log_output_queue.clone();
         let ntp_diff = base.ntp_diff.clone();
         let flow_map_config = base.flow_map_config.clone();
-        let log_parse_config = base.log_parse_config.clone();
+        let log_parser_config = base.log_parser_config.clone();
         let collector_config = base.collector_config.clone();
         let packet_sequence_output_queue = base.packet_sequence_output_queue.clone(); // Enterprise Edition Feature: packet-sequence
         let stats = base.stats.clone();
@@ -115,8 +111,10 @@ impl LocalPlusModeDispatcher {
         let tap_type_handler = base.tap_type_handler.clone();
         let mut tunnel_info = TunnelInfo::default();
         let npb_dedup_enabled = base.npb_dedup_enabled.clone();
-        let ctrl_mac = base.ctrl_mac;
         let pool_raw_size = self.pool_raw_size;
+        let tunnel_type_trim_bitmap = base.tunnel_type_trim_bitmap.clone();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let cpu_set = base.options.lock().unwrap().cpu_set;
 
         self.flow_generator_thread_handler.replace(
             thread::Builder::new()
@@ -126,7 +124,7 @@ impl LocalPlusModeDispatcher {
                     let mut output_batch = Vec::with_capacity(HANDLER_BATCH_SIZE);
                     let mut flow_map = FlowMap::new(
                         id as u32,
-                        flow_output_queue,
+                        Some(flow_output_queue),
                         l7_stats_output_queue,
                         policy_getter,
                         log_output_queue,
@@ -136,11 +134,17 @@ impl LocalPlusModeDispatcher {
                         stats,
                         false, // !from_ebpf
                     );
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    if cpu_set != CpuSet::new() {
+                        if let Err(e) = sched_setaffinity(Pid::from_raw(0), &cpu_set) {
+                            warn!("CPU Affinity({:?}) bind error: {:?}.", &cpu_set, e);
+                        }
+                    }
 
                     while !terminated.load(Ordering::Relaxed) {
                         let config = Config {
                             flow: &flow_map_config.load(),
-                            log_parser: &log_parse_config.load(),
+                            log_parser: &log_parser_config.load(),
                             collector: &collector_config.load(),
                             #[cfg(any(target_os = "linux", target_os = "android"))]
                             ebpf: None,
@@ -159,7 +163,7 @@ impl LocalPlusModeDispatcher {
                         for mut packet in batch.drain(..) {
                             let pipeline = {
                                 let pipelines = pipelines.lock().unwrap();
-                                if let Some(p) = pipelines.get(&(packet.if_index as u32)) {
+                                if let Some(p) = pipelines.get(&(packet.if_index as u64)) {
                                     p.clone()
                                 } else if pipelines.is_empty() {
                                     continue;
@@ -202,12 +206,13 @@ impl LocalPlusModeDispatcher {
                                     || MacAddr::is_multicast(&packet.raw));
 
                             // LOCAL模式L2END使用underlay网络的MAC地址，实际流量解析使用overlay
-                            let cur_tunnel_type_bitmap = tunnel_type_bitmap.lock().unwrap().clone();
+                            let cur_tunnel_type_bitmap = tunnel_type_bitmap.read().unwrap().clone();
                             let decap_length = match BaseDispatcher::decap_tunnel(
                                 &mut packet.raw,
                                 &tap_type_handler,
                                 &mut tunnel_info,
                                 cur_tunnel_type_bitmap,
+                                tunnel_type_trim_bitmap,
                             ) {
                                 Ok((l, _)) => l,
                                 Err(e) => {
@@ -251,8 +256,6 @@ impl LocalPlusModeDispatcher {
                                 if meta_packet.lookup_key.src_mac == MacAddr::ZERO
                                     && meta_packet.lookup_key.dst_mac == MacAddr::ZERO
                                 {
-                                    meta_packet.lookup_key.src_mac = ctrl_mac;
-                                    meta_packet.lookup_key.dst_mac = ctrl_mac;
                                     meta_packet.lookup_key.l2_end_0 = true;
                                     meta_packet.lookup_key.l2_end_1 = true;
                                 }
@@ -261,11 +264,11 @@ impl LocalPlusModeDispatcher {
                             meta_packet.tap_port = TapPort::from_local_mac(
                                 meta_packet.lookup_key.get_nat_source(),
                                 tunnel_info.tunnel_type,
-                                u64::from(pipeline.vm_mac) as u32,
+                                u64::from(pipeline.bond_mac) as u32,
                             );
                             BaseDispatcher::prepare_flow(
                                 &mut meta_packet,
-                                TapType::Cloud,
+                                CaptureNetworkType::Cloud,
                                 false,
                                 id as u8,
                                 npb_dedup_enabled.load(Ordering::Relaxed),
@@ -297,7 +300,7 @@ impl LocalPlusModeDispatcher {
     // 1. Lookup pipeline
     // 2. NPB/PCAP/...
     fn run_additional_packet_pipeline(&mut self, receiver: Receiver<MiniPacket<'static>>) {
-        let base = &self.base;
+        let base = &self.base.is;
         let terminated = base.terminated.clone();
         let pipelines = base.pipelines.clone();
 
@@ -317,7 +320,7 @@ impl LocalPlusModeDispatcher {
                         for mini_packet in batch.drain(..) {
                             let pipeline = {
                                 let pipelines = pipelines.lock().unwrap();
-                                if let Some(p) = pipelines.get(&(mini_packet.if_index() as u32)) {
+                                if let Some(p) = pipelines.get(&(mini_packet.if_index() as u64)) {
                                     p.clone()
                                 } else if pipelines.is_empty() {
                                     continue;
@@ -351,29 +354,21 @@ impl LocalPlusModeDispatcher {
     }
 
     fn setup_inner_thread_and_queue(&mut self) -> DebugSender<Packet> {
-        let id = self.base.id.to_string();
+        let id = self.base.is.id;
         let name = "0.1-raw-packet-to-flow-generator";
         let (sender_to_parser, receiver_from_dispatcher, counter) =
             bounded_with_debug(self.inner_queue_size, name, &self.queue_debugger);
         self.stats_collector.register_countable(
-            "queue",
+            &QueueStats { id, module: name },
             Countable::Owned(Box::new(counter)),
-            vec![
-                StatsOption::Tag("module", name.to_string()),
-                StatsOption::Tag("index", id.clone()),
-            ],
         );
 
         let name = "0.2-packet-to-additional-pipeline";
         let (sender_to_pipeline, receiver_from_flow, counter) =
             bounded_with_debug(self.inner_queue_size, name, &self.queue_debugger);
         self.stats_collector.register_countable(
-            "queue",
+            &QueueStats { id, module: name },
             Countable::Owned(Box::new(counter)),
-            vec![
-                StatsOption::Tag("module", name.to_string()),
-                StatsOption::Tag("index", id),
-            ],
         );
 
         self.run_flow_generator(receiver_from_dispatcher, sender_to_pipeline);
@@ -383,7 +378,7 @@ impl LocalPlusModeDispatcher {
 
     pub(super) fn run(&mut self) {
         let sender_to_parser = self.setup_inner_thread_and_queue();
-        let base = &mut self.base;
+        let base = &mut self.base.is;
         info!("Start local plus dispatcher {}", base.log_id);
         let time_diff = base.ntp_diff.load(Ordering::Relaxed);
         let mut prev_timestamp = get_timestamp(time_diff);
@@ -398,7 +393,7 @@ impl LocalPlusModeDispatcher {
             // The lifecycle of the recved will end before the next call to recv.
             let recved = unsafe {
                 BaseDispatcher::recv(
-                    &mut base.engine,
+                    &mut self.base.engine,
                     &base.leaky_bucket,
                     &base.exception_handler,
                     &mut prev_timestamp,
@@ -417,7 +412,7 @@ impl LocalPlusModeDispatcher {
                     base.need_update_bpf.store(true, Ordering::Relaxed);
                 }
                 drop(recved);
-                base.check_and_update_bpf();
+                base.check_and_update_bpf(&mut self.base.engine);
                 continue;
             }
             if base.pause.load(Ordering::Relaxed) {
@@ -441,11 +436,12 @@ impl LocalPlusModeDispatcher {
                 original_length: packet.capture_length as u32,
                 raw_length: packet.data.len() as u32,
                 if_index: packet.if_index,
+                ns_ino: 0,
             };
             batch.push(info);
 
             drop(packet);
-            base.check_and_update_bpf();
+            base.check_and_update_bpf(&mut self.base.engine);
         }
         if let Some(handler) = self.flow_generator_thread_handler.take() {
             let _ = handler.join();
@@ -454,8 +450,8 @@ impl LocalPlusModeDispatcher {
             let _ = handler.join();
         }
 
-        base.terminate_handler();
-        info!("Stopped dispatcher {}", base.log_id);
+        self.base.terminate_handler();
+        info!("Stopped dispatcher {}", self.base.is.log_id);
     }
 
     pub(super) fn listener(&self) -> LocalPlusModeDispatcherListener {
@@ -475,7 +471,7 @@ impl LocalPlusModeDispatcher {
 
 #[derive(Clone)]
 pub struct LocalPlusModeDispatcherListener {
-    base: BaseDispatcherListener,
+    pub(super) base: BaseDispatcherListener,
     #[cfg(target_os = "linux")]
     extractor: Arc<LibvirtXmlExtractor>,
     rewriter: MacRewriter,
@@ -509,10 +505,6 @@ impl LocalPlusModeDispatcherListener {
         return self.base.id;
     }
 
-    pub fn local_dispatcher_count(&self) -> usize {
-        return self.base.local_dispatcher_count;
-    }
-
     pub fn flow_acl_change(&self) {
         // Start capturing traffic after resource information is distributed
         self.base.pause.store(false, Ordering::Relaxed);
@@ -523,45 +515,21 @@ impl LocalPlusModeDispatcherListener {
         &self,
         interfaces: &[Link],
         if_mac_source: IfMacSource,
-        trident_type: TridentType,
+        agent_type: AgentType,
         blacklist: &Vec<u64>,
     ) {
         let mut interfaces = interfaces.to_vec();
-        if !blacklist.is_empty() {
-            // 当虚拟机内的容器节点已部署采集器时，宿主机采集器需要排除容器节点的接口，避免采集双份重复流量
-            let mut blackset = HashSet::with_capacity(blacklist.len());
-            for mac in blacklist {
-                blackset.insert(*mac & 0xffffffff);
-            }
-            let mut rejected = vec![];
-            interfaces.retain(|iface| {
-                if blackset.contains(&(u64::from(iface.mac_addr) & 0xffffffff)) {
-                    rejected.push(iface.mac_addr);
-                    false
-                } else {
-                    true
-                }
-            });
-            if !rejected.is_empty() {
-                debug!(
-                    "Dispatcher{} Tap interfaces {:?} rejected by blacklist",
-                    self.base.log_id, rejected
-                );
-            }
-        }
         // interfaces为实际TAP口的集合，macs为TAP口对应主机的MAC地址集合
         interfaces.sort_by_key(|link| link.if_index);
-        let keys = interfaces
-            .iter()
-            .map(|link| link.if_index)
-            .collect::<Vec<_>>();
+        let keys: Vec<u64> = interfaces.iter().map(|link| link.if_index as u64).collect();
         let macs = self.get_mapped_macs(
             &interfaces,
             if_mac_source,
-            trident_type,
+            agent_type,
             #[cfg(target_os = "linux")]
             &self.base.options.lock().unwrap().tap_mac_script,
         );
+        let (keys, macs) = skip_by_blacklist(&self.base.log_id, keys, macs, blacklist);
         self.base.on_vm_change(&keys, &macs);
         self.base.on_tap_interface_change(interfaces, if_mac_source);
     }
@@ -570,7 +538,7 @@ impl LocalPlusModeDispatcherListener {
         &self,
         interfaces: &Vec<Link>,
         if_mac_source: IfMacSource,
-        trident_type: TridentType,
+        agent_type: AgentType,
         #[cfg(target_os = "linux")] tap_mac_script: &str,
     ) -> Vec<MacAddr> {
         let mut macs = vec![];
@@ -597,7 +565,7 @@ impl LocalPlusModeDispatcherListener {
             macs.push(match if_mac_source {
                 IfMacSource::IfMac => {
                     let mut mac = iface.mac_addr;
-                    if trident_type == TridentType::TtProcess {
+                    if agent_type == AgentType::TtProcess {
                         let mut octets = mac.octets().to_owned();
                         octets[0] = 0;
                         mac = octets.into();
