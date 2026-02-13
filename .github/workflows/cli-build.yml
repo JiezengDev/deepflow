@@ -22,8 +22,38 @@ permissions:
   contents: write
 
 jobs:
+  check_develop_local_tag:
+    name: check develop-local tag source
+    runs-on: ubuntu-latest
+    outputs:
+      allowed: ${{ steps.check.outputs.allowed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Check tag source branch
+        id: check
+        run: |
+          if [ "${{ github.ref_type }}" != "tag" ]; then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch origin develop-local || true
+          if ! git show-ref --verify --quiet refs/remotes/origin/develop-local; then
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git merge-base --is-ancestor "${{ github.sha }}" "origin/develop-local"; then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build_cli:
     name: build cli
+    needs: check_develop_local_tag
+    if: ${{ github.ref_type != 'tag' || needs.check_develop_local_tag.outputs.allowed == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
