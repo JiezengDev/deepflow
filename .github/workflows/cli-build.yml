@@ -18,6 +18,9 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: write
+
 jobs:
   build_cli:
     name: build cli
@@ -109,17 +112,10 @@ jobs:
           ossutil cp -rf cli/bin/deepflow-ctl.darwin-amd64 oss://deepflow-ce/bin/ctl/stable/darwin/amd64/deepflow-ctl
           ossutil cp -rf cli/bin/deepflow-ctl.darwin-arm64 oss://deepflow-ce/bin/ctl/stable/darwin/arm64/deepflow-ctl
 
-      # - name: Prepare for upload package
-      #   shell: bash
-      #   run: |
-      #     sha256sum dist/* > deepflow-agent.sha256sum.txt
-
-      # - name: Release and upload packages
-      #   uses: softprops/action-gh-release@v1
-      #   if: startsWith(github.ref, 'refs/tags/')
-      #   env:
-      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      #   with:
-      #     files: |
-      #       deepflow-agent.sha256sum.txt
-      #       dist/*
+      - name: Release and upload packages
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            cli/bin/deepflow-agent.sha256sum.txt
+            cli/bin/deepflow-ctl.*
