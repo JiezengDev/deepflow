@@ -111,8 +111,10 @@
     kubectl apply -f .github/ack/cli-build-job.yaml
 
 - name: Wait ACK build job done
+  env:
+    ACK_JOB_NAME: deepflow-cli-build
   run: |
-    kubectl wait --for=condition=complete --timeout=3600s job/deepflow-cli-build
+    kubectl wait --for=condition=complete --timeout=3600s job/${ACK_JOB_NAME}
 ```
 
 > 建议将 Job YAML 放在 `/.github/ack/`，便于与 workflow 配置统一管理。
